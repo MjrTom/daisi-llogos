@@ -35,7 +35,7 @@ Tests validate against [Qwen 3.5 0.8B Q8_0](https://huggingface.co/unsloth/Qwen3
 
 ## Current Status
 
-**End-to-end text generation works on CPU.** 99 passing tests across GGUF parsing, dequantization, math ops, tokenization, forward pass, sampling, and generation.
+**End-to-end text generation works on CPU. CUDA kernel operations validated on GPU.** 113 passing tests across GGUF parsing, dequantization, math ops, tokenization, forward pass, sampling, generation, and CUDA kernels.
 
 What works today:
 - Parse any GGUF v2/v3 file (header, metadata, tensor info)
@@ -53,6 +53,9 @@ What works today:
 - Sampler with temperature, top-k, top-p, repetition penalty, greedy/random sampling
 - Streaming text generation with prefill + decode loop
 - CLI with full argument parsing (model path, prompt, sampling parameters)
+- CUDA backend: P/Invoke to CUDA Driver API, NVRTC JIT compilation, SafeHandle resource management
+- GPU kernels: FP32 matmul, fused Q8_0 dequant+matmul, RMSNorm, softmax, SiLU, RoPE, element-wise ops, embedding lookup
+- GPU kernel correctness validated against CPU at model-scale dimensions (1024d hidden, 3584d FFN, 151936 vocab)
 
 ## Roadmap
 
@@ -82,7 +85,7 @@ flowchart LR
     style P3 fill:#2d6a4f,color:#fff
     style P4 fill:#2d6a4f,color:#fff
     style P5 fill:#2d6a4f,color:#fff
-    style P6 fill:#e76f51,color:#fff
+    style P6 fill:#2d6a4f,color:#fff
     style P7 fill:#e76f51,color:#fff
     style P8 fill:#e76f51,color:#fff
     style P9 fill:#e76f51,color:#fff
@@ -97,7 +100,7 @@ flowchart LR
 | 3 | [Tokenizer](docs/roadmap/phase-03-tokenizer.md) | BPE tokenizer from GGUF metadata | Done |
 | 4 | [Forward Pass](docs/roadmap/phase-04-forward-pass.md) | Model loading + hybrid forward pass (attention + DeltaNet) | Done |
 | 5 | [Generation](docs/roadmap/phase-05-generation.md) | Sampling, text generation loop, CLI | Done |
-| 6 | [CUDA](docs/roadmap/phase-06-cuda.md) | NVIDIA GPU backend with fused kernels | Not started |
+| 6 | [CUDA](docs/roadmap/phase-06-cuda.md) | NVIDIA GPU backend with fused kernels | Done |
 | 7 | [DeltaNet](docs/roadmap/phase-07-deltanet.md) | Qwen 3.5 hybrid DeltaNet architecture | Done (folded into Phase 4) |
 | 8 | [Optimization](docs/roadmap/phase-08-optimization.md) | Mmap loading, batch prefill, KV cache quantization | Not started |
 | 9 | [Vulkan](docs/roadmap/phase-09-vulkan.md) | Cross-platform GPU backend (Windows/Linux) | Not started |

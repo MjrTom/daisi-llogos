@@ -1,0 +1,18 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <RootNamespace>Daisi.Llama.Cuda</RootNamespace>
+    <AssemblyName>Daisi.Llama.Cuda</AssemblyName>
+    <AllowUnsafeBlocks>true</AllowUnsafeBlocks>
+  </PropertyGroup>
+  <ItemGroup>
+    <InternalsVisibleTo Include="Daisi.Llama.Tests" />
+  </ItemGroup>
+  <ItemGroup>
+    <ProjectReference Include="..\Daisi.Llama\Daisi.Llama.csproj" />
+    <ProjectReference Include="..\Daisi.Llama.Cpu\Daisi.Llama.Cpu.csproj" />
+  </ItemGroup>
+  <ItemGroup>
+    <EmbeddedResource Include="kernels\elementwise.cu" LogicalName="elementwise.cu" />
+    <EmbeddedResource Include="kernels\dequant_matmul.cu" LogicalName="dequant_matmul.cu" />
+  </ItemGroup>
+</Project>

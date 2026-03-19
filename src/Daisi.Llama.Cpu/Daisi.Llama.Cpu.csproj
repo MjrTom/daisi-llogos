@@ -5,6 +5,7 @@
   </PropertyGroup>
   <ItemGroup>
     <InternalsVisibleTo Include="Daisi.Llama.Tests" />
+    <InternalsVisibleTo Include="Daisi.Llama.Cuda" />
   </ItemGroup>
   <ItemGroup>
     <ProjectReference Include="..\Daisi.Llama\Daisi.Llama.csproj" />
