@@ -176,10 +176,12 @@ Weight tensors and KV cache use device-local memory (fastest). Uploads use a sta
 
 ## Done Criteria
 
-- [ ] Vulkan API bindings via P/Invoke
-- [ ] SafeHandle wrappers for instance, device, buffers, pipelines
-- [ ] SPIR-V compute shaders for all inference operations
-- [ ] Fused dequant+matmul for Q8_0, Q4_0
-- [ ] Forward pass matches CPU output within tolerance
-- [ ] End-to-end generation works on NVIDIA and AMD GPUs
+- [x] Vulkan API bindings via P/Invoke
+- [x] SafeHandle wrappers for instance, device, buffers, pipelines
+- [x] SPIR-V compute shaders for all inference operations
+- [x] Fused dequant+matmul for Q8_0, F32
+- [x] Forward pass matches CPU output within tolerance
+- [x] End-to-end generation works on NVIDIA GPU
 - [ ] Performance: competitive with CUDA backend (within 20%)
+- [ ] Q4_0 dequant+matmul shader
+- [ ] AMD/Intel GPU validation

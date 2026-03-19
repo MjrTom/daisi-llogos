@@ -1,0 +1,41 @@
+#version 450
+#extension GL_EXT_shader_8bit_storage : enable
+#extension GL_EXT_shader_explicit_arithmetic_types_int8 : enable
+#extension GL_EXT_shader_16bit_storage : enable
+#extension GL_EXT_shader_explicit_arithmetic_types_float16 : enable
+
+layout(local_size_x = 256) in;
+
+layout(push_constant) uniform PushConstants {
+    uint hiddenDim;
+    int tokenId;
+    uint tableType; // 0=F32, 1=Q8_0
+};
+
+layout(set = 0, binding = 0) buffer OutputBuf { float output_data[]; };
+layout(set = 0, binding = 1) buffer TableBuf { uint8_t table_data[]; };
+
+void main() {
+    uint idx = gl_GlobalInvocationID.x;
+    if (idx >= hiddenDim) return;
+
+    if (tableType == 0) {
+        // F32: each element is 4 bytes
+        uint byteOff = (uint(tokenId) * hiddenDim + idx) * 4;
+        uint bits = uint(table_data[byteOff]) |
+                   (uint(table_data[byteOff+1]) << 8) |
+                   (uint(table_data[byteOff+2]) << 16) |
+                   (uint(table_data[byteOff+3]) << 24);
+        output_data[idx] = uintBitsToFloat(bits);
+    } else {
+        // Q8_0: blocks of 34 bytes (2-byte f16 scale + 32 int8 weights)
+        uint blocksPerRow = hiddenDim / 32;
+        uint blockIdx = idx / 32;
+        uint blockOffset = idx % 32;
+        uint blockByteOff = (uint(tokenId) * blocksPerRow + blockIdx) * 34;
+        uint scaleBits = uint(table_data[blockByteOff]) | (uint(table_data[blockByteOff + 1]) << 8);
+        float scale = unpackHalf2x16(scaleBits).x;
+        int8_t q = int8_t(table_data[blockByteOff + 2 + blockOffset]);
+        output_data[idx] = scale * float(q);
+    }
+}

@@ -8,6 +8,7 @@ A ground-up C# reimplementation of llama.cpp targeting .NET 10. Native performan
 |----------|---------|--------|
 | Windows x64 | CPU (AVX2/AVX-512) | Priority |
 | Windows x64 | CUDA 13 (NVIDIA) | Priority |
+| Windows x64 | Vulkan (NVIDIA/AMD/Intel) | Done |
 | Linux x64 | CPU (AVX2/AVX-512) | Planned |
 | Linux x64 | Vulkan (NVIDIA/AMD/Intel) | Planned |
 | macOS arm64 | Metal (Apple Silicon) | Planned |
@@ -34,6 +35,12 @@ dotnet run --project src/Daisi.Llama.Cli -- \
     --prompt "Hello, world" \
     --backend cuda
 
+# Generate text (Vulkan GPU — NVIDIA/AMD/Intel)
+dotnet run --project src/Daisi.Llama.Cli -- \
+    --model C:\GGUFS\Qwen3.5-0.8B-Q8_0.gguf \
+    --prompt "Hello, world" \
+    --backend vulkan
+
 # Sliding window + attention sinks (fixed memory, infinite streaming)
 dotnet run --project src/Daisi.Llama.Cli -- \
     --model C:\GGUFS\Qwen3.5-0.8B-Q8_0.gguf \
@@ -52,7 +59,7 @@ Tests validate against [Qwen 3.5 0.8B Q8_0](https://huggingface.co/unsloth/Qwen3
 
 ## Current Status
 
-**End-to-end text generation on both CPU and GPU.** 136 passing tests.
+**End-to-end text generation on CPU, CUDA, and Vulkan.** 149 passing tests.
 
 ### Benchmarks
 
@@ -69,6 +76,7 @@ Qwen 3.5 0.8B Q8_0, 256 decode tokens, FP16 KV cache. Measured on AMD Ryzen 9 99
 | CPU (AVX2) | `full --paged` | 6.8 | 6.6 | Grows on demand |
 | CUDA (RTX 5080) | `full --paged` | 136.2 | 42.3 | Grows on demand |
 | CUDA (RTX 5080) | `full --paged --offload-pages 2` | 129.5 | 41.4 | 2 pages VRAM + RAM |
+| Vulkan (RTX 5080) | `full` | 20.8 | 17.3 | Grows with context |
 
 Sliding window modes use fixed memory regardless of total tokens generated. On CPU, the smaller attention window gives a measurable decode speedup (~44% faster with `window:1024` vs `full` at 256 tokens). On GPU, decode is already compute-bound at this model size so the benefit appears at longer contexts. Paged cache adds <2% overhead vs monolithic; RAM offloading via pinned host memory adds <3%.
 
@@ -78,6 +86,7 @@ What works today:
 - `IComputeBackend` / `ITensor` abstraction — forward pass is backend-agnostic
 - CPU backend: AVX2 SIMD matmul (fused Q8_0 dequant), multi-threaded, Q8_0/Q4_0/Q4_K dequantization
 - CUDA backend: NVRTC JIT compilation, block-per-neuron matmul with warp reduction, stream-batched kernels, async D2D copy
+- Vulkan backend: SPIR-V compute shaders, explicit memory management, cross-platform GPU (NVIDIA/AMD/Intel)
 - 13 composite GPU operations: GatedAttention, DeltaNetStep, CausalConv1d, ComputeDecayBeta, etc.
 - Complete hybrid forward pass: standard gated attention (6 layers) + DeltaNet (18 layers)
 - BPE tokenizer, KV cache, DeltaNet recurrent state + conv1d buffers
@@ -88,7 +97,7 @@ What works today:
 - Sampler with temperature, top-k, top-p, repetition penalty
 - Memory-mapped model loading (zero intermediate byte[] copies)
 - Benchmark suite with separate prefill/decode timing (`--bench`)
-- CLI: `--backend cpu|cuda`, `--bench`, `--no-mmap`, `--attention`, `--paged`, `--offload-pages`, model path, prompt, sampling parameters
+- CLI: `--backend cpu|cuda|vulkan`, `--bench`, `--no-mmap`, `--attention`, `--paged`, `--offload-pages`, model path, prompt, sampling parameters
 
 ## Roadmap
 
@@ -123,7 +132,7 @@ flowchart LR
     style P6 fill:#2d6a4f,color:#fff
     style P7 fill:#2d6a4f,color:#fff
     style P8 fill:#2d6a4f,color:#fff
-    style P9 fill:#e76f51,color:#fff
+    style P9 fill:#2d6a4f,color:#fff
     style P10 fill:#e76f51,color:#fff
     style P11 fill:#2d6a4f,color:#fff
 ```
@@ -139,7 +148,7 @@ flowchart LR
 | 6 | [CUDA](docs/roadmap/phase-06-cuda.md) | NVIDIA GPU backend with fused kernels | Done |
 | 7 | [DeltaNet](docs/roadmap/phase-07-deltanet.md) | Qwen 3.5 hybrid DeltaNet architecture | Done (folded into Phase 4) |
 | 8 | [Optimization](docs/roadmap/phase-08-optimization.md) | Mmap loading, benchmark suite, multi-threaded CPU, CUDA tuning | Done |
-| 9 | [Vulkan](docs/roadmap/phase-09-vulkan.md) | Cross-platform GPU backend (Windows/Linux) | Not started |
+| 9 | [Vulkan](docs/roadmap/phase-09-vulkan.md) | Cross-platform GPU backend (Windows/Linux) | Done |
 | 10 | [Metal](docs/roadmap/phase-10-metal.md) | Apple GPU backend (macOS/iOS) | Not started |
 | 11 | [Long Context](docs/roadmap/phase-11-long-context.md) | Flash attention, paged KV, RAM offload — 200K+ context on 16GB | Done (11a-11e) |
 
@@ -153,6 +162,7 @@ flowchart LR
 | [Inference Pipeline](docs/inference-pipeline.md) | Complete walkthrough: tokenize → forward pass → sample |
 | [CUDA Backend](docs/cuda-backend.md) | P/Invoke design, kernel compilation, fused operations |
 | [DeltaNet](docs/deltanet.md) | Gated DeltaNet linear attention and hybrid architecture |
+| [Vulkan Backend](docs/vulkan-backend.md) | P/Invoke design, SPIR-V shaders, cross-platform GPU compute |
 | [Long Context](docs/roadmap/phase-11-long-context.md) | Flash attention, paged KV cache, RAM offloading for 200K+ context |
 
 ## Solution Structure
@@ -163,7 +173,7 @@ daisi-llama/
 │   ├── Daisi.Llama/            Core library (GGUF, model, inference, tokenizer)
 │   ├── Daisi.Llama.Cpu/        CPU compute backend (SIMD)
 │   ├── Daisi.Llama.Cuda/       NVIDIA CUDA backend
-│   ├── Daisi.Llama.Vulkan/     Vulkan compute backend
+│   ├── Daisi.Llama.Vulkan/     Vulkan compute backend (SPIR-V shaders)
 │   ├── Daisi.Llama.Metal/      Apple Metal backend
 │   └── Daisi.Llama.Cli/        Command-line interface
 ├── tests/

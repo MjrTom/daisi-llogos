@@ -1,0 +1,77 @@
+#version 450
+
+// DeltaNet step: state update + output computation + per-head RMSNorm.
+// One workgroup per group.
+
+layout(local_size_x = 256) in;
+
+layout(push_constant) uniform PushConstants {
+    uint groupCount;
+    uint headDim;
+    float scaleVal;
+    float normEps;
+};
+
+layout(set = 0, binding = 0) buffer OutputBuf { float output_data[]; };
+layout(set = 0, binding = 1) buffer QBuf { float q_data[]; };
+layout(set = 0, binding = 2) buffer KBuf { float k_data[]; };
+layout(set = 0, binding = 3) buffer VBuf { float v_data[]; };
+layout(set = 0, binding = 4) buffer StateBuf { float state_data[]; };
+layout(set = 0, binding = 5) buffer DecayBuf { float decay_data[]; };
+layout(set = 0, binding = 6) buffer BetaBuf { float beta_data[]; };
+layout(set = 0, binding = 7) buffer NormWBuf { float norm_w[]; };
+
+shared float sdata[256];
+
+void main() {
+    uint g = gl_WorkGroupID.x;
+    if (g >= groupCount) return;
+    uint tid = gl_LocalInvocationID.x;
+
+    uint baseOff = g * headDim;
+    uint stateOff = g * headDim * headDim;
+    float d = decay_data[g];
+    float b = beta_data[g];
+
+    // Step 1: sk = S^T * k (one element per thread for j < headDim)
+    // Step 2: error = (v - d*sk) * beta
+    for (uint j = tid; j < headDim; j += 256) {
+        float sk = 0.0;
+        for (uint i = 0; i < headDim; i++)
+            sk += state_data[stateOff + i * headDim + j] * k_data[baseOff + i];
+        float error_j = (v_data[baseOff + j] - d * sk) * b;
+
+        // Step 3: S_new[i][j] = d * S_old[i][j] + k[i] * error[j]
+        for (uint i = 0; i < headDim; i++)
+            state_data[stateOff + i * headDim + j] = d * state_data[stateOff + i * headDim + j] + k_data[baseOff + i] * error_j;
+    }
+
+    barrier();
+
+    // Step 4: o[j] = S_new^T * q * scale
+    for (uint j = tid; j < headDim; j += 256) {
+        float sum = 0.0;
+        for (uint i = 0; i < headDim; i++)
+            sum += state_data[stateOff + i * headDim + j] * q_data[baseOff + i];
+        output_data[baseOff + j] = sum * scaleVal;
+    }
+
+    barrier();
+
+    // Per-head RMSNorm
+    float local_sum = 0.0;
+    for (uint i = tid; i < headDim; i += 256)
+        local_sum += output_data[baseOff + i] * output_data[baseOff + i];
+    sdata[tid] = local_sum;
+    barrier();
+
+    for (uint s = 128; s > 0; s >>= 1) {
+        if (tid < s) sdata[tid] += sdata[tid + s];
+        barrier();
+    }
+
+    float rms = sqrt(sdata[0] / float(headDim) + normEps);
+    float inv_rms = 1.0 / rms;
+    for (uint i = tid; i < headDim; i += 256)
+        output_data[baseOff + i] = output_data[baseOff + i] * inv_rms * norm_w[i];
+}

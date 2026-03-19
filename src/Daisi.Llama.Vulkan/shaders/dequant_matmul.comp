@@ -1,0 +1,69 @@
+#version 450
+#extension GL_EXT_shader_8bit_storage : enable
+#extension GL_EXT_shader_explicit_arithmetic_types_int8 : enable
+#extension GL_EXT_shader_16bit_storage : enable
+#extension GL_EXT_shader_explicit_arithmetic_types_float16 : enable
+
+layout(local_size_x = 32) in;
+
+layout(push_constant) uniform PushConstants {
+    uint M;
+    uint K;
+    uint N;
+    uint weightType; // 0=F32, 1=Q8_0
+};
+
+layout(set = 0, binding = 0) buffer OutputBuf { float output_data[]; };
+layout(set = 0, binding = 1) buffer InputBuf { float input_data[]; };
+layout(set = 0, binding = 2) buffer WeightBuf { uint8_t weight_data[]; };
+
+shared float sdata[32];
+
+void main() {
+    uint row = gl_WorkGroupID.x; // output neuron
+    uint tid = gl_LocalInvocationID.x;
+    if (row >= N) return;
+
+    float acc = 0.0;
+
+    if (weightType == 0) {
+        // F32 weights: weight_data is actually float[]
+        // Row-major: weight[row][k] at offset (row * K + k) * 4
+        for (uint k = tid; k < K; k += 32) {
+            uint byteOff = (row * K + k) * 4;
+            uint bits = uint(weight_data[byteOff]) |
+                       (uint(weight_data[byteOff+1]) << 8) |
+                       (uint(weight_data[byteOff+2]) << 16) |
+                       (uint(weight_data[byteOff+3]) << 24);
+            acc += uintBitsToFloat(bits) * input_data[k];
+        }
+    } else {
+        // Q8_0: blocks of 34 bytes (2-byte f16 scale + 32 int8 weights)
+        uint blocksPerRow = K / 32;
+        for (uint b = tid; b < blocksPerRow; b += 32) {
+            uint blockOff = (row * blocksPerRow + b) * 34;
+            // Read FP16 scale (2 bytes, little-endian)
+            uint scaleBits = uint(weight_data[blockOff]) | (uint(weight_data[blockOff + 1]) << 8);
+            float scale = unpackHalf2x16(scaleBits).x;
+            // Dequantize 32 int8 values and dot with input
+            for (uint i = 0; i < 32; i++) {
+                int8_t q = int8_t(weight_data[blockOff + 2 + i]);
+                acc += (scale * float(q)) * input_data[b * 32 + i];
+            }
+        }
+    }
+
+    // Warp-level reduction via shared memory
+    sdata[tid] = acc;
+    barrier();
+    for (uint s = 16; s > 0; s >>= 1) {
+        if (tid < s)
+            sdata[tid] += sdata[tid + s];
+        barrier();
+    }
+
+    if (tid == 0) {
+        // For M=1 (single token inference), output is just output[row]
+        output_data[row] = sdata[0];
+    }
+}

@@ -6,6 +6,7 @@
   <ItemGroup>
     <InternalsVisibleTo Include="Daisi.Llama.Tests" />
     <InternalsVisibleTo Include="Daisi.Llama.Cuda" />
+    <InternalsVisibleTo Include="Daisi.Llama.Vulkan" />
   </ItemGroup>
   <ItemGroup>
     <ProjectReference Include="..\Daisi.Llama\Daisi.Llama.csproj" />

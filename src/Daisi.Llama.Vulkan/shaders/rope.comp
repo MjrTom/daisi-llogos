@@ -1,0 +1,53 @@
+#version 450
+
+layout(local_size_x = 256) in;
+
+layout(push_constant) uniform PushConstants {
+    uint qTotal;
+    uint kTotal;
+    uint headDim;
+    uint ropeDim;
+    int positionOffset;
+    float ropeTheta;
+};
+
+layout(set = 0, binding = 0) buffer QBuf { float q_data[]; };
+layout(set = 0, binding = 1) buffer KBuf { float k_data[]; };
+
+void main() {
+    uint idx = gl_GlobalInvocationID.x;
+    uint maxPairs = max(qTotal, kTotal) / 2;
+    if (idx >= maxPairs) return;
+
+    // Apply RoPE to Q
+    if (idx * 2 < qTotal) {
+        uint headIdx = (idx * 2) / headDim;
+        uint dimIdx = (idx * 2) % headDim;
+        if (dimIdx < ropeDim) {
+            float freq = pow(ropeTheta, -float(dimIdx) / float(ropeDim));
+            float angle = float(positionOffset) * freq;
+            float cos_a = cos(angle);
+            float sin_a = sin(angle);
+            float x0 = q_data[idx * 2];
+            float x1 = q_data[idx * 2 + 1];
+            q_data[idx * 2]     = x0 * cos_a - x1 * sin_a;
+            q_data[idx * 2 + 1] = x0 * sin_a + x1 * cos_a;
+        }
+    }
+
+    // Apply RoPE to K
+    if (idx * 2 < kTotal) {
+        uint headIdx = (idx * 2) / headDim;
+        uint dimIdx = (idx * 2) % headDim;
+        if (dimIdx < ropeDim) {
+            float freq = pow(ropeTheta, -float(dimIdx) / float(ropeDim));
+            float angle = float(positionOffset) * freq;
+            float cos_a = cos(angle);
+            float sin_a = sin(angle);
+            float x0 = k_data[idx * 2];
+            float x1 = k_data[idx * 2 + 1];
+            k_data[idx * 2]     = x0 * cos_a - x1 * sin_a;
+            k_data[idx * 2 + 1] = x0 * sin_a + x1 * cos_a;
+        }
+    }
+}

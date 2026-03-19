@@ -1,0 +1,52 @@
+#version 450
+#extension GL_EXT_shader_8bit_storage : enable
+#extension GL_EXT_shader_explicit_arithmetic_types_int8 : enable
+
+// Shared push constants for element count
+layout(push_constant) uniform PushConstants {
+    uint n;
+    uint extra1;
+    uint extra2;
+    uint extra3;
+    uint extra4;
+    uint extra5;
+    uint extra6;
+    uint extra7;
+};
+
+// ── RMS Norm ──────────────────────────────────────────────────────────────────
+// Bindings: 0=output, 1=input, 2=weight
+// push: n, extra1 = float bits of eps
+
+layout(local_size_x = 256) in;
+
+layout(set = 0, binding = 0) buffer OutputBuf { float output_data[]; };
+layout(set = 0, binding = 1) buffer InputBuf { float input_data[]; };
+layout(set = 0, binding = 2) buffer WeightBuf { float weight_data[]; };
+
+shared float sdata[256];
+
+void main() {
+    uint tid = gl_LocalInvocationID.x;
+    float eps = uintBitsToFloat(extra1);
+
+    // Parallel reduction for sum of squares
+    float local_sum = 0.0;
+    for (uint i = tid; i < n; i += 256)
+        local_sum += input_data[i] * input_data[i];
+    sdata[tid] = local_sum;
+    barrier();
+
+    for (uint s = 128; s > 0; s >>= 1) {
+        if (tid < s)
+            sdata[tid] += sdata[tid + s];
+        barrier();
+    }
+
+    float rms = sqrt(sdata[0] / float(n) + eps);
+    float inv_rms = 1.0 / rms;
+
+    // Apply normalization
+    for (uint i = tid; i < n; i += 256)
+        output_data[i] = input_data[i] * inv_rms * weight_data[i];
+}
