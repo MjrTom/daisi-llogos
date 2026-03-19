@@ -253,6 +253,8 @@ Layer L, KV Cache:
 - At 32K context: 2 KB × 32,768 = **64 MB per layer**, × 28 layers = **1.75 GB total**
 - KV cache quantization (Q8_0) roughly halves this to ~900 MB.
 
+**Hybrid architecture advantage for long context:** Qwen 3.5 0.8B uses only 6 standard attention layers (needing KV cache) out of 24 total. The other 18 are DeltaNet layers with fixed 1 MB state per layer, regardless of context length. This means KV cache memory scales with only 6 layers instead of 24 — a 4x reduction that makes 200K+ context feasible on 16GB GPUs. See [Phase 11: Long Context](roadmap/phase-11-long-context.md) for the full strategy.
+
 ---
 
 ## Prefill vs Decode

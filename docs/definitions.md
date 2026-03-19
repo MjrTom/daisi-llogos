@@ -192,3 +192,18 @@ sequenceDiagram
 | **Memory bandwidth** | Rate of data transfer between memory and compute units (GB/s). Decode performance is typically bottlenecked by memory bandwidth since it reads the entire KV cache per token. |
 | **Occupancy** | Fraction of a GPU's maximum concurrent threads that are actually active. Higher occupancy generally means better latency hiding, but not always higher throughput. |
 | **KV cache quantization** | Storing the KV cache in a lower-precision format (e.g., FP8 or Q8_0 instead of FP16) to reduce memory usage and bandwidth requirements during decode. Enables longer context lengths. |
+
+---
+
+## Long Context
+
+| Term | Summary |
+|------|---------|
+| **Flash attention** | Tiled attention algorithm that computes exact attention without materializing the full S×S score matrix. Uses online softmax (log-sum-exp correction) to combine tiles. Eliminates shared memory limits on context length and improves cache locality. |
+| **Online softmax** | Numerically stable softmax computed incrementally over tiles. Each tile produces a partial max, sum, and weighted output. Tiles are merged by rescaling: `out = exp(prev_max - new_max) * prev_out + tile_out`, then renormalized. Key enabler for flash attention and streaming KV reads. |
+| **Paged KV cache** | KV cache allocated as fixed-size pages (e.g., 256 tokens each) instead of a monolithic contiguous buffer. Pages are allocated on demand and can live in different memory tiers (VRAM, RAM, SSD). Eliminates pre-allocation waste and enables efficient memory management. Inspired by vLLM's PagedAttention. |
+| **KV cache offloading** | Moving KV cache pages between memory tiers: VRAM (fast, limited) → system RAM (slower, larger) → NVMe SSD (slowest, largest). During attention, pages are streamed back to VRAM in chunks. Combined with flash attention tiling, this enables context lengths far exceeding GPU memory. |
+| **Sliding window attention** | Attention restricted to the most recent W tokens instead of the full context. Reduces KV cache to a fixed-size ring buffer. Constant memory and constant compute per token regardless of total context length. Quality tradeoff: cannot recall information beyond the window. |
+| **Attention sinks** | Observation from StreamingLLM: initial tokens in a sequence consistently receive high attention weight across all layers and heads. Retaining these "sink" tokens (typically 4-128) alongside a sliding window preserves generation quality compared to a pure sliding window. |
+| **Token eviction** | Dynamically removing low-importance KV entries from the cache based on cumulative attention scores (Heavy Hitter Oracle / H2O). More adaptive than a fixed sliding window — important tokens survive regardless of position. |
+| **Pinned memory** | Host (CPU) memory that is page-locked, preventing the OS from swapping it. Required for asynchronous GPU↔CPU transfers. Allocated via `cuMemAllocHost`. Enables overlapping compute with data transfer for KV cache offloading. |

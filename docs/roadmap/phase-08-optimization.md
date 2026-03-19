@@ -100,6 +100,8 @@ Quantizing the KV cache on write and dequantizing on read. The attention computa
 
 Quality impact is minimal because attention weights act as a weighted average, smoothing quantization noise.
 
+> **See also:** [Phase 11 (Long Context)](phase-11-long-context.md) builds on KV cache quantization with paged allocation, flash attention, and RAM offloading to support 200K+ token contexts on 16GB GPUs.
+
 ### Multi-Threaded CPU MatMul
 
 ```mermaid

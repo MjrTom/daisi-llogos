@@ -69,6 +69,7 @@ flowchart LR
     P8["Phase 8\nOptimization"]
     P9["Phase 9\nVulkan"]
     P10["Phase 10\nMetal"]
+    P11["Phase 11\nLong Context"]
 
     P1 --> P2 --> P4
     P3 --> P4 --> P5
@@ -76,6 +77,7 @@ flowchart LR
     P5 --> P7
     P6 --> P8
     P7 --> P8
+    P8 --> P11
     P8 --> P9 --> P10
 
     style P1 fill:#2d6a4f,color:#fff
@@ -84,10 +86,11 @@ flowchart LR
     style P4 fill:#2d6a4f,color:#fff
     style P5 fill:#2d6a4f,color:#fff
     style P6 fill:#2d6a4f,color:#fff
-    style P7 fill:#e76f51,color:#fff
+    style P7 fill:#2d6a4f,color:#fff
     style P8 fill:#e76f51,color:#fff
     style P9 fill:#e76f51,color:#fff
     style P10 fill:#e76f51,color:#fff
+    style P11 fill:#e76f51,color:#fff
 ```
 
 | Phase | Name | Goal | Status |
@@ -103,6 +106,7 @@ flowchart LR
 | 8 | [Optimization](docs/roadmap/phase-08-optimization.md) | Mmap loading, batch prefill, KV cache quantization | Not started |
 | 9 | [Vulkan](docs/roadmap/phase-09-vulkan.md) | Cross-platform GPU backend (Windows/Linux) | Not started |
 | 10 | [Metal](docs/roadmap/phase-10-metal.md) | Apple GPU backend (macOS/iOS) | Not started |
+| 11 | [Long Context](docs/roadmap/phase-11-long-context.md) | Flash attention, paged KV, RAM offload — 200K+ context on 16GB | Not started |
 
 ## Documentation
 
@@ -114,6 +118,7 @@ flowchart LR
 | [Inference Pipeline](docs/inference-pipeline.md) | Complete walkthrough: tokenize → forward pass → sample |
 | [CUDA Backend](docs/cuda-backend.md) | P/Invoke design, kernel compilation, fused operations |
 | [DeltaNet](docs/deltanet.md) | Gated DeltaNet linear attention and hybrid architecture |
+| [Long Context](docs/roadmap/phase-11-long-context.md) | Flash attention, paged KV cache, RAM offloading for 200K+ context |
 
 ## Solution Structure
 
