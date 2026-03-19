@@ -204,18 +204,36 @@ public sealed class CpuBackend : IComputeBackend
     public void KvCacheWrite(ITensor kCache, ITensor vCache, ITensor k, ITensor v,
         int nKvHeads, int keyLength, int valueLength, int maxSeqLen, int position)
     {
-        var kCacheSpan = kCache.AsFloatSpan();
-        var vCacheSpan = vCache.AsFloatSpan();
         var kSpan = k.AsFloatSpan();
         var vSpan = v.AsFloatSpan();
 
-        for (int h = 0; h < nKvHeads; h++)
+        if (kCache.Type == GgmlType.F16)
         {
-            int kCacheOff = h * maxSeqLen * keyLength + position * keyLength;
-            kSpan.Slice(h * keyLength, keyLength).CopyTo(kCacheSpan.Slice(kCacheOff, keyLength));
+            var kCacheHalf = MemoryMarshal.Cast<byte, Half>(((CpuTensor)kCache).RawDataMut);
+            var vCacheHalf = MemoryMarshal.Cast<byte, Half>(((CpuTensor)vCache).RawDataMut);
+            for (int h = 0; h < nKvHeads; h++)
+            {
+                int kCacheOff = h * maxSeqLen * keyLength + position * keyLength;
+                for (int d = 0; d < keyLength; d++)
+                    kCacheHalf[kCacheOff + d] = (Half)kSpan[h * keyLength + d];
 
-            int vCacheOff = h * maxSeqLen * valueLength + position * valueLength;
-            vSpan.Slice(h * valueLength, valueLength).CopyTo(vCacheSpan.Slice(vCacheOff, valueLength));
+                int vCacheOff = h * maxSeqLen * valueLength + position * valueLength;
+                for (int d = 0; d < valueLength; d++)
+                    vCacheHalf[vCacheOff + d] = (Half)vSpan[h * valueLength + d];
+            }
+        }
+        else
+        {
+            var kCacheSpan = kCache.AsFloatSpan();
+            var vCacheSpan = vCache.AsFloatSpan();
+            for (int h = 0; h < nKvHeads; h++)
+            {
+                int kCacheOff = h * maxSeqLen * keyLength + position * keyLength;
+                kSpan.Slice(h * keyLength, keyLength).CopyTo(kCacheSpan.Slice(kCacheOff, keyLength));
+
+                int vCacheOff = h * maxSeqLen * valueLength + position * valueLength;
+                vSpan.Slice(h * valueLength, valueLength).CopyTo(vCacheSpan.Slice(vCacheOff, valueLength));
+            }
         }
     }
 
@@ -228,16 +246,29 @@ public sealed class CpuBackend : IComputeBackend
         var outSpan = output.AsFloatSpan();
         var qAttnSpan = qAttn.AsFloatSpan();
         var qGateSpan = qGate.AsFloatSpan();
-        var kCacheSpan = kCache.AsFloatSpan();
-        var vCacheSpan = vCache.AsFloatSpan();
+        bool isFp16 = kCache.Type == GgmlType.F16;
 
         int headsPerGroup = numHeads / numKvHeads;
         int kHeadStride = maxSeqLen * keyLength;
         int vHeadStride = maxSeqLen * valueLength;
 
-        Span<float> scores = seqLen <= 1024
-            ? stackalloc float[seqLen]
-            : new float[seqLen];
+        // Tiled online softmax — constant memory regardless of seqLen
+        const int tileSize = 256;
+        Span<float> tileScores = stackalloc float[tileSize];
+
+        // Get cache spans based on type
+        Span<Half> kCacheHalf = default, vCacheHalf = default;
+        Span<float> kCacheF32 = default, vCacheF32 = default;
+        if (isFp16)
+        {
+            kCacheHalf = MemoryMarshal.Cast<byte, Half>(((CpuTensor)kCache).RawDataMut);
+            vCacheHalf = MemoryMarshal.Cast<byte, Half>(((CpuTensor)vCache).RawDataMut);
+        }
+        else
+        {
+            kCacheF32 = kCache.AsFloatSpan();
+            vCacheF32 = vCache.AsFloatSpan();
+        }
 
         for (int h = 0; h < numHeads; h++)
         {
@@ -245,43 +276,80 @@ public sealed class CpuBackend : IComputeBackend
             int qOff = h * keyLength;
             int kvKBase = kvHead * kHeadStride;
             int kvVBase = kvHead * vHeadStride;
-
-            // Attention scores
-            for (int p = 0; p < seqLen; p++)
-            {
-                float dot = 0;
-                int kOff = kvKBase + p * keyLength;
-                for (int d = 0; d < keyLength; d++)
-                    dot += qAttnSpan[qOff + d] * kCacheSpan[kOff + d];
-                scores[p] = dot * scale;
-            }
-
-            // Softmax
-            float max = float.NegativeInfinity;
-            for (int i = 0; i < seqLen; i++)
-                if (scores[i] > max) max = scores[i];
-            float sum = 0;
-            for (int i = 0; i < seqLen; i++)
-            {
-                scores[i] = MathF.Exp(scores[i] - max);
-                sum += scores[i];
-            }
-            float invSum = 1.0f / sum;
-            for (int i = 0; i < seqLen; i++)
-                scores[i] *= invSum;
-
-            // Weighted V sum + sigmoid gating
             int outOff = h * valueLength;
+
+            // Initialize output to zero
+            for (int d = 0; d < valueLength; d++)
+                outSpan[outOff + d] = 0;
+
+            float runningMax = float.NegativeInfinity;
+            float runningSum = 0;
+
+            // Process tiles
+            for (int tileStart = 0; tileStart < seqLen; tileStart += tileSize)
+            {
+                int tileEnd = Math.Min(tileStart + tileSize, seqLen);
+                int tileLen = tileEnd - tileStart;
+
+                // Compute attention scores for this tile
+                for (int t = 0; t < tileLen; t++)
+                {
+                    int p = tileStart + t;
+                    float dot = 0;
+                    int kOff = kvKBase + p * keyLength;
+                    if (isFp16)
+                        for (int d = 0; d < keyLength; d++)
+                            dot += qAttnSpan[qOff + d] * (float)kCacheHalf[kOff + d];
+                    else
+                        for (int d = 0; d < keyLength; d++)
+                            dot += qAttnSpan[qOff + d] * kCacheF32[kOff + d];
+                    tileScores[t] = dot * scale;
+                }
+
+                // Tile max
+                float tileMax = float.NegativeInfinity;
+                for (int t = 0; t < tileLen; t++)
+                    if (tileScores[t] > tileMax) tileMax = tileScores[t];
+
+                // Exp and tile sum
+                float tileSum = 0;
+                for (int t = 0; t < tileLen; t++)
+                {
+                    tileScores[t] = MathF.Exp(tileScores[t] - tileMax);
+                    tileSum += tileScores[t];
+                }
+
+                // Online softmax merge
+                float newMax = MathF.Max(runningMax, tileMax);
+                float correctionOld = MathF.Exp(runningMax - newMax);
+                float correctionNew = MathF.Exp(tileMax - newMax);
+
+                // Update output: rescale old + add new tile
+                for (int d = 0; d < valueLength; d++)
+                {
+                    float tileVal = 0;
+                    if (isFp16)
+                        for (int t = 0; t < tileLen; t++)
+                            tileVal += tileScores[t] * (float)vCacheHalf[kvVBase + (tileStart + t) * valueLength + d];
+                    else
+                        for (int t = 0; t < tileLen; t++)
+                            tileVal += tileScores[t] * vCacheF32[kvVBase + (tileStart + t) * valueLength + d];
+
+                    outSpan[outOff + d] = outSpan[outOff + d] * correctionOld + tileVal * correctionNew;
+                }
+
+                runningSum = runningSum * correctionOld + tileSum * correctionNew;
+                runningMax = newMax;
+            }
+
+            // Normalize and apply sigmoid gating
+            float invSum = runningSum > 0 ? 1.0f / runningSum : 0;
             for (int d = 0; d < valueLength; d++)
             {
-                float val = 0;
-                for (int p = 0; p < seqLen; p++)
-                    val += scores[p] * vCacheSpan[kvVBase + p * valueLength + d];
-                // Sigmoid gate
                 float gateVal = d < keyLength
                     ? 1.0f / (1.0f + MathF.Exp(-qGateSpan[h * keyLength + d]))
                     : 1.0f;
-                outSpan[outOff + d] = val * gateVal;
+                outSpan[outOff + d] = outSpan[outOff + d] * invSum * gateVal;
             }
         }
     }

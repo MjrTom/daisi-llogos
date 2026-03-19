@@ -239,8 +239,8 @@ Instead of evicting by recency, track cumulative attention scores per cached tok
 
 ## Done Criteria
 
-- [ ] **11a:** Flash/tiled attention — no shared memory limit on context length
-- [ ] **11b:** FP16 KV cache — 2x memory reduction, <1% perplexity impact
+- [x] **11a:** Flash/tiled attention — no shared memory limit on context length
+- [x] **11b:** FP16 KV cache — 2x memory reduction, <1% perplexity impact
 - [ ] **11c:** Paged KV cache — dynamic allocation, no pre-allocation waste
 - [ ] **11d:** RAM offloading — 500K+ context on 16GB GPU with 32GB RAM
 - [ ] **11e:** Sliding window + sinks — infinite streaming with fixed memory

@@ -6,6 +6,7 @@ namespace Daisi.Llama.Inference;
 /// <summary>
 /// Key-value cache for standard attention layers only.
 /// Layout per layer: [nKvHeads × maxSeqLen × keyLength] for K, [nKvHeads × maxSeqLen × valueLength] for V.
+/// Supports FP16 storage for 2x memory savings (set cacheType to GgmlType.F16).
 /// </summary>
 public sealed class KvCache : IDisposable
 {
@@ -16,6 +17,7 @@ public sealed class KvCache : IDisposable
     private readonly int _nKvHeads;
     private readonly int _keyLength;
     private readonly int _valueLength;
+    private readonly GgmlType _cacheType;
 
     /// <summary>Number of positions currently filled.</summary>
     public int Length { get; private set; }
@@ -23,13 +25,15 @@ public sealed class KvCache : IDisposable
     public int NumKvHeads => _nKvHeads;
     public int KeyLength => _keyLength;
     public int ValueLength => _valueLength;
+    public GgmlType CacheType => _cacheType;
 
-    public KvCache(IComputeBackend backend, ModelConfig config, int maxSeqLen)
+    public KvCache(IComputeBackend backend, ModelConfig config, int maxSeqLen, GgmlType cacheType = GgmlType.F16)
     {
         _maxSeqLen = maxSeqLen;
         _nKvHeads = config.NumKvHeads;
         _keyLength = config.KeyLength;
         _valueLength = config.ValueLength;
+        _cacheType = cacheType;
 
         var attnLayers = new List<int>();
         for (int i = 0; i < config.NumLayers; i++)
@@ -47,8 +51,8 @@ public sealed class KvCache : IDisposable
             int layer = _layerIndices[i];
             long kSize = _nKvHeads * _maxSeqLen * _keyLength;
             long vSize = _nKvHeads * _maxSeqLen * _valueLength;
-            _kCaches[i] = backend.CreateTensor($"kv_k_{layer}", GgmlType.F32, [kSize]);
-            _vCaches[i] = backend.CreateTensor($"kv_v_{layer}", GgmlType.F32, [vSize]);
+            _kCaches[i] = backend.CreateTensor($"kv_k_{layer}", cacheType, [kSize]);
+            _vCaches[i] = backend.CreateTensor($"kv_v_{layer}", cacheType, [vSize]);
         }
     }
 

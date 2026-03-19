@@ -1,6 +1,53 @@
 // daisi-llama CUDA kernels: composite operations for forward pass
 // These support the IComputeBackend composite operations used by ForwardPass.
 
+// FP16 ↔ FP32 conversion using bit manipulation (no cuda_fp16.h needed for NVRTC)
+__device__ float fp16_to_fp32(unsigned short h)
+{
+    unsigned int sign = (h >> 15) & 1;
+    unsigned int exp_val = (h >> 10) & 0x1f;
+    unsigned int mant = h & 0x3ff;
+    unsigned int f;
+    if (exp_val == 0) {
+        if (mant == 0) f = sign << 31;
+        else { exp_val = 1; while (!(mant & 0x400)) { mant <<= 1; exp_val--; } mant &= 0x3ff; f = (sign << 31) | ((exp_val + 127 - 15) << 23) | (mant << 13); }
+    } else if (exp_val == 31) {
+        f = (sign << 31) | 0x7f800000 | (mant << 13);
+    } else {
+        f = (sign << 31) | ((exp_val + 127 - 15) << 23) | (mant << 13);
+    }
+    return *reinterpret_cast<float*>(&f);
+}
+
+__device__ unsigned short fp32_to_fp16(float val)
+{
+    unsigned int f = *reinterpret_cast<unsigned int*>(&val);
+    unsigned int sign = (f >> 16) & 0x8000;
+    int exp_val = ((f >> 23) & 0xff) - 127 + 15;
+    unsigned int mant = (f >> 13) & 0x3ff;
+    if (exp_val <= 0) return (unsigned short)sign;  // flush to zero
+    if (exp_val >= 31) return (unsigned short)(sign | 0x7c00);  // infinity
+    return (unsigned short)(sign | (exp_val << 10) | mant);
+}
+
+// Helper to load float from either FP32 or FP16 cache
+__device__ float load_cache_val(const void* cache, int idx, int isFp16)
+{
+    if (isFp16)
+        return fp16_to_fp32(((const unsigned short*)cache)[idx]);
+    else
+        return ((const float*)cache)[idx];
+}
+
+// Helper to store float to either FP32 or FP16 cache
+__device__ void store_cache_val(void* cache, int idx, float val, int isFp16)
+{
+    if (isFp16)
+        ((unsigned short*)cache)[idx] = fp32_to_fp16(val);
+    else
+        ((float*)cache)[idx] = val;
+}
+
 extern "C" {
 
 // ── SiLU in-place ────────────────────────────────────────────────────────────
@@ -124,11 +171,12 @@ __global__ void deinterleave_q(float* qAttn, float* qGate, const float* qFull,
 // ── KV cache write ───────────────────────────────────────────────────────────
 // Write k[nKvHeads * keyLength] and v[nKvHeads * valueLength] into cache at position.
 // kCache: [nKvHeads × maxSeqLen × keyLength], vCache: [nKvHeads × maxSeqLen × valueLength]
+// Supports FP16 cache: if cacheIsFp16, converts FP32 inputs to FP16 on write.
 
-__global__ void kv_cache_write(float* kCache, float* vCache,
+__global__ void kv_cache_write(void* kCache, void* vCache,
                                 const float* k, const float* v,
                                 int nKvHeads, int keyLength, int valueLength,
-                                int maxSeqLen, int position)
+                                int maxSeqLen, int position, int cacheIsFp16)
 {
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
     int totalK = nKvHeads * keyLength;
@@ -140,7 +188,7 @@ __global__ void kv_cache_write(float* kCache, float* vCache,
         int head = idx / keyLength;
         int dim = idx % keyLength;
         int cache_idx = head * maxSeqLen * keyLength + position * keyLength + dim;
-        kCache[cache_idx] = k[idx];
+        store_cache_val(kCache, cache_idx, k[idx], cacheIsFp16);
     }
 
     // Write V
@@ -149,20 +197,25 @@ __global__ void kv_cache_write(float* kCache, float* vCache,
         int head = idx / valueLength;
         int dim = idx % valueLength;
         int cache_idx = head * maxSeqLen * valueLength + position * valueLength + dim;
-        vCache[cache_idx] = v[idx];
+        store_cache_val(vCache, cache_idx, v[idx], cacheIsFp16);
     }
 }
 
-// ── Gated Attention ──────────────────────────────────────────────────────────
-// One block per attention head.
+// ── Gated Attention (Tiled / Flash) ─────────────────────────────────────────
+// One block per attention head. Uses online softmax to tile the computation,
+// so shared memory usage is O(tileSize + blockDim) regardless of context length.
+// Supports FP16 KV cache via cacheIsFp16 parameter.
+//
 // output[h] = sigmoid(qGate[h]) * softmax(qAttn[h] @ kCache[kv_h]^T * scale) @ vCache[kv_h]
+
+#define ATTN_TILE_SIZE 256
 
 __global__ void gated_attention(float* output,
                                  const float* qAttn, const float* qGate,
-                                 const float* kCache, const float* vCache,
+                                 const void* kCache, const void* vCache,
                                  int numHeads, int numKvHeads, int keyLength,
                                  int valueLength, int maxSeqLen, int seqLen,
-                                 float scale)
+                                 float scale, int cacheIsFp16)
 {
     extern __shared__ float shared[];
     int head = blockIdx.x;
@@ -172,107 +225,102 @@ __global__ void gated_attention(float* output,
 
     const float* q = qAttn + head * keyLength;
     const float* qg = qGate + head * keyLength;
-    const float* kBase = kCache + kvHead * maxSeqLen * keyLength;
-    const float* vBase = vCache + kvHead * maxSeqLen * valueLength;
 
-    // shared layout: [seqLen scores] then [seqLen temps]
+    // Byte offsets into cache depend on element size
+    int elemSize = cacheIsFp16 ? 1 : 1; // handled by load_cache_val
+    int kBaseOffset = kvHead * maxSeqLen * keyLength;
+    int vBaseOffset = kvHead * maxSeqLen * valueLength;
+
+    // Shared memory layout: [ATTN_TILE_SIZE scores] + [blockDim.x temp for reduction]
     float* scores = shared;
+    float* temp = shared + ATTN_TILE_SIZE;
 
-    // Step 1: Compute attention scores = q @ K^T * scale
-    for (int pos = tid; pos < seqLen; pos += stride)
-    {
-        float dot = 0.0f;
-        const float* kVec = kBase + pos * keyLength;
-        for (int d = 0; d < keyLength; d++)
-            dot += q[d] * kVec[d];
-        scores[pos] = dot * scale;
-    }
-    __syncthreads();
-
-    // Step 2: Softmax over scores[0..seqLen-1]
-    // Find max
-    float local_max = -1e30f;
-    for (int pos = tid; pos < seqLen; pos += stride)
-        local_max = fmaxf(local_max, scores[pos]);
-
-    // Use second part of shared mem for reduction
-    float* temp = shared + seqLen;
-    temp[tid] = local_max;
-    __syncthreads();
-
-    for (int s = blockDim.x / 2; s > 0; s >>= 1)
-    {
-        if (tid < s)
-            temp[tid] = fmaxf(temp[tid], temp[tid + s]);
-        __syncthreads();
-    }
-    float max_val = temp[0];
-    __syncthreads();
-
-    // Exp and sum
-    float local_sum = 0.0f;
-    for (int pos = tid; pos < seqLen; pos += stride)
-    {
-        float val = expf(scores[pos] - max_val);
-        scores[pos] = val;
-        local_sum += val;
-    }
-
-    temp[tid] = local_sum;
-    __syncthreads();
-
-    for (int s = blockDim.x / 2; s > 0; s >>= 1)
-    {
-        if (tid < s)
-            temp[tid] += temp[tid + s];
-        __syncthreads();
-    }
-    float inv_sum = 1.0f / temp[0];
-    __syncthreads();
-
-    for (int pos = tid; pos < seqLen; pos += stride)
-        scores[pos] *= inv_sum;
-    __syncthreads();
-
-    // Step 3: Compute sigmoid gate for this head
-    float gate_sum = 0.0f;
-    for (int d = tid; d < keyLength; d += stride)
-        gate_sum += 1.0f; // placeholder for gate norm; actually per-element
-    // Actually: sigmoid(qGate) is per-element, applied to output
-
-    // Step 4: Weighted V sum with gating
+    // Initialize output to zero
     float* outHead = output + head * valueLength;
     for (int d = tid; d < valueLength; d += stride)
-    {
-        float val = 0.0f;
-        for (int pos = 0; pos < seqLen; pos++)
-            val += scores[pos] * vBase[pos * valueLength + d];
-
-        // Sigmoid gate: average qGate elements for this head's contribution
-        // Actually: gate is sigmoid per-element on qGate, then applied as scalar per head
-        outHead[d] = val;
-    }
+        outHead[d] = 0.0f;
     __syncthreads();
 
-    // Apply sigmoid gating: multiply entire head output by mean(sigmoid(qGate[h]))
-    // Wait - the actual gating is: output *= sigmoid(qGate) per dimension
-    // But qGate is keyLength dimensions and output is valueLength dimensions.
-    // Looking at the CPU code: gate = sigmoid(qGate), then output[d] *= gate[d]
-    // But keyLength != valueLength in general... Actually for Qwen 3.5 keyLen == valLen == 256.
-    // The correct approach: gate is computed per-head as dot or per-element.
-    // From the CPU code in CpuBackend.GatedAttention:
-    //   sigmoid gate applied per-dimension of output, using qGate[h*keyLen + d]
-    //   since keyLen == valLen for this model.
+    // Online softmax state (same across all threads after reductions)
+    float running_max = -1e30f;
+    float running_sum = 0.0f;
 
-    // Simple approach: multiply output[d] by sigmoid(qGate[h*keyLen + d])
+    // Process tiles
+    for (int tile_start = 0; tile_start < seqLen; tile_start += ATTN_TILE_SIZE)
+    {
+        int tile_end = tile_start + ATTN_TILE_SIZE;
+        if (tile_end > seqLen) tile_end = seqLen;
+        int tile_len = tile_end - tile_start;
+
+        // Compute attention scores for this tile: q @ K_tile^T * scale
+        for (int t = tid; t < tile_len; t += stride)
+        {
+            float dot = 0.0f;
+            int kOffset = kBaseOffset + (tile_start + t) * keyLength;
+            for (int d = 0; d < keyLength; d++)
+                dot += q[d] * load_cache_val(kCache, kOffset + d, cacheIsFp16);
+            scores[t] = dot * scale;
+        }
+        __syncthreads();
+
+        // Find tile max via reduction
+        float local_max = -1e30f;
+        for (int t = tid; t < tile_len; t += stride)
+            local_max = fmaxf(local_max, scores[t]);
+        temp[tid] = local_max;
+        __syncthreads();
+        for (int s = blockDim.x / 2; s > 0; s >>= 1) {
+            if (tid < s) temp[tid] = fmaxf(temp[tid], temp[tid + s]);
+            __syncthreads();
+        }
+        float tile_max = temp[0];
+        __syncthreads();
+
+        // Compute exp(scores - tile_max) and tile sum
+        float local_sum = 0.0f;
+        for (int t = tid; t < tile_len; t += stride) {
+            float val = expf(scores[t] - tile_max);
+            scores[t] = val;
+            local_sum += val;
+        }
+        temp[tid] = local_sum;
+        __syncthreads();
+        for (int s = blockDim.x / 2; s > 0; s >>= 1) {
+            if (tid < s) temp[tid] += temp[tid + s];
+            __syncthreads();
+        }
+        float tile_sum = temp[0];
+        __syncthreads();
+
+        // Online softmax merge: rescale running output
+        float new_max = fmaxf(running_max, tile_max);
+        float correction_old = expf(running_max - new_max);
+        float correction_new = expf(tile_max - new_max);
+
+        // Update output: rescale old accumulation + add new tile's weighted V
+        for (int d = tid; d < valueLength; d += stride)
+        {
+            float tile_val = 0.0f;
+            for (int t = 0; t < tile_len; t++)
+            {
+                int vIdx = vBaseOffset + (tile_start + t) * valueLength + d;
+                tile_val += scores[t] * load_cache_val(vCache, vIdx, cacheIsFp16);
+            }
+            outHead[d] = outHead[d] * correction_old + tile_val * correction_new;
+        }
+        __syncthreads();
+
+        running_sum = running_sum * correction_old + tile_sum * correction_new;
+        running_max = new_max;
+    }
+
+    // Normalize by total sum and apply sigmoid gating
+    float inv_sum = (running_sum > 0.0f) ? 1.0f / running_sum : 0.0f;
     for (int d = tid; d < valueLength; d += stride)
     {
-        if (d < keyLength)
-        {
-            float g = qg[d];
-            float sig = 1.0f / (1.0f + expf(-g));
-            outHead[d] *= sig;
-        }
+        float g = (d < keyLength) ? qg[d] : 0.0f;
+        float sig = 1.0f / (1.0f + expf(-g));
+        outHead[d] = outHead[d] * inv_sum * sig;
     }
 }
 

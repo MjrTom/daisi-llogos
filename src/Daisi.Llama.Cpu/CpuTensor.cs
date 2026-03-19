@@ -49,6 +49,11 @@ public sealed class CpuTensor : ITensor
     /// </summary>
     internal ReadOnlySpan<byte> RawData => _data;
 
+    /// <summary>
+    /// Mutable access to the underlying raw byte buffer (for in-place writes like FP16 cache).
+    /// </summary>
+    internal Span<byte> RawDataMut => _data;
+
     /// <inheritdoc />
     public Span<float> AsFloatSpan()
     {

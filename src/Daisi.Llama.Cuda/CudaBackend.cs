@@ -384,11 +384,12 @@ public sealed class CudaBackend : IComputeBackend
         ulong vcPtr = vcT.DevicePtr;
         ulong kPtr = kT.DevicePtr;
         ulong vPtr = vT.DevicePtr;
+        int cacheIsFp16 = kCache.Type == GgmlType.F16 ? 1 : 0;
 
         int maxElems = Math.Max(nKvHeads * keyLength, nKvHeads * valueLength);
         var func = _compositeModule.GetFunction("kv_cache_write");
         uint grid = (uint)((maxElems + BlockSize - 1) / BlockSize);
-        nint* kArgs = stackalloc nint[9];
+        nint* kArgs = stackalloc nint[10];
         kArgs[0] = (nint)(&kcPtr);
         kArgs[1] = (nint)(&vcPtr);
         kArgs[2] = (nint)(&kPtr);
@@ -398,6 +399,7 @@ public sealed class CudaBackend : IComputeBackend
         kArgs[6] = (nint)(&valueLength);
         kArgs[7] = (nint)(&maxSeqLen);
         kArgs[8] = (nint)(&position);
+        kArgs[9] = (nint)(&cacheIsFp16);
         _stream.Launch(func, grid, 1, 1, (uint)BlockSize, 1, 1, 0, kArgs);
 
     }
@@ -418,11 +420,13 @@ public sealed class CudaBackend : IComputeBackend
         ulong qgPtr = qgT.DevicePtr;
         ulong kcPtr = kcT.DevicePtr;
         ulong vcPtr = vcT.DevicePtr;
+        int cacheIsFp16 = kCache.Type == GgmlType.F16 ? 1 : 0;
 
-        // One block per head, shared memory for scores + reduction temp
-        uint sharedMem = (uint)((seqLen + BlockSize) * sizeof(float));
+        // Tiled attention: shared memory for tile scores + reduction temp (constant size)
+        const int tileSize = 256;
+        uint sharedMem = (uint)((tileSize + BlockSize) * sizeof(float));
         var func = _compositeModule.GetFunction("gated_attention");
-        nint* kArgs = stackalloc nint[12];
+        nint* kArgs = stackalloc nint[13];
         kArgs[0] = (nint)(&outPtr);
         kArgs[1] = (nint)(&qaPtr);
         kArgs[2] = (nint)(&qgPtr);
@@ -435,6 +439,7 @@ public sealed class CudaBackend : IComputeBackend
         kArgs[9] = (nint)(&maxSeqLen);
         kArgs[10] = (nint)(&seqLen);
         kArgs[11] = (nint)(&scale);
+        kArgs[12] = (nint)(&cacheIsFp16);
         _stream.Launch(func, (uint)numHeads, 1, 1, (uint)BlockSize, 1, 1, sharedMem, kArgs);
 
     }

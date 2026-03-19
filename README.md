@@ -46,7 +46,7 @@ Tests validate against [Qwen 3.5 0.8B Q8_0](https://huggingface.co/unsloth/Qwen3
 
 ## Current Status
 
-**End-to-end text generation on both CPU and GPU.** Qwen 3.5 0.8B Q8_0: ~9 tok/s CPU (AVX2), ~44 tok/s CUDA (RTX 5080). 118 passing tests.
+**End-to-end text generation on both CPU and GPU.** Qwen 3.5 0.8B Q8_0: ~9 tok/s CPU (AVX2), ~44 tok/s CUDA (RTX 5080). 123 passing tests.
 
 What works today:
 - Parse any GGUF v2/v3 file (header, metadata, tensor info)
@@ -57,6 +57,8 @@ What works today:
 - 13 composite GPU operations: GatedAttention, DeltaNetStep, CausalConv1d, ComputeDecayBeta, etc.
 - Complete hybrid forward pass: standard gated attention (6 layers) + DeltaNet (18 layers)
 - BPE tokenizer, KV cache, DeltaNet recurrent state + conv1d buffers
+- Tiled/flash attention with online softmax (no shared memory limit on context length)
+- FP16 KV cache (2x memory savings, default)
 - Sampler with temperature, top-k, top-p, repetition penalty
 - Memory-mapped model loading (zero intermediate byte[] copies)
 - Benchmark suite with separate prefill/decode timing (`--bench`)
@@ -113,7 +115,7 @@ flowchart LR
 | 8 | [Optimization](docs/roadmap/phase-08-optimization.md) | Mmap loading, benchmark suite, multi-threaded CPU, CUDA tuning | Done |
 | 9 | [Vulkan](docs/roadmap/phase-09-vulkan.md) | Cross-platform GPU backend (Windows/Linux) | Not started |
 | 10 | [Metal](docs/roadmap/phase-10-metal.md) | Apple GPU backend (macOS/iOS) | Not started |
-| 11 | [Long Context](docs/roadmap/phase-11-long-context.md) | Flash attention, paged KV, RAM offload — 200K+ context on 16GB | Not started |
+| 11 | [Long Context](docs/roadmap/phase-11-long-context.md) | Flash attention, paged KV, RAM offload — 200K+ context on 16GB | In progress (11a, 11b done) |
 
 ## Documentation
 
