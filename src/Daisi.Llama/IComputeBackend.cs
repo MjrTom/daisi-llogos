@@ -24,4 +24,52 @@ public interface IComputeBackend : IDisposable
     /// The data span must match the expected byte size for the given type and dimensions.
     /// </summary>
     ITensor LoadTensor(string name, GgmlType type, ReadOnlySpan<long> dimensions, ReadOnlySpan<byte> data);
+
+    // ── Math Operations ──────────────────────────────────────────────────────
+
+    /// <summary>
+    /// Matrix multiplication: output = a × b.
+    /// a is [M × K], b is [K × N], output is [M × N]. All stored as 1D row-major.
+    /// b may be quantized — the backend fuses dequantization into the multiply.
+    /// </summary>
+    void MatMul(ITensor output, ITensor a, ITensor b, int M, int K, int N);
+
+    /// <summary>
+    /// RMS normalization: output[i] = (input[i] / rms) * weight[i]
+    /// where rms = sqrt(mean(input²) + eps).
+    /// All tensors are 1D with the same element count.
+    /// </summary>
+    void RmsNorm(ITensor output, ITensor input, ITensor weight, float eps);
+
+    /// <summary>
+    /// Numerically stable softmax over a 1D float tensor.
+    /// output[i] = exp(input[i] - max) / sum(exp(input - max)).
+    /// </summary>
+    void Softmax(ITensor output, ITensor input);
+
+    /// <summary>
+    /// SiLU activation: output[i] = input[i] * sigmoid(input[i]).
+    /// </summary>
+    void SiLU(ITensor output, ITensor input);
+
+    /// <summary>
+    /// Rotary position embedding applied in-place to q and k tensors.
+    /// Rotates pairs of dimensions (2i, 2i+1) by position-dependent angles.
+    /// </summary>
+    /// <param name="q">Query tensor [nHeads × headDim], modified in-place.</param>
+    /// <param name="k">Key tensor [nKvHeads × headDim], modified in-place.</param>
+    /// <param name="headDim">Dimension of each attention head.</param>
+    /// <param name="positionOffset">Starting position index for the rotation.</param>
+    /// <param name="ropeTheta">RoPE frequency base (e.g. 1000000.0).</param>
+    void RoPE(ITensor q, ITensor k, int headDim, int positionOffset, float ropeTheta);
+
+    /// <summary>
+    /// Element-wise multiply: output[i] = a[i] * b[i].
+    /// </summary>
+    void ElementMul(ITensor output, ITensor a, ITensor b);
+
+    /// <summary>
+    /// Element-wise add: output[i] = a[i] + b[i].
+    /// </summary>
+    void ElementAdd(ITensor output, ITensor a, ITensor b);
 }

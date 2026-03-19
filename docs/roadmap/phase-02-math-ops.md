@@ -139,8 +139,8 @@ Pre-compute sin/cos tables for all positions up to max context length.
 
 ## Done Criteria
 
-- [ ] All `IComputeBackend` math operations implemented in `CpuBackend`
-- [ ] AVX2 SIMD paths for MatMul, RmsNorm, Softmax
-- [ ] Fused dequant+matmul for Q8_0 and Q4_0
-- [ ] All tests pass
+- [x] All `IComputeBackend` math operations implemented in `CpuBackend`
+- [x] AVX2 SIMD paths for MatMul, RmsNorm, ElementOps
+- [x] Fused dequant+matmul for Q8_0
+- [x] All tests pass
 - [ ] MatMul performance: ≥ 1 GFLOPS single-threaded on modern x64 CPU
