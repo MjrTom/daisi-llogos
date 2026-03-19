@@ -46,6 +46,10 @@ What works today:
 - CPU backend with dequantization for Q8_0, Q4_0, Q4_K (AVX2 SIMD + scalar fallback)
 - Load quantized tensors from GGUF and dequantize to FP32
 - CPU SIMD math operations: MatMul (FP32 + fused Q8_0), RMSNorm, softmax, SiLU, RoPE, element-wise add/mul
+- BPE tokenizer from GGUF metadata (GPT-2 byte encoding + direct UTF-8 modes)
+- Complete hybrid forward pass: standard gated attention + DeltaNet layers
+- Model loading from GGUF into CPU backend with polymorphic layer weights
+- KV cache for attention layers, recurrent state + conv1d buffers for DeltaNet layers
 
 ## Roadmap
 
@@ -72,8 +76,8 @@ flowchart LR
 
     style P1 fill:#2d6a4f,color:#fff
     style P2 fill:#2d6a4f,color:#fff
-    style P3 fill:#e76f51,color:#fff
-    style P4 fill:#e76f51,color:#fff
+    style P3 fill:#2d6a4f,color:#fff
+    style P4 fill:#2d6a4f,color:#fff
     style P5 fill:#e76f51,color:#fff
     style P6 fill:#e76f51,color:#fff
     style P7 fill:#e76f51,color:#fff
