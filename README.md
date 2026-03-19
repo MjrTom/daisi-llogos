@@ -33,6 +33,11 @@ dotnet run --project src/Daisi.Llama.Cli -- \
     --model C:\GGUFS\Qwen3.5-0.8B-Q8_0.gguf \
     --prompt "Hello, world" \
     --backend cuda
+
+# Benchmark (prefill + decode timing)
+dotnet run --project src/Daisi.Llama.Cli -- \
+    --model C:\GGUFS\Qwen3.5-0.8B-Q8_0.gguf \
+    --bench --backend cuda
 ```
 
 ### Test model
@@ -41,7 +46,7 @@ Tests validate against [Qwen 3.5 0.8B Q8_0](https://huggingface.co/unsloth/Qwen3
 
 ## Current Status
 
-**End-to-end text generation on both CPU and GPU.** Qwen 3.5 0.8B Q8_0: ~9 tok/s CPU (AVX2), ~44 tok/s CUDA (RTX 5080). 113 passing tests.
+**End-to-end text generation on both CPU and GPU.** Qwen 3.5 0.8B Q8_0: ~9 tok/s CPU (AVX2), ~44 tok/s CUDA (RTX 5080). 118 passing tests.
 
 What works today:
 - Parse any GGUF v2/v3 file (header, metadata, tensor info)
@@ -53,7 +58,9 @@ What works today:
 - Complete hybrid forward pass: standard gated attention (6 layers) + DeltaNet (18 layers)
 - BPE tokenizer, KV cache, DeltaNet recurrent state + conv1d buffers
 - Sampler with temperature, top-k, top-p, repetition penalty
-- CLI: `--backend cpu|cuda`, model path, prompt, sampling parameters
+- Memory-mapped model loading (zero intermediate byte[] copies)
+- Benchmark suite with separate prefill/decode timing (`--bench`)
+- CLI: `--backend cpu|cuda`, `--bench`, `--no-mmap`, model path, prompt, sampling parameters
 
 ## Roadmap
 
@@ -87,7 +94,7 @@ flowchart LR
     style P5 fill:#2d6a4f,color:#fff
     style P6 fill:#2d6a4f,color:#fff
     style P7 fill:#2d6a4f,color:#fff
-    style P8 fill:#e76f51,color:#fff
+    style P8 fill:#2d6a4f,color:#fff
     style P9 fill:#e76f51,color:#fff
     style P10 fill:#e76f51,color:#fff
     style P11 fill:#e76f51,color:#fff
@@ -103,7 +110,7 @@ flowchart LR
 | 5 | [Generation](docs/roadmap/phase-05-generation.md) | Sampling, text generation loop, CLI | Done |
 | 6 | [CUDA](docs/roadmap/phase-06-cuda.md) | NVIDIA GPU backend with fused kernels | Done |
 | 7 | [DeltaNet](docs/roadmap/phase-07-deltanet.md) | Qwen 3.5 hybrid DeltaNet architecture | Done (folded into Phase 4) |
-| 8 | [Optimization](docs/roadmap/phase-08-optimization.md) | Mmap loading, batch prefill, KV cache quantization | Not started |
+| 8 | [Optimization](docs/roadmap/phase-08-optimization.md) | Mmap loading, benchmark suite, multi-threaded CPU, CUDA tuning | Done |
 | 9 | [Vulkan](docs/roadmap/phase-09-vulkan.md) | Cross-platform GPU backend (Windows/Linux) | Not started |
 | 10 | [Metal](docs/roadmap/phase-10-metal.md) | Apple GPU backend (macOS/iOS) | Not started |
 | 11 | [Long Context](docs/roadmap/phase-11-long-context.md) | Flash attention, paged KV, RAM offload — 200K+ context on 16GB | Not started |

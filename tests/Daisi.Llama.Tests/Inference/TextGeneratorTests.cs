@@ -91,6 +91,42 @@ public class TextGeneratorTests
         // The model should produce something related to Paris
     }
 
+    [Fact]
+    public void ReportsPrefillStats()
+    {
+        if (!TestConstants.ModelExists) return;
+
+        using var ctx = LoadModel();
+        var generator = new TextGenerator(ctx.Forward, ctx.Tokenizer, seed: 42);
+
+        var p = new GenerationParams { MaxTokens = 3, Temperature = 0 };
+        var all = generator.Generate("The capital of France is", p).ToList();
+
+        var done = all.Last();
+        Assert.True(done.IsDone);
+        Assert.True(done.PrefillTokens > 0, "Prefill tokens should be reported");
+        Assert.True(done.PrefillTokensPerSecond > 0, "Prefill tok/s should be positive");
+    }
+
+    [Fact]
+    public void Benchmark_ReturnsTimings()
+    {
+        if (!TestConstants.ModelExists) return;
+
+        using var ctx = LoadModel();
+        var generator = new TextGenerator(ctx.Forward, ctx.Tokenizer, seed: 42);
+
+        var result = generator.Benchmark("Hello, world", maxTokens: 5);
+
+        Assert.True(result.PromptTokens > 0);
+        Assert.True(result.GeneratedTokens > 0);
+        Assert.True(result.PrefillTokPerSec > 0);
+        Assert.True(result.DecodeTokPerSec > 0);
+        Assert.True(result.PrefillTime > TimeSpan.Zero);
+        Assert.True(result.DecodeTime > TimeSpan.Zero);
+        Assert.Equal(result.PrefillTime + result.DecodeTime, result.TotalTime);
+    }
+
     // ── Helpers ───────────────────────────────────────────────────────────────
 
     private static ModelContext LoadModel()

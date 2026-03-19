@@ -34,7 +34,7 @@ public sealed class GgufFile
     }
 
     /// <summary>
-    /// Read raw tensor data bytes from the stream.
+    /// Read raw tensor data bytes from the stream (heap-allocated copy).
     /// </summary>
     public byte[] ReadTensorData(Stream stream, GgufTensorInfo tensor)
     {
@@ -44,6 +44,13 @@ public sealed class GgufFile
         stream.ReadExactly(data);
         return data;
     }
+
+    /// <summary>
+    /// Get the absolute byte offset of a tensor's data within the file.
+    /// Used by memory-mapped loading to avoid heap allocation.
+    /// </summary>
+    public long GetTensorDataOffset(GgufTensorInfo tensor) =>
+        TensorDataOffset + (long)tensor.Offset;
 
     /// <summary>
     /// Parse a GGUF file from a stream. Reads header, metadata, and tensor info.

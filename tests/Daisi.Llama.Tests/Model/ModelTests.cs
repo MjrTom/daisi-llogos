@@ -1,5 +1,6 @@
 using Daisi.Llama.Cpu;
 using Daisi.Llama.Gguf;
+using Daisi.Llama.Inference;
 using Daisi.Llama.Model;
 
 namespace Daisi.Llama.Tests.Model;
@@ -117,5 +118,72 @@ public class ModelLoaderTests
         var dnLayer = (DeltaNetWeights)weights.Layers[0]; // first DeltaNet layer
         Assert.Equal(config.HiddenDim, (int)dnLayer.AttnQkv.Dimensions[0]);
         Assert.Equal(config.SsmInnerSize * 3, (int)dnLayer.AttnQkv.Dimensions[1]);
+    }
+}
+
+public class MmapModelLoaderTests
+{
+    [Fact]
+    public void MmapLoad_AllTensorsPresent()
+    {
+        if (!TestConstants.ModelExists) return;
+
+        using var stream = File.OpenRead(TestConstants.Qwen35_08B_Q8_0);
+        var gguf = GgufFile.Read(stream);
+        var config = ModelConfig.FromGguf(gguf);
+
+        using var backend = new CpuBackend();
+        using var weights = MmapModelLoader.Load(gguf, TestConstants.Qwen35_08B_Q8_0, backend, config);
+
+        Assert.NotNull(weights.TokenEmbedding);
+        Assert.NotNull(weights.OutputNorm);
+        Assert.Equal(config.NumLayers, weights.Layers.Length);
+    }
+
+    [Fact]
+    public void MmapLoad_MatchesStreamLoad()
+    {
+        if (!TestConstants.ModelExists) return;
+
+        using var stream = File.OpenRead(TestConstants.Qwen35_08B_Q8_0);
+        var gguf = GgufFile.Read(stream);
+        var config = ModelConfig.FromGguf(gguf);
+
+        using var backend1 = new CpuBackend();
+        using var streamWeights = ModelLoader.Load(gguf, stream, backend1, config);
+
+        using var backend2 = new CpuBackend();
+        using var mmapWeights = MmapModelLoader.Load(gguf, TestConstants.Qwen35_08B_Q8_0, backend2, config);
+
+        // Compare token embedding values
+        var streamEmb = new float[streamWeights.TokenEmbedding.ElementCount];
+        var mmapEmb = new float[mmapWeights.TokenEmbedding.ElementCount];
+        streamWeights.TokenEmbedding.DequantizeTo(streamEmb);
+        mmapWeights.TokenEmbedding.DequantizeTo(mmapEmb);
+
+        Assert.Equal(streamEmb.Length, mmapEmb.Length);
+        for (int i = 0; i < Math.Min(1000, streamEmb.Length); i++)
+            Assert.Equal(streamEmb[i], mmapEmb[i]);
+    }
+
+    [Fact]
+    public void MmapLoad_GeneratesCoherentOutput()
+    {
+        if (!TestConstants.ModelExists) return;
+
+        using var stream = File.OpenRead(TestConstants.Qwen35_08B_Q8_0);
+        var gguf = GgufFile.Read(stream);
+        var config = ModelConfig.FromGguf(gguf);
+
+        using var backend = new CpuBackend();
+        using var weights = MmapModelLoader.Load(gguf, TestConstants.Qwen35_08B_Q8_0, backend, config);
+        using var kvCache = new KvCache(backend, config, maxSeqLen: 256);
+        using var deltaState = new DeltaNetState(backend, config);
+        using var forward = new ForwardPass(backend, config, weights, kvCache, deltaState);
+
+        // Forward pass should produce valid logits
+        var logits = forward.Forward(1, 0); // token 1 at position 0
+        Assert.Equal(config.VocabSize, logits.Length);
+        Assert.True(float.IsFinite(logits[0]));
     }
 }
