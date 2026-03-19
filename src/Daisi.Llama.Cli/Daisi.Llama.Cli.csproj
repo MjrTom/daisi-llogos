@@ -1,0 +1,11 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <OutputType>Exe</OutputType>
+    <RootNamespace>Daisi.Llama.Cli</RootNamespace>
+    <AssemblyName>daisi-llama</AssemblyName>
+  </PropertyGroup>
+  <ItemGroup>
+    <ProjectReference Include="..\Daisi.Llama\Daisi.Llama.csproj" />
+    <ProjectReference Include="..\Daisi.Llama.Cpu\Daisi.Llama.Cpu.csproj" />
+  </ItemGroup>
+</Project>
