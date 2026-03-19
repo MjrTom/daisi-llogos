@@ -146,8 +146,9 @@ Handle special byte tokens (e.g., `<0x0A>` for newline) by converting them back 
 
 ## Done Criteria
 
-- [ ] `BpeTokenizer` encodes and decodes text correctly
-- [ ] Built from GGUF metadata (no external tokenizer files)
-- [ ] Special tokens (BOS, EOS) handled
-- [ ] Round-trip: `decode(encode(text)) == text` for valid UTF-8 inputs
+- [x] `BpeTokenizer` encodes and decodes text correctly
+- [x] Built from GGUF metadata (no external tokenizer files)
+- [x] Special tokens (BOS, EOS) handled
+- [x] Round-trip: `decode(encode(text)) == text` for valid UTF-8 inputs
+- [x] GPT-2 byte encoding and direct UTF-8 modes both supported
 - [ ] Matches llama.cpp tokenization output for a set of reference strings
