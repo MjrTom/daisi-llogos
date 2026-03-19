@@ -23,10 +23,16 @@ dotnet build
 # Run tests (requires Qwen 3.5 0.8B Q8_0 in C:\GGUFS)
 dotnet test
 
-# Generate text
+# Generate text (CPU)
 dotnet run --project src/Daisi.Llama.Cli -- \
     --model C:\GGUFS\Qwen3.5-0.8B-Q8_0.gguf \
     --prompt "Hello, world"
+
+# Generate text (CUDA GPU)
+dotnet run --project src/Daisi.Llama.Cli -- \
+    --model C:\GGUFS\Qwen3.5-0.8B-Q8_0.gguf \
+    --prompt "Hello, world" \
+    --backend cuda
 ```
 
 ### Test model
@@ -35,27 +41,19 @@ Tests validate against [Qwen 3.5 0.8B Q8_0](https://huggingface.co/unsloth/Qwen3
 
 ## Current Status
 
-**End-to-end text generation produces coherent output on CPU. CUDA kernel operations validated on GPU.** 113 passing tests across GGUF parsing, dequantization, math ops, tokenization, forward pass, sampling, generation, and CUDA kernels.
+**End-to-end text generation on both CPU and GPU.** Qwen 3.5 0.8B Q8_0: ~9 tok/s CPU (AVX2), ~44 tok/s CUDA (RTX 5080). 113 passing tests.
 
 What works today:
 - Parse any GGUF v2/v3 file (header, metadata, tensor info)
-- Query model metadata (architecture, dimensions, vocab)
-- Read tensor data on demand (lazy loading)
 - Full quantization type support (41 GgmlType variants with block/type size calculation)
-- `IComputeBackend` and `ITensor` compute abstraction interfaces
-- CPU backend with dequantization for Q8_0, Q4_0, Q4_K (AVX2 SIMD + scalar fallback)
-- Load quantized tensors from GGUF and dequantize to FP32
-- CPU SIMD math operations: MatMul (FP32 + fused Q8_0), RMSNorm, softmax, SiLU, RoPE, element-wise add/mul
-- BPE tokenizer from GGUF metadata (GPT-2 byte encoding + direct UTF-8 modes)
-- Complete hybrid forward pass: standard gated attention + DeltaNet layers
-- Model loading from GGUF into CPU backend with polymorphic layer weights
-- KV cache for attention layers, recurrent state + conv1d buffers for DeltaNet layers
-- Sampler with temperature, top-k, top-p, repetition penalty, greedy/random sampling
-- Streaming text generation with prefill + decode loop
-- CLI with full argument parsing (model path, prompt, sampling parameters)
-- CUDA backend: P/Invoke to CUDA Driver API, NVRTC JIT compilation, SafeHandle resource management
-- GPU kernels: FP32 matmul, fused Q8_0 dequant+matmul, RMSNorm, softmax, SiLU, RoPE, element-wise ops, embedding lookup
-- GPU kernel correctness validated against CPU at model-scale dimensions (1024d hidden, 3584d FFN, 151936 vocab)
+- `IComputeBackend` / `ITensor` abstraction — forward pass is backend-agnostic
+- CPU backend: AVX2 SIMD matmul (fused Q8_0 dequant), multi-threaded, Q8_0/Q4_0/Q4_K dequantization
+- CUDA backend: NVRTC JIT compilation, block-per-neuron matmul with warp reduction, stream-batched kernels, async D2D copy
+- 13 composite GPU operations: GatedAttention, DeltaNetStep, CausalConv1d, ComputeDecayBeta, etc.
+- Complete hybrid forward pass: standard gated attention (6 layers) + DeltaNet (18 layers)
+- BPE tokenizer, KV cache, DeltaNet recurrent state + conv1d buffers
+- Sampler with temperature, top-k, top-p, repetition penalty
+- CLI: `--backend cpu|cuda`, model path, prompt, sampling parameters
 
 ## Roadmap
 
