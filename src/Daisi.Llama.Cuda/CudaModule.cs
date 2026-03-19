@@ -41,8 +41,9 @@ internal sealed class CudaModule : IDisposable
 
         try
         {
-            // Compile with default options
-            var result = NvrtcApi.CompileProgram(prog, 0, null);
+            // Compile with fast math for performance
+            var options = new[] { "--use_fast_math" };
+            var result = NvrtcApi.CompileProgram(prog, options.Length, options);
             if (result != NvrtcResult.Success)
             {
                 // Get compilation log

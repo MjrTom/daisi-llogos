@@ -70,6 +70,9 @@ public sealed class CudaTensor : ITensor
         if (destination.Length < ElementCount)
             throw new ArgumentException($"Destination too small.");
 
+        // Sync any active CUDA stream before D2H transfer
+        ActiveStream?.Synchronize();
+
         if (Type == GgmlType.F32)
         {
             _memory!.CopyToHost(destination.Slice(0, (int)ElementCount));
@@ -95,6 +98,11 @@ public sealed class CudaTensor : ITensor
         throw new InvalidOperationException(
             "Cannot get float span for GPU tensor. Use kernel operations or DequantizeTo instead.");
     }
+
+    /// <summary>
+    /// Set the stream to synchronize before D2H transfers.
+    /// </summary>
+    internal static CudaStream? ActiveStream { get; set; }
 
     /// <summary>
     /// Download F32 tensor data to a host buffer.

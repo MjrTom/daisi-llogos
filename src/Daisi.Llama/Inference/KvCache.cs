@@ -11,7 +11,7 @@ public sealed class KvCache : IDisposable
 {
     private readonly ITensor[] _kCaches;
     private readonly ITensor[] _vCaches;
-    private readonly int[] _layerIndices; // maps sequential index → actual layer number
+    private readonly int[] _layerIndices;
     private readonly int _maxSeqLen;
     private readonly int _nKvHeads;
     private readonly int _keyLength;
@@ -19,6 +19,10 @@ public sealed class KvCache : IDisposable
 
     /// <summary>Number of positions currently filled.</summary>
     public int Length { get; private set; }
+    public int MaxSeqLen => _maxSeqLen;
+    public int NumKvHeads => _nKvHeads;
+    public int KeyLength => _keyLength;
+    public int ValueLength => _valueLength;
 
     public KvCache(IComputeBackend backend, ModelConfig config, int maxSeqLen)
     {
@@ -27,7 +31,6 @@ public sealed class KvCache : IDisposable
         _keyLength = config.KeyLength;
         _valueLength = config.ValueLength;
 
-        // Only allocate for standard attention layers
         var attnLayers = new List<int>();
         for (int i = 0; i < config.NumLayers; i++)
         {
@@ -44,8 +47,8 @@ public sealed class KvCache : IDisposable
             int layer = _layerIndices[i];
             long kSize = _nKvHeads * _maxSeqLen * _keyLength;
             long vSize = _nKvHeads * _maxSeqLen * _valueLength;
-            _kCaches[i] = backend.CreateTensor($"kv_k_{layer}", GgmlType.F32, [(long)kSize]);
-            _vCaches[i] = backend.CreateTensor($"kv_v_{layer}", GgmlType.F32, [(long)vSize]);
+            _kCaches[i] = backend.CreateTensor($"kv_k_{layer}", GgmlType.F32, [kSize]);
+            _vCaches[i] = backend.CreateTensor($"kv_v_{layer}", GgmlType.F32, [vSize]);
         }
     }
 
@@ -56,10 +59,26 @@ public sealed class KvCache : IDisposable
         throw new ArgumentException($"Layer {layer} is not a standard attention layer.");
     }
 
+    /// <summary>Get K cache tensor for a standard attention layer.</summary>
+    public ITensor GetKCacheTensor(int layer) => _kCaches[GetCacheIndex(layer)];
+
+    /// <summary>Get V cache tensor for a standard attention layer.</summary>
+    public ITensor GetVCacheTensor(int layer) => _vCaches[GetCacheIndex(layer)];
+
     /// <summary>
-    /// Write K and V for a single position.
-    /// k: [nKvHeads × keyLength], v: [nKvHeads × valueLength].
+    /// Write K and V for a single position using backend operations.
     /// </summary>
+    public void Write(IComputeBackend backend, int layer, int position, ITensor k, ITensor v)
+    {
+        int idx = GetCacheIndex(layer);
+        backend.KvCacheWrite(_kCaches[idx], _vCaches[idx], k, v,
+            _nKvHeads, _keyLength, _valueLength, _maxSeqLen, position);
+
+        if (position >= Length)
+            Length = position + 1;
+    }
+
+    // Legacy span-based methods for backward compatibility
     public void Write(int layer, int position, ReadOnlySpan<float> k, ReadOnlySpan<float> v)
     {
         int idx = GetCacheIndex(layer);
@@ -69,24 +88,18 @@ public sealed class KvCache : IDisposable
         for (int h = 0; h < _nKvHeads; h++)
         {
             int kCacheOff = h * _maxSeqLen * _keyLength + position * _keyLength;
-            int kSrcOff = h * _keyLength;
-            k.Slice(kSrcOff, _keyLength).CopyTo(kSpan.Slice(kCacheOff, _keyLength));
+            k.Slice(h * _keyLength, _keyLength).CopyTo(kSpan.Slice(kCacheOff, _keyLength));
 
             int vCacheOff = h * _maxSeqLen * _valueLength + position * _valueLength;
-            int vSrcOff = h * _valueLength;
-            v.Slice(vSrcOff, _valueLength).CopyTo(vSpan.Slice(vCacheOff, _valueLength));
+            v.Slice(h * _valueLength, _valueLength).CopyTo(vSpan.Slice(vCacheOff, _valueLength));
         }
 
         if (position >= Length)
             Length = position + 1;
     }
 
-    /// <summary>Get K cache span for a standard attention layer.</summary>
     public Span<float> GetKCache(int layer) => _kCaches[GetCacheIndex(layer)].AsFloatSpan();
-
-    /// <summary>Get V cache span for a standard attention layer.</summary>
     public Span<float> GetVCache(int layer) => _vCaches[GetCacheIndex(layer)].AsFloatSpan();
-
     public int KHeadStride => _maxSeqLen * _keyLength;
     public int VHeadStride => _maxSeqLen * _valueLength;
 

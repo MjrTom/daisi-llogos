@@ -1,8 +1,10 @@
 using System.Diagnostics;
 using Daisi.Llama.Cpu;
+using Daisi.Llama.Cuda;
 using Daisi.Llama.Gguf;
 using Daisi.Llama.Inference;
 using Daisi.Llama.Model;
+using Daisi.Llama;
 using Daisi.Llama.Tokenizer;
 
 // Parse arguments
@@ -27,7 +29,9 @@ var loadSw = Stopwatch.StartNew();
 var stream = File.OpenRead(options.ModelPath);
 var gguf = GgufFile.Read(stream);
 var config = ModelConfig.FromGguf(gguf);
-var backend = new CpuBackend();
+IComputeBackend backend = options.Backend == "cuda"
+    ? new CudaBackend()
+    : new CpuBackend();
 var weights = ModelLoader.Load(gguf, stream, backend, config);
 var kvCache = new KvCache(backend, config, maxSeqLen: options.MaxContext);
 var deltaState = new DeltaNetState(backend, config);
@@ -110,6 +114,9 @@ static CliArgs ParseArgs(string[] args)
             case "--seed":
                 result.Seed = int.Parse(NextArg(args, ref i));
                 break;
+            case "--backend" or "-b":
+                result.Backend = NextArg(args, ref i);
+                break;
             case "--help" or "-h":
                 result.ShowHelp = true;
                 break;
@@ -138,6 +145,7 @@ static void PrintUsage()
           --top-p <f>              Top-p nucleus sampling (default: 0.9)
           --repeat-penalty <f>     Repetition penalty (default: 1.1)
           --seed <n>               Random seed for reproducibility
+          --backend, -b <name>     Compute backend: cpu or cuda (default: cpu)
           --help, -h               Show this help
         """);
 }
@@ -153,5 +161,6 @@ class CliArgs
     public float TopP = 0.9f;
     public float RepeatPenalty = 1.1f;
     public int? Seed;
+    public string Backend = "cpu";
     public bool ShowHelp;
 }

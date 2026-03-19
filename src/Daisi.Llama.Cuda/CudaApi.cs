@@ -67,6 +67,15 @@ internal static partial class CudaApi
     [LibraryImport(Lib, EntryPoint = "cuMemcpyDtoH_v2")]
     internal static unsafe partial CuResult MemcpyDtoH(void* dstHost, ulong srcDevice, ulong byteCount);
 
+    [LibraryImport(Lib, EntryPoint = "cuMemcpyDtoD_v2")]
+    internal static partial CuResult MemcpyDtoD(ulong dstDevice, ulong srcDevice, ulong byteCount);
+
+    [LibraryImport(Lib, EntryPoint = "cuMemcpyDtoDAsync_v2")]
+    internal static partial CuResult MemcpyDtoDAsync(ulong dstDevice, ulong srcDevice, ulong byteCount, nint stream);
+
+    [LibraryImport(Lib, EntryPoint = "cuMemsetD8_v2")]
+    internal static partial CuResult MemsetD8(ulong dstDevice, byte value, ulong count);
+
     // ── Stream ───────────────────────────────────────────────────────────────
 
     [LibraryImport(Lib, EntryPoint = "cuStreamCreate")]
@@ -87,6 +96,26 @@ internal static partial class CudaApi
         uint blockDimX, uint blockDimY, uint blockDimZ,
         uint sharedMemBytes, nint stream,
         nint* kernelParams, nint* extra);
+
+    // ── Graph capture ──────────────────────────────────────────────────────
+
+    [LibraryImport(Lib, EntryPoint = "cuStreamBeginCapture_v2")]
+    internal static partial CuResult StreamBeginCapture(nint stream, int mode);
+
+    [LibraryImport(Lib, EntryPoint = "cuStreamEndCapture")]
+    internal static partial CuResult StreamEndCapture(nint stream, out nint graph);
+
+    [LibraryImport(Lib, EntryPoint = "cuGraphInstantiate_v2")]
+    internal static partial CuResult GraphInstantiate(out nint graphExec, nint graph, nint logBuffer, nint bufferSize, int flags);
+
+    [LibraryImport(Lib, EntryPoint = "cuGraphLaunch")]
+    internal static partial CuResult GraphLaunch(nint graphExec, nint stream);
+
+    [LibraryImport(Lib, EntryPoint = "cuGraphDestroy")]
+    internal static partial CuResult GraphDestroy(nint graph);
+
+    [LibraryImport(Lib, EntryPoint = "cuGraphExecDestroy")]
+    internal static partial CuResult GraphExecDestroy(nint graphExec);
 
     // ── Helpers ──────────────────────────────────────────────────────────────
 

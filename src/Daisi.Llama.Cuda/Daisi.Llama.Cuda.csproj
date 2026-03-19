@@ -14,5 +14,6 @@
   <ItemGroup>
     <EmbeddedResource Include="kernels\elementwise.cu" LogicalName="elementwise.cu" />
     <EmbeddedResource Include="kernels\dequant_matmul.cu" LogicalName="dequant_matmul.cu" />
+    <EmbeddedResource Include="kernels\composite_ops.cu" LogicalName="composite_ops.cu" />
   </ItemGroup>
 </Project>

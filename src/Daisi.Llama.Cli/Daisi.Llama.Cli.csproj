@@ -7,5 +7,6 @@
   <ItemGroup>
     <ProjectReference Include="..\Daisi.Llama\Daisi.Llama.csproj" />
     <ProjectReference Include="..\Daisi.Llama.Cpu\Daisi.Llama.Cpu.csproj" />
+    <ProjectReference Include="..\Daisi.Llama.Cuda\Daisi.Llama.Cuda.csproj" />
   </ItemGroup>
 </Project>
