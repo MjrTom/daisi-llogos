@@ -1,0 +1,24 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <RootNamespace>Daisi.Llama.Vulkan</RootNamespace>
+    <AssemblyName>Daisi.Llama.Vulkan</AssemblyName>
+    <AllowUnsafeBlocks>true</AllowUnsafeBlocks>
+  </PropertyGroup>
+  <ItemGroup>
+    <InternalsVisibleTo Include="Daisi.Llama.Tests" />
+  </ItemGroup>
+  <ItemGroup>
+    <ProjectReference Include="..\Daisi.Llama\Daisi.Llama.csproj" />
+    <ProjectReference Include="..\Daisi.Llama.Cpu\Daisi.Llama.Cpu.csproj" />
+  </ItemGroup>
+  <ItemGroup>
+    <EmbeddedResource Include="shaders\compiled\*.spv" LogicalName="%(Filename)%(Extension)" />
+  </ItemGroup>
+  <Target Name="CompileShaders" BeforeTargets="PrepareForBuild" Condition="Exists('$(MSBuildProjectDirectory)\shaders') AND '$(VulkanSdkPath)' != ''">
+    <Exec Command="&quot;$(VulkanSdkPath)\Bin\glslc.exe&quot; &quot;%(CompShaders.FullPath)&quot; -o &quot;$(MSBuildProjectDirectory)\shaders\compiled\%(CompShaders.Filename).spv&quot; --target-env=vulkan1.0"
+          WorkingDirectory="$(MSBuildProjectDirectory)" />
+  </Target>
+  <ItemGroup>
+    <CompShaders Include="shaders\*.comp" />
+  </ItemGroup>
+</Project>

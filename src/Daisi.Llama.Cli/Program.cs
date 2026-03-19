@@ -1,6 +1,7 @@
 using System.Diagnostics;
 using Daisi.Llama.Cpu;
 using Daisi.Llama.Cuda;
+using Daisi.Llama.Vulkan;
 using Daisi.Llama.Gguf;
 using Daisi.Llama.Inference;
 using Daisi.Llama.Model;
@@ -29,9 +30,12 @@ var loadSw = Stopwatch.StartNew();
 using var stream = File.OpenRead(options.ModelPath);
 var gguf = GgufFile.Read(stream);
 var config = ModelConfig.FromGguf(gguf);
-IComputeBackend backend = options.Backend == "cuda"
-    ? new CudaBackend()
-    : new CpuBackend();
+IComputeBackend backend = options.Backend switch
+{
+    "cuda" => new CudaBackend(),
+    "vulkan" => new VulkanBackend(),
+    _ => new CpuBackend(),
+};
 
 // Use memory-mapped loading if --mmap is set (default: true)
 ModelWeights weights;
@@ -204,7 +208,7 @@ static void PrintUsage()
           --top-p <f>              Top-p nucleus sampling (default: 0.9)
           --repeat-penalty <f>     Repetition penalty (default: 1.1)
           --seed <n>               Random seed for reproducibility
-          --backend, -b <name>     Compute backend: cpu or cuda (default: cpu)
+          --backend, -b <name>     Compute backend: cpu, cuda, or vulkan (default: cpu)
           --bench                  Run benchmark (prefill + decode timing)
           --no-mmap                Disable memory-mapped loading (use stream loading)
           --attention <mode>       Attention strategy: full, window:<N>, sinks:<S>,<W> (default: full)

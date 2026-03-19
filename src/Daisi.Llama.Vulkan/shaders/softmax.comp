@@ -1,0 +1,54 @@
+#version 450
+
+layout(local_size_x = 256) in;
+
+layout(push_constant) uniform PushConstants {
+    uint n;
+};
+
+layout(set = 0, binding = 0) buffer OutputBuf { float output_data[]; };
+layout(set = 0, binding = 1) buffer InputBuf { float input_data[]; };
+
+shared float sdata[256];
+
+void main() {
+    uint tid = gl_LocalInvocationID.x;
+
+    // Find max (reduction)
+    float local_max = -1.0/0.0; // -inf
+    for (uint i = tid; i < n; i += 256)
+        local_max = max(local_max, input_data[i]);
+    sdata[tid] = local_max;
+    barrier();
+
+    for (uint s = 128; s > 0; s >>= 1) {
+        if (tid < s)
+            sdata[tid] = max(sdata[tid], sdata[tid + s]);
+        barrier();
+    }
+    float max_val = sdata[0];
+    barrier();
+
+    // Sum of exp(x - max)
+    float local_sum = 0.0;
+    for (uint i = tid; i < n; i += 256) {
+        float e = exp(input_data[i] - max_val);
+        output_data[i] = e;
+        local_sum += e;
+    }
+    sdata[tid] = local_sum;
+    barrier();
+
+    for (uint s = 128; s > 0; s >>= 1) {
+        if (tid < s)
+            sdata[tid] += sdata[tid + s];
+        barrier();
+    }
+    float sum_val = sdata[0];
+    barrier();
+
+    // Normalize
+    float inv_sum = 1.0 / sum_val;
+    for (uint i = tid; i < n; i += 256)
+        output_data[i] *= inv_sum;
+}

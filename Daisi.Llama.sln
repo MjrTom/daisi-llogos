@@ -15,6 +15,8 @@ Project("{2150E333-8FDC-42A3-9474-1A3956D46DE8}") = "src", "src", "{827E0CD3-B72
 EndProject
 Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "Daisi.Llama.Cuda", "src\Daisi.Llama.Cuda\Daisi.Llama.Cuda.csproj", "{0A08305F-6A89-4B3D-B9F4-C6BB114543BF}"
 EndProject
+Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "Daisi.Llama.Vulkan", "src\Daisi.Llama.Vulkan\Daisi.Llama.Vulkan.csproj", "{A920A166-8BA2-42C5-A74A-C3A176000AC9}"
+EndProject
 Global
 	GlobalSection(SolutionConfigurationPlatforms) = preSolution
 		Debug|Any CPU = Debug|Any CPU
@@ -85,11 +87,24 @@ Global
 		{0A08305F-6A89-4B3D-B9F4-C6BB114543BF}.Release|x64.Build.0 = Release|Any CPU
 		{0A08305F-6A89-4B3D-B9F4-C6BB114543BF}.Release|x86.ActiveCfg = Release|Any CPU
 		{0A08305F-6A89-4B3D-B9F4-C6BB114543BF}.Release|x86.Build.0 = Release|Any CPU
+		{A920A166-8BA2-42C5-A74A-C3A176000AC9}.Debug|Any CPU.ActiveCfg = Debug|Any CPU
+		{A920A166-8BA2-42C5-A74A-C3A176000AC9}.Debug|Any CPU.Build.0 = Debug|Any CPU
+		{A920A166-8BA2-42C5-A74A-C3A176000AC9}.Debug|x64.ActiveCfg = Debug|Any CPU
+		{A920A166-8BA2-42C5-A74A-C3A176000AC9}.Debug|x64.Build.0 = Debug|Any CPU
+		{A920A166-8BA2-42C5-A74A-C3A176000AC9}.Debug|x86.ActiveCfg = Debug|Any CPU
+		{A920A166-8BA2-42C5-A74A-C3A176000AC9}.Debug|x86.Build.0 = Debug|Any CPU
+		{A920A166-8BA2-42C5-A74A-C3A176000AC9}.Release|Any CPU.ActiveCfg = Release|Any CPU
+		{A920A166-8BA2-42C5-A74A-C3A176000AC9}.Release|Any CPU.Build.0 = Release|Any CPU
+		{A920A166-8BA2-42C5-A74A-C3A176000AC9}.Release|x64.ActiveCfg = Release|Any CPU
+		{A920A166-8BA2-42C5-A74A-C3A176000AC9}.Release|x64.Build.0 = Release|Any CPU
+		{A920A166-8BA2-42C5-A74A-C3A176000AC9}.Release|x86.ActiveCfg = Release|Any CPU
+		{A920A166-8BA2-42C5-A74A-C3A176000AC9}.Release|x86.Build.0 = Release|Any CPU
 	EndGlobalSection
 	GlobalSection(SolutionProperties) = preSolution
 		HideSolutionNode = FALSE
 	EndGlobalSection
 	GlobalSection(NestedProjects) = preSolution
 		{0A08305F-6A89-4B3D-B9F4-C6BB114543BF} = {827E0CD3-B72D-47B6-A68D-7590B98EB39B}
+		{A920A166-8BA2-42C5-A74A-C3A176000AC9} = {827E0CD3-B72D-47B6-A68D-7590B98EB39B}
 	EndGlobalSection
 EndGlobal

@@ -1,0 +1,144 @@
+#version 450
+
+// Tiled gated attention with online softmax.
+// One workgroup per attention head.
+
+layout(local_size_x = 256) in;
+
+layout(push_constant) uniform PushConstants {
+    uint numHeads;
+    uint numKvHeads;
+    uint keyLength;
+    uint valueLength;
+    uint maxSeqLen;
+    uint seqLen;
+    float scale;
+    uint cacheIsFp16;
+};
+
+layout(set = 0, binding = 0) buffer OutputBuf { float output_data[]; };
+layout(set = 0, binding = 1) buffer QAttnBuf { float q_attn[]; };
+layout(set = 0, binding = 2) buffer QGateBuf { float q_gate[]; };
+layout(set = 0, binding = 3) buffer KCacheBuf { float k_cache[]; };
+layout(set = 0, binding = 4) buffer VCacheBuf { float v_cache[]; };
+
+// Read a float from K cache that may contain packed FP16 pairs
+float read_k(uint idx) {
+    if (cacheIsFp16 != 0) {
+        vec2 pair = unpackHalf2x16(floatBitsToUint(k_cache[idx / 2]));
+        return (idx % 2 == 0) ? pair.x : pair.y;
+    }
+    return k_cache[idx];
+}
+
+// Read a float from V cache that may contain packed FP16 pairs
+float read_v(uint idx) {
+    if (cacheIsFp16 != 0) {
+        vec2 pair = unpackHalf2x16(floatBitsToUint(v_cache[idx / 2]));
+        return (idx % 2 == 0) ? pair.x : pair.y;
+    }
+    return v_cache[idx];
+}
+
+shared float tile_scores[256];
+shared float sdata[256];
+
+void main() {
+    uint h = gl_WorkGroupID.x;
+    if (h >= numHeads) return;
+    uint tid = gl_LocalInvocationID.x;
+
+    uint headsPerGroup = numHeads / numKvHeads;
+    uint kvHead = h / headsPerGroup;
+    uint qOff = h * keyLength;
+    uint kvKBase = kvHead * maxSeqLen * keyLength;
+    uint kvVBase = kvHead * maxSeqLen * valueLength;
+    uint outOff = h * valueLength;
+
+    // Initialize output accumulator in shared memory approach — use per-thread accumulators
+    // For valueLength <= 256, each thread handles some dimensions
+    float running_max = -1.0/0.0;
+    float running_sum = 0.0;
+
+    // Per-thread partial output (one float per value dim this thread handles)
+    // We process tiles of 256 positions
+    const uint TILE = 256;
+
+    // Zero output
+    for (uint d = tid; d < valueLength; d += 256)
+        output_data[outOff + d] = 0.0;
+
+    barrier();
+
+    for (uint tileStart = 0; tileStart < seqLen; tileStart += TILE) {
+        uint tileEnd = min(tileStart + TILE, seqLen);
+        uint tileLen = tileEnd - tileStart;
+
+        // Compute scores for this tile (each thread handles one position)
+        float my_score = -1.0/0.0;
+        if (tid < tileLen) {
+            uint p = tileStart + tid;
+            float dot = 0.0;
+            for (uint d = 0; d < keyLength; d++)
+                dot += q_attn[qOff + d] * read_k(kvKBase + p * keyLength + d);
+            my_score = dot * scale;
+        }
+        tile_scores[tid] = my_score;
+        barrier();
+
+        // Find tile max (reduction)
+        sdata[tid] = my_score;
+        barrier();
+        for (uint s = 128; s > 0; s >>= 1) {
+            if (tid < s)
+                sdata[tid] = max(sdata[tid], sdata[tid + s]);
+            barrier();
+        }
+        float tile_max = sdata[0];
+        barrier();
+
+        // Compute exp and tile sum
+        float my_exp = 0.0;
+        if (tid < tileLen)
+            my_exp = exp(tile_scores[tid] - tile_max);
+        tile_scores[tid] = my_exp;
+
+        sdata[tid] = my_exp;
+        barrier();
+        for (uint s = 128; s > 0; s >>= 1) {
+            if (tid < s)
+                sdata[tid] += sdata[tid + s];
+            barrier();
+        }
+        float tile_sum = sdata[0];
+        barrier();
+
+        // Online softmax merge
+        float new_max = max(running_max, tile_max);
+        float corr_old = exp(running_max - new_max);
+        float corr_new = exp(tile_max - new_max);
+
+        // Update output: rescale old + add new tile contribution
+        for (uint d = tid; d < valueLength; d += 256) {
+            float tile_val = 0.0;
+            for (uint t = 0; t < tileLen; t++)
+                tile_val += tile_scores[t] * read_v(kvVBase + (tileStart + t) * valueLength + d);
+
+            output_data[outOff + d] = output_data[outOff + d] * corr_old + tile_val * corr_new;
+        }
+
+        running_sum = running_sum * corr_old + tile_sum * corr_new;
+        running_max = new_max;
+
+        barrier();
+    }
+
+    // Normalize and apply sigmoid gating
+    float inv_sum = running_sum > 0.0 ? 1.0 / running_sum : 0.0;
+    for (uint d = tid; d < valueLength; d += 256) {
+        float gate_val = 1.0;
+        if (d < keyLength)
+            gate_val = 1.0 / (1.0 + exp(-q_gate[h * keyLength + d]));
+        output_data[outOff + d] = output_data[outOff + d] * inv_sum * gate_val;
+    }
+}

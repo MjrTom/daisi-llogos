@@ -1,0 +1,241 @@
+#version 450
+#extension GL_EXT_shader_8bit_storage : enable
+#extension GL_EXT_shader_explicit_arithmetic_types_int8 : enable
+#extension GL_EXT_shader_16bit_storage : enable
+#extension GL_EXT_shader_explicit_arithmetic_types_float16 : enable
+
+// This shader implements multiple composite operations selected by push constant opcode.
+// Only one operation runs per dispatch (selected by `opcode`).
+
+layout(local_size_x = 256) in;
+
+layout(push_constant) uniform PushConstants {
+    uint opcode;       // operation selector
+    uint param0;
+    uint param1;
+    uint param2;
+    uint param3;
+    uint param4;
+    uint param5;
+    uint param6;
+};
+
+layout(set = 0, binding = 0) buffer Buf0 { float data0[]; };
+layout(set = 0, binding = 1) buffer Buf1 { float data1[]; };
+layout(set = 0, binding = 2) buffer Buf2 { float data2[]; };
+layout(set = 0, binding = 3) buffer Buf3 { float data3[]; };
+layout(set = 0, binding = 4) buffer Buf4 { float data4[]; };
+layout(set = 0, binding = 5) buffer Buf5 { float data5[]; };
+layout(set = 0, binding = 6) buffer Buf6 { float data6[]; };
+layout(set = 0, binding = 7) buffer Buf7 { float data7[]; };
+
+shared float sdata[256];
+
+// ── Opcode 0: SiLU in-place (data0) ──────────────────────────────────────────
+// param0 = n
+void op_silu_inplace() {
+    uint idx = gl_GlobalInvocationID.x;
+    if (idx >= param0) return;
+    float x = data0[idx];
+    data0[idx] = x / (1.0 + exp(-x));
+}
+
+// ── Opcode 1: SiLU gate: data0[i] = data1[i] * silu(data2[i]) ──────────────
+// param0 = n
+void op_silu_gate() {
+    uint idx = gl_GlobalInvocationID.x;
+    if (idx >= param0) return;
+    float g = data2[idx];
+    data0[idx] = data1[idx] * g / (1.0 + exp(-g));
+}
+
+// ── Opcode 2: Split QKV: data0=q, data1=k, data2=v from data3=qkv ──────────
+// param0 = innerSize
+void op_split_qkv() {
+    uint idx = gl_GlobalInvocationID.x;
+    if (idx >= param0) return;
+    data0[idx] = data3[idx];
+    data1[idx] = data3[param0 + idx];
+    data2[idx] = data3[param0 * 2 + idx];
+}
+
+// ── Opcode 3: De-interleave Q ───────────────────────────────────────────────
+// data0=qAttn, data1=qGate, data2=qFull
+// param0=numHeads, param1=headDim
+void op_deinterleave_q() {
+    uint idx = gl_GlobalInvocationID.x;
+    uint total = param0 * param1;
+    if (idx >= total) return;
+    uint head = idx / param1;
+    uint dim = idx % param1;
+    data0[idx] = data2[head * 2 * param1 + dim];
+    data1[idx] = data2[head * 2 * param1 + param1 + dim];
+}
+
+// ── Opcode 4: L2 norm groups ────────────────────────────────────────────────
+// data0 = data (in-place), param0=numGroups, param1=groupDim
+// One workgroup per group
+void op_l2_norm_groups() {
+    uint g = gl_WorkGroupID.x;
+    if (g >= param0) return;
+    uint tid = gl_LocalInvocationID.x;
+    uint off = g * param1;
+
+    float local_sum = 0.0;
+    for (uint i = tid; i < param1; i += 256)
+        local_sum += data0[off + i] * data0[off + i];
+    sdata[tid] = local_sum;
+    barrier();
+
+    for (uint s = 128; s > 0; s >>= 1) {
+        if (tid < s) sdata[tid] += sdata[tid + s];
+        barrier();
+    }
+
+    float inv_norm = 1.0 / sqrt(sdata[0] + 1e-12);
+    for (uint i = tid; i < param1; i += 256)
+        data0[off + i] *= inv_norm;
+}
+
+// ── Opcode 5: Per-head RMSNorm ──────────────────────────────────────────────
+// data0 = data (in-place), data1 = weight
+// param0=numHeads, param1=headDim, param2=float eps bits
+void op_per_head_rms_norm() {
+    uint h = gl_WorkGroupID.x;
+    if (h >= param0) return;
+    uint tid = gl_LocalInvocationID.x;
+    uint off = h * param1;
+    float eps = uintBitsToFloat(param2);
+
+    float local_sum = 0.0;
+    for (uint i = tid; i < param1; i += 256)
+        local_sum += data0[off + i] * data0[off + i];
+    sdata[tid] = local_sum;
+    barrier();
+
+    for (uint s = 128; s > 0; s >>= 1) {
+        if (tid < s) sdata[tid] += sdata[tid + s];
+        barrier();
+    }
+
+    float rms = sqrt(sdata[0] / float(param1) + eps);
+    float inv_rms = 1.0 / rms;
+    for (uint i = tid; i < param1; i += 256)
+        data0[off + i] = data0[off + i] * inv_rms * data1[i];
+}
+
+// ── Opcode 6: KV cache write ────────────────────────────────────────────────
+// data0=kCache, data1=vCache, data2=k, data3=v
+// param0=nKvHeads, param1=keyLength, param2=valueLength, param3=maxSeqLen, param4=position, param5=cacheIsFp16
+//
+// For FP16: each thread writes a PAIR of FP16 values packed into one uint32 (stored as float).
+// This avoids race conditions. Grid should be max(nKvHeads*keyLength, nKvHeads*valueLength)/2 for FP16.
+// For F32: each thread writes one value.
+void op_kv_cache_write() {
+    uint idx = gl_GlobalInvocationID.x;
+
+    if (param5 != 0) {
+        // FP16 mode: each thread writes 2 FP16 values packed into 1 float
+        uint totalKPairs = (param0 * param1) / 2;
+        uint totalVPairs = (param0 * param2) / 2;
+        uint maxPairs = max(totalKPairs, totalVPairs);
+        if (idx >= maxPairs) return;
+
+        // Write K pair
+        if (idx < totalKPairs) {
+            uint elemIdx = idx * 2;
+            uint h = elemIdx / param1;
+            uint d = elemIdx % param1;
+            uint cacheBase = h * param3 * param1 + param4 * param1 + d;
+            float v0 = data2[elemIdx];
+            float v1 = data2[elemIdx + 1];
+            // Pack two FP16 values into one uint32 stored as float
+            data0[cacheBase / 2] = uintBitsToFloat(packHalf2x16(vec2(v0, v1)));
+        }
+
+        // Write V pair
+        if (idx < totalVPairs) {
+            uint elemIdx = idx * 2;
+            uint h = elemIdx / param2;
+            uint d = elemIdx % param2;
+            uint cacheBase = h * param3 * param2 + param4 * param2 + d;
+            float v0 = data3[elemIdx];
+            float v1 = data3[elemIdx + 1];
+            data1[cacheBase / 2] = uintBitsToFloat(packHalf2x16(vec2(v0, v1)));
+        }
+    } else {
+        // F32 mode: each thread writes one value
+        uint maxElems = max(param0 * param1, param0 * param2);
+        if (idx >= maxElems) return;
+
+        if (idx < param0 * param1) {
+            uint h = idx / param1;
+            uint d = idx % param1;
+            uint cacheOff = h * param3 * param1 + param4 * param1 + d;
+            data0[cacheOff] = data2[idx];
+        }
+
+        if (idx < param0 * param2) {
+            uint h = idx / param2;
+            uint d = idx % param2;
+            uint cacheOff = h * param3 * param2 + param4 * param2 + d;
+            data1[cacheOff] = data3[idx];
+        }
+    }
+}
+
+// ── Opcode 7: Compute decay + beta ──────────────────────────────────────────
+// data0=decay, data1=beta, data2=alphaProj, data3=betaProj, data4=ssmA, data5=dtBias
+// param0=groupCount
+void op_compute_decay_beta() {
+    uint g = gl_GlobalInvocationID.x;
+    if (g >= param0) return;
+    float softplus = log(1.0 + exp(data2[g] + data5[g]));
+    data0[g] = exp(data4[g] * softplus);
+    data1[g] = 1.0 / (1.0 + exp(-data3[g]));
+}
+
+// ── Opcode 8: Causal conv1d ─────────────────────────────────────────────────
+// data0=qkv (in-place), data1=convBuffer, data2=convWeight, data3=temp
+// param0=channels, param1=kernelSize
+void op_causal_conv1d() {
+    uint c = gl_GlobalInvocationID.x;
+    if (c >= param0) return;
+    uint bufSlots = param1 - 1;
+
+    float s = 0.0;
+    for (uint k = 0; k < bufSlots; k++)
+        s += data1[k * param0 + c] * data2[c * param1 + k];
+    s += data0[c] * data2[c * param1 + bufSlots];
+
+    data3[c] = s; // temp result
+
+    // Barrier needed between read and write of conv buffer
+    barrier();
+
+    // Shift buffer: we need the old qkv value before overwriting
+    float old_qkv = data0[c];
+
+    // Shift buffer slots
+    for (uint k = 0; k < bufSlots - 1; k++)
+        data1[k * param0 + c] = data1[(k + 1) * param0 + c];
+    if (bufSlots > 0)
+        data1[(bufSlots - 1) * param0 + c] = old_qkv;
+
+    // Write result
+    data0[c] = data3[c];
+}
+
+void main() {
+    switch (opcode) {
+        case 0: op_silu_inplace(); break;
+        case 1: op_silu_gate(); break;
+        case 2: op_split_qkv(); break;
+        case 3: op_deinterleave_q(); break;
+        case 4: op_l2_norm_groups(); break;
+        case 5: op_per_head_rms_norm(); break;
+        case 6: op_kv_cache_write(); break;
+        case 7: op_compute_decay_beta(); break;
+        case 8: op_causal_conv1d(); break;
+    }
+}
