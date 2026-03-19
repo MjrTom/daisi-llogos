@@ -7,48 +7,70 @@ namespace Daisi.Llama.Cpu;
 
 /// <summary>
 /// Matrix multiplication with optional fused dequantization.
-/// output[M×N] = a[M×K] × b[K×N], where b may be quantized.
-/// All matrices are row-major 1D spans.
+/// b is always [N×K] (GGUF convention: each of N output rows has K input weights).
+/// output[i,j] = dot(a[i,:], b[j,:])
 /// </summary>
 internal static class MatMul
 {
     private const int Q8_0BlockSize = 32;
     private const int Q8_0TypeSize = 34;
 
+    // Minimum N to justify thread pool overhead
+    private const int ParallelThreshold = 32;
+
     /// <summary>
-    /// FP32 × FP32 matrix multiply.
-    /// b is [N×K] (GGUF convention: each of N output rows has K weights).
-    /// output[i,j] = dot(a[i,:], b[j,:])
+    /// FP32 × FP32 matrix multiply. b is [N×K].
     /// </summary>
     public static void Multiply(Span<float> output, ReadOnlySpan<float> a, ReadOnlySpan<float> b, int M, int K, int N)
     {
-        if (Avx2.IsSupported && K >= 8)
-            MultiplyAvx2(output, a, b, M, K, N);
+        if (Fma.IsSupported && K >= 8)
+            MultiplyFma(output, a, b, M, K, N);
         else
             MultiplyScalar(output, a, b, M, K, N);
     }
 
     /// <summary>
-    /// FP32 × Q8_0 fused dequant+matmul.
-    /// a is [M×K] FP32, b is [K×N] Q8_0 stored as N column vectors each of K elements.
-    /// b layout: N contiguous Q8_0-encoded vectors of length K.
+    /// FP32 × Q8_0 fused dequant+matmul. b is [N×K] quantized.
+    /// Multi-threaded over N when N is large enough.
     /// </summary>
-    public static void MultiplyQ8_0(Span<float> output, ReadOnlySpan<float> a, ReadOnlySpan<byte> b, int M, int K, int N)
+    public static unsafe void MultiplyQ8_0(Span<float> output, ReadOnlySpan<float> a, ReadOnlySpan<byte> b, int M, int K, int N)
     {
-        // b is row-major [K×N] but stored quantized. Each row of K elements across N columns.
-        // Actually for weight matrices, b is [N×K] quantized (each of N output neurons has K weights).
-        // We compute: for each (i,j): output[i,j] = dot(a_row_i[K], b_row_j[K])
-        // This matches llama.cpp convention where weights are [outDim × inDim].
         int blocksPerRow = K / Q8_0BlockSize;
         int bytesPerRow = blocksPerRow * Q8_0TypeSize;
 
-        for (int i = 0; i < M; i++)
+        fixed (float* aFixedPtr = a)
+        fixed (byte* bFixedPtr = b)
+        fixed (float* oFixedPtr = output)
         {
-            var aRow = a.Slice(i * K, K);
-            for (int j = 0; j < N; j++)
+            // Copy to local to avoid fixed-in-lambda restriction
+            nint aBase = (nint)aFixedPtr;
+            nint bBase = (nint)bFixedPtr;
+            nint oBase = (nint)oFixedPtr;
+
+            for (int i = 0; i < M; i++)
             {
-                var bRow = b.Slice(j * bytesPerRow, bytesPerRow);
-                output[i * N + j] = DotQ8_0(aRow, bRow, blocksPerRow);
+                float* aRow = (float*)aBase + i * K;
+                float* oRow = (float*)oBase + i * N;
+
+                if (N >= ParallelThreshold)
+                {
+                    nint bCapture = bBase;
+                    int bprCapture = bytesPerRow;
+                    int blkCapture = blocksPerRow;
+                    Parallel.For(0, N, j =>
+                    {
+                        byte* bRow = (byte*)bCapture + j * bprCapture;
+                        oRow[j] = DotQ8_0Ptr(aRow, bRow, blkCapture);
+                    });
+                }
+                else
+                {
+                    for (int j = 0; j < N; j++)
+                    {
+                        byte* bRow = (byte*)bBase + j * bytesPerRow;
+                        oRow[j] = DotQ8_0Ptr(aRow, bRow, blocksPerRow);
+                    }
+                }
             }
         }
     }
@@ -57,7 +79,6 @@ internal static class MatMul
 
     private static void MultiplyScalar(Span<float> output, ReadOnlySpan<float> a, ReadOnlySpan<float> b, int M, int K, int N)
     {
-        // b is [N×K]: row j has K weights for output j
         for (int i = 0; i < M; i++)
         {
             for (int j = 0; j < N; j++)
@@ -72,10 +93,9 @@ internal static class MatMul
         }
     }
 
-    // ── FP32 AVX2 ────────────────────────────────────────────────────────────
-    // b is [N×K]: each output row j has K weights. SIMD over K dimension.
+    // ── FP32 FMA ──────────────────────────────────────────────────────────────
 
-    private static void MultiplyAvx2(Span<float> output, ReadOnlySpan<float> a, ReadOnlySpan<float> b, int M, int K, int N)
+    private static void MultiplyFma(Span<float> output, ReadOnlySpan<float> a, ReadOnlySpan<float> b, int M, int K, int N)
     {
         ref float aRef = ref MemoryMarshal.GetReference(a);
         ref float bRef = ref MemoryMarshal.GetReference(b);
@@ -93,9 +113,7 @@ internal static class MatMul
                 {
                     var vA = Vector256.LoadUnsafe(ref Unsafe.Add(ref aRef, aBase + k));
                     var vB = Vector256.LoadUnsafe(ref Unsafe.Add(ref bRef, bBase + k));
-                    vSum = Avx2.IsSupported
-                        ? System.Runtime.Intrinsics.X86.Fma.MultiplyAdd(vA, vB, vSum)
-                        : vSum + vA * vB;
+                    vSum = Fma.MultiplyAdd(vA, vB, vSum);
                 }
                 float sum = Vector256.Sum(vSum);
                 for (; k < K; k++)
@@ -105,23 +123,91 @@ internal static class MatMul
         }
     }
 
-    // ── Q8_0 Fused Dot Product ───────────────────────────────────────────────
+    // ── Q8_0 Fused Dot Product ──────────────────────────────────────────────
 
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
-    private static float DotQ8_0(ReadOnlySpan<float> aVec, ReadOnlySpan<byte> bQ8, int blockCount)
+    private static unsafe float DotQ8_0Ptr(float* aVec, byte* bQ8, int blockCount)
+    {
+        if (Avx2.IsSupported)
+            return DotQ8_0Avx2(aVec, bQ8, blockCount);
+        return DotQ8_0Scalar(aVec, bQ8, blockCount);
+    }
+
+    /// <summary>
+    /// AVX2 fused Q8_0 dot product. Each Q8_0 block is 2 bytes FP16 scale + 32 int8 quants.
+    /// Uses vpmovsxbd (sign-extend byte→dword) + vcvtdq2ps + vfmadd for high throughput.
+    /// </summary>
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    private static unsafe float DotQ8_0Avx2(float* aVec, byte* bQ8, int blockCount)
+    {
+        var acc = Vector256<float>.Zero;
+        bool hasFma = Fma.IsSupported;
+
+        for (int b = 0; b < blockCount; b++)
+        {
+            byte* blockPtr = bQ8 + b * Q8_0TypeSize;
+            float* aPtr = aVec + b * Q8_0BlockSize;
+            sbyte* quants = (sbyte*)(blockPtr + 2);
+
+            // Read FP16 scale → FP32
+            float scale = (float)Unsafe.ReadUnaligned<Half>(blockPtr);
+            var vScale = Vector256.Create(scale);
+
+            // Sign-extend 4 groups of 8 int8 → 8 int32 → 8 float, then multiply with a
+            // vpmovsxbd: load 8 bytes from memory, sign-extend to 8 int32s in ymm
+            var q0 = Avx2.ConvertToVector256Int32(Vector128.CreateScalarUnsafe(
+                Unsafe.ReadUnaligned<long>(quants)).AsSByte());
+            var q1 = Avx2.ConvertToVector256Int32(Vector128.CreateScalarUnsafe(
+                Unsafe.ReadUnaligned<long>(quants + 8)).AsSByte());
+            var q2 = Avx2.ConvertToVector256Int32(Vector128.CreateScalarUnsafe(
+                Unsafe.ReadUnaligned<long>(quants + 16)).AsSByte());
+            var q3 = Avx2.ConvertToVector256Int32(Vector128.CreateScalarUnsafe(
+                Unsafe.ReadUnaligned<long>(quants + 24)).AsSByte());
+
+            // Convert int32 → float
+            var f0 = Avx.ConvertToVector256Single(q0);
+            var f1 = Avx.ConvertToVector256Single(q1);
+            var f2 = Avx.ConvertToVector256Single(q2);
+            var f3 = Avx.ConvertToVector256Single(q3);
+
+            // Load 32 floats from activation vector
+            var a0 = Avx.LoadVector256(aPtr);
+            var a1 = Avx.LoadVector256(aPtr + 8);
+            var a2 = Avx.LoadVector256(aPtr + 16);
+            var a3 = Avx.LoadVector256(aPtr + 24);
+
+            // Accumulate: acc += scale * sum(a[i] * quant[i])
+            if (hasFma)
+            {
+                var blockSum = Fma.MultiplyAdd(a0, f0,
+                               Fma.MultiplyAdd(a1, f1,
+                               Fma.MultiplyAdd(a2, f2, a3 * f3)));
+                acc = Fma.MultiplyAdd(vScale, blockSum, acc);
+            }
+            else
+            {
+                var blockSum = a0 * f0 + a1 * f1 + a2 * f2 + a3 * f3;
+                acc += vScale * blockSum;
+            }
+        }
+
+        return Vector256.Sum(acc);
+    }
+
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    private static unsafe float DotQ8_0Scalar(float* aVec, byte* bQ8, int blockCount)
     {
         float sum = 0;
         for (int b = 0; b < blockCount; b++)
         {
-            int srcOff = b * Q8_0TypeSize;
-            int aOff = b * Q8_0BlockSize;
-            float scale = (float)BitConverter.ToHalf(bQ8.Slice(srcOff, 2));
+            byte* blockPtr = bQ8 + b * Q8_0TypeSize;
+            float* aPtr = aVec + b * Q8_0BlockSize;
+            float scale = (float)Unsafe.ReadUnaligned<Half>(blockPtr);
+            sbyte* quants = (sbyte*)(blockPtr + 2);
 
             float blockSum = 0;
             for (int i = 0; i < Q8_0BlockSize; i++)
-            {
-                blockSum += aVec[aOff + i] * (sbyte)bQ8[srcOff + 2 + i];
-            }
+                blockSum += aPtr[i] * quants[i];
             sum += scale * blockSum;
         }
         return sum;
