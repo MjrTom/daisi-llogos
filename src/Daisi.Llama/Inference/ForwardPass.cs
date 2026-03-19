@@ -156,10 +156,18 @@ public sealed class ForwardPass : IDisposable
         var kSpan = _kProj.AsFloatSpan();
         var vSpan = _vProj.AsFloatSpan();
 
-        // Split Q into Q_attn and Q_gate (first half = attn, second half = gate)
+        // De-interleave Q: GGUF stores [q_h0, gate_h0, q_h1, gate_h1, ...]
+        // We need separate Q_attn and Q_gate contiguous buffers
         int qAttnSize = numHeads * keyLen;
-        var qAttn = qFull.Slice(0, qAttnSize);
-        var qGate = qFull.Slice(qAttnSize, qAttnSize);
+        Span<float> qAttn = new float[qAttnSize];
+        Span<float> qGate = new float[qAttnSize];
+        for (int h = 0; h < numHeads; h++)
+        {
+            int srcOff = h * 2 * keyLen;
+            int dstOff = h * keyLen;
+            qFull.Slice(srcOff, keyLen).CopyTo(qAttn.Slice(dstOff, keyLen));
+            qFull.Slice(srcOff + keyLen, keyLen).CopyTo(qGate.Slice(dstOff, keyLen));
+        }
 
         // Per-head Q norm and K norm
         var qNormW = w.AttnQNorm.AsFloatSpan();
@@ -267,14 +275,22 @@ public sealed class ForwardPass : IDisposable
         var convW = w.SsmConv1d.AsFloatSpan(); // [convKernel × qkvDim] but stored as [qkvDim, convKernel] in GGUF
         ApplyCausalConv1d(qkv, convBuf, convW, qkvDim, convKernel);
 
+        // SiLU activation on entire conv output (Q+K+V), matching llama.cpp
+        for (int i = 0; i < qkvDim; i++)
+            qkv[i] = qkv[i] * Sigmoid(qkv[i]);
+
         // Split QKV
         var qSpan = qkv.Slice(0, innerSize);
         var kSpan = qkv.Slice(innerSize, innerSize);
         var vSpan = qkv.Slice(innerSize * 2, innerSize);
 
-        // SiLU activation on Q
-        for (int i = 0; i < innerSize; i++)
-            qSpan[i] = qSpan[i] * Sigmoid(qSpan[i]);
+        // L2-normalize Q and K per head (critical for DeltaNet stability)
+        for (int g = 0; g < groupCount; g++)
+        {
+            int off = g * headDim;
+            L2NormInPlace(qSpan.Slice(off, headDim));
+            L2NormInPlace(kSpan.Slice(off, headDim));
+        }
 
         // Compute alpha (time step / decay) and beta (learning rate)
         ProjectLinear(_ssmAlpha, _normOut, w.SsmAlpha);
@@ -284,14 +300,14 @@ public sealed class ForwardPass : IDisposable
         var ssmA = w.SsmA.AsFloatSpan();
         var dtBias = w.SsmDtBias.AsFloatSpan();
 
-        // Compute decay factors
+        // Compute decay factors: gate = ssmA * softplus(alpha + dt_bias), decay = exp(gate)
+        // ssmA stores -exp(A_log), so gate is negative → decay < 1
         Span<float> decay = stackalloc float[groupCount];
         Span<float> beta = stackalloc float[groupCount];
         for (int g = 0; g < groupCount; g++)
         {
             float dt = SoftPlus(alphaSpan[g] + dtBias[g]);
-            float a = -MathF.Exp(ssmA[g]);
-            decay[g] = MathF.Exp(a * dt);
+            decay[g] = MathF.Exp(ssmA[g] * dt);
             beta[g] = Sigmoid(betaSpan[g]);
         }
 
@@ -299,37 +315,51 @@ public sealed class ForwardPass : IDisposable
         var state = _deltaState.GetState(layer);
         var outSpan = _ssmOutput.AsFloatSpan();
         var normW = w.SsmNorm.AsFloatSpan();
+        float scale = 1.0f / MathF.Sqrt(headDim);
+
+        Span<float> error = headDim <= 256
+            ? stackalloc float[headDim]
+            : new float[headDim];
 
         for (int g = 0; g < groupCount; g++)
         {
             int baseOff = g * headDim;
             int stateOff = g * headDim * headDim;
 
-            // State update: S = decay * S + beta * outer(k, v)
-            // Using simplified DeltaNet (without delta rule correction for Phase 4)
             float d = decay[g];
             float b = beta[g];
+
+            // Fused delta rule (matches llama.cpp CUDA kernel):
+            // 1. sk[j] = sum_i(S[i,j] * k[i])  -- from OLD state before decay
+            // 2. error[j] = (v[j] - d * sk[j]) * beta
+            // 3. S_new[i,j] = d * S_old[i,j] + k[i] * error[j]
+            // 4. o[j] = sum_i(S_new[i,j] * q[i]) * scale
+            for (int j = 0; j < headDim; j++)
+            {
+                float sk = 0;
+                for (int i = 0; i < headDim; i++)
+                    sk += state[stateOff + i * headDim + j] * kSpan[baseOff + i];
+                error[j] = (vSpan[baseOff + j] - d * sk) * b;
+            }
 
             for (int i = 0; i < headDim; i++)
             {
                 float ki = kSpan[baseOff + i];
                 int rowOff = stateOff + i * headDim;
                 for (int j = 0; j < headDim; j++)
-                {
-                    state[rowOff + j] = d * state[rowOff + j] + b * ki * vSpan[baseOff + j];
-                }
+                    state[rowOff + j] = d * state[rowOff + j] + ki * error[j];
             }
 
-            // Output: o = S^T × q
+            // Output from UPDATED state: o = S_new^T × q × scale
             for (int j = 0; j < headDim; j++)
             {
                 float sum = 0;
                 for (int i = 0; i < headDim; i++)
                     sum += state[stateOff + i * headDim + j] * qSpan[baseOff + i];
-                outSpan[baseOff + j] = sum;
+                outSpan[baseOff + j] = sum * scale;
             }
 
-            // Per-head RMSNorm
+            // Per-head RMSNorm on output
             RmsNormInPlace(outSpan.Slice(baseOff, headDim), normW, _config.NormEps);
         }
 
@@ -419,6 +449,16 @@ public sealed class ForwardPass : IDisposable
         float invSum = 1.0f / sum;
         for (int i = 0; i < values.Length; i++)
             values[i] *= invSum;
+    }
+
+    private static void L2NormInPlace(Span<float> data)
+    {
+        float sumSq = 0;
+        for (int i = 0; i < data.Length; i++)
+            sumSq += data[i] * data[i];
+        float invNorm = 1.0f / MathF.Sqrt(sumSq + 1e-12f);
+        for (int i = 0; i < data.Length; i++)
+            data[i] *= invNorm;
     }
 
     private static float Sigmoid(float x) => 1.0f / (1.0f + MathF.Exp(-x));

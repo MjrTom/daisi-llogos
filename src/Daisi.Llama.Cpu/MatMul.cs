@@ -17,6 +17,8 @@ internal static class MatMul
 
     /// <summary>
     /// FP32 × FP32 matrix multiply.
+    /// b is [N×K] (GGUF convention: each of N output rows has K weights).
+    /// output[i,j] = dot(a[i,:], b[j,:])
     /// </summary>
     public static void Multiply(Span<float> output, ReadOnlySpan<float> a, ReadOnlySpan<float> b, int M, int K, int N)
     {
@@ -55,23 +57,23 @@ internal static class MatMul
 
     private static void MultiplyScalar(Span<float> output, ReadOnlySpan<float> a, ReadOnlySpan<float> b, int M, int K, int N)
     {
-        output.Clear();
+        // b is [N×K]: row j has K weights for output j
         for (int i = 0; i < M; i++)
         {
-            for (int k = 0; k < K; k++)
+            for (int j = 0; j < N; j++)
             {
-                float aVal = a[i * K + k];
-                for (int j = 0; j < N; j++)
-                {
-                    output[i * N + j] += aVal * b[k * N + j];
-                }
+                float sum = 0;
+                int aOff = i * K;
+                int bOff = j * K;
+                for (int k = 0; k < K; k++)
+                    sum += a[aOff + k] * b[bOff + k];
+                output[i * N + j] = sum;
             }
         }
     }
 
     // ── FP32 AVX2 ────────────────────────────────────────────────────────────
-    // b is row-major [K×N] so column access is strided — SIMD works well
-    // when we restructure as: for each row i, accumulate across k into output row.
+    // b is [N×K]: each output row j has K weights. SIMD over K dimension.
 
     private static void MultiplyAvx2(Span<float> output, ReadOnlySpan<float> a, ReadOnlySpan<float> b, int M, int K, int N)
     {
@@ -79,24 +81,26 @@ internal static class MatMul
         ref float bRef = ref MemoryMarshal.GetReference(b);
         ref float oRef = ref MemoryMarshal.GetReference(output);
 
-        output.Clear();
         for (int i = 0; i < M; i++)
         {
-            for (int k = 0; k < K; k++)
+            int aBase = i * K;
+            for (int j = 0; j < N; j++)
             {
-                float aVal = Unsafe.Add(ref aRef, i * K + k);
-                var vA = Vector256.Create(aVal);
-                int j = 0;
-                for (; j + 8 <= N; j += 8)
+                int bBase = j * K;
+                var vSum = Vector256<float>.Zero;
+                int k = 0;
+                for (; k + 8 <= K; k += 8)
                 {
-                    int oIdx = i * N + j;
-                    int bIdx = k * N + j;
-                    var vO = Vector256.LoadUnsafe(ref Unsafe.Add(ref oRef, oIdx));
-                    var vB = Vector256.LoadUnsafe(ref Unsafe.Add(ref bRef, bIdx));
-                    (vO + vA * vB).StoreUnsafe(ref Unsafe.Add(ref oRef, oIdx));
+                    var vA = Vector256.LoadUnsafe(ref Unsafe.Add(ref aRef, aBase + k));
+                    var vB = Vector256.LoadUnsafe(ref Unsafe.Add(ref bRef, bBase + k));
+                    vSum = Avx2.IsSupported
+                        ? System.Runtime.Intrinsics.X86.Fma.MultiplyAdd(vA, vB, vSum)
+                        : vSum + vA * vB;
                 }
-                for (; j < N; j++)
-                    Unsafe.Add(ref oRef, i * N + j) += aVal * Unsafe.Add(ref bRef, k * N + j);
+                float sum = Vector256.Sum(vSum);
+                for (; k < K; k++)
+                    sum += Unsafe.Add(ref aRef, aBase + k) * Unsafe.Add(ref bRef, bBase + k);
+                Unsafe.Add(ref oRef, i * N + j) = sum;
             }
         }
     }

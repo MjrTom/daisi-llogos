@@ -9,12 +9,13 @@ public class MatMulTests
     [Fact]
     public void FP32_SmallKnown()
     {
-        // A = [[1, 2, 3], [4, 5, 6]]  (2×3)
-        // B = [[7, 8], [9, 10], [11, 12]]  (3×2)
-        // C = [[58, 64], [139, 154]]  (2×2)
+        // A = [[1, 2, 3], [4, 5, 6]]  (M=2, K=3)
+        // B stored as [N×K] = [[7, 9, 11], [8, 10, 12]]  (N=2 output rows, K=3 each)
+        // This is B^T of the standard math [[7,8],[9,10],[11,12]]
+        // C = A × B_math = [[58, 64], [139, 154]]
         using var backend = new CpuBackend();
         using var a = LoadF32(backend, "a", [2, 3], [1, 2, 3, 4, 5, 6]);
-        using var b = LoadF32(backend, "b", [3, 2], [7, 8, 9, 10, 11, 12]);
+        using var b = LoadF32(backend, "b", [3, 2], [7, 9, 11, 8, 10, 12]);
         using var c = backend.CreateTensor("c", GgmlType.F32, [2, 2]);
 
         backend.MatMul(c, a, b, 2, 3, 2);

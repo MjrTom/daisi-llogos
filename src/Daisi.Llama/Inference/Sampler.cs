@@ -21,7 +21,7 @@ public sealed class Sampler
         int vocabSize = logits.Length;
 
         // Copy logits so we can mutate
-        Span<float> work = vocabSize <= 262144
+        Span<float> work = vocabSize <= 8192
             ? stackalloc float[vocabSize]
             : new float[vocabSize];
         logits.CopyTo(work);
@@ -87,12 +87,8 @@ public sealed class Sampler
     {
         // Find the k-th largest value using partial sort
         int n = logits.Length;
-        Span<int> indices = n <= 262144
-            ? stackalloc int[n]
-            : new int[n];
-        for (int i = 0; i < n; i++) indices[i] = i;
 
-        // Partial sort to find top-k threshold
+        // Find top-k threshold
         float kthValue = FindKthLargest(logits, k);
 
         // Zero out everything below threshold

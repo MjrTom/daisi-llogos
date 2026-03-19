@@ -35,7 +35,7 @@ Tests validate against [Qwen 3.5 0.8B Q8_0](https://huggingface.co/unsloth/Qwen3
 
 ## Current Status
 
-**End-to-end text generation works on CPU. CUDA kernel operations validated on GPU.** 113 passing tests across GGUF parsing, dequantization, math ops, tokenization, forward pass, sampling, generation, and CUDA kernels.
+**End-to-end text generation produces coherent output on CPU. CUDA kernel operations validated on GPU.** 113 passing tests across GGUF parsing, dequantization, math ops, tokenization, forward pass, sampling, generation, and CUDA kernels.
 
 What works today:
 - Parse any GGUF v2/v3 file (header, metadata, tensor info)
