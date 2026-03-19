@@ -11,7 +11,7 @@ public class GgufFileTests
     [Fact]
     public void ReadFile_Synthetic_ParsesHeaderAndMetadata()
     {
-        // Build a minimal valid GGUF file with 1 metadata KV and 1 tensor
+        // Build a minimal valid GGUF v3 file with 1 metadata KV and 1 tensor
         using var ms = new MemoryStream();
         using var bw = new BinaryWriter(ms);
 
@@ -23,16 +23,16 @@ public class GgufFileTests
 
         // Metadata: general.architecture = "test"
         var key = "general.architecture"u8;
-        bw.Write((uint)key.Length);
+        bw.Write((ulong)key.Length);
         bw.Write(key);
         bw.Write((uint)GgufMetadataValueType.String);
         var val = "test"u8;
-        bw.Write((uint)val.Length);
+        bw.Write((ulong)val.Length);
         bw.Write(val);
 
         // Tensor info: "weight" (1D, 32 elements, F32)
         var tname = "weight"u8;
-        bw.Write((uint)tname.Length);
+        bw.Write((ulong)tname.Length);
         bw.Write(tname);
         bw.Write((uint)1); // 1D
         bw.Write((ulong)32); // 32 elements
@@ -104,7 +104,6 @@ public class GgufFileTests
         using var stream = File.OpenRead(TestConstants.Qwen35_08B_Q8_0);
         var file = GgufFile.Read(stream);
 
-        // Qwen 3.5 should report its architecture
         var arch = file.GetMetadataString("general.architecture");
         Assert.Contains("qwen", arch, StringComparison.OrdinalIgnoreCase);
     }

@@ -13,18 +13,13 @@ public class GgufTensorInfoTests
         using var ms = new MemoryStream();
         using var bw = new BinaryWriter(ms);
 
-        // Name: "blk.0.attn_q.weight"
         var name = "blk.0.attn_q.weight"u8;
-        bw.Write((uint)name.Length);
+        bw.Write((ulong)name.Length);
         bw.Write(name);
-        // n_dimensions: 2
-        bw.Write((uint)2);
-        // dimensions: [1024, 1024]
+        bw.Write((uint)2); // n_dimensions
         bw.Write((ulong)1024);
         bw.Write((ulong)1024);
-        // type: F32 = 0
         bw.Write((uint)GgmlType.F32);
-        // offset: 0
         bw.Write((ulong)0);
 
         ms.Position = 0;
@@ -46,12 +41,12 @@ public class GgufTensorInfoTests
         using var bw = new BinaryWriter(ms);
 
         var name = "output_norm.weight"u8;
-        bw.Write((uint)name.Length);
+        bw.Write((ulong)name.Length);
         bw.Write(name);
-        bw.Write((uint)1); // 1D
-        bw.Write((ulong)1024); // dimension
+        bw.Write((uint)1);
+        bw.Write((ulong)1024);
         bw.Write((uint)GgmlType.Q8_0);
-        bw.Write((ulong)4096); // offset
+        bw.Write((ulong)4096);
 
         ms.Position = 0;
         var reader = new GgufReader(ms);

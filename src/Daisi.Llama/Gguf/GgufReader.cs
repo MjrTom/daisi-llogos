@@ -71,7 +71,8 @@ public sealed class GgufReader
 
     private string ReadString()
     {
-        var length = _br.ReadUInt32();
+        // GGUF v2+ uses uint64 for string lengths
+        var length = _br.ReadUInt64();
         var bytes = _br.ReadBytes((int)length);
         return Encoding.UTF8.GetString(bytes);
     }
