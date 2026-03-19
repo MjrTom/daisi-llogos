@@ -9,7 +9,7 @@ namespace Daisi.Llama.Inference;
 /// Supports FP16 storage for 2x memory savings (set cacheType to GgmlType.F16).
 /// Supports sliding window + attention sinks for fixed-memory streaming (set strategy).
 /// </summary>
-public sealed class KvCache : IDisposable
+public sealed class KvCache : IKvCache
 {
     private readonly ITensor[] _kCaches;
     private readonly ITensor[] _vCaches;

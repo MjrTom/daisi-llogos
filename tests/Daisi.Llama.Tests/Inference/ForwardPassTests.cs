@@ -133,12 +133,12 @@ public class ForwardPassTests
         public ModelConfig Config { get; }
         public CpuBackend Backend { get; }
         public ModelWeights Weights { get; }
-        public KvCache KvCache { get; }
+        public IKvCache KvCache { get; }
         public DeltaNetState DeltaState { get; }
         public ForwardPass Forward { get; }
 
         public ModelContext(Stream stream, GgufFile gguf, ModelConfig config,
-            CpuBackend backend, ModelWeights weights, KvCache kvCache,
+            CpuBackend backend, ModelWeights weights, IKvCache kvCache,
             DeltaNetState deltaState, ForwardPass forward)
         {
             Stream = stream; Gguf = gguf; Config = config;

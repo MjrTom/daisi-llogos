@@ -11,20 +11,25 @@ public sealed class CudaTensor : ITensor
 {
     private readonly long[] _dimensions;
     private CudaDeviceMemory? _memory;
+    private CudaPinnedMemory? _pinnedMemory;
     private bool _disposed;
 
-    internal CudaTensor(string name, GgmlType type, ReadOnlySpan<long> dimensions)
+    internal CudaTensor(string name, GgmlType type, ReadOnlySpan<long> dimensions, bool pinned = false)
     {
         Name = name;
         Type = type;
+        IsPinned = pinned;
         _dimensions = dimensions.ToArray();
         ElementCount = ComputeElementCount(dimensions);
         ByteSize = (long)GgmlTypeInfo.ByteSize(type, (ulong)ElementCount);
-        _memory = new CudaDeviceMemory((ulong)ByteSize);
+        if (pinned)
+            _pinnedMemory = new CudaPinnedMemory((ulong)ByteSize);
+        else
+            _memory = new CudaDeviceMemory((ulong)ByteSize);
     }
 
     internal CudaTensor(string name, GgmlType type, ReadOnlySpan<long> dimensions, ReadOnlySpan<byte> data)
-        : this(name, type, dimensions)
+        : this(name, type, dimensions, pinned: false)
     {
         _memory!.CopyFromHost(data);
     }
@@ -44,13 +49,18 @@ public sealed class CudaTensor : ITensor
     /// <inheritdoc />
     public long ByteSize { get; }
 
-    /// <summary>
-    /// Device pointer for kernel parameters.
-    /// </summary>
-    internal ulong DevicePtr => _memory?.DevicePtr ?? 0;
+    /// <summary>Whether this tensor is backed by pinned host memory.</summary>
+    internal bool IsPinned { get; }
 
     /// <summary>
-    /// The underlying device memory allocation.
+    /// Device pointer for kernel parameters. Works for both device and pinned memory.
+    /// </summary>
+    internal ulong DevicePtr => IsPinned
+        ? (_pinnedMemory?.DevicePtr ?? 0)
+        : (_memory?.DevicePtr ?? 0);
+
+    /// <summary>
+    /// The underlying device memory allocation. Only valid for non-pinned tensors.
     /// </summary>
     internal CudaDeviceMemory Memory => _memory ?? throw new ObjectDisposedException(Name);
 
@@ -60,7 +70,10 @@ public sealed class CudaTensor : ITensor
         ObjectDisposedException.ThrowIf(_disposed, this);
         if (data.Length != ByteSize)
             throw new ArgumentException($"Data length {data.Length} does not match tensor byte size {ByteSize}.");
-        _memory!.CopyFromHost(data);
+        if (IsPinned)
+            _pinnedMemory!.CopyFromHost(data);
+        else
+            _memory!.CopyFromHost(data);
     }
 
     /// <inheritdoc />
@@ -75,14 +88,19 @@ public sealed class CudaTensor : ITensor
 
         if (Type == GgmlType.F32)
         {
-            _memory!.CopyToHost(destination.Slice(0, (int)ElementCount));
+            if (IsPinned)
+                _pinnedMemory!.CopyToHost(destination.Slice(0, (int)ElementCount));
+            else
+                _memory!.CopyToHost(destination.Slice(0, (int)ElementCount));
         }
         else
         {
             // Download raw bytes then dequantize on CPU (fallback)
             var raw = new byte[ByteSize];
-            _memory!.CopyToHost(raw.AsSpan());
-            // Create a temporary CPU tensor for dequantization
+            if (IsPinned)
+                _pinnedMemory!.CopyToHost(raw.AsSpan());
+            else
+                _memory!.CopyToHost(raw.AsSpan());
             var cpuTensor = new Cpu.CpuTensor(Name + "_tmp", Type, _dimensions, raw);
             cpuTensor.DequantizeTo(destination);
             cpuTensor.Dispose();
@@ -134,6 +152,8 @@ public sealed class CudaTensor : ITensor
         {
             _memory?.Dispose();
             _memory = null;
+            _pinnedMemory?.Dispose();
+            _pinnedMemory = null;
             _disposed = true;
         }
     }

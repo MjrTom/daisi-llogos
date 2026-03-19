@@ -592,6 +592,18 @@ public sealed class CudaBackend : IComputeBackend
     }
 
     /// <inheritdoc />
+    public void CopyTensorBytes(ITensor dst, ITensor src, long byteCount)
+    {
+        var dstT = (CudaTensor)dst;
+        var srcT = (CudaTensor)src;
+        CudaApi.Check(CudaApi.MemcpyDtoD(dstT.DevicePtr, srcT.DevicePtr, (ulong)byteCount), "cuMemcpyDtoD");
+    }
+
+    /// <inheritdoc />
+    public ITensor CreateHostTensor(string name, GgmlType type, ReadOnlySpan<long> dimensions) =>
+        new CudaTensor(name, type, dimensions, pinned: true);
+
+    /// <inheritdoc />
     public void Dispose()
     {
         if (!_disposed)

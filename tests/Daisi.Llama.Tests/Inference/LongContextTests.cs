@@ -267,17 +267,147 @@ public class LongContextTests
         Assert.True(text.Any(char.IsLetter), "Sinks output contains no letters — likely degenerate");
     }
 
+    // ── Paged KV Cache ─────────────────────────────────────────────────────
+
+    [Fact]
+    public void PagedKvCache_GrowsWithUsage()
+    {
+        if (!TestConstants.ModelExists) return;
+
+        using var stream = File.OpenRead(TestConstants.Qwen35_08B_Q8_0);
+        var gguf = GgufFile.Read(stream);
+        var config = ModelConfig.FromGguf(gguf);
+        using var backend = new CpuBackend();
+
+        using var cache = new PagedKvCache(backend, config, maxSeqLen: 4096);
+
+        Assert.Equal(0, cache.AllocatedPages);
+
+        // Write to position 0 — should allocate first page
+        var k = backend.CreateTensor("k", GgmlType.F32, [config.NumKvHeads * config.KeyLength]);
+        var v = backend.CreateTensor("v", GgmlType.F32, [config.NumKvHeads * config.ValueLength]);
+
+        int attnLayer = -1;
+        for (int i = 0; i < config.NumLayers; i++)
+            if (config.IsStandardAttention(i)) { attnLayer = i; break; }
+
+        cache.Write(backend, attnLayer, 0, k, v);
+        Assert.Equal(1, cache.AllocatedPages);
+        Assert.Equal(1, cache.Length);
+
+        // Write to position 255 — still in first page
+        cache.Write(backend, attnLayer, 255, k, v);
+        Assert.Equal(1, cache.AllocatedPages);
+
+        // Write to position 256 — triggers second page
+        cache.Write(backend, attnLayer, 256, k, v);
+        Assert.Equal(2, cache.AllocatedPages);
+
+        k.Dispose();
+        v.Dispose();
+    }
+
+    [Fact]
+    public void PagedKvCache_MemoryScalesWithContext()
+    {
+        if (!TestConstants.ModelExists) return;
+
+        using var stream = File.OpenRead(TestConstants.Qwen35_08B_Q8_0);
+        var gguf = GgufFile.Read(stream);
+        var config = ModelConfig.FromGguf(gguf);
+        using var backend = new CpuBackend();
+
+        // Monolithic cache allocates upfront for full maxSeqLen
+        using var mono = new KvCache(backend, config, maxSeqLen: 4096);
+        long monoBytes = 0;
+        for (int i = 0; i < config.NumLayers; i++)
+            if (config.IsStandardAttention(i))
+                monoBytes += mono.GetKCacheTensor(i).ByteSize + mono.GetVCacheTensor(i).ByteSize;
+
+        // Paged cache starts empty, allocates on demand
+        using var paged = new PagedKvCache(backend, config, maxSeqLen: 4096);
+        Assert.Equal(0, paged.AllocatedBytes);
+
+        // After writing 1 position, paged should use much less than monolithic
+        var k = backend.CreateTensor("k", GgmlType.F32, [config.NumKvHeads * config.KeyLength]);
+        var v = backend.CreateTensor("v", GgmlType.F32, [config.NumKvHeads * config.ValueLength]);
+        int attnLayer = -1;
+        for (int i = 0; i < config.NumLayers; i++)
+            if (config.IsStandardAttention(i)) { attnLayer = i; break; }
+        paged.Write(backend, attnLayer, 0, k, v);
+
+        Assert.True(paged.AllocatedBytes < monoBytes,
+            $"Paged {paged.AllocatedBytes} should be less than monolithic {monoBytes}");
+
+        k.Dispose();
+        v.Dispose();
+    }
+
+    [Fact]
+    public void PagedKvCache_CoherentOutput()
+    {
+        // Paged cache should produce the same output as monolithic cache
+        if (!TestConstants.ModelExists) return;
+
+        using var ctxMono = LoadModel(maxSeqLen: 512);
+        using var ctxPaged = LoadModel(maxSeqLen: 512, usePaged: true);
+        var tokMono = TokenizerFactory.FromGguf(ctxMono.Gguf);
+        var tokPaged = TokenizerFactory.FromGguf(ctxPaged.Gguf);
+
+        var genMono = new TextGenerator(ctxMono.Forward, tokMono, seed: 42);
+        var genPaged = new TextGenerator(ctxPaged.Forward, tokPaged, seed: 42);
+
+        var p = new GenerationParams { MaxTokens = 10, Temperature = 0 };
+
+        var tokensMono = genMono.Generate("Hello", p).Where(t => !t.IsDone).Select(t => t.TokenId).ToArray();
+        var tokensPaged = genPaged.Generate("Hello", p).Where(t => !t.IsDone).Select(t => t.TokenId).ToArray();
+
+        // Greedy output should match exactly
+        Assert.Equal(tokensMono.Length, tokensPaged.Length);
+        for (int i = 0; i < tokensMono.Length; i++)
+            Assert.Equal(tokensMono[i], tokensPaged[i]);
+    }
+
+    [Fact]
+    public void PagedKvCache_LargerContext_Stable()
+    {
+        // Paged cache should handle larger context that spans multiple pages
+        if (!TestConstants.ModelExists) return;
+
+        using var ctx = LoadModel(maxSeqLen: 2048, usePaged: true);
+        var tokenizer = TokenizerFactory.FromGguf(ctx.Gguf);
+        var ids = tokenizer.Encode("The quick brown fox jumps over the lazy dog. " +
+            "This tests the paged KV cache across multiple page boundaries.");
+
+        ReadOnlySpan<float> logits = default;
+        for (int i = 0; i < ids.Length; i++)
+            logits = ctx.Forward.Forward(ids[i], i);
+
+        Assert.Equal(ctx.Config.VocabSize, logits.Length);
+        Assert.True(float.IsFinite(logits[0]), "Paged cache output not finite");
+
+        // Generate a few more
+        for (int i = 0; i < 5; i++)
+        {
+            int argmax = ArgMax(logits);
+            logits = ctx.Forward.Forward(argmax, ids.Length + i);
+            Assert.True(float.IsFinite(logits[0]));
+        }
+    }
+
     // ── Helpers ───────────────────────────────────────────────────────────────
 
     private static ModelContext LoadModel(GgmlType cacheType = GgmlType.F16, int maxSeqLen = 256,
-        AttentionStrategy? strategy = null)
+        AttentionStrategy? strategy = null, bool usePaged = false)
     {
         var stream = File.OpenRead(TestConstants.Qwen35_08B_Q8_0);
         var gguf = GgufFile.Read(stream);
         var config = ModelConfig.FromGguf(gguf);
         var backend = new CpuBackend();
         var weights = ModelLoader.Load(gguf, stream, backend, config);
-        var kvCache = new KvCache(backend, config, maxSeqLen: maxSeqLen, cacheType: cacheType, strategy: strategy);
+        IKvCache kvCache = usePaged
+            ? new PagedKvCache(backend, config, maxSeqLen: maxSeqLen, cacheType: cacheType, strategy: strategy)
+            : new KvCache(backend, config, maxSeqLen: maxSeqLen, cacheType: cacheType, strategy: strategy);
         var deltaState = new DeltaNetState(backend, config);
         var forward = new ForwardPass(backend, config, weights, kvCache, deltaState);
         return new ModelContext(stream, gguf, config, backend, weights, kvCache, deltaState, forward);
@@ -299,12 +429,12 @@ public class LongContextTests
         public ModelConfig Config { get; }
         public CpuBackend Backend { get; }
         public ModelWeights Weights { get; }
-        public KvCache KvCache { get; }
+        public IKvCache KvCache { get; }
         public DeltaNetState DeltaState { get; }
         public ForwardPass Forward { get; }
 
         public ModelContext(Stream stream, GgufFile gguf, ModelConfig config,
-            CpuBackend backend, ModelWeights weights, KvCache kvCache,
+            CpuBackend backend, ModelWeights weights, IKvCache kvCache,
             DeltaNetState deltaState, ForwardPass forward)
         {
             Stream = stream; Gguf = gguf; Config = config;

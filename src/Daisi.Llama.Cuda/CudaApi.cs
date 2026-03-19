@@ -76,6 +76,15 @@ internal static partial class CudaApi
     [LibraryImport(Lib, EntryPoint = "cuMemsetD8_v2")]
     internal static partial CuResult MemsetD8(ulong dstDevice, byte value, ulong count);
 
+    [LibraryImport(Lib, EntryPoint = "cuMemAllocHost_v2")]
+    internal static partial CuResult MemAllocHost(out nint pp, ulong bytesize);
+
+    [LibraryImport(Lib, EntryPoint = "cuMemFreeHost")]
+    internal static partial CuResult MemFreeHost(nint p);
+
+    [LibraryImport(Lib, EntryPoint = "cuMemHostGetDevicePointer_v2")]
+    internal static partial CuResult MemHostGetDevicePointer(out ulong pdptr, nint p, uint flags);
+
     // ── Stream ───────────────────────────────────────────────────────────────
 
     [LibraryImport(Lib, EntryPoint = "cuStreamCreate")]

@@ -52,7 +52,7 @@ Tests validate against [Qwen 3.5 0.8B Q8_0](https://huggingface.co/unsloth/Qwen3
 
 ## Current Status
 
-**End-to-end text generation on both CPU and GPU.** 132 passing tests.
+**End-to-end text generation on both CPU and GPU.** 136 passing tests.
 
 ### Benchmarks
 
@@ -66,8 +66,11 @@ Qwen 3.5 0.8B Q8_0, 256 decode tokens, FP16 KV cache. Measured on AMD Ryzen 9 99
 | CUDA (RTX 5080) | `full` | 138.8 | 42.9 | Grows with context |
 | CUDA (RTX 5080) | `window:1024` | 134.9 | 43.2 | Fixed 2 MB |
 | CUDA (RTX 5080) | `sinks:64,4096` | 128.8 | 42.7 | Fixed 8 MB |
+| CPU (AVX2) | `full --paged` | 6.8 | 6.6 | Grows on demand |
+| CUDA (RTX 5080) | `full --paged` | 136.2 | 42.3 | Grows on demand |
+| CUDA (RTX 5080) | `full --paged --offload-pages 2` | 129.5 | 41.4 | 2 pages VRAM + RAM |
 
-Sliding window modes use fixed memory regardless of total tokens generated. On CPU, the smaller attention window gives a measurable decode speedup (~44% faster with `window:1024` vs `full` at 256 tokens). On GPU, decode is already compute-bound at this model size so the benefit appears at longer contexts.
+Sliding window modes use fixed memory regardless of total tokens generated. On CPU, the smaller attention window gives a measurable decode speedup (~44% faster with `window:1024` vs `full` at 256 tokens). On GPU, decode is already compute-bound at this model size so the benefit appears at longer contexts. Paged cache adds <2% overhead vs monolithic; RAM offloading via pinned host memory adds <3%.
 
 What works today:
 - Parse any GGUF v2/v3 file (header, metadata, tensor info)
@@ -81,10 +84,11 @@ What works today:
 - Tiled/flash attention with online softmax (no shared memory limit on context length)
 - FP16 KV cache (2x memory savings, default)
 - Sliding window + attention sinks for fixed-memory streaming (`--attention sinks:64,4096`)
+- Paged KV cache with dynamic allocation (`--paged`), RAM offloading (`--offload-pages`)
 - Sampler with temperature, top-k, top-p, repetition penalty
 - Memory-mapped model loading (zero intermediate byte[] copies)
 - Benchmark suite with separate prefill/decode timing (`--bench`)
-- CLI: `--backend cpu|cuda`, `--bench`, `--no-mmap`, `--attention`, model path, prompt, sampling parameters
+- CLI: `--backend cpu|cuda`, `--bench`, `--no-mmap`, `--attention`, `--paged`, `--offload-pages`, model path, prompt, sampling parameters
 
 ## Roadmap
 
@@ -121,7 +125,7 @@ flowchart LR
     style P8 fill:#2d6a4f,color:#fff
     style P9 fill:#e76f51,color:#fff
     style P10 fill:#e76f51,color:#fff
-    style P11 fill:#e76f51,color:#fff
+    style P11 fill:#2d6a4f,color:#fff
 ```
 
 | Phase | Name | Goal | Status |
@@ -137,7 +141,7 @@ flowchart LR
 | 8 | [Optimization](docs/roadmap/phase-08-optimization.md) | Mmap loading, benchmark suite, multi-threaded CPU, CUDA tuning | Done |
 | 9 | [Vulkan](docs/roadmap/phase-09-vulkan.md) | Cross-platform GPU backend (Windows/Linux) | Not started |
 | 10 | [Metal](docs/roadmap/phase-10-metal.md) | Apple GPU backend (macOS/iOS) | Not started |
-| 11 | [Long Context](docs/roadmap/phase-11-long-context.md) | Flash attention, paged KV, RAM offload — 200K+ context on 16GB | In progress (11a, 11b, 11e done) |
+| 11 | [Long Context](docs/roadmap/phase-11-long-context.md) | Flash attention, paged KV, RAM offload — 200K+ context on 16GB | Done (11a-11e) |
 
 ## Documentation
 
