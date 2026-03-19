@@ -46,4 +46,9 @@ public interface ITensor : IDisposable
     /// The destination length must be at least <see cref="ElementCount"/>.
     /// </summary>
     void DequantizeTo(Span<float> destination);
+
+    /// <summary>
+    /// Get a writable float span over the tensor data. Only valid for F32 tensors.
+    /// </summary>
+    Span<float> AsFloatSpan();
 }

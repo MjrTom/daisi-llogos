@@ -174,9 +174,12 @@ Pre-allocated FP32 buffers reused across layers to avoid per-layer allocation:
 
 ## Done Criteria
 
-- [ ] Model loads from GGUF into CPU backend (all tensors, correct shapes)
-- [ ] Forward pass runs on Qwen 3.5 0.8B Q8_0 without errors
-- [ ] Output logits have correct shape (vocab_size)
-- [ ] Output is deterministic (same input → same output)
-- [ ] KV cache correctly stores and retrieves per-position K/V
-- [ ] Scratch buffers are reused (no per-layer allocation)
+- [x] Model loads from GGUF into CPU backend (all tensors, correct shapes)
+- [x] Forward pass runs on Qwen 3.5 0.8B Q8_0 without errors
+- [x] Output logits have correct shape (vocab_size)
+- [x] Output is deterministic (same input → same output)
+- [x] KV cache correctly stores and retrieves per-position K/V
+- [x] Scratch buffers are reused (no per-layer allocation)
+- [x] Hybrid architecture: both standard attention and DeltaNet layers
+- [x] Gated attention with Q/K norms and partial RoPE
+- [x] DeltaNet state machine with conv1d shift buffers

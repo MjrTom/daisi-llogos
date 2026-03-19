@@ -1,3 +1,4 @@
+using System.Runtime.InteropServices;
 using Daisi.Llama.Gguf;
 
 namespace Daisi.Llama.Cpu;
@@ -70,11 +71,12 @@ public sealed class CpuBackend : IComputeBackend
     }
 
     /// <inheritdoc />
-    public void RoPE(ITensor q, ITensor k, int headDim, int positionOffset, float ropeTheta)
+    public void RoPE(ITensor q, ITensor k, int headDim, int ropeDim, int positionOffset, float ropeTheta)
     {
         var qSpan = ((CpuTensor)q).AsFloatSpan();
         var kSpan = ((CpuTensor)k).AsFloatSpan();
-        Cpu.Rope.Apply(qSpan, kSpan, headDim, positionOffset, ropeTheta);
+        int effectiveRopeDim = ropeDim > 0 ? ropeDim : headDim;
+        Cpu.Rope.Apply(qSpan, kSpan, headDim, effectiveRopeDim, positionOffset, ropeTheta);
     }
 
     /// <inheritdoc />
@@ -93,6 +95,43 @@ public sealed class CpuBackend : IComputeBackend
         var aSpan = ((CpuTensor)a).AsFloatSpan();
         var bSpan = ((CpuTensor)b).AsFloatSpan();
         Cpu.ElementOps.Add(o, aSpan, bSpan);
+    }
+
+    /// <inheritdoc />
+    public void EmbeddingLookup(ITensor output, ITensor table, int tokenId)
+    {
+        var outSpan = ((CpuTensor)output).AsFloatSpan();
+        var raw = ((CpuTensor)table).RawData;
+        int hiddenDim = (int)table.Dimensions[0]; // GGUF dim[0] = row length
+
+        switch (table.Type)
+        {
+            case GgmlType.F32:
+            {
+                var floats = MemoryMarshal.Cast<byte, float>(raw);
+                floats.Slice(tokenId * hiddenDim, hiddenDim).CopyTo(outSpan);
+                break;
+            }
+            case GgmlType.Q8_0:
+            {
+                int blocksPerRow = hiddenDim / 32;
+                int bytesPerRow = blocksPerRow * 34; // Q8_0: 2 bytes scale + 32 bytes quants
+                var rowData = raw.Slice(tokenId * bytesPerRow, bytesPerRow);
+                Dequantize.DequantizeQ8_0(rowData, outSpan.Slice(0, hiddenDim));
+                break;
+            }
+            case GgmlType.F16:
+            {
+                int bytesPerRow = hiddenDim * 2;
+                var rowBytes = raw.Slice(tokenId * bytesPerRow, bytesPerRow);
+                var halfs = MemoryMarshal.Cast<byte, Half>(rowBytes);
+                for (int i = 0; i < hiddenDim; i++)
+                    outSpan[i] = (float)halfs[i];
+                break;
+            }
+            default:
+                throw new NotSupportedException($"EmbeddingLookup not implemented for type {table.Type}.");
+        }
     }
 
     /// <inheritdoc />

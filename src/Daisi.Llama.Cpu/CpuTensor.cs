@@ -49,11 +49,8 @@ public sealed class CpuTensor : ITensor
     /// </summary>
     internal ReadOnlySpan<byte> RawData => _data;
 
-    /// <summary>
-    /// Direct read/write access to the data interpreted as FP32.
-    /// Only valid when <see cref="Type"/> is <see cref="GgmlType.F32"/>.
-    /// </summary>
-    internal Span<float> AsFloatSpan()
+    /// <inheritdoc />
+    public Span<float> AsFloatSpan()
     {
         if (Type != GgmlType.F32)
             throw new InvalidOperationException($"Cannot get float span for tensor of type {Type}.");

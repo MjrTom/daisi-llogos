@@ -327,7 +327,7 @@ public class RopeTests
         using var q = LoadF32(backend, "q", [4], qData);
         using var k = LoadF32(backend, "k", [4], kData);
 
-        backend.RoPE(q, k, 4, 0, 10000f);
+        backend.RoPE(q, k, 4, 0, 0, 10000f);
 
         var qResult = GetFloats(q);
         var kResult = GetFloats(k);
@@ -351,7 +351,7 @@ public class RopeTests
         using var q = LoadF32(backend, "q", [4], qData);
         using var k = LoadF32(backend, "k", [4], kData);
 
-        backend.RoPE(q, k, 4, 42, 10000f);
+        backend.RoPE(q, k, 4, 0, 42, 10000f);
 
         var qResult = GetFloats(q);
         var kResult = GetFloats(k);
@@ -373,7 +373,7 @@ public class RopeTests
         using var q = LoadF32(backend, "q", [8], qData);
         using var k = LoadF32(backend, "k", [4], kData);
 
-        backend.RoPE(q, k, 4, 5, 10000f);
+        backend.RoPE(q, k, 4, 0, 5, 10000f);
 
         var qResult = GetFloats(q);
         // Both heads should be rotated independently

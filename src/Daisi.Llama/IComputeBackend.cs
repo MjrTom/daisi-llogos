@@ -55,13 +55,15 @@ public interface IComputeBackend : IDisposable
     /// <summary>
     /// Rotary position embedding applied in-place to q and k tensors.
     /// Rotates pairs of dimensions (2i, 2i+1) by position-dependent angles.
+    /// Only the first <paramref name="ropeDim"/> dimensions of each head are rotated.
     /// </summary>
     /// <param name="q">Query tensor [nHeads × headDim], modified in-place.</param>
     /// <param name="k">Key tensor [nKvHeads × headDim], modified in-place.</param>
     /// <param name="headDim">Dimension of each attention head.</param>
+    /// <param name="ropeDim">Number of dimensions to apply rotation to (0 = all).</param>
     /// <param name="positionOffset">Starting position index for the rotation.</param>
     /// <param name="ropeTheta">RoPE frequency base (e.g. 1000000.0).</param>
-    void RoPE(ITensor q, ITensor k, int headDim, int positionOffset, float ropeTheta);
+    void RoPE(ITensor q, ITensor k, int headDim, int ropeDim, int positionOffset, float ropeTheta);
 
     /// <summary>
     /// Element-wise multiply: output[i] = a[i] * b[i].
@@ -72,4 +74,13 @@ public interface IComputeBackend : IDisposable
     /// Element-wise add: output[i] = a[i] + b[i].
     /// </summary>
     void ElementAdd(ITensor output, ITensor a, ITensor b);
+
+    /// <summary>
+    /// Copy a single row from a (possibly quantized) embedding table into an FP32 output tensor.
+    /// Dequantizes the row if the table is quantized.
+    /// </summary>
+    /// <param name="output">FP32 tensor to write the embedding into.</param>
+    /// <param name="table">Embedding table tensor with dimensions [hiddenDim, vocabSize] (GGUF order).</param>
+    /// <param name="tokenId">Row index (token ID) to look up.</param>
+    void EmbeddingLookup(ITensor output, ITensor table, int tokenId);
 }
