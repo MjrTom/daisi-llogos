@@ -165,4 +165,16 @@ public interface IComputeBackend : IDisposable
     /// Zero all elements of a tensor.
     /// </summary>
     void ZeroTensor(ITensor tensor);
+
+    /// <summary>
+    /// Copy the first byteCount bytes from src to dst. dst may be larger than src.
+    /// Used for growing cache reallocation.
+    /// </summary>
+    void CopyTensorBytes(ITensor dst, ITensor src, long byteCount);
+
+    /// <summary>
+    /// Create a tensor in host-accessible memory (pinned for GPU, regular for CPU).
+    /// GPU kernels can access this tensor via mapped device pointers, but at reduced bandwidth.
+    /// </summary>
+    ITensor CreateHostTensor(string name, GgmlType type, ReadOnlySpan<long> dimensions);
 }

@@ -241,12 +241,12 @@ Instead of evicting by recency, track cumulative attention scores per cached tok
 
 - [x] **11a:** Flash/tiled attention — no shared memory limit on context length
 - [x] **11b:** FP16 KV cache — 2x memory reduction, <1% perplexity impact
-- [ ] **11c:** Paged KV cache — dynamic allocation, no pre-allocation waste
-- [ ] **11d:** RAM offloading — 500K+ context on 16GB GPU with 32GB RAM
+- [x] **11c:** Paged KV cache — dynamic allocation, no pre-allocation waste
+- [x] **11d:** RAM offloading — pinned host memory pages, GPU reads via mapped pointers
 - [x] **11e:** Sliding window + sinks — infinite streaming with fixed memory
 - [ ] 200K context generates coherent text at >25 tok/s on RTX 5080
 - [ ] 1M context functional (with RAM offloading) at >8 tok/s
-- [ ] Memory usage scales with actual context, not max context
+- [x] Memory usage scales with actual context, not max context
 
 ---
 
@@ -275,8 +275,8 @@ flowchart LR
 
     style A fill:#2d6a4f,color:#fff
     style B fill:#2d6a4f,color:#fff
-    style C fill:#e76f51,color:#fff
-    style D fill:#e76f51,color:#fff
+    style C fill:#2d6a4f,color:#fff
+    style D fill:#2d6a4f,color:#fff
     style E fill:#2d6a4f,color:#fff
     style F fill:#e76f51,color:#fff
 ```

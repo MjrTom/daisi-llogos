@@ -12,7 +12,7 @@ public sealed class ForwardPass : IDisposable
     private readonly IComputeBackend _backend;
     private readonly ModelConfig _config;
     private readonly ModelWeights _weights;
-    private readonly KvCache _kvCache;
+    private readonly IKvCache _kvCache;
     private readonly DeltaNetState _deltaState;
 
     // Scratch buffers
@@ -47,7 +47,7 @@ public sealed class ForwardPass : IDisposable
     private readonly ITensor _up;
 
     public ForwardPass(IComputeBackend backend, ModelConfig config, ModelWeights weights,
-        KvCache kvCache, DeltaNetState deltaState)
+        IKvCache kvCache, DeltaNetState deltaState)
     {
         _backend = backend;
         _config = config;
@@ -94,7 +94,7 @@ public sealed class ForwardPass : IDisposable
         _up = CreateF32("scratch_ffn_up", config.IntermediateDim);
     }
 
-    public KvCache KvCache => _kvCache;
+    public IKvCache KvCache => _kvCache;
     public DeltaNetState DeltaState => _deltaState;
 
     /// <summary>

@@ -44,7 +44,12 @@ var strategy = AttentionStrategy.Parse(options.Attention);
 int maxContext = strategy.Mode != AttentionMode.Full && strategy.CacheCapacity > 0
     ? strategy.CacheCapacity
     : options.MaxContext;
-var kvCache = new KvCache(backend, config, maxSeqLen: maxContext, strategy: strategy);
+IKvCache kvCache;
+if (options.Paged)
+    kvCache = new PagedKvCache(backend, config, maxSeqLen: maxContext, strategy: strategy,
+        vramPageBudget: options.OffloadPages);
+else
+    kvCache = new KvCache(backend, config, maxSeqLen: maxContext, strategy: strategy);
 var deltaState = new DeltaNetState(backend, config);
 var forward = new ForwardPass(backend, config, weights, kvCache, deltaState);
 var tokenizer = TokenizerFactory.FromGguf(gguf);
@@ -56,9 +61,10 @@ var attnInfo = strategy.Mode switch
     AttentionMode.Sinks => $", sinks:{strategy.SinkTokens},{strategy.WindowSize}",
     _ => ""
 };
+var pagedInfo = options.Paged ? $", paged{(options.OffloadPages > 0 ? $" offload>{options.OffloadPages}" : "")}" : "";
 Console.Error.WriteLine($"Model loaded in {loadSw.Elapsed.TotalSeconds:F1}s " +
     $"({config.Architecture}, {config.NumLayers} layers, {config.HiddenDim}d" +
-    $"{(options.UseMmap ? ", mmap" : "")}{attnInfo})");
+    $"{(options.UseMmap ? ", mmap" : "")}{attnInfo}{pagedInfo})");
 
 var generator = new TextGenerator(forward, tokenizer, options.Seed);
 
@@ -163,6 +169,13 @@ static CliArgs ParseArgs(string[] args)
             case "--attention":
                 result.Attention = NextArg(args, ref i);
                 break;
+            case "--paged":
+                result.Paged = true;
+                break;
+            case "--offload-pages":
+                result.Paged = true;
+                result.OffloadPages = int.Parse(NextArg(args, ref i));
+                break;
             case "--help" or "-h":
                 result.ShowHelp = true;
                 break;
@@ -195,6 +208,8 @@ static void PrintUsage()
           --bench                  Run benchmark (prefill + decode timing)
           --no-mmap                Disable memory-mapped loading (use stream loading)
           --attention <mode>       Attention strategy: full, window:<N>, sinks:<S>,<W> (default: full)
+          --paged                  Use paged KV cache (dynamic allocation, grows with context)
+          --offload-pages <n>      Enable RAM offloading: keep first N pages in VRAM, rest in RAM
           --help, -h               Show this help
         """);
 }
@@ -215,4 +230,6 @@ class CliArgs
     public bool Bench;
     public bool UseMmap = true;
     public string Attention = "full";
+    public bool Paged;
+    public int OffloadPages;
 }

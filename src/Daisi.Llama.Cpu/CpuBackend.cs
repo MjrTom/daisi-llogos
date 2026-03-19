@@ -492,6 +492,18 @@ public sealed class CpuBackend : IComputeBackend
     }
 
     /// <inheritdoc />
+    public void CopyTensorBytes(ITensor dst, ITensor src, long byteCount)
+    {
+        var srcData = ((CpuTensor)src).RawData;
+        var dstData = ((CpuTensor)dst).RawDataMut;
+        srcData.Slice(0, (int)byteCount).CopyTo(dstData.Slice(0, (int)byteCount));
+    }
+
+    /// <inheritdoc />
+    public ITensor CreateHostTensor(string name, GgmlType type, ReadOnlySpan<long> dimensions) =>
+        CreateTensor(name, type, dimensions); // CPU tensors are already in host memory
+
+    /// <inheritdoc />
     public void Dispose()
     {
         // No unmanaged resources to clean up.
