@@ -40,15 +40,25 @@ if (options.UseMmap)
 else
     weights = ModelLoader.Load(gguf, stream, backend, config);
 
-var kvCache = new KvCache(backend, config, maxSeqLen: options.MaxContext);
+var strategy = AttentionStrategy.Parse(options.Attention);
+int maxContext = strategy.Mode != AttentionMode.Full && strategy.CacheCapacity > 0
+    ? strategy.CacheCapacity
+    : options.MaxContext;
+var kvCache = new KvCache(backend, config, maxSeqLen: maxContext, strategy: strategy);
 var deltaState = new DeltaNetState(backend, config);
 var forward = new ForwardPass(backend, config, weights, kvCache, deltaState);
 var tokenizer = TokenizerFactory.FromGguf(gguf);
 
 loadSw.Stop();
+var attnInfo = strategy.Mode switch
+{
+    AttentionMode.Window => $", window:{strategy.WindowSize}",
+    AttentionMode.Sinks => $", sinks:{strategy.SinkTokens},{strategy.WindowSize}",
+    _ => ""
+};
 Console.Error.WriteLine($"Model loaded in {loadSw.Elapsed.TotalSeconds:F1}s " +
     $"({config.Architecture}, {config.NumLayers} layers, {config.HiddenDim}d" +
-    $"{(options.UseMmap ? ", mmap" : "")})");
+    $"{(options.UseMmap ? ", mmap" : "")}{attnInfo})");
 
 var generator = new TextGenerator(forward, tokenizer, options.Seed);
 
@@ -150,6 +160,9 @@ static CliArgs ParseArgs(string[] args)
             case "--no-mmap":
                 result.UseMmap = false;
                 break;
+            case "--attention":
+                result.Attention = NextArg(args, ref i);
+                break;
             case "--help" or "-h":
                 result.ShowHelp = true;
                 break;
@@ -181,6 +194,7 @@ static void PrintUsage()
           --backend, -b <name>     Compute backend: cpu or cuda (default: cpu)
           --bench                  Run benchmark (prefill + decode timing)
           --no-mmap                Disable memory-mapped loading (use stream loading)
+          --attention <mode>       Attention strategy: full, window:<N>, sinks:<S>,<W> (default: full)
           --help, -h               Show this help
         """);
 }
@@ -200,4 +214,5 @@ class CliArgs
     public bool ShowHelp;
     public bool Bench;
     public bool UseMmap = true;
+    public string Attention = "full";
 }

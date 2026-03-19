@@ -161,7 +161,6 @@ public sealed class ForwardPass : IDisposable
         int keyLen = _config.KeyLength;
         int valLen = _config.ValueLength;
         int ropeDim = _config.RopeDimCount;
-        int seqLen = position + 1;
         float scale = 1.0f / MathF.Sqrt(keyLen);
 
         // Q/K/V projections
@@ -179,8 +178,11 @@ public sealed class ForwardPass : IDisposable
         // RoPE (partial — only first ropeDim dims)
         _backend.RoPE(_qAttn, _kProj, keyLen, ropeDim, position, _config.RopeTheta);
 
-        // Write K/V to cache
+        // Write K/V to cache (maps position through strategy — ring buffer for sliding window)
         _kvCache.Write(_backend, layer, position, _kProj, _vProj);
+
+        // seqLen is read AFTER write so it includes the current token
+        int seqLen = _kvCache.Length;
 
         // Compute attention with gating
         var kCacheTensor = _kvCache.GetKCacheTensor(layer);

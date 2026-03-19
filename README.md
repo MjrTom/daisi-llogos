@@ -34,6 +34,12 @@ dotnet run --project src/Daisi.Llama.Cli -- \
     --prompt "Hello, world" \
     --backend cuda
 
+# Sliding window + attention sinks (fixed memory, infinite streaming)
+dotnet run --project src/Daisi.Llama.Cli -- \
+    --model C:\GGUFS\Qwen3.5-0.8B-Q8_0.gguf \
+    --prompt "Hello, world" \
+    --attention sinks:64,4096
+
 # Benchmark (prefill + decode timing)
 dotnet run --project src/Daisi.Llama.Cli -- \
     --model C:\GGUFS\Qwen3.5-0.8B-Q8_0.gguf \
@@ -46,7 +52,22 @@ Tests validate against [Qwen 3.5 0.8B Q8_0](https://huggingface.co/unsloth/Qwen3
 
 ## Current Status
 
-**End-to-end text generation on both CPU and GPU.** Qwen 3.5 0.8B Q8_0: ~9 tok/s CPU (AVX2), ~44 tok/s CUDA (RTX 5080). 123 passing tests.
+**End-to-end text generation on both CPU and GPU.** 132 passing tests.
+
+### Benchmarks
+
+Qwen 3.5 0.8B Q8_0, 256 decode tokens, FP16 KV cache. Measured on AMD Ryzen 9 9900X + NVIDIA RTX 5080.
+
+| Backend | Attention | Prefill (tok/s) | Decode (tok/s) | KV Memory |
+|---------|-----------|----------------:|---------------:|----------:|
+| CPU (AVX2) | `full` | 7.9 | 5.5 | Grows with context |
+| CPU (AVX2) | `window:1024` | 8.2 | 7.9 | Fixed 2 MB |
+| CPU (AVX2) | `sinks:64,4096` | 7.9 | 6.9 | Fixed 8 MB |
+| CUDA (RTX 5080) | `full` | 138.8 | 42.9 | Grows with context |
+| CUDA (RTX 5080) | `window:1024` | 134.9 | 43.2 | Fixed 2 MB |
+| CUDA (RTX 5080) | `sinks:64,4096` | 128.8 | 42.7 | Fixed 8 MB |
+
+Sliding window modes use fixed memory regardless of total tokens generated. On CPU, the smaller attention window gives a measurable decode speedup (~44% faster with `window:1024` vs `full` at 256 tokens). On GPU, decode is already compute-bound at this model size so the benefit appears at longer contexts.
 
 What works today:
 - Parse any GGUF v2/v3 file (header, metadata, tensor info)
@@ -59,10 +80,11 @@ What works today:
 - BPE tokenizer, KV cache, DeltaNet recurrent state + conv1d buffers
 - Tiled/flash attention with online softmax (no shared memory limit on context length)
 - FP16 KV cache (2x memory savings, default)
+- Sliding window + attention sinks for fixed-memory streaming (`--attention sinks:64,4096`)
 - Sampler with temperature, top-k, top-p, repetition penalty
 - Memory-mapped model loading (zero intermediate byte[] copies)
 - Benchmark suite with separate prefill/decode timing (`--bench`)
-- CLI: `--backend cpu|cuda`, `--bench`, `--no-mmap`, model path, prompt, sampling parameters
+- CLI: `--backend cpu|cuda`, `--bench`, `--no-mmap`, `--attention`, model path, prompt, sampling parameters
 
 ## Roadmap
 
@@ -115,7 +137,7 @@ flowchart LR
 | 8 | [Optimization](docs/roadmap/phase-08-optimization.md) | Mmap loading, benchmark suite, multi-threaded CPU, CUDA tuning | Done |
 | 9 | [Vulkan](docs/roadmap/phase-09-vulkan.md) | Cross-platform GPU backend (Windows/Linux) | Not started |
 | 10 | [Metal](docs/roadmap/phase-10-metal.md) | Apple GPU backend (macOS/iOS) | Not started |
-| 11 | [Long Context](docs/roadmap/phase-11-long-context.md) | Flash attention, paged KV, RAM offload — 200K+ context on 16GB | In progress (11a, 11b done) |
+| 11 | [Long Context](docs/roadmap/phase-11-long-context.md) | Flash attention, paged KV, RAM offload — 200K+ context on 16GB | In progress (11a, 11b, 11e done) |
 
 ## Documentation
 

@@ -7,6 +7,7 @@ namespace Daisi.Llama.Inference;
 /// Key-value cache for standard attention layers only.
 /// Layout per layer: [nKvHeads × maxSeqLen × keyLength] for K, [nKvHeads × maxSeqLen × valueLength] for V.
 /// Supports FP16 storage for 2x memory savings (set cacheType to GgmlType.F16).
+/// Supports sliding window + attention sinks for fixed-memory streaming (set strategy).
 /// </summary>
 public sealed class KvCache : IDisposable
 {
@@ -18,17 +19,26 @@ public sealed class KvCache : IDisposable
     private readonly int _keyLength;
     private readonly int _valueLength;
     private readonly GgmlType _cacheType;
+    private readonly AttentionStrategy _strategy;
 
-    /// <summary>Number of positions currently filled.</summary>
+    /// <summary>Number of positions visible to attention (capped by strategy capacity).</summary>
     public int Length { get; private set; }
     public int MaxSeqLen => _maxSeqLen;
     public int NumKvHeads => _nKvHeads;
     public int KeyLength => _keyLength;
     public int ValueLength => _valueLength;
     public GgmlType CacheType => _cacheType;
+    public AttentionStrategy Strategy => _strategy;
 
-    public KvCache(IComputeBackend backend, ModelConfig config, int maxSeqLen, GgmlType cacheType = GgmlType.F16)
+    public KvCache(IComputeBackend backend, ModelConfig config, int maxSeqLen,
+        GgmlType cacheType = GgmlType.F16, AttentionStrategy? strategy = null)
     {
+        _strategy = strategy ?? AttentionStrategy.Full;
+
+        // For window/sinks strategies, clamp maxSeqLen to the cache capacity
+        if (_strategy.Mode != AttentionMode.Full && _strategy.CacheCapacity > 0)
+            maxSeqLen = Math.Min(maxSeqLen, _strategy.CacheCapacity);
+
         _maxSeqLen = maxSeqLen;
         _nKvHeads = config.NumKvHeads;
         _keyLength = config.KeyLength;
@@ -71,35 +81,36 @@ public sealed class KvCache : IDisposable
 
     /// <summary>
     /// Write K and V for a single position using backend operations.
+    /// The position is mapped through the attention strategy (ring buffer for sliding window).
     /// </summary>
     public void Write(IComputeBackend backend, int layer, int position, ITensor k, ITensor v)
     {
+        int slot = _strategy.MapPosition(position);
         int idx = GetCacheIndex(layer);
         backend.KvCacheWrite(_kCaches[idx], _vCaches[idx], k, v,
-            _nKvHeads, _keyLength, _valueLength, _maxSeqLen, position);
+            _nKvHeads, _keyLength, _valueLength, _maxSeqLen, slot);
 
-        if (position >= Length)
-            Length = position + 1;
+        Length = _strategy.EffectiveSeqLen(position);
     }
 
     // Legacy span-based methods for backward compatibility
     public void Write(int layer, int position, ReadOnlySpan<float> k, ReadOnlySpan<float> v)
     {
+        int slot = _strategy.MapPosition(position);
         int idx = GetCacheIndex(layer);
         var kSpan = _kCaches[idx].AsFloatSpan();
         var vSpan = _vCaches[idx].AsFloatSpan();
 
         for (int h = 0; h < _nKvHeads; h++)
         {
-            int kCacheOff = h * _maxSeqLen * _keyLength + position * _keyLength;
+            int kCacheOff = h * _maxSeqLen * _keyLength + slot * _keyLength;
             k.Slice(h * _keyLength, _keyLength).CopyTo(kSpan.Slice(kCacheOff, _keyLength));
 
-            int vCacheOff = h * _maxSeqLen * _valueLength + position * _valueLength;
+            int vCacheOff = h * _maxSeqLen * _valueLength + slot * _valueLength;
             v.Slice(h * _valueLength, _valueLength).CopyTo(vSpan.Slice(vCacheOff, _valueLength));
         }
 
-        if (position >= Length)
-            Length = position + 1;
+        Length = _strategy.EffectiveSeqLen(position);
     }
 
     public Span<float> GetKCache(int layer) => _kCaches[GetCacheIndex(layer)].AsFloatSpan();
