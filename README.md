@@ -23,7 +23,7 @@ dotnet build
 # Run tests (requires Qwen 3.5 0.8B Q8_0 in C:\GGUFS)
 dotnet test
 
-# Generate text (available after Phase 5)
+# Generate text
 dotnet run --project src/Daisi.Llama.Cli -- \
     --model C:\GGUFS\Qwen3.5-0.8B-Q8_0.gguf \
     --prompt "Hello, world"
@@ -35,7 +35,7 @@ Tests validate against [Qwen 3.5 0.8B Q8_0](https://huggingface.co/unsloth/Qwen3
 
 ## Current Status
 
-**GGUF parser: complete.** The parser reads GGUF v2/v3 files — header, metadata KV pairs (all 13 value types), tensor info descriptors, and lazy tensor data access. Validated against Qwen 3.5 0.8B Q8_0 with 18 passing tests (unit + integration).
+**End-to-end text generation works on CPU.** 99 passing tests across GGUF parsing, dequantization, math ops, tokenization, forward pass, sampling, and generation.
 
 What works today:
 - Parse any GGUF v2/v3 file (header, metadata, tensor info)
@@ -50,6 +50,9 @@ What works today:
 - Complete hybrid forward pass: standard gated attention + DeltaNet layers
 - Model loading from GGUF into CPU backend with polymorphic layer weights
 - KV cache for attention layers, recurrent state + conv1d buffers for DeltaNet layers
+- Sampler with temperature, top-k, top-p, repetition penalty, greedy/random sampling
+- Streaming text generation with prefill + decode loop
+- CLI with full argument parsing (model path, prompt, sampling parameters)
 
 ## Roadmap
 
@@ -78,7 +81,7 @@ flowchart LR
     style P2 fill:#2d6a4f,color:#fff
     style P3 fill:#2d6a4f,color:#fff
     style P4 fill:#2d6a4f,color:#fff
-    style P5 fill:#e76f51,color:#fff
+    style P5 fill:#2d6a4f,color:#fff
     style P6 fill:#e76f51,color:#fff
     style P7 fill:#e76f51,color:#fff
     style P8 fill:#e76f51,color:#fff
@@ -93,9 +96,9 @@ flowchart LR
 | 2 | [Math Ops](docs/roadmap/phase-02-math-ops.md) | CPU SIMD matmul, RMSNorm, softmax, SiLU, RoPE | Done |
 | 3 | [Tokenizer](docs/roadmap/phase-03-tokenizer.md) | BPE tokenizer from GGUF metadata | Done |
 | 4 | [Forward Pass](docs/roadmap/phase-04-forward-pass.md) | Model loading + hybrid forward pass (attention + DeltaNet) | Done |
-| 5 | [Generation](docs/roadmap/phase-05-generation.md) | Sampling, KV cache, text generation, CLI | Not started |
+| 5 | [Generation](docs/roadmap/phase-05-generation.md) | Sampling, text generation loop, CLI | Done |
 | 6 | [CUDA](docs/roadmap/phase-06-cuda.md) | NVIDIA GPU backend with fused kernels | Not started |
-| 7 | [DeltaNet](docs/roadmap/phase-07-deltanet.md) | Qwen 3.5 hybrid DeltaNet architecture | Not started |
+| 7 | [DeltaNet](docs/roadmap/phase-07-deltanet.md) | Qwen 3.5 hybrid DeltaNet architecture | Done (folded into Phase 4) |
 | 8 | [Optimization](docs/roadmap/phase-08-optimization.md) | Mmap loading, batch prefill, KV cache quantization | Not started |
 | 9 | [Vulkan](docs/roadmap/phase-09-vulkan.md) | Cross-platform GPU backend (Windows/Linux) | Not started |
 | 10 | [Metal](docs/roadmap/phase-10-metal.md) | Apple GPU backend (macOS/iOS) | Not started |

@@ -167,9 +167,9 @@ await foreach (var token in generator.GenerateAsync(prompt, parameters))
 
 ## Done Criteria
 
-- [ ] Sampler implements temperature, top-k, top-p, repetition penalty
-- [ ] Text generator runs prefill + decode loop with streaming output
-- [ ] CLI accepts model path and parameters, generates text
-- [ ] End-to-end: `daisi-llama --model qwen.gguf --prompt "Hello"` produces readable output
-- [ ] Generation stops at EOS token or max token limit
-- [ ] Performance: measurable tokens/sec reported at end of generation
+- [x] Sampler implements temperature, top-k, top-p, repetition penalty
+- [x] Text generator runs prefill + decode loop with streaming output
+- [x] CLI accepts model path and parameters, generates text
+- [x] End-to-end: `daisi-llama --model qwen.gguf --prompt "Hello"` produces readable output
+- [x] Generation stops at EOS token or max token limit
+- [x] Performance: measurable tokens/sec reported at end of generation
