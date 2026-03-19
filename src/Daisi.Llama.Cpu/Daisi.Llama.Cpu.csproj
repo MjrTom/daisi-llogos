@@ -4,6 +4,9 @@
     <AssemblyName>Daisi.Llama.Cpu</AssemblyName>
   </PropertyGroup>
   <ItemGroup>
+    <InternalsVisibleTo Include="Daisi.Llama.Tests" />
+  </ItemGroup>
+  <ItemGroup>
     <ProjectReference Include="..\Daisi.Llama\Daisi.Llama.csproj" />
   </ItemGroup>
 </Project>

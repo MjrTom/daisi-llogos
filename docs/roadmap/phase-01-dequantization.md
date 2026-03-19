@@ -153,9 +153,9 @@ The 6-bit scale unpacking requires careful bit manipulation (lower 4 bits stored
 
 ## Done Criteria
 
-- [ ] `IComputeBackend` and `ITensor` interfaces defined and documented
-- [ ] `CpuBackend` implements `CreateTensor` and `LoadTensor`
-- [ ] Q8_0, Q4_0, and Q4_K dequantization produce correct FP32 output
-- [ ] AVX2 SIMD paths exist for Q8_0 and Q4_0 with scalar fallback
-- [ ] All dequantization tests pass against hand-crafted and real-model data
+- [x] `IComputeBackend` and `ITensor` interfaces defined and documented
+- [x] `CpuBackend` implements `CreateTensor` and `LoadTensor`
+- [x] Q8_0, Q4_0, and Q4_K dequantization produce correct FP32 output
+- [x] AVX2 SIMD paths exist for Q8_0 and Q4_0 with scalar fallback
+- [x] All dequantization tests pass against hand-crafted and real-model data
 - [ ] Performance: Q8_0 dequantization saturates memory bandwidth on a single core

@@ -42,6 +42,9 @@ What works today:
 - Query model metadata (architecture, dimensions, vocab)
 - Read tensor data on demand (lazy loading)
 - Full quantization type support (41 GgmlType variants with block/type size calculation)
+- `IComputeBackend` and `ITensor` compute abstraction interfaces
+- CPU backend with dequantization for Q8_0, Q4_0, Q4_K (AVX2 SIMD + scalar fallback)
+- Load quantized tensors from GGUF and dequantize to FP32
 
 ## Roadmap
 
@@ -66,7 +69,7 @@ flowchart LR
     P7 --> P8
     P8 --> P9 --> P10
 
-    style P1 fill:#e76f51,color:#fff
+    style P1 fill:#2d6a4f,color:#fff
     style P2 fill:#e76f51,color:#fff
     style P3 fill:#e76f51,color:#fff
     style P4 fill:#e76f51,color:#fff
@@ -81,7 +84,7 @@ flowchart LR
 | Phase | Name | Goal | Status |
 |-------|------|------|--------|
 | 0 | [GGUF Parser](#current-status) | Parse GGUF files, read metadata and tensor info | Done |
-| 1 | [Dequantization](docs/roadmap/phase-01-dequantization.md) | `IComputeBackend` + CPU dequantization (Q8_0, Q4_0, Q4_K) | Not started |
+| 1 | [Dequantization](docs/roadmap/phase-01-dequantization.md) | `IComputeBackend` + CPU dequantization (Q8_0, Q4_0, Q4_K) | Done |
 | 2 | [Math Ops](docs/roadmap/phase-02-math-ops.md) | CPU SIMD matmul, RMSNorm, softmax, SiLU, RoPE | Not started |
 | 3 | [Tokenizer](docs/roadmap/phase-03-tokenizer.md) | BPE tokenizer from GGUF metadata | Not started |
 | 4 | [Forward Pass](docs/roadmap/phase-04-forward-pass.md) | Model loading + transformer forward pass | Not started |
