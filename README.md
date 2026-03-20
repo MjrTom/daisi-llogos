@@ -63,42 +63,39 @@ See [Tested Models](docs/tested-models.md) for verified models, performance benc
 
 ## Current Status
 
-**End-to-end text generation on CPU, CUDA, and Vulkan.** 225+ passing tests. Supports Q8_0, F16, F32, I2_S (BitNet), TQ1_0, and K-quant (Q4_K, Q5_K, Q6_K) formats across all backends.
+**End-to-end text generation on CPU, CUDA, and Vulkan.** 251+ passing tests. Supports Q8_0, F16, F32, I2_S (BitNet), TQ1_0, and K-quant (Q4_K, Q5_K, Q6_K) formats across all backends.
 
 ### Benchmarks
 
-Qwen 3.5 0.8B Q8_0, 256 decode tokens, FP16 KV cache. Measured on AMD Ryzen 9 9900X + NVIDIA RTX 5080.
+Measured on AMD Ryzen 9 9900X + NVIDIA RTX 5080, FP16 KV cache.
 
-| Backend | Attention | Prefill (tok/s) | Decode (tok/s) | KV Memory |
-|---------|-----------|----------------:|---------------:|----------:|
-| CPU (AVX2) | `full` | 7.9 | 5.5 | Grows with context |
-| CPU (AVX2) | `window:1024` | 8.2 | 7.9 | Fixed 2 MB |
-| CPU (AVX2) | `sinks:64,4096` | 7.9 | 6.9 | Fixed 8 MB |
-| CUDA (RTX 5080) | `full` | 138.8 | 42.9 | Grows with context |
-| CUDA (RTX 5080) | `window:1024` | 134.9 | 43.2 | Fixed 2 MB |
-| CUDA (RTX 5080) | `sinks:64,4096` | 128.8 | 42.7 | Fixed 8 MB |
-| CPU (AVX2) | `full --paged` | 6.8 | 6.6 | Grows on demand |
-| CUDA (RTX 5080) | `full --paged` | 136.2 | 42.3 | Grows on demand |
-| CUDA (RTX 5080) | `full --paged --offload-pages 2` | 129.5 | 41.4 | 2 pages VRAM + RAM |
-| Vulkan (RTX 5080) | `full` | 20.8 | 17.3 | Grows with context |
+| Model | Backend | Prefill (tok/s) | Decode (tok/s) |
+|-------|---------|----------------:|---------------:|
+| Qwen3.5-0.8B Q8_0 | CUDA | 115 | 218 |
+| Qwen3-8B Q8_0 | CUDA | 67 | 68 |
+| Qwen3-8B Q4_K_M | CUDA | 49 | 50 |
+| Qwen3.5-9B Q8_0 | CUDA | 57 | 62 |
+| Qwen3.5-0.8B Q8_0 | CPU | 15 | 22 |
+| TinyLlama 1.1B Q8_0 | CPU | 5 | 13 |
+| Vulkan (0.8B Q8_0) | Vulkan | 21 | 17 |
 
-Sliding window modes use fixed memory regardless of total tokens generated. On CPU, the smaller attention window gives a measurable decode speedup (~44% faster with `window:1024` vs `full` at 256 tokens). On GPU, decode is already compute-bound at this model size so the benefit appears at longer contexts. Paged cache adds <2% overhead vs monolithic; RAM offloading via pinned host memory adds <3%.
+CUDA performance optimizations: `__dp4a` integer dot products for Q8_0 (llama.cpp inspired), aligned Q8_0 weight repacking, cuBLAS for F32 GEMV, fused forward pass kernels (RmsNormResidual, SwiGLU, AddRmsNorm), GPU-side argmax, candidate-based sampler, architecture-specific NVRTC compilation with PTX disk cache.
 
 What works today:
 - Parse any GGUF v2/v3 file (header, metadata, tensor info)
 - Full quantization type support (41 GgmlType variants with block/type size calculation)
 - `IComputeBackend` / `ITensor` abstraction — forward pass is backend-agnostic
 - CPU backend: AVX2 SIMD matmul (fused Q8_0 dequant), multi-threaded, full dequantization (Q8_0, Q4_0, Q4_K, Q5_K, Q6_K, Q3_K, Q2_K, Q4_1, Q5_0, Q5_1, BF16, F16, I2_S, TQ1_0)
-- CUDA backend: NVRTC JIT compilation, fused dequant+matmul kernels (F32, F16, Q8_0, Q4_K, Q5_K, Q6_K, I2_S, TQ1_0), stream-batched, async D2D copy
+- CUDA backend: NVRTC JIT compilation with PTX cache, `__dp4a` Q8_0 matmul, cuBLAS F32, fused dequant+matmul kernels (F32, F16, Q8_0, Q4_K, Q5_K, Q6_K, I2_S, TQ1_0), aligned Q8_0 repacking, Q8_1 activation cache
 - Vulkan backend: SPIR-V compute shaders, fused dequant+matmul (F32, F16, Q8_0, Q4_K, Q6_K, I2_S, TQ1_0), cross-platform GPU (NVIDIA/AMD/Intel)
-- 13 composite GPU operations: GatedAttention, DeltaNetStep, CausalConv1d, ComputeDecayBeta, etc.
-- Complete hybrid forward pass: standard gated attention (6 layers) + DeltaNet (18 layers)
+- 16+ composite GPU operations: GatedAttention, DeltaNetStep, CausalConv1d, ComputeDecayBeta, SplitUnequalQKV, RepeatTile, ArgMax, RmsNormResidual, SwiGLU, AddRmsNorm, etc.
+- Complete hybrid forward pass: standard gated attention + DeltaNet (Qwen3.5 0.8B and 9B)
 - BPE tokenizer, KV cache, DeltaNet recurrent state + conv1d buffers
 - Tiled/flash attention with online softmax (no shared memory limit on context length)
 - FP16 KV cache (2x memory savings, default)
 - Sliding window + attention sinks for fixed-memory streaming (`--attention sinks:64,4096`)
 - Paged KV cache with dynamic allocation (`--paged`), RAM offloading (`--offload-pages`)
-- Sampler with temperature, top-k, top-p, repetition penalty
+- Candidate-based sampler with temperature, top-k, top-p, repetition penalty (O(k) not O(N log N))
 - Memory-mapped model loading (zero intermediate byte[] copies)
 - Benchmark suite with separate prefill/decode timing (`--bench`)
 - CLI: `--backend cpu|cuda|vulkan`, `--bench`, `--no-mmap`, `--attention`, `--paged`, `--offload-pages`, model path, prompt, sampling parameters
