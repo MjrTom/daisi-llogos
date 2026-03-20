@@ -91,8 +91,8 @@ __global__ void matmul_f32(float* output, const float* a, const float* b,
 
 // ── Fused Q8_0 Dequant + MatMul ─────────────────────────────────────────────
 // One block per output neuron. Threads cooperatively process Q8_0 blocks.
-// Uses vectorized loads (float4/char4) for 4× fewer memory transactions.
-// Grid: N blocks, Block: 256 threads.
+// Uses vectorized float4 loads for activation.
+// Grid: N blocks, Block: adaptive threads.
 
 __global__ void dequant_matmul_q8_0(float* output, const float* a,
                                      const unsigned char* b,
@@ -114,11 +114,7 @@ __global__ void dequant_matmul_q8_0(float* output, const float* a,
     for (int blk = tid; blk < blocks_per_row; blk += blockSize)
     {
         const unsigned char* block_ptr = b_row + blk * 34;
-
-        // FP16 → FP32 scale
         float scale = fp16_to_fp32(*reinterpret_cast<const unsigned short*>(block_ptr));
-
-        // Vectorized float4 loads for activation (aligned), scalar for quants (unaligned)
         const signed char* quants = (const signed char*)(block_ptr + 2);
         const float4* ap = reinterpret_cast<const float4*>(a + blk * 32);
 
@@ -131,30 +127,21 @@ __global__ void dequant_matmul_q8_0(float* output, const float* a,
             block_sum += ai.x * (float)quants[base]     + ai.y * (float)quants[base + 1]
                        + ai.z * (float)quants[base + 2] + ai.w * (float)quants[base + 3];
         }
-
         sum += scale * block_sum;
     }
 
     // Warp reduction
     sum = warp_reduce_sum(sum);
-
-    // Write warp sums to shared memory
     int lane = tid & 31;
     int warp = tid >> 5;
-    if (lane == 0)
-        shared[warp] = sum;
+    if (lane == 0) shared[warp] = sum;
     __syncthreads();
 
-    // Final reduction by first warp
     int numWarps = blockSize >> 5;
-    if (tid < numWarps)
-        sum = shared[tid];
-    else
-        sum = 0.0f;
+    if (tid < numWarps) sum = shared[tid]; else sum = 0.0f;
     sum = warp_reduce_sum(sum);
 
-    if (tid == 0)
-        output[n] = sum;
+    if (tid == 0) output[n] = sum;
 }
 
 // ── Fused I2_S (BitNet ternary) Dequant + MatMul ───────────────────────────

@@ -404,6 +404,45 @@ __global__ void add_rms_norm(float* output, float* hidden, const float* a, const
         output[i] = hidden[i] * inv_rms * weight[i];
 }
 
+// ── ArgMax reduction ──────────────────────────────────────────────────────────
+// Find the index of the maximum value. Result written to output[0] as float (cast to int).
+// Single block launch with shared memory reduction.
+
+__global__ void argmax(float* output, const float* input, int n)
+{
+    extern __shared__ float sdata[];  // [2 * blockDim.x]: values then indices
+    int tid = threadIdx.x;
+    int stride = blockDim.x;
+    float* svals = sdata;
+    float* sidxs = sdata + blockDim.x;
+
+    // Phase 1: each thread finds its local max
+    float bestVal = -1e30f;
+    float bestIdx = 0;
+    for (int i = tid; i < n; i += stride)
+    {
+        float v = input[i];
+        if (v > bestVal) { bestVal = v; bestIdx = (float)i; }
+    }
+    svals[tid] = bestVal;
+    sidxs[tid] = bestIdx;
+    __syncthreads();
+
+    // Phase 2: tree reduction
+    for (int s = blockDim.x / 2; s > 0; s >>= 1)
+    {
+        if (tid < s && svals[tid + s] > svals[tid])
+        {
+            svals[tid] = svals[tid + s];
+            sidxs[tid] = sidxs[tid + s];
+        }
+        __syncthreads();
+    }
+
+    if (tid == 0)
+        output[0] = sidxs[0];
+}
+
 // ── Fill tensor ───────────────────────────────────────────────────────────────
 // output[i] = value
 
