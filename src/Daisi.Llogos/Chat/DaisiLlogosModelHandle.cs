@@ -67,7 +67,7 @@ public sealed class DaisiLlogosModelHandle : IDisposable
         else
         {
             var kvCache = new KvCache(Backend, Config, _contextSize);
-            var deltaState = new DeltaNetState(Backend, Config);
+            var deltaState = new DeltaNetState(Backend, Config, Weights);
             var forward = new ForwardPass(Backend, Config, Weights, kvCache, deltaState);
             return (forward, kvCache);
         }
