@@ -16,6 +16,7 @@ public sealed class CudaBackend : IComputeBackend
     private readonly nint _cublasHandle;
     private CudaDeviceMemory? _q8_1Scratch; // scratch for quantized activation
     private int _q8_1ScratchK; // K dimension of current scratch
+    private ulong _q8_1CachedInputPtr; // device ptr of last quantized activation (for reuse)
     private bool _disposed;
 
     private const int BlockSize = 256;
@@ -120,25 +121,32 @@ public sealed class CudaBackend : IComputeBackend
         else if (b.Type == GgmlType.Q8_0 && K >= 2048)
         {
             // dp4a path: quantize activation to int8, use integer dot product hardware.
-            // Only for K >= 2048 where quantization overhead is amortized.
+            // Cache: skip re-quantization if the same activation tensor is used again
+            // (e.g., Q/K/V projections all share normOut, gate/up share normOut).
             int numBlocks = K / 32;
-            int q8_1Bytes = numBlocks * 36; // 36 bytes per Q8_1 block
+            int q8_1Bytes = numBlocks * 36;
             if (_q8_1Scratch == null || _q8_1ScratchK < K)
             {
                 _q8_1Scratch?.Dispose();
                 _q8_1Scratch = new CudaDeviceMemory((ulong)q8_1Bytes);
                 _q8_1ScratchK = K;
+                _q8_1CachedInputPtr = 0; // invalidate cache on resize
             }
             ulong q8_1Ptr = _q8_1Scratch.DevicePtr;
 
-            var quantFunc = _matmulModule.GetFunction("quantize_f32_q8_1");
-            uint quantGrid = (uint)((numBlocks + BlockSize - 1) / BlockSize);
-            int kVal = K;
-            nint* qArgs = stackalloc nint[3];
-            qArgs[0] = (nint)(&q8_1Ptr);
-            qArgs[1] = (nint)(&aPtr);
-            qArgs[2] = (nint)(&kVal);
-            _stream.Launch(quantFunc, quantGrid, 1, 1, (uint)BlockSize, 1, 1, 0, qArgs);
+            // Only quantize if activation changed since last call
+            if (_q8_1CachedInputPtr != aPtr)
+            {
+                var quantFunc = _matmulModule.GetFunction("quantize_f32_q8_1");
+                uint quantGrid = (uint)((numBlocks + BlockSize - 1) / BlockSize);
+                int kVal = K;
+                nint* qArgs = stackalloc nint[3];
+                qArgs[0] = (nint)(&q8_1Ptr);
+                qArgs[1] = (nint)(&aPtr);
+                qArgs[2] = (nint)(&kVal);
+                _stream.Launch(quantFunc, quantGrid, 1, 1, (uint)BlockSize, 1, 1, 0, qArgs);
+                _q8_1CachedInputPtr = aPtr;
+            }
 
             // Step 2: Q8_0 × Q8_1 matmul using __dp4a (aligned or unaligned path)
             bool isAligned = bT is CudaTensor ct && ct.IsAlignedQ8_0;
@@ -146,12 +154,13 @@ public sealed class CudaBackend : IComputeBackend
                 ? "dequant_matmul_q8_0_q8_1_aligned"
                 : "dequant_matmul_q8_0_q8_1");
             int nVal = N;
+            int kVal2 = K;
             nint* kArgs = stackalloc nint[6];
             kArgs[0] = (nint)(&outPtr);
             kArgs[1] = (nint)(&q8_1Ptr);
             kArgs[2] = (nint)(&bPtr);
             kArgs[3] = (nint)(&M);
-            kArgs[4] = (nint)(&kVal);
+            kArgs[4] = (nint)(&kVal2);
             kArgs[5] = (nint)(&nVal);
             _stream.Launch(func, gridX, 1, 1, (uint)matmulBlockSize, 1, 1, sharedMem, kArgs);
         }
