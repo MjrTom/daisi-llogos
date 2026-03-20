@@ -7,13 +7,13 @@
 
 ## Goal
 
-Complete the inference pipeline: sample tokens from logits, run the autoregressive generation loop, and expose it through the CLI. After this phase, daisi-llama generates text on CPU — the first end-to-end milestone.
+Complete the inference pipeline: sample tokens from logits, run the autoregressive generation loop, and expose it through the CLI. After this phase, daisi-llogos generates text on CPU — the first end-to-end milestone.
 
 ---
 
 ## What Gets Built
 
-### Core library (`Daisi.Llama`)
+### Core library (`Daisi.Llogos`)
 
 | File | Contents |
 |------|----------|
@@ -21,7 +21,7 @@ Complete the inference pipeline: sample tokens from logits, run the autoregressi
 | `Inference/GenerationParams.cs` | Temperature, top-k, top-p, repetition penalty, max tokens |
 | `Inference/TextGenerator.cs` | Prefill + decode loop, streaming output |
 
-### CLI (`Daisi.Llama.Cli`)
+### CLI (`Daisi.Llogos.Cli`)
 
 | File | Contents |
 |------|----------|
@@ -122,7 +122,7 @@ flowchart TD
 ### CLI Usage
 
 ```
-daisi-llama --model C:\GGUFS\Qwen3.5-0.8B-Q8_0.gguf --prompt "Hello, world"
+daisi-llogos --model C:\GGUFS\Qwen3.5-0.8B-Q8_0.gguf --prompt "Hello, world"
 
 Options:
   --model <path>         Path to GGUF model file (required)
@@ -170,6 +170,6 @@ await foreach (var token in generator.GenerateAsync(prompt, parameters))
 - [x] Sampler implements temperature, top-k, top-p, repetition penalty
 - [x] Text generator runs prefill + decode loop with streaming output
 - [x] CLI accepts model path and parameters, generates text
-- [x] End-to-end: `daisi-llama --model qwen.gguf --prompt "Hello"` produces readable output
+- [x] End-to-end: `daisi-llogos --model qwen.gguf --prompt "Hello"` produces readable output
 - [x] Generation stops at EOS token or max token limit
 - [x] Performance: measurable tokens/sec reported at end of generation

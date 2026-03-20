@@ -7,13 +7,13 @@
 
 ## Goal
 
-Implement a Metal compute backend that runs inference on Apple GPUs. This enables daisi-llama on macOS (Apple Silicon and Intel Macs) and iOS devices. The iOS distribution uses an XCFramework for native integration.
+Implement a Metal compute backend that runs inference on Apple GPUs. This enables daisi-llogos on macOS (Apple Silicon and Intel Macs) and iOS devices. The iOS distribution uses an XCFramework for native integration.
 
 ---
 
 ## What Gets Built
 
-### Metal backend (`Daisi.Llama.Metal`)
+### Metal backend (`Daisi.Llogos.Metal`)
 
 | File | Contents |
 |------|----------|
@@ -37,7 +37,7 @@ Implement a Metal compute backend that runs inference on Apple GPUs. This enable
 | File | Contents |
 |------|----------|
 | `build-xcframework.sh` | Build script for XCFramework |
-| `Daisi.Llama.Metal.xcframework` | Universal framework for iOS devices + simulators |
+| `Daisi.Llogos.Metal.xcframework` | Universal framework for iOS devices + simulators |
 
 ---
 
@@ -190,16 +190,16 @@ On Intel Macs, use `MTLResourceStorageModeManaged` with explicit `didModifyRange
 For iOS distribution, Metal shaders and the .NET native AOT-compiled library are packaged as an XCFramework:
 
 ```
-Daisi.Llama.Metal.xcframework/
+Daisi.Llogos.Metal.xcframework/
 ├── ios-arm64/
-│   └── DaisiLlama.framework/
-│       ├── DaisiLlama (native binary)
+│   └── DaisiLlogos.framework/
+│       ├── DaisiLlogos (native binary)
 │       ├── default.metallib (compiled shaders)
 │       └── Info.plist
 ├── ios-arm64-simulator/
-│   └── DaisiLlama.framework/
+│   └── DaisiLlogos.framework/
 └── macos-arm64-x86_64/
-    └── DaisiLlama.framework/
+    └── DaisiLlogos.framework/
 ```
 
 ### Platform differences

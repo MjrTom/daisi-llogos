@@ -13,7 +13,7 @@ Implement a BPE tokenizer that reads vocabulary and merge rules from GGUF metada
 
 ## What Gets Built
 
-### Core library (`Daisi.Llama`)
+### Core library (`Daisi.Llogos`)
 
 | File | Contents |
 |------|----------|

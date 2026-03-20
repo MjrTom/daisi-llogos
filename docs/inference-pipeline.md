@@ -1,6 +1,6 @@
 # Inference Pipeline
 
-> Complete walkthrough of how daisi-llama transforms input text into generated output.
+> Complete walkthrough of how daisi-llogos transforms input text into generated output.
 > [Definitions](definitions.md) | [Architecture](architecture.md) | [Roadmap](../README.md#roadmap)
 
 ---

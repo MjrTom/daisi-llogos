@@ -13,7 +13,7 @@ Implement a Vulkan compute backend that runs inference on any Vulkan-capable GPU
 
 ## What Gets Built
 
-### Vulkan backend (`Daisi.Llama.Vulkan`)
+### Vulkan backend (`Daisi.Llogos.Vulkan`)
 
 | File | Contents |
 |------|----------|

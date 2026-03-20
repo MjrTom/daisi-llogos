@@ -13,7 +13,7 @@ Implement all math operations required by `IComputeBackend` on the CPU using .NE
 
 ## What Gets Built
 
-### CPU backend (`Daisi.Llama.Cpu`)
+### CPU backend (`Daisi.Llogos.Cpu`)
 
 | File | Contents |
 |------|----------|

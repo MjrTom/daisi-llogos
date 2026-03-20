@@ -7,7 +7,7 @@
 
 ## Goal
 
-Optimize every stage of the pipeline for maximum throughput and minimum memory usage. This phase is about making daisi-llama fast, not just correct.
+Optimize every stage of the pipeline for maximum throughput and minimum memory usage. This phase is about making daisi-llogos fast, not just correct.
 
 ---
 
