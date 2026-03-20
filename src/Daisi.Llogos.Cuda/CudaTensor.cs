@@ -14,14 +14,20 @@ public sealed class CudaTensor : ITensor
     private CudaPinnedMemory? _pinnedMemory;
     private bool _disposed;
 
-    internal CudaTensor(string name, GgmlType type, ReadOnlySpan<long> dimensions, bool pinned = false)
+    internal CudaTensor(string name, GgmlType type, ReadOnlySpan<long> dimensions,
+        bool pinned = false, bool alignedQ8_0 = false)
     {
         Name = name;
         Type = type;
         IsPinned = pinned;
+        IsAlignedQ8_0 = alignedQ8_0;
         _dimensions = dimensions.ToArray();
         ElementCount = ComputeElementCount(dimensions);
-        ByteSize = (long)GgmlTypeInfo.ByteSize(type, (ulong)ElementCount);
+        // Aligned Q8_0 uses 36 bytes per block instead of 34
+        long byteSize = alignedQ8_0
+            ? (ElementCount / 32) * 36
+            : (long)GgmlTypeInfo.ByteSize(type, (ulong)ElementCount);
+        ByteSize = byteSize;
         if (pinned)
             _pinnedMemory = new CudaPinnedMemory((ulong)ByteSize);
         else
@@ -51,6 +57,9 @@ public sealed class CudaTensor : ITensor
 
     /// <summary>Whether this tensor is backed by pinned host memory.</summary>
     internal bool IsPinned { get; }
+
+    /// <summary>Whether Q8_0 data is repacked to 36-byte aligned blocks.</summary>
+    internal bool IsAlignedQ8_0 { get; }
 
     /// <summary>
     /// Device pointer for kernel parameters. Works for both device and pinned memory.
