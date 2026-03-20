@@ -11,9 +11,12 @@ The CUDA backend provides GPU-accelerated inference on NVIDIA GPUs using CUDA 13
 
 Key design choices:
 - **CUDA Driver API** (not Runtime API) — explicit context management, direct kernel loading
-- **Pre-compiled .cubin kernels** — no JIT compilation at startup, deterministic performance
-- **SafeHandle wrappers** — managed RAII for all CUDA resources (contexts, modules, streams, device memory)
-- **Fused kernels** — dequantize and compute in a single kernel to minimize memory traffic
+- **NVRTC JIT compilation** with PTX disk cache — architecture-specific codegen, ~0.6s cached startup
+- **cuBLAS integration** — SGEMV for F32 matmul (ships with CUDA Toolkit, no extra dependency)
+- **`__dp4a` integer dot products** — quantize activation to Q8_1, use hardware int8 multiply-accumulate for Q8_0 (inspired by llama.cpp)
+- **Aligned Q8_0 repacking** — 36-byte blocks with 4-byte aligned quants for direct `int*` loads
+- **Fused kernels** — RmsNormResidual, SwiGLU, AddRmsNorm, GPU-side ArgMax, SplitUnequalQKV, RepeatTile
+- **Q8_1 activation cache** — skip re-quantization when consecutive matmuls share the same input
 
 ---
 

@@ -100,37 +100,27 @@ _ssmAlpha = CreateF32("scratch_ssm_alpha", numVHeads);
 
 ---
 
-## 5. Qwen3.5-9B DeltaNet Output Quality
+## 5. Qwen3.5-9B DeltaNet Q/K Head Expansion (Fixed)
 
 ### Symptom
 
-After fixing the conv buffer overflow (issue 2) and K-quant bugs (issue 1), the 9B model produces coherent English text but with lower quality than expected. The 0.8B model correctly answers "The capital of France is Paris" while the 9B model produces semi-coherent but wrong content like `"the name of France, which country is the one with that name was actually in 2019-2019-201"`.
+After fixing the conv buffer overflow (issue 2) and K-quant bugs (issue 1), the 9B model produced coherent English text but with incorrect content. The 0.8B model correctly answered "The capital of France is Paris" while the 9B produced `"the name of France, which country is the one with that name was actually in 2019-2019-201"`.
 
-### What's Been Verified Correct
+### Root Cause
 
-1. **Decay formula** — Confirmed against llama.cpp `qwen35.cpp`: `gate = softplus(alpha + dt_bias) * ssm_a` where ssm_a stores pre-computed `-exp(A_log)`. Our formula matches.
-2. **QKV split order** — Confirmed as [Q, K, V] by llama.cpp reference.
-3. **Repeat-interleave** — Applied after L2 normalization, matching the reference order.
-4. **DeltaNet state update math** — The delta rule (error → state update → output) matches the `fla` library formulation.
-5. **Conv1d buffer management** — Stores pre-conv values, shifts correctly, conv weight ordering matches GGUF layout.
-6. **SiLUGate** — `output * SiLU(gate)` matches the reference `output × SiLU(Z)`.
-7. **Buffer sizes** — All scratch buffers correctly sized from actual weight tensor dimensions.
+**Repeat-interleave vs repeat (tiling) for Q/K head expansion.** The Q/K heads needed to be expanded from 16 → 32 heads to match the V head count. Our code used `repeat_interleave` which produces `[h0, h0, h1, h1, ...]`, but `ggml_repeat` in llama.cpp uses tiling: `[h0, h1, ..., h15, h0, h1, ..., h15]`. This paired every Q/K head with the wrong V head, corrupting the DeltaNet state update across all 24 layers.
 
-### Possible Remaining Issues
+The 0.8B model was unaffected because it has equal head counts (16 Q/K/V heads, no expansion needed).
 
-1. **Chat model without chat template** — Qwen3.5 is a chat/thinking model. Raw text completion (without the expected chat template) may produce lower quality output. The 0.8B model also degenerates quickly after saying "Paris" (going into quiz format). This may not be a code bug.
+### Fix
 
-2. **Error accumulation across 24 DeltaNet layers** — The 9B has 24 DeltaNet layers vs 18 for the 0.8B. Small numerical differences in the recurrent state update could compound more aggressively with more layers.
+Changed `RepeatInterleave` to use tiling: copy the full source block N times instead of interleaving individual heads.
 
-3. **Chunked vs recurrent DeltaNet** — The reference HuggingFace implementation uses `chunk_gated_delta_rule` (processes multiple tokens at once with matrix operations). Our step-by-step recurrent implementation is mathematically equivalent but may accumulate floating-point errors differently.
+### Validated
 
-### How to Debug Further
-
-1. **Test with chat template** — Format the prompt using Qwen3.5's chat template to see if output quality improves. This would confirm whether the issue is model behavior vs code bug.
-
-2. **Layer-by-layer comparison against llama.cpp** — Dump hidden states after each DeltaNet layer from both implementations and find where they diverge.
-
-3. **Compare first-token logits** — If the top-5 logits after the full forward pass match llama.cpp's output, the implementation is correct and the quality issue is prompt-related.
+- 9B Q8_0 CUDA: `"Paris, which sits on the Seine River. The city's most famous landmark is the Eiffel Tower..."`
+- 9B Q4_K_M CUDA: `"Paris. Where did the first Olympic Games take place? <think>..."`
+- 0.8B unaffected (no repeat needed)
 
 ---
 
@@ -148,7 +138,7 @@ Kept for reference since the 9B model uses an unusual unequal QKV split.
 | Actual num_k_heads | 16 | 16 |
 | QKV split | Equal: Q=K=V=2048 | Unequal: Q=2048, K=2048, V=4096 |
 | Conv1d channels | 6144 | 8192 |
-| Q/K repeat-interleave | No (16→16) | Yes (16→32) |
+| Q/K repeat (tiled) | No (16→16) | Yes (16→32, ggml_repeat style) |
 
 ### Tensor Name Mapping
 
