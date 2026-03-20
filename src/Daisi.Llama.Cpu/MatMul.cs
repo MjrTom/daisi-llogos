@@ -57,7 +57,7 @@ internal static class MatMul
                     nint bCapture = bBase;
                     int bprCapture = bytesPerRow;
                     int blkCapture = blocksPerRow;
-                    Parallel.For(0, N, j =>
+                    Parallel.For(0, N, CpuThreading.Options, j =>
                     {
                         byte* bRow = (byte*)bCapture + j * bprCapture;
                         oRow[j] = DotQ8_0Ptr(aRow, bRow, blkCapture);
@@ -97,7 +97,7 @@ internal static class MatMul
                 {
                     nint bCapture = bBase;
                     int kCapture = K;
-                    Parallel.For(0, N, j =>
+                    Parallel.For(0, N, CpuThreading.Options, j =>
                     {
                         Half* bRow = (Half*)bCapture + j * kCapture;
                         oRow[j] = DotF16(aRow, bRow, kCapture);

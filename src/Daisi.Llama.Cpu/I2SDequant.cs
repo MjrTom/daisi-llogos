@@ -78,7 +78,7 @@ internal static class I2SDequant
                     long bprCapture = packedBytesPerRow;
                     float scaleCapture = scale;
                     int kCapture = K;
-                    Parallel.For(0, N, j =>
+                    Parallel.For(0, N, CpuThreading.Options, j =>
                     {
                         byte* bRow = (byte*)bCapture + j * bprCapture;
                         oRow[j] = DotI2S(aRow, bRow, kCapture, scaleCapture);
