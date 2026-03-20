@@ -40,7 +40,8 @@ public enum GgmlType : uint
     // 31-33 reserved
     TQ1_0 = 34,
     TQ2_0 = 35,
-    // 36-38 reserved
+    I2_S = 36, // BitNet ternary: 2-bit packed, per-tensor scale, 128-element interleaved groups
+    // 37-38 reserved
     MXFP4 = 39,
     NVFP4 = 40,
 }
@@ -86,6 +87,7 @@ public static class GgmlTypeInfo
         GgmlType.BF16 => 1,
         GgmlType.TQ1_0 => 256,
         GgmlType.TQ2_0 => 256,
+        GgmlType.I2_S => 1,
         GgmlType.MXFP4 => 256,
         GgmlType.NVFP4 => 64,
         _ => throw new NotSupportedException($"Unknown GGML type: {type}")
@@ -127,6 +129,7 @@ public static class GgmlTypeInfo
         GgmlType.BF16 => 2,
         GgmlType.TQ1_0 => 54,
         GgmlType.TQ2_0 => 64,
+        GgmlType.I2_S => 1,
         GgmlType.MXFP4 => 132,
         GgmlType.NVFP4 => 36,
         _ => throw new NotSupportedException($"Unknown GGML type: {type}")
@@ -137,6 +140,10 @@ public static class GgmlTypeInfo
     /// </summary>
     public static ulong ByteSize(GgmlType type, ulong elementCount)
     {
+        // I2_S: 2-bit packed (4 elements/byte) + 32-byte trailer with per-tensor scale
+        if (type == GgmlType.I2_S)
+            return elementCount / 4 + 32;
+
         var blockSize = (ulong)BlockSize(type);
         var typeSize = (ulong)TypeSize(type);
         var blockCount = (elementCount + blockSize - 1) / blockSize;

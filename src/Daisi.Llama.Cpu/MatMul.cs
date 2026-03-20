@@ -75,6 +75,137 @@ internal static class MatMul
         }
     }
 
+    /// <summary>
+    /// FP32 × FP16 matrix multiply. b is [N×K] stored as Half.
+    /// Used for tied embeddings (F16 token_embd as output weight).
+    /// AVX2+F16C: vcvtph2ps converts 8 half→8 float, then FMA accumulate.
+    /// </summary>
+    public static unsafe void MultiplyF16(Span<float> output, ReadOnlySpan<float> a, ReadOnlySpan<Half> b, int M, int K, int N)
+    {
+        fixed (float* aPtr = a)
+        fixed (Half* bPtr = b)
+        fixed (float* oPtr = output)
+        {
+            nint bBase = (nint)bPtr;
+
+            for (int i = 0; i < M; i++)
+            {
+                float* aRow = aPtr + i * K;
+                float* oRow = oPtr + i * N;
+
+                if (N >= ParallelThreshold)
+                {
+                    nint bCapture = bBase;
+                    int kCapture = K;
+                    Parallel.For(0, N, j =>
+                    {
+                        Half* bRow = (Half*)bCapture + j * kCapture;
+                        oRow[j] = DotF16(aRow, bRow, kCapture);
+                    });
+                }
+                else
+                {
+                    for (int j = 0; j < N; j++)
+                    {
+                        Half* bRow = bPtr + j * K;
+                        oRow[j] = DotF16(aRow, bRow, K);
+                    }
+                }
+            }
+        }
+    }
+
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    private static unsafe float DotF16(float* aVec, Half* bHalf, int K)
+    {
+        if (Fma.IsSupported)
+            return DotF16Fma(aVec, bHalf, K);
+        return DotF16Scalar(aVec, bHalf, K);
+    }
+
+    /// <summary>
+    /// FMA-accelerated FP16 dot product. Uses bit manipulation to convert FP16→FP32
+    /// in integer domain (avoiding managed Half conversion overhead), then FMA accumulate.
+    /// </summary>
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    private static unsafe float DotF16Fma(float* aVec, Half* bHalf, int K)
+    {
+        var acc0 = Vector256<float>.Zero;
+        var acc1 = Vector256<float>.Zero;
+        ushort* bPtr = (ushort*)bHalf;
+        int k = 0;
+
+        // Process 16 elements per iteration (2 × 8-wide FMA)
+        for (; k + 16 <= K; k += 16)
+        {
+            var f0 = ConvertHalf8ToFloat(bPtr + k);
+            var f1 = ConvertHalf8ToFloat(bPtr + k + 8);
+            var a0 = Avx.LoadVector256(aVec + k);
+            var a1 = Avx.LoadVector256(aVec + k + 8);
+
+            acc0 = Fma.MultiplyAdd(a0, f0, acc0);
+            acc1 = Fma.MultiplyAdd(a1, f1, acc1);
+        }
+
+        for (; k + 8 <= K; k += 8)
+        {
+            var f = ConvertHalf8ToFloat(bPtr + k);
+            var a = Avx.LoadVector256(aVec + k);
+            acc0 = Fma.MultiplyAdd(a, f, acc0);
+        }
+
+        float sum = Vector256.Sum(acc0 + acc1);
+
+        for (; k < K; k++)
+            sum += aVec[k] * (float)bHalf[k];
+
+        return sum;
+    }
+
+    /// <summary>
+    /// Convert 8 FP16 values to 8 FP32 using AVX2 integer bit manipulation.
+    /// FP16: 1 sign + 5 exp + 10 mantissa → FP32: 1 sign + 8 exp + 23 mantissa
+    /// Handles normal values only (denorms treated as zero, which is fine for model weights).
+    /// </summary>
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    private static unsafe Vector256<float> ConvertHalf8ToFloat(ushort* src)
+    {
+        // Load 8 × uint16, zero-extend to 8 × uint32
+        var h = Vector128.Create(
+            src[0], src[1], src[2], src[3],
+            src[4], src[5], src[6], src[7]);
+        var w = Avx2.ConvertToVector256Int32(h.AsInt16()).AsUInt32();
+
+        // Extract sign, exponent, mantissa
+        var sign = Avx2.And(w, Vector256.Create(0x8000u));
+        var exp = Avx2.And(w, Vector256.Create(0x7C00u));
+        var man = Avx2.And(w, Vector256.Create(0x03FFu));
+
+        // Shift to FP32 positions: sign << 16, exp << 13, man << 13
+        // But exp needs bias adjustment: FP16 bias=15, FP32 bias=127, diff=112
+        // New exp = (old_exp << 13) + (112 << 23)
+        var signF = Avx2.ShiftLeftLogical(sign, 16);
+        var expF = Avx2.ShiftLeftLogical(exp, 13);
+        var manF = Avx2.ShiftLeftLogical(man, 13);
+
+        // Add exp bias (112 << 23 = 0x38000000) only for non-zero exponents
+        var expBias = Vector256.Create(0x38000000u);
+        var isZeroExp = Avx2.CompareEqual(exp, Vector256<uint>.Zero);
+        var biasedExp = Avx2.Add(expF, Avx2.AndNot(isZeroExp, expBias));
+
+        var result = Avx2.Or(Avx2.Or(signF, biasedExp), manF);
+        return result.AsSingle();
+    }
+
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    private static unsafe float DotF16Scalar(float* aVec, Half* bHalf, int K)
+    {
+        float sum = 0;
+        for (int k = 0; k < K; k++)
+            sum += aVec[k] * (float)bHalf[k];
+        return sum;
+    }
+
     // ── FP32 Scalar ──────────────────────────────────────────────────────────
 
     private static void MultiplyScalar(Span<float> output, ReadOnlySpan<float> a, ReadOnlySpan<float> b, int M, int K, int N)

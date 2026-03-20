@@ -39,6 +39,22 @@ public sealed class CpuBackend : IComputeBackend
             var bRaw = ((CpuTensor)b).RawData;
             Cpu.MatMul.MultiplyQ8_0(o, aSpan, bRaw, M, K, N);
         }
+        else if (b.Type == GgmlType.TQ1_0)
+        {
+            var bRaw = ((CpuTensor)b).RawData;
+            Cpu.TernaryMatMul.MultiplyTQ1_0(o, aSpan, bRaw, M, K, N);
+        }
+        else if (b.Type == GgmlType.I2_S)
+        {
+            var bRaw = ((CpuTensor)b).RawData;
+            Cpu.I2SDequant.Multiply(o, aSpan, bRaw, M, K, N);
+        }
+        else if (b.Type == GgmlType.F16)
+        {
+            var bRaw = ((CpuTensor)b).RawData;
+            var bHalf = MemoryMarshal.Cast<byte, Half>(bRaw);
+            Cpu.MatMul.MultiplyF16(o, aSpan, bHalf, M, K, N);
+        }
         else
         {
             throw new NotSupportedException($"MatMul not implemented for weight type {b.Type}.");
