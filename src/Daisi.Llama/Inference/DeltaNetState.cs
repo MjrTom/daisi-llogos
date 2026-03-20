@@ -40,14 +40,17 @@ public sealed class DeltaNetState : IDisposable
         _states = new ITensor[_layerIndices.Length];
         _convBuffers = new ITensor[_layerIndices.Length];
 
-        int stateSize = _groupCount * _headDim * _headDim;
-        int convBufSize = (_convKernel - 1) * _qkvDim;
-
-        for (int i = 0; i < _layerIndices.Length; i++)
+        if (_layerIndices.Length > 0)
         {
-            int layer = _layerIndices[i];
-            _states[i] = backend.CreateTensor($"delta_state_{layer}", GgmlType.F32, [stateSize]);
-            _convBuffers[i] = backend.CreateTensor($"delta_conv_{layer}", GgmlType.F32, [convBufSize]);
+            int stateSize = _groupCount * _headDim * _headDim;
+            int convBufSize = (_convKernel - 1) * _qkvDim;
+
+            for (int i = 0; i < _layerIndices.Length; i++)
+            {
+                int layer = _layerIndices[i];
+                _states[i] = backend.CreateTensor($"delta_state_{layer}", GgmlType.F32, [stateSize]);
+                _convBuffers[i] = backend.CreateTensor($"delta_conv_{layer}", GgmlType.F32, [convBufSize]);
+            }
         }
     }
 

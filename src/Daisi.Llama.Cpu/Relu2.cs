@@ -14,4 +14,13 @@ internal static class Relu2
             output[i] = x * x;
         }
     }
+
+    public static void ApplyInPlace(Span<float> data)
+    {
+        for (int i = 0; i < data.Length; i++)
+        {
+            float x = MathF.Max(0, data[i]);
+            data[i] = x * x;
+        }
+    }
 }

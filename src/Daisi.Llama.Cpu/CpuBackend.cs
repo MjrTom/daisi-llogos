@@ -520,6 +520,17 @@ public sealed class CpuBackend : IComputeBackend
         CreateTensor(name, type, dimensions); // CPU tensors are already in host memory
 
     /// <inheritdoc />
+    public void FillTensor(ITensor tensor, float value) =>
+        tensor.AsFloatSpan().Fill(value);
+
+    /// <inheritdoc />
+    public void SquaredReLU(ITensor data)
+    {
+        var span = data.AsFloatSpan();
+        Cpu.Relu2.ApplyInPlace(span);
+    }
+
+    /// <inheritdoc />
     public void Dispose()
     {
         // No unmanaged resources to clean up.

@@ -62,8 +62,7 @@ public sealed class BitNetForwardPass : IDisposable
         // Dummy gate: fill with 88.0 so sigmoid(88)≈1.0 exactly
         // This makes GatedAttention behave as standard (ungated) attention
         _qGate = CreateF32("scratch_q_gate", qDim);
-        var gateSpan = _qGate.AsFloatSpan();
-        gateSpan.Fill(88.0f);
+        backend.FillTensor(_qGate, 88.0f);
 
         _gate = CreateF32("scratch_ffn_gate", config.IntermediateDim);
         _up = CreateF32("scratch_ffn_up", config.IntermediateDim);
@@ -172,18 +171,7 @@ public sealed class BitNetForwardPass : IDisposable
         ProjectLinear(_hidden, _ffnNormOut, w.FfnDown);
     }
 
-    /// <summary>
-    /// In-place Squared ReLU: output[i] = max(0, input[i])^2
-    /// </summary>
-    private void SquaredReLU(ITensor data)
-    {
-        var span = data.AsFloatSpan();
-        for (int i = 0; i < span.Length; i++)
-        {
-            float x = MathF.Max(0, span[i]);
-            span[i] = x * x;
-        }
-    }
+    private void SquaredReLU(ITensor data) => _backend.SquaredReLU(data);
 
     private void ProjectLinear(ITensor output, ITensor input, ITensor weight)
     {

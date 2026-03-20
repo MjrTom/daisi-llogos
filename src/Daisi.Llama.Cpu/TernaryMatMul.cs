@@ -47,7 +47,7 @@ internal static class TernaryMatMul
                     nint bCapture = bBase;
                     int bprCapture = bytesPerRow;
                     int blkCapture = blocksPerRow;
-                    Parallel.For(0, N, j =>
+                    Parallel.For(0, N, CpuThreading.Options, j =>
                     {
                         byte* bRow = (byte*)bCapture + j * bprCapture;
                         oRow[j] = DotTQ1_0(aRow, bRow, blkCapture);

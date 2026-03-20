@@ -226,6 +226,23 @@ void op_causal_conv1d() {
     data0[c] = data3[c];
 }
 
+// ── Opcode 9: Fill tensor ────────────────────────────────────────────────────
+// data0 = tensor (in-place), param0 = n, param1 = float value bits
+void op_fill_tensor() {
+    uint idx = gl_GlobalInvocationID.x;
+    if (idx >= param0) return;
+    data0[idx] = uintBitsToFloat(param1);
+}
+
+// ── Opcode 10: Squared ReLU in-place ────────────────────────────────────────
+// data0 = tensor (in-place), param0 = n
+void op_squared_relu() {
+    uint idx = gl_GlobalInvocationID.x;
+    if (idx >= param0) return;
+    float x = max(0.0, data0[idx]);
+    data0[idx] = x * x;
+}
+
 void main() {
     switch (opcode) {
         case 0: op_silu_inplace(); break;
@@ -237,5 +254,7 @@ void main() {
         case 6: op_kv_cache_write(); break;
         case 7: op_compute_decay_beta(); break;
         case 8: op_causal_conv1d(); break;
+        case 9: op_fill_tensor(); break;
+        case 10: op_squared_relu(); break;
     }
 }

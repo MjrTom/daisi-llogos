@@ -278,11 +278,20 @@ public sealed class CudaBackend : IComputeBackend
             kArgs[3] = (nint)(&tokenId);
             _stream.Launch(func, grid, 1, 1, (uint)BlockSize, 1, 1, 0, kArgs);
         }
+        else if (table.Type == GgmlType.F16)
+        {
+            var func = _elementwiseModule.GetFunction("embedding_lookup_f16");
+            nint* kArgs = stackalloc nint[4];
+            kArgs[0] = (nint)(&outPtr);
+            kArgs[1] = (nint)(&tablePtr);
+            kArgs[2] = (nint)(&hiddenDim);
+            kArgs[3] = (nint)(&tokenId);
+            _stream.Launch(func, grid, 1, 1, (uint)BlockSize, 1, 1, 0, kArgs);
+        }
         else
         {
             throw new NotSupportedException($"EmbeddingLookup not implemented for type {table.Type}.");
         }
-
 
     }
 
@@ -602,6 +611,37 @@ public sealed class CudaBackend : IComputeBackend
     /// <inheritdoc />
     public ITensor CreateHostTensor(string name, GgmlType type, ReadOnlySpan<long> dimensions) =>
         new CudaTensor(name, type, dimensions, pinned: true);
+
+    /// <inheritdoc />
+    public unsafe void FillTensor(ITensor tensor, float value)
+    {
+        var t = (CudaTensor)tensor;
+        ulong ptr = t.DevicePtr;
+        int n = (int)tensor.ElementCount;
+
+        var func = _elementwiseModule.GetFunction("fill_tensor");
+        uint grid = (uint)((n + BlockSize - 1) / BlockSize);
+        nint* kArgs = stackalloc nint[3];
+        kArgs[0] = (nint)(&ptr);
+        kArgs[1] = (nint)(&n);
+        kArgs[2] = (nint)(&value);
+        _stream.Launch(func, grid, 1, 1, (uint)BlockSize, 1, 1, 0, kArgs);
+    }
+
+    /// <inheritdoc />
+    public unsafe void SquaredReLU(ITensor data)
+    {
+        var dT = (CudaTensor)data;
+        ulong dPtr = dT.DevicePtr;
+        int n = (int)data.ElementCount;
+
+        var func = _elementwiseModule.GetFunction("squared_relu");
+        uint grid = (uint)((n + BlockSize - 1) / BlockSize);
+        nint* kArgs = stackalloc nint[2];
+        kArgs[0] = (nint)(&dPtr);
+        kArgs[1] = (nint)(&n);
+        _stream.Launch(func, grid, 1, 1, (uint)BlockSize, 1, 1, 0, kArgs);
+    }
 
     /// <inheritdoc />
     public void Dispose()

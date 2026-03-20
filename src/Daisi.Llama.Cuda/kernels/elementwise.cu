@@ -222,4 +222,56 @@ __global__ void embedding_lookup_q8_0(float* output, const unsigned char* table,
     output[idx] = scale * (float)quant;
 }
 
+// ── F16 embedding lookup ──────────────────────────────────────────────────────
+// Each element is 2 bytes (FP16). Dequantize one row to FP32.
+
+__global__ void embedding_lookup_f16(float* output, const unsigned char* table,
+                                      int hidden_dim, int token_id)
+{
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= hidden_dim) return;
+
+    int bytes_per_row = hidden_dim * 2;
+    const unsigned char* row = table + token_id * bytes_per_row;
+    int byte_off = idx * 2;
+
+    unsigned short bits = ((unsigned short)row[byte_off + 1] << 8) | row[byte_off];
+    // Convert FP16 to FP32
+    int sign = (bits >> 15) & 1;
+    int exp = (bits >> 10) & 0x1f;
+    int mant = bits & 0x3ff;
+    float val;
+    if (exp == 0)
+        val = (sign ? -1.0f : 1.0f) * (mant / 1024.0f) * (1.0f / 16384.0f);
+    else if (exp == 31)
+        val = 0.0f;
+    else
+        val = (sign ? -1.0f : 1.0f) * (1.0f + mant / 1024.0f) * powf(2.0f, (float)(exp - 15));
+
+    output[idx] = val;
+}
+
+// ── Fill tensor ───────────────────────────────────────────────────────────────
+// output[i] = value
+
+__global__ void fill_tensor(float* output, int n, float value)
+{
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx < n)
+        output[idx] = value;
+}
+
+// ── Squared ReLU (in-place) ──────────────────────────────────────────────────
+// data[i] = max(0, data[i])^2
+
+__global__ void squared_relu(float* data, int n)
+{
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx < n)
+    {
+        float x = fmaxf(0.0f, data[idx]);
+        data[idx] = x * x;
+    }
+}
+
 } // extern "C"

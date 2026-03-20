@@ -9,7 +9,7 @@ layout(local_size_x = 256) in;
 layout(push_constant) uniform PushConstants {
     uint hiddenDim;
     int tokenId;
-    uint tableType; // 0=F32, 1=Q8_0
+    uint tableType; // 0=F32, 1=Q8_0, 2=F16
 };
 
 layout(set = 0, binding = 0) buffer OutputBuf { float output_data[]; };
@@ -27,7 +27,7 @@ void main() {
                    (uint(table_data[byteOff+2]) << 16) |
                    (uint(table_data[byteOff+3]) << 24);
         output_data[idx] = uintBitsToFloat(bits);
-    } else {
+    } else if (tableType == 1) {
         // Q8_0: blocks of 34 bytes (2-byte f16 scale + 32 int8 weights)
         uint blocksPerRow = hiddenDim / 32;
         uint blockIdx = idx / 32;
@@ -37,5 +37,10 @@ void main() {
         float scale = unpackHalf2x16(scaleBits).x;
         int8_t q = int8_t(table_data[blockByteOff + 2 + blockOffset]);
         output_data[idx] = scale * float(q);
+    } else {
+        // F16: each element is 2 bytes
+        uint byteOff = (uint(tokenId) * hiddenDim + idx) * 2;
+        uint bits = uint(table_data[byteOff]) | (uint(table_data[byteOff + 1]) << 8);
+        output_data[idx] = unpackHalf2x16(bits).x;
     }
 }

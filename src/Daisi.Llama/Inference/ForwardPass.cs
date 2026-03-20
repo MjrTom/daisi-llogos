@@ -23,9 +23,9 @@ public sealed class ForwardPass : IDisposable
     private readonly float[] _logitsBuffer;
 
     // Standard attention scratch
-    private readonly ITensor _qFull;    // [numHeads × keyLength × 2] (attn + gate interleaved)
-    private readonly ITensor _qAttn;    // [numHeads × keyLength] (de-interleaved)
-    private readonly ITensor _qGate;    // [numHeads × keyLength] (de-interleaved)
+    private readonly ITensor? _qFull;   // [numHeads × keyLength × 2] (attn + gate interleaved, gated Q only)
+    private readonly ITensor _qAttn;    // [numHeads × keyLength]
+    private readonly ITensor _qGate;    // [numHeads × keyLength] (dummy gate for non-gated models)
     private readonly ITensor _kProj;    // [numKvHeads × keyLength]
     private readonly ITensor _vProj;    // [numKvHeads × valueLength]
     private readonly ITensor _attnOut;  // [numHeads × valueLength]
@@ -62,10 +62,14 @@ public sealed class ForwardPass : IDisposable
         _logitsBuffer = new float[config.VocabSize];
 
         // Standard attention scratch
-        int qFullDim = config.NumHeads * config.KeyLength * 2;
-        _qFull = CreateF32("scratch_q_full", qFullDim);
+        // Gated Q (Qwen) needs a 2× buffer for interleaved Q+gate; standard models project directly to _qAttn
+        bool hasGatedQ = config.HasDeltaNet; // Qwen hybrid uses gated Q in its attention layers
+        if (hasGatedQ)
+            _qFull = CreateF32("scratch_q_full", config.NumHeads * config.KeyLength * 2);
         _qAttn = CreateF32("scratch_q_attn", config.NumHeads * config.KeyLength);
         _qGate = CreateF32("scratch_q_gate", config.NumHeads * config.KeyLength);
+        if (!hasGatedQ)
+            backend.FillTensor(_qGate, 88.0f); // sigmoid(88)≈1.0 → ungated attention
         _kProj = CreateF32("scratch_k", config.NumKvHeads * config.KeyLength);
         _vProj = CreateF32("scratch_v", config.NumKvHeads * config.ValueLength);
         _attnOut = CreateF32("scratch_attn_out", config.NumHeads * config.ValueLength);
@@ -163,17 +167,26 @@ public sealed class ForwardPass : IDisposable
         int ropeDim = _config.RopeDimCount;
         float scale = 1.0f / MathF.Sqrt(keyLen);
 
-        // Q/K/V projections
-        ProjectLinear(_qFull, _normOut, w.AttnQ);
+        // K/V projections (same for gated and non-gated)
         ProjectLinear(_kProj, _normOut, w.AttnK);
         ProjectLinear(_vProj, _normOut, w.AttnV);
 
-        // De-interleave Q: [q_h0, gate_h0, q_h1, gate_h1, ...] → separate buffers
-        _backend.DeInterleaveQ(_qAttn, _qGate, _qFull, numHeads, keyLen);
+        if (w.HasGatedQ)
+        {
+            // Qwen-style: Q projects to 2× dim (interleaved Q_attn + Q_gate)
+            ProjectLinear(_qFull!, _normOut, w.AttnQ);
+            _backend.DeInterleaveQ(_qAttn, _qGate, _qFull!, numHeads, keyLen);
 
-        // Per-head Q norm and K norm
-        _backend.PerHeadRmsNorm(_qAttn, w.AttnQNorm, numHeads, keyLen, _config.NormEps);
-        _backend.PerHeadRmsNorm(_kProj, w.AttnKNorm, numKvHeads, keyLen, _config.NormEps);
+            // Per-head Q/K norms
+            _backend.PerHeadRmsNorm(_qAttn, w.AttnQNorm!, numHeads, keyLen, _config.NormEps);
+            _backend.PerHeadRmsNorm(_kProj, w.AttnKNorm!, numKvHeads, keyLen, _config.NormEps);
+        }
+        else
+        {
+            // Standard LLaMA-style: Q projects directly to numHeads × keyLength
+            ProjectLinear(_qAttn, _normOut, w.AttnQ);
+            // _qGate already filled with 88.0 (sigmoid=1.0) in constructor
+        }
 
         // RoPE (partial — only first ropeDim dims)
         _backend.RoPE(_qAttn, _kProj, keyLen, ropeDim, position, _config.RopeTheta);
@@ -184,7 +197,7 @@ public sealed class ForwardPass : IDisposable
         // seqLen is read AFTER write so it includes the current token
         int seqLen = _kvCache.Length;
 
-        // Compute attention with gating
+        // Compute attention (gating is a no-op when gate=88.0)
         var kCacheTensor = _kvCache.GetKCacheTensor(layer);
         var vCacheTensor = _kvCache.GetVCacheTensor(layer);
         _backend.GatedAttention(_attnOut, _qAttn, _qGate, kCacheTensor, vCacheTensor,
@@ -262,7 +275,7 @@ public sealed class ForwardPass : IDisposable
         _residual.Dispose();
         _normOut.Dispose();
         _logits.Dispose();
-        _qFull.Dispose();
+        _qFull?.Dispose();
         _qAttn.Dispose();
         _qGate.Dispose();
         _kProj.Dispose();

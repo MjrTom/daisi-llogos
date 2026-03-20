@@ -177,4 +177,15 @@ public interface IComputeBackend : IDisposable
     /// GPU kernels can access this tensor via mapped device pointers, but at reduced bandwidth.
     /// </summary>
     ITensor CreateHostTensor(string name, GgmlType type, ReadOnlySpan<long> dimensions);
+
+    /// <summary>
+    /// Fill all elements of an F32 tensor with a constant value.
+    /// </summary>
+    void FillTensor(ITensor tensor, float value);
+
+    /// <summary>
+    /// In-place Squared ReLU: data[i] = max(0, data[i])².
+    /// Used by BitNet b1.58 instead of SiLU.
+    /// </summary>
+    void SquaredReLU(ITensor data);
 }

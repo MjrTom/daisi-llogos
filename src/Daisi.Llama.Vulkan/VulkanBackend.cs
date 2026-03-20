@@ -184,7 +184,12 @@ public sealed class VulkanBackend : IComputeBackend
         var buffers = new VulkanBuffer[] { outT.DeviceBuffer, tableT.DeviceBuffer };
         var ds = _embeddingPipeline.AllocateDescriptorSet(buffers);
 
-        uint tableType = table.Type == GgmlType.Q8_0 ? 1u : 0u;
+        uint tableType = table.Type switch
+        {
+            GgmlType.Q8_0 => 1u,
+            GgmlType.F16 => 2u,
+            _ => 0u, // F32
+        };
         uint* pc = stackalloc uint[3];
         pc[0] = (uint)hiddenDim;
         *(int*)&pc[1] = tokenId;
@@ -375,6 +380,26 @@ public sealed class VulkanBackend : IComputeBackend
 
     public ITensor CreateHostTensor(string name, GgmlType type, ReadOnlySpan<long> dimensions) =>
         CreateTensor(name, type, dimensions); // Vulkan handles staging internally
+
+    public unsafe void FillTensor(ITensor tensor, float value)
+    {
+        uint n = (uint)tensor.ElementCount;
+        uint valueBits;
+        *(float*)&valueBits = value;
+        uint grid = (n + WorkGroupSize - 1) / WorkGroupSize;
+        DispatchComposite(9, n, valueBits, 0, 0, 0, 0, 0,
+            ((VulkanTensor)tensor).DeviceBuffer,
+            gridOverride: grid);
+    }
+
+    public unsafe void SquaredReLU(ITensor data)
+    {
+        uint n = (uint)data.ElementCount;
+        uint grid = (n + WorkGroupSize - 1) / WorkGroupSize;
+        DispatchComposite(10, n, 0, 0, 0, 0, 0, 0,
+            ((VulkanTensor)data).DeviceBuffer,
+            gridOverride: grid);
+    }
 
     // ── Private Helpers ──────────────────────────────────────────────────────
 
