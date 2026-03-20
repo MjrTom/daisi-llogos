@@ -233,8 +233,9 @@ public class DequantizeQ4_KTests
         block[4 + 4] = 5;  // mins[0] & 63 = 5
         // Rest zero
 
-        // Nibbles for sub-block 0: all 7
-        for (int i = 0; i < 16; i++)
+        // Nibbles for chunk 0 (qs[0..31]): all 7
+        // lo nibble → elements 0..31 (sub-block 0), hi nibble → elements 32..63 (sub-block 1)
+        for (int i = 0; i < 32; i++)
             block[16 + i] = 0x77; // low=7, high=7
 
         var output = new float[256];

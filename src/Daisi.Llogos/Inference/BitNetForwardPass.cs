@@ -14,7 +14,7 @@ namespace Daisi.Llogos.Inference;
 /// - No per-head Q/K norms
 /// - Tied embeddings (output weight = token embedding)
 /// </summary>
-public sealed class BitNetForwardPass : IDisposable
+public sealed class BitNetForwardPass : IForwardPass
 {
     private readonly IComputeBackend _backend;
     private readonly ModelConfig _config;
@@ -70,6 +70,12 @@ public sealed class BitNetForwardPass : IDisposable
     }
 
     public IKvCache KvCache => _kvCache;
+
+    /// <inheritdoc />
+    public void ResetState()
+    {
+        _kvCache.Reset();
+    }
 
     public ReadOnlySpan<float> Forward(int tokenId, int position)
     {

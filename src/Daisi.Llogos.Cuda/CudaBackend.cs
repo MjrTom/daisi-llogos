@@ -84,9 +84,88 @@ public sealed class CudaBackend : IComputeBackend
             kArgs[5] = (nint)(&nVal);
             _stream.Launch(func, gridX, 1, 1, (uint)matmulBlockSize, 1, 1, sharedMem, kArgs);
         }
+        else if (b.Type == GgmlType.I2_S)
+        {
+            var func = _matmulModule.GetFunction("dequant_matmul_i2s");
+            int nVal = N;
+            nint* kArgs = stackalloc nint[6];
+            kArgs[0] = (nint)(&outPtr);
+            kArgs[1] = (nint)(&aPtr);
+            kArgs[2] = (nint)(&bPtr);
+            kArgs[3] = (nint)(&M);
+            kArgs[4] = (nint)(&K);
+            kArgs[5] = (nint)(&nVal);
+            _stream.Launch(func, gridX, 1, 1, (uint)matmulBlockSize, 1, 1, sharedMem, kArgs);
+        }
+        else if (b.Type == GgmlType.TQ1_0)
+        {
+            var func = _matmulModule.GetFunction("dequant_matmul_tq1_0");
+            int nVal = N;
+            nint* kArgs = stackalloc nint[6];
+            kArgs[0] = (nint)(&outPtr);
+            kArgs[1] = (nint)(&aPtr);
+            kArgs[2] = (nint)(&bPtr);
+            kArgs[3] = (nint)(&M);
+            kArgs[4] = (nint)(&K);
+            kArgs[5] = (nint)(&nVal);
+            _stream.Launch(func, gridX, 1, 1, (uint)matmulBlockSize, 1, 1, sharedMem, kArgs);
+        }
+        else if (b.Type == GgmlType.F16)
+        {
+            var func = _matmulModule.GetFunction("dequant_matmul_f16");
+            int nVal = N;
+            nint* kArgs = stackalloc nint[6];
+            kArgs[0] = (nint)(&outPtr);
+            kArgs[1] = (nint)(&aPtr);
+            kArgs[2] = (nint)(&bPtr);
+            kArgs[3] = (nint)(&M);
+            kArgs[4] = (nint)(&K);
+            kArgs[5] = (nint)(&nVal);
+            _stream.Launch(func, gridX, 1, 1, (uint)matmulBlockSize, 1, 1, sharedMem, kArgs);
+        }
+        else if (b.Type == GgmlType.Q4_K)
+        {
+            var func = _matmulModule.GetFunction("dequant_matmul_q4_k");
+            int nVal = N;
+            nint* kArgs = stackalloc nint[6];
+            kArgs[0] = (nint)(&outPtr);
+            kArgs[1] = (nint)(&aPtr);
+            kArgs[2] = (nint)(&bPtr);
+            kArgs[3] = (nint)(&M);
+            kArgs[4] = (nint)(&K);
+            kArgs[5] = (nint)(&nVal);
+            _stream.Launch(func, gridX, 1, 1, (uint)matmulBlockSize, 1, 1, sharedMem, kArgs);
+        }
+        else if (b.Type == GgmlType.Q5_K)
+        {
+            var func = _matmulModule.GetFunction("dequant_matmul_q5_k");
+            int nVal = N;
+            nint* kArgs = stackalloc nint[6];
+            kArgs[0] = (nint)(&outPtr);
+            kArgs[1] = (nint)(&aPtr);
+            kArgs[2] = (nint)(&bPtr);
+            kArgs[3] = (nint)(&M);
+            kArgs[4] = (nint)(&K);
+            kArgs[5] = (nint)(&nVal);
+            _stream.Launch(func, gridX, 1, 1, (uint)matmulBlockSize, 1, 1, sharedMem, kArgs);
+        }
+        else if (b.Type == GgmlType.Q6_K)
+        {
+            var func = _matmulModule.GetFunction("dequant_matmul_q6_k");
+            int nVal = N;
+            nint* kArgs = stackalloc nint[6];
+            kArgs[0] = (nint)(&outPtr);
+            kArgs[1] = (nint)(&aPtr);
+            kArgs[2] = (nint)(&bPtr);
+            kArgs[3] = (nint)(&M);
+            kArgs[4] = (nint)(&K);
+            kArgs[5] = (nint)(&nVal);
+            _stream.Launch(func, gridX, 1, 1, (uint)matmulBlockSize, 1, 1, sharedMem, kArgs);
+        }
         else
         {
-            throw new NotSupportedException($"MatMul not implemented for weight type {b.Type}.");
+            // Generic fallback: download data, dequantize on CPU, compute on CPU, upload result
+            GenericCpuFallbackMatMul(outT, aT, bT, M, K, N);
         }
 
 
@@ -288,9 +367,19 @@ public sealed class CudaBackend : IComputeBackend
             kArgs[3] = (nint)(&tokenId);
             _stream.Launch(func, grid, 1, 1, (uint)BlockSize, 1, 1, 0, kArgs);
         }
+        else if (table.Type == GgmlType.Q4_K)
+        {
+            var func = _elementwiseModule.GetFunction("embedding_lookup_q4_k");
+            nint* kArgs = stackalloc nint[4];
+            kArgs[0] = (nint)(&outPtr);
+            kArgs[1] = (nint)(&tablePtr);
+            kArgs[2] = (nint)(&hiddenDim);
+            kArgs[3] = (nint)(&tokenId);
+            _stream.Launch(func, grid, 1, 1, (uint)BlockSize, 1, 1, 0, kArgs);
+        }
         else
         {
-            throw new NotSupportedException($"EmbeddingLookup not implemented for type {table.Type}.");
+            GenericCpuFallbackEmbeddingLookup(outT, tableT, hiddenDim, tokenId);
         }
 
     }
@@ -641,6 +730,49 @@ public sealed class CudaBackend : IComputeBackend
         kArgs[0] = (nint)(&dPtr);
         kArgs[1] = (nint)(&n);
         _stream.Launch(func, grid, 1, 1, (uint)BlockSize, 1, 1, 0, kArgs);
+    }
+
+    // ── Generic CPU Fallback ──────────────────────────────────────────────────
+
+    private unsafe void GenericCpuFallbackMatMul(CudaTensor outT, CudaTensor aT, CudaTensor bT, int M, int K, int N)
+    {
+        _stream.Synchronize();
+
+        // Download A (F32) and B (quantized) to CPU
+        var aData = new float[M * K];
+        aT.DownloadTo(aData);
+
+        var bBytes = new byte[bT.ByteSize];
+        bT.Memory.CopyToHost(bBytes);
+
+        // Dequant+matmul on CPU
+        using var cpuBackend = new Cpu.CpuBackend();
+        var aBytes = new byte[aData.Length * 4];
+        Buffer.BlockCopy(aData, 0, aBytes, 0, aBytes.Length);
+        using var cpuA = cpuBackend.LoadTensor("a", GgmlType.F32, [M * K], aBytes);
+        using var cpuB = cpuBackend.LoadTensor("b", bT.Type, bT.Dimensions, bBytes);
+        using var cpuOut = cpuBackend.CreateTensor("out", GgmlType.F32, [M * N]);
+        cpuBackend.MatMul(cpuOut, cpuA, cpuB, M, K, N);
+
+        // Upload result
+        var result = cpuOut.AsFloatSpan();
+        outT.UploadFrom(result);
+    }
+
+    private unsafe void GenericCpuFallbackEmbeddingLookup(CudaTensor outT, CudaTensor tableT, int hiddenDim, int tokenId)
+    {
+        _stream.Synchronize();
+
+        var tableBytes = new byte[tableT.ByteSize];
+        tableT.Memory.CopyToHost(tableBytes);
+
+        using var cpuBackend = new Cpu.CpuBackend();
+        using var cpuTable = cpuBackend.LoadTensor("t", tableT.Type, tableT.Dimensions, tableBytes);
+        using var cpuOut = cpuBackend.CreateTensor("out", GgmlType.F32, [hiddenDim]);
+        cpuBackend.EmbeddingLookup(cpuOut, cpuTable, tokenId);
+
+        var result = cpuOut.AsFloatSpan();
+        outT.UploadFrom(result);
     }
 
     /// <inheritdoc />

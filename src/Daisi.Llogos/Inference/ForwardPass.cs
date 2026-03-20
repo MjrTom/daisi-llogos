@@ -7,7 +7,7 @@ namespace Daisi.Llogos.Inference;
 /// Hybrid transformer forward pass supporting both standard attention and DeltaNet layers.
 /// Uses only IComputeBackend operations — no AsFloatSpan() — so it works on both CPU and GPU.
 /// </summary>
-public sealed class ForwardPass : IDisposable
+public sealed class ForwardPass : IForwardPass
 {
     private readonly IComputeBackend _backend;
     private readonly ModelConfig _config;
@@ -63,7 +63,11 @@ public sealed class ForwardPass : IDisposable
 
         // Standard attention scratch
         // Gated Q (Qwen) needs a 2× buffer for interleaved Q+gate; standard models project directly to _qAttn
-        bool hasGatedQ = config.HasDeltaNet; // Qwen hybrid uses gated Q in its attention layers
+        // Detect from actual weights: if any standard attention layer has Q/K norms, it's gated
+        bool hasGatedQ = false;
+        for (int i = 0; i < config.NumLayers; i++)
+            if (weights.Layers[i] is StandardAttentionWeights saw && saw.HasGatedQ)
+                { hasGatedQ = true; break; }
         if (hasGatedQ)
             _qFull = CreateF32("scratch_q_full", config.NumHeads * config.KeyLength * 2);
         _qAttn = CreateF32("scratch_q_attn", config.NumHeads * config.KeyLength);
@@ -74,19 +78,34 @@ public sealed class ForwardPass : IDisposable
         _vProj = CreateF32("scratch_v", config.NumKvHeads * config.ValueLength);
         _attnOut = CreateF32("scratch_attn_out", config.NumHeads * config.ValueLength);
 
-        // DeltaNet scratch
+        // DeltaNet scratch — derive sizes from actual weight tensors
         if (config.SsmInnerSize > 0)
         {
-            _qkvBuf = CreateF32("scratch_qkv", config.SsmInnerSize * 3);
-            _ssmQ = CreateF32("scratch_ssm_q", config.SsmInnerSize);
-            _ssmK = CreateF32("scratch_ssm_k", config.SsmInnerSize);
-            _ssmV = CreateF32("scratch_ssm_v", config.SsmInnerSize);
-            _ssmAlpha = CreateF32("scratch_ssm_alpha", config.SsmGroupCount);
-            _ssmBeta = CreateF32("scratch_ssm_beta", config.SsmGroupCount);
-            _ssmDecay = CreateF32("scratch_ssm_decay", config.SsmGroupCount);
-            _ssmBetaVal = CreateF32("scratch_ssm_betaval", config.SsmGroupCount);
-            _ssmGate = CreateF32("scratch_ssm_gate", config.SsmInnerSize);
-            _ssmOutput = CreateF32("scratch_ssm_out", config.SsmInnerSize);
+            // Find first DeltaNet layer to get actual tensor dimensions
+            DeltaNetWeights? deltaLayer = null;
+            for (int i = 0; i < config.NumLayers; i++)
+                if (!config.IsStandardAttention(i) && weights.Layers[i] is DeltaNetWeights dw)
+                    { deltaLayer = dw; break; }
+
+            int qkvOutDim = deltaLayer != null ? (int)deltaLayer.AttnQkv.Dimensions[1] : config.SsmInnerSize * 3;
+            int numVHeads = deltaLayer != null ? (int)deltaLayer.SsmAlpha.Dimensions[1] : config.SsmGroupCount;
+            int valueDim = numVHeads * (config.SsmStateSize > 0 ? config.SsmStateSize : config.SsmHeadDim);
+            // Key dim: whatever remains after subtracting valueDim
+            int keyDim = (qkvOutDim - valueDim) / 2;
+            int numKHeads = keyDim > 0 ? keyDim / (valueDim / numVHeads) : numVHeads;
+
+            _qkvBuf = CreateF32("scratch_qkv", qkvOutDim);
+            // Q and K may be smaller than V if num_k_heads < num_v_heads.
+            // After repeat-interleave, Q and K become valueDim-sized.
+            _ssmQ = CreateF32("scratch_ssm_q", valueDim);
+            _ssmK = CreateF32("scratch_ssm_k", valueDim);
+            _ssmV = CreateF32("scratch_ssm_v", valueDim);
+            _ssmAlpha = CreateF32("scratch_ssm_alpha", numVHeads);
+            _ssmBeta = CreateF32("scratch_ssm_beta", numVHeads);
+            _ssmDecay = CreateF32("scratch_ssm_decay", numVHeads);
+            _ssmBetaVal = CreateF32("scratch_ssm_betaval", numVHeads);
+            _ssmGate = CreateF32("scratch_ssm_gate", valueDim);
+            _ssmOutput = CreateF32("scratch_ssm_out", valueDim);
         }
         else
         {
@@ -100,6 +119,13 @@ public sealed class ForwardPass : IDisposable
 
     public IKvCache KvCache => _kvCache;
     public DeltaNetState DeltaState => _deltaState;
+
+    /// <inheritdoc />
+    public void ResetState()
+    {
+        _kvCache.Reset();
+        _deltaState.Reset();
+    }
 
     /// <summary>
     /// Run a forward pass for a single token at the given position.
@@ -173,7 +199,7 @@ public sealed class ForwardPass : IDisposable
 
         if (w.HasGatedQ)
         {
-            // Qwen-style: Q projects to 2× dim (interleaved Q_attn + Q_gate)
+            // Qwen3.5-style: Q projects to 2× dim (interleaved Q_attn + Q_gate)
             ProjectLinear(_qFull!, _normOut, w.AttnQ);
             _backend.DeInterleaveQ(_qAttn, _qGate, _qFull!, numHeads, keyLen);
 
@@ -183,9 +209,16 @@ public sealed class ForwardPass : IDisposable
         }
         else
         {
-            // Standard LLaMA-style: Q projects directly to numHeads × keyLength
+            // Standard Q projection (no gating)
             ProjectLinear(_qAttn, _normOut, w.AttnQ);
             // _qGate already filled with 88.0 (sigmoid=1.0) in constructor
+
+            // Apply per-head Q/K norms if present (Qwen3-style: norms without gating)
+            if (w.AttnQNorm != null)
+            {
+                _backend.PerHeadRmsNorm(_qAttn, w.AttnQNorm, numHeads, keyLen, _config.NormEps);
+                _backend.PerHeadRmsNorm(_kProj, w.AttnKNorm!, numKvHeads, keyLen, _config.NormEps);
+            }
         }
 
         // RoPE (partial — only first ropeDim dims)
@@ -211,50 +244,135 @@ public sealed class ForwardPass : IDisposable
 
     private void ForwardDeltaNet(DeltaNetWeights w, int layer)
     {
-        int innerSize = _config.SsmInnerSize;
-        int groupCount = _config.SsmGroupCount;
-        int headDim = _config.SsmHeadDim;
-        int qkvDim = innerSize * 3;
         int convKernel = _config.SsmConvKernel;
+        int headDim = _config.SsmStateSize > 0 ? _config.SsmStateSize : _config.SsmHeadDim;
 
-        // QKV projection
+        // Derive dimensions from weight tensors
+        int numVHeads = (int)w.SsmAlpha.Dimensions[1]; // num_v_heads (32 for 9B)
+        int valueDim = numVHeads * headDim;             // 32 × 128 = 4096
+        int qkvOutDim = (int)w.AttnQkv.Dimensions[1];  // 8192 for 9B
+        int keyDim = (qkvOutDim - valueDim) / 2;        // (8192-4096)/2 = 2048
+        int numKHeads = keyDim / headDim;                // 2048/128 = 16
+        int repeatFactor = numVHeads / numKHeads;        // 32/16 = 2
+
+        // 1. QKV projection
         ProjectLinear(_qkvBuf, _normOut, w.AttnQkv);
 
-        // Causal conv1d using shift buffer
+        // 2. Causal conv1d on full Q+K+V output
+        int convChannels = (int)(w.SsmConv1d.ElementCount / convKernel);
         var convBuf = _deltaState.GetConvBufferTensor(layer);
-        _backend.CausalConv1d(_qkvBuf, convBuf, w.SsmConv1d, qkvDim, convKernel);
+        _backend.CausalConv1d(_qkvBuf, convBuf, w.SsmConv1d, convChannels, convKernel);
 
-        // SiLU activation on entire conv output (Q+K+V)
+        // 3. SiLU activation
         _backend.SiLUInPlace(_qkvBuf);
 
-        // Split QKV into separate tensors
-        _backend.SplitQKV(_ssmQ, _ssmK, _ssmV, _qkvBuf, innerSize);
+        // 4. Split Q(keyDim) + K(keyDim) + V(valueDim) — possibly unequal
+        if (keyDim == valueDim)
+        {
+            // Equal split (0.8B model: keyDim = valueDim = innerSize)
+            _backend.SplitQKV(_ssmQ, _ssmK, _ssmV, _qkvBuf, keyDim);
+        }
+        else
+        {
+            // Unequal split (9B model: keyDim=2048, valueDim=4096)
+            // Copy Q, K from qkvBuf, then V
+            _backend.CopyTensorBytes(_ssmQ, _qkvBuf, keyDim * sizeof(float));
 
-        // L2-normalize Q and K per head
-        _backend.L2NormGroups(_ssmQ, groupCount, headDim);
-        _backend.L2NormGroups(_ssmK, groupCount, headDim);
+            // K starts at offset keyDim — need a shifted copy
+            // Use the generic SplitQKV but with keyDim as the split size,
+            // then copy V separately from offset 2*keyDim
+            SplitUnequal(_qkvBuf, _ssmQ, _ssmK, _ssmV, keyDim, valueDim);
+        }
 
-        // Compute alpha and beta projections
+        // 5. L2-normalize Q and K (num_k_heads groups)
+        _backend.L2NormGroups(_ssmQ, numKHeads, headDim);
+        _backend.L2NormGroups(_ssmK, numKHeads, headDim);
+
+        // 6. Repeat-interleave Q and K from num_k_heads → num_v_heads
+        if (repeatFactor > 1)
+        {
+            RepeatInterleave(_ssmQ, numKHeads, headDim, repeatFactor);
+            RepeatInterleave(_ssmK, numKHeads, headDim, repeatFactor);
+        }
+
+        // 7. Compute alpha and beta projections
         ProjectLinear(_ssmAlpha, _normOut, w.SsmAlpha);
         ProjectLinear(_ssmBeta, _normOut, w.SsmBeta);
 
-        // Compute decay and beta values
+        // 8. Compute decay and beta values
         _backend.ComputeDecayBeta(_ssmDecay, _ssmBetaVal, _ssmAlpha, _ssmBeta,
-            w.SsmA, w.SsmDtBias, groupCount);
+            w.SsmA, w.SsmDtBias, numVHeads);
 
-        // DeltaNet state update + output + per-head norm
+        // 9. DeltaNet state update + output + per-head norm
         var stateTensor = _deltaState.GetStateTensor(layer);
         float scale = 1.0f / MathF.Sqrt(headDim);
         _backend.DeltaNetStep(_ssmOutput, _ssmQ, _ssmK, _ssmV,
             stateTensor, _ssmDecay, _ssmBetaVal,
-            w.SsmNorm, groupCount, headDim, scale, _config.NormEps);
+            w.SsmNorm, numVHeads, headDim, scale, _config.NormEps);
 
-        // Gate: output = output * silu(gate)
+        // 10. Gate: output = RMSNorm(output) * SiLU(Z)
         ProjectLinear(_ssmGate, _normOut, w.AttnGate);
         _backend.SiLUGate(_ssmOutput, _ssmOutput, _ssmGate);
 
-        // Output projection
+        // 11. Output projection
         ProjectLinear(_hidden, _ssmOutput, w.SsmOut);
+    }
+
+    /// <summary>
+    /// Split QKV buffer with unequal Q/K and V sizes using backend CopyTensorBytes.
+    /// Layout: [Q: keyDim] [K: keyDim] [V: valueDim]
+    /// </summary>
+    private void SplitUnequal(ITensor qkv, ITensor q, ITensor k, ITensor v,
+        int keyDim, int valueDim)
+    {
+        // Download QKV, split on CPU, re-upload
+        int totalElems = keyDim * 2 + valueDim;
+        var buf = new float[totalElems];
+        qkv.DequantizeTo(buf.AsSpan(0, totalElems));
+
+        // Q: first keyDim elements → q tensor (which is valueDim-sized, pad with zeros)
+        var qBuf = new byte[q.ByteSize];
+        Buffer.BlockCopy(buf, 0, qBuf, 0, keyDim * sizeof(float));
+        q.CopyFrom(qBuf);
+
+        // K: next keyDim elements → k tensor (valueDim-sized, pad with zeros)
+        var kBuf = new byte[k.ByteSize];
+        Buffer.BlockCopy(buf, keyDim * sizeof(float), kBuf, 0, keyDim * sizeof(float));
+        k.CopyFrom(kBuf);
+
+        // V: last valueDim elements → v tensor
+        var vBuf = new byte[v.ByteSize];
+        Buffer.BlockCopy(buf, keyDim * 2 * sizeof(float), vBuf, 0, valueDim * sizeof(float));
+        v.CopyFrom(vBuf);
+    }
+
+    /// <summary>
+    /// Repeat-interleave tensor data from numHeads groups to numHeads*factor groups.
+    /// Each head of headDim elements is repeated 'factor' times.
+    /// Done in-place (tensor must be large enough for the expanded result).
+    /// </summary>
+    private void RepeatInterleave(ITensor tensor, int numHeads, int headDim, int factor)
+    {
+        // Download, repeat, re-upload
+        int srcSize = numHeads * headDim;
+        int dstSize = numHeads * factor * headDim;
+        var src = new float[dstSize]; // full tensor size
+        tensor.DequantizeTo(src);
+
+        // Work backwards to avoid overwriting
+        for (int h = numHeads - 1; h >= 0; h--)
+        {
+            int srcOff = h * headDim;
+            for (int r = factor - 1; r >= 0; r--)
+            {
+                int dstOff = (h * factor + r) * headDim;
+                Array.Copy(src, srcOff, src, dstOff, headDim);
+            }
+        }
+
+        var bytes = new byte[dstSize * sizeof(float)];
+        Buffer.BlockCopy(src, 0, bytes, 0, bytes.Length);
+        tensor.CopyFrom(bytes);
     }
 
     // ── Helpers ──────────────────────────────────────────────────────────────

@@ -46,7 +46,9 @@ public sealed class DaisiLlogosTextBackend : ITextInferenceBackend
         var config = ModelConfig.FromGguf(gguf);
         var tokenizer = TokenizerFactory.FromGguf(gguf);
         var chatTemplate = ChatTemplate.FromGguf(gguf);
-        var weights = MmapModelLoader.Load(gguf, request.FilePath, backend, config);
+        var weights = config.IsBitNet
+            ? BitNetModelLoader.Load(gguf, stream, backend, config)
+            : MmapModelLoader.Load(gguf, request.FilePath, backend, config);
 
         var contextSize = request.ContextSize > 0
             ? (int)Math.Min(request.ContextSize, config.MaxContext)

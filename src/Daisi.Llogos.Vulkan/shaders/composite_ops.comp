@@ -203,6 +203,7 @@ void op_causal_conv1d() {
     if (c >= param0) return;
     uint bufSlots = param1 - 1;
 
+    // GGUF dim layout: [kernelSize, channels] → row-major = channels × kernelSize
     float s = 0.0;
     for (uint k = 0; k < bufSlots; k++)
         s += data1[k * param0 + c] * data2[c * param1 + k];

@@ -39,6 +39,9 @@ public sealed class ModelConfig
 
     public int SsmHeadDim => SsmGroupCount > 0 ? SsmInnerSize / SsmGroupCount : 0;
 
+    /// <summary>True when the model uses BitNet b1.58 architecture.</summary>
+    public bool IsBitNet => Architecture.StartsWith("bitnet", StringComparison.OrdinalIgnoreCase);
+
     /// <summary>True when the model has any DeltaNet/SSM layers.</summary>
     public bool HasDeltaNet => SsmInnerSize > 0;
 

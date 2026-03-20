@@ -10,7 +10,7 @@ layout(push_constant) uniform PushConstants {
     uint M;
     uint K;
     uint N;
-    uint weightType; // 0=F32, 1=Q8_0
+    uint weightType; // 0=F32, 1=Q8_0, 2=TQ1_0, 3=I2_S, 4=F16
 };
 
 layout(set = 0, binding = 0) buffer OutputBuf { float output_data[]; };
@@ -37,7 +37,7 @@ void main() {
                        (uint(weight_data[byteOff+3]) << 24);
             acc += uintBitsToFloat(bits) * input_data[k];
         }
-    } else {
+    } else if (weightType == 1) {
         // Q8_0: blocks of 34 bytes (2-byte f16 scale + 32 int8 weights)
         uint blocksPerRow = K / 32;
         for (uint b = tid; b < blocksPerRow; b += 32) {
@@ -49,6 +49,128 @@ void main() {
             for (uint i = 0; i < 32; i++) {
                 int8_t q = int8_t(weight_data[blockOff + 2 + i]);
                 acc += (scale * float(q)) * input_data[b * 32 + i];
+            }
+        }
+    } else if (weightType == 2) {
+        // TQ1_0: 256 elements per block, 54 bytes (52 base-3 packed + 2 padding)
+        // 5 trits per byte: trit 0=-1, 1=0, 2=+1. No scale.
+        uint blocksPerRow = K / 256;
+        uint bytesPerRow = blocksPerRow * 54;
+        for (uint blk = tid; blk < blocksPerRow; blk += 32) {
+            uint blockOff = row * bytesPerRow + blk * 54;
+            uint aBase = blk * 256;
+            uint elemIdx = 0;
+            for (uint byteIdx = 0; byteIdx < 52 && elemIdx < 256; byteIdx++) {
+                int packed = int(weight_data[blockOff + byteIdx]);
+                for (uint t = 0; t < 5 && elemIdx < 256; t++) {
+                    int trit = packed % 3;
+                    packed /= 3;
+                    int w = trit - 1; // 0->-1, 1->0, 2->+1
+                    if (w == 1)
+                        acc += input_data[aBase + elemIdx];
+                    else if (w == -1)
+                        acc -= input_data[aBase + elemIdx];
+                    elemIdx++;
+                }
+            }
+        }
+    } else if (weightType == 3) {
+        // I2_S: 2-bit packed, 4 values/byte, 128-element interleaved groups.
+        // Per-tensor float32 scale at byte offset K*N/4.
+        uint totalPacked = K * N / 4;
+        uint scaleBits = uint(weight_data[totalPacked]) |
+                        (uint(weight_data[totalPacked + 1]) << 8) |
+                        (uint(weight_data[totalPacked + 2]) << 16) |
+                        (uint(weight_data[totalPacked + 3]) << 24);
+        float scale = uintBitsToFloat(scaleBits);
+        uint packedPerRow = K / 4;
+        uint chunks = K / 128;
+        for (uint chunk = tid; chunk < chunks; chunk += 32) {
+            uint bOff = row * packedPerRow + chunk * 32;
+            uint aBase = chunk * 128;
+            for (uint gp = 0; gp < 32; gp++) {
+                uint bv = uint(weight_data[bOff + gp]);
+                uint c0 = (bv >> 6) & 3u;
+                uint c1 = (bv >> 4) & 3u;
+                uint c2 = (bv >> 2) & 3u;
+                uint c3 = bv & 3u;
+                float w0 = float(c0 == 2u) - float(c0 == 0u);
+                float w1 = float(c1 == 2u) - float(c1 == 0u);
+                float w2 = float(c2 == 2u) - float(c2 == 0u);
+                float w3 = float(c3 == 2u) - float(c3 == 0u);
+                acc += input_data[aBase + 0 * 32 + gp] * w0;
+                acc += input_data[aBase + 1 * 32 + gp] * w1;
+                acc += input_data[aBase + 2 * 32 + gp] * w2;
+                acc += input_data[aBase + 3 * 32 + gp] * w3;
+            }
+        }
+        acc *= scale;
+    } else if (weightType == 4) {
+        // F16: 2 bytes per element, dequantize to FP32
+        for (uint k = tid; k < K; k += 32) {
+            uint byteOff = (row * K + k) * 2;
+            uint bits = uint(weight_data[byteOff]) | (uint(weight_data[byteOff + 1]) << 8);
+            float w = unpackHalf2x16(bits).x;
+            acc += w * input_data[k];
+        }
+    } else if (weightType == 5) {
+        // Q4_K: super block = 256 elements, 144 bytes
+        uint sbPerRow = K / 256;
+        uint bytesPerRow = sbPerRow * 144;
+        for (uint sb = tid; sb < sbPerRow; sb += 32) {
+            uint sbOff = row * bytesPerRow + sb * 144;
+            uint aBase = sb * 256;
+            uint dBits = uint(weight_data[sbOff]) | (uint(weight_data[sbOff+1]) << 8);
+            uint dminBits = uint(weight_data[sbOff+2]) | (uint(weight_data[sbOff+3]) << 8);
+            float d = unpackHalf2x16(dBits).x;
+            float dmin = unpackHalf2x16(dminBits).x;
+            for (uint chunk = 0; chunk < 4; chunk++) {
+                uint j0 = chunk * 2;
+                uint j1 = chunk * 2 + 1;
+                int sc0, m0, sc1, m1;
+                if (j0 < 4) { sc0 = int(weight_data[sbOff+4+j0]) & 63; m0 = int(weight_data[sbOff+8+j0]) & 63; }
+                else { sc0 = (int(weight_data[sbOff+4+j0+4]) & 0xF) | ((int(weight_data[sbOff+4+j0-4]) >> 6) << 4);
+                       m0 = (int(weight_data[sbOff+4+j0+4]) >> 4) | ((int(weight_data[sbOff+4+j0]) >> 6) << 4); }
+                if (j1 < 4) { sc1 = int(weight_data[sbOff+4+j1]) & 63; m1 = int(weight_data[sbOff+8+j1]) & 63; }
+                else { sc1 = (int(weight_data[sbOff+4+j1+4]) & 0xF) | ((int(weight_data[sbOff+4+j1-4]) >> 6) << 4);
+                       m1 = (int(weight_data[sbOff+4+j1+4]) >> 4) | ((int(weight_data[sbOff+4+j1]) >> 6) << 4); }
+                float ss0 = d * float(sc0); float sm0 = dmin * float(m0);
+                float ss1 = d * float(sc1); float sm1 = dmin * float(m1);
+                for (uint l = 0; l < 32; l++) {
+                    uint packed = uint(weight_data[sbOff+16+chunk*32+l]);
+                    acc += input_data[aBase+chunk*64+l] * (ss0 * float(packed & 0xFu) - sm0);
+                    acc += input_data[aBase+chunk*64+l+32] * (ss1 * float(packed >> 4) - sm1);
+                }
+            }
+        }
+    } else if (weightType == 6) {
+        // Q6_K: super block = 256 elements, 210 bytes. Interleaved ql/qh layout.
+        uint sbPerRow = K / 256;
+        uint bytesPerRow = sbPerRow * 210;
+        for (uint sb = tid; sb < sbPerRow; sb += 32) {
+            uint sbOff = row * bytesPerRow + sb * 210;
+            uint aBase = sb * 256;
+            uint dBits = uint(weight_data[sbOff+208]) | (uint(weight_data[sbOff+209]) << 8);
+            float d = unpackHalf2x16(dBits).x;
+            for (uint h = 0; h < 2; h++) {
+                uint qlOff = sbOff + h * 64;
+                uint qhOff = sbOff + 128 + h * 32;
+                uint scIdx = h * 8;
+                uint aOff = aBase + h * 128;
+                for (uint l = 0; l < 32; l++) {
+                    int q1 = ((int(weight_data[qlOff+l]) & 0xF)     | (((int(weight_data[qhOff+l]) >> 0) & 3) << 4)) - 32;
+                    int q2 = ((int(weight_data[qlOff+l+32]) & 0xF)  | (((int(weight_data[qhOff+l]) >> 2) & 3) << 4)) - 32;
+                    int q3 = ((int(weight_data[qlOff+l]) >> 4)       | (((int(weight_data[qhOff+l]) >> 4) & 3) << 4)) - 32;
+                    int q4 = ((int(weight_data[qlOff+l+32]) >> 4)    | (((int(weight_data[qhOff+l]) >> 6) & 3) << 4)) - 32;
+                    int sc0 = int(int8_t(weight_data[sbOff+192+scIdx+0]));
+                    int sc2 = int(int8_t(weight_data[sbOff+192+scIdx+2]));
+                    int sc4 = int(int8_t(weight_data[sbOff+192+scIdx+4]));
+                    int sc6 = int(int8_t(weight_data[sbOff+192+scIdx+6]));
+                    acc += input_data[aOff+l]    * (d * float(sc0) * float(q1));
+                    acc += input_data[aOff+l+32] * (d * float(sc2) * float(q2));
+                    acc += input_data[aOff+l+64] * (d * float(sc4) * float(q3));
+                    acc += input_data[aOff+l+96] * (d * float(sc6) * float(q4));
+                }
             }
         }
     }

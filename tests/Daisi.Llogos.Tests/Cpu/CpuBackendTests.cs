@@ -100,12 +100,16 @@ public class CpuBackendTests
     }
 
     [Fact]
-    public void DequantizeTo_UnsupportedType_Throws()
+    public void DequantizeTo_F16_Works()
     {
         using var backend = new CpuBackend();
-        using var tensor = backend.CreateTensor("test", GgmlType.F16, [1]);
+        var data = new byte[2];
+        BitConverter.TryWriteBytes(data, (Half)1.5f);
+        using var tensor = backend.LoadTensor("test", GgmlType.F16, [1], data);
 
-        Assert.Throws<NotSupportedException>(() => tensor.DequantizeTo(new float[1]));
+        var result = new float[1];
+        tensor.DequantizeTo(result);
+        Assert.Equal(1.5f, result[0], 0.01f);
     }
 }
 

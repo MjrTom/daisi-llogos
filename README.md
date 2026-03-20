@@ -57,9 +57,13 @@ dotnet run --project src/Daisi.Llogos.Cli -- \
 
 Tests validate against [Qwen 3.5 0.8B Q8_0](https://huggingface.co/unsloth/Qwen3.5-0.8B-GGUF). Download the GGUF file to `C:\GGUFS\Qwen3.5-0.8B-Q8_0.gguf`. Tests that require the model skip gracefully if the file is not present.
 
+### Tested models
+
+See [Tested Models](docs/tested-models.md) for verified models, performance benchmarks, supported quantization formats, and recommended downloads.
+
 ## Current Status
 
-**End-to-end text generation on CPU, CUDA, and Vulkan.** 149 passing tests.
+**End-to-end text generation on CPU, CUDA, and Vulkan.** 225+ passing tests. Supports Q8_0, F16, F32, I2_S (BitNet), TQ1_0, and K-quant (Q4_K, Q5_K, Q6_K) formats across all backends.
 
 ### Benchmarks
 
@@ -84,9 +88,9 @@ What works today:
 - Parse any GGUF v2/v3 file (header, metadata, tensor info)
 - Full quantization type support (41 GgmlType variants with block/type size calculation)
 - `IComputeBackend` / `ITensor` abstraction — forward pass is backend-agnostic
-- CPU backend: AVX2 SIMD matmul (fused Q8_0 dequant), multi-threaded, Q8_0/Q4_0/Q4_K dequantization
-- CUDA backend: NVRTC JIT compilation, block-per-neuron matmul with warp reduction, stream-batched kernels, async D2D copy
-- Vulkan backend: SPIR-V compute shaders, explicit memory management, cross-platform GPU (NVIDIA/AMD/Intel)
+- CPU backend: AVX2 SIMD matmul (fused Q8_0 dequant), multi-threaded, full dequantization (Q8_0, Q4_0, Q4_K, Q5_K, Q6_K, Q3_K, Q2_K, Q4_1, Q5_0, Q5_1, BF16, F16, I2_S, TQ1_0)
+- CUDA backend: NVRTC JIT compilation, fused dequant+matmul kernels (F32, F16, Q8_0, Q4_K, Q5_K, Q6_K, I2_S, TQ1_0), stream-batched, async D2D copy
+- Vulkan backend: SPIR-V compute shaders, fused dequant+matmul (F32, F16, Q8_0, Q4_K, Q6_K, I2_S, TQ1_0), cross-platform GPU (NVIDIA/AMD/Intel)
 - 13 composite GPU operations: GatedAttention, DeltaNetStep, CausalConv1d, ComputeDecayBeta, etc.
 - Complete hybrid forward pass: standard gated attention (6 layers) + DeltaNet (18 layers)
 - BPE tokenizer, KV cache, DeltaNet recurrent state + conv1d buffers
@@ -164,6 +168,7 @@ flowchart LR
 | [DeltaNet](docs/deltanet.md) | Gated DeltaNet linear attention and hybrid architecture |
 | [Vulkan Backend](docs/vulkan-backend.md) | P/Invoke design, SPIR-V shaders, cross-platform GPU compute |
 | [Long Context](docs/roadmap/phase-11-long-context.md) | Flash attention, paged KV cache, RAM offloading for 200K+ context |
+| [Tested Models](docs/tested-models.md) | Verified models, performance benchmarks, supported quantization formats |
 
 ## Solution Structure
 

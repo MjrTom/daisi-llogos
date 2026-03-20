@@ -57,7 +57,99 @@ public sealed class CpuBackend : IComputeBackend
         }
         else
         {
-            throw new NotSupportedException($"MatMul not implemented for weight type {b.Type}.");
+            // Generic fallback: dequantize weight rows on the fly, then F32 dot product.
+            // Works for any type that CpuTensor.DequantizeTo supports (Q4_K, Q5_K, Q6_K, etc.)
+            GenericDequantMatMul(o, aSpan, (CpuTensor)b, M, K, N);
+        }
+    }
+
+    private static unsafe void GenericDequantMatMul(Span<float> output, ReadOnlySpan<float> a, CpuTensor b, int M, int K, int N)
+    {
+        int blockSize = GgmlTypeInfo.BlockSize(b.Type);
+        int typeSize = GgmlTypeInfo.TypeSize(b.Type);
+        int blocksPerRow = K / blockSize;
+        int bytesPerRow = blocksPerRow * typeSize;
+        var bRaw = b.RawData;
+        var bType = b.Type;
+
+        fixed (float* aPtr = a)
+        fixed (byte* bPtr = bRaw)
+        fixed (float* oPtr = output)
+        {
+            nint bBase = (nint)bPtr;
+            int bprCapture = bytesPerRow;
+            int kCapture = K;
+
+            for (int i = 0; i < M; i++)
+            {
+                float* aRow = aPtr + i * K;
+                float* oRow = oPtr + i * N;
+
+                Parallel.For(0, N, CpuThreading.Options, j =>
+                {
+                    var tempRow = new float[kCapture];
+                    var rowData = new ReadOnlySpan<byte>((byte*)bBase + j * bprCapture, bprCapture);
+                    DequantizeRow(bType, rowData, tempRow, kCapture);
+
+                    float dot = 0;
+                    for (int k = 0; k < kCapture; k++)
+                        dot += aRow[k] * tempRow[k];
+                    oRow[j] = dot;
+                });
+            }
+        }
+    }
+
+    private static void DequantizeRow(GgmlType type, ReadOnlySpan<byte> source, Span<float> dest, int K)
+    {
+        switch (type)
+        {
+            case GgmlType.Q8_0:
+                Dequantize.DequantizeQ8_0(source, dest);
+                break;
+            case GgmlType.Q4_0:
+                Dequantize.DequantizeQ4_0(source, dest);
+                break;
+            case GgmlType.Q4_1:
+                Dequantize.DequantizeQ4_1(source, dest);
+                break;
+            case GgmlType.Q5_0:
+                Dequantize.DequantizeQ5_0(source, dest);
+                break;
+            case GgmlType.Q5_1:
+                Dequantize.DequantizeQ5_1(source, dest);
+                break;
+            case GgmlType.Q4_K:
+                Dequantize.DequantizeQ4_K(source, dest);
+                break;
+            case GgmlType.Q5_K:
+                Dequantize.DequantizeQ5_K(source, dest);
+                break;
+            case GgmlType.Q6_K:
+                Dequantize.DequantizeQ6_K(source, dest);
+                break;
+            case GgmlType.Q3_K:
+                Dequantize.DequantizeQ3_K(source, dest);
+                break;
+            case GgmlType.Q2_K:
+                Dequantize.DequantizeQ2_K(source, dest);
+                break;
+            case GgmlType.BF16:
+                Dequantize.DequantizeBF16(source, dest);
+                break;
+            case GgmlType.F16:
+            {
+                var halfs = MemoryMarshal.Cast<byte, Half>(source);
+                for (int i = 0; i < K; i++)
+                    dest[i] = (float)halfs[i];
+                break;
+            }
+            default:
+                // For any type not explicitly handled, create a temporary CpuTensor to dequantize
+                var tempTensor = new CpuTensor("_dequant_tmp", type, [K], source);
+                tempTensor.DequantizeTo(dest);
+                tempTensor.Dispose();
+                break;
         }
     }
 
@@ -146,7 +238,16 @@ public sealed class CpuBackend : IComputeBackend
                 break;
             }
             default:
-                throw new NotSupportedException($"EmbeddingLookup not implemented for type {table.Type}.");
+            {
+                // Generic fallback: compute row byte offset and dequantize
+                int blockSize = GgmlTypeInfo.BlockSize(table.Type);
+                int typeSize = GgmlTypeInfo.TypeSize(table.Type);
+                int blocksPerRow = hiddenDim / blockSize;
+                int bytesPerRow = blocksPerRow * typeSize;
+                var rowData = raw.Slice(tokenId * bytesPerRow, bytesPerRow);
+                DequantizeRow(table.Type, rowData, outSpan.Slice(0, hiddenDim), hiddenDim);
+                break;
+            }
         }
     }
 
@@ -380,6 +481,7 @@ public sealed class CpuBackend : IComputeBackend
 
         var result = new float[channels];
 
+        // GGUF dim layout: [kernelSize, channels] → row-major = channels × kernelSize
         for (int c = 0; c < channels; c++)
         {
             float s = 0;

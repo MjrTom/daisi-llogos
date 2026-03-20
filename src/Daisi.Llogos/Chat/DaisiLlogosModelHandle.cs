@@ -52,15 +52,25 @@ public sealed class DaisiLlogosModelHandle : IDisposable
     }
 
     /// <summary>
-    /// Create a new ForwardPass + KV cache + DeltaNetState for a new session.
+    /// Create a new forward pass + KV cache for a new session.
+    /// Detects BitNet architecture and creates the appropriate types.
     /// Each session gets its own inference state while sharing the model weights.
     /// </summary>
-    internal (ForwardPass forward, KvCache kvCache, DeltaNetState deltaState) CreateInferenceResources()
+    public (IForwardPass forward, IKvCache kvCache) CreateInferenceResources()
     {
-        var kvCache = new KvCache(Backend, Config, _contextSize);
-        var deltaState = new DeltaNetState(Backend, Config);
-        var forward = new ForwardPass(Backend, Config, Weights, kvCache, deltaState);
-        return (forward, kvCache, deltaState);
+        if (Config.IsBitNet)
+        {
+            var kvCache = new BitNetKvCache(Backend, Config, _contextSize);
+            var forward = new BitNetForwardPass(Backend, Config, Weights, kvCache);
+            return (forward, kvCache);
+        }
+        else
+        {
+            var kvCache = new KvCache(Backend, Config, _contextSize);
+            var deltaState = new DeltaNetState(Backend, Config);
+            var forward = new ForwardPass(Backend, Config, Weights, kvCache, deltaState);
+            return (forward, kvCache);
+        }
     }
 
     /// <summary>
@@ -68,7 +78,7 @@ public sealed class DaisiLlogosModelHandle : IDisposable
     /// </summary>
     public DaisiLlogosChatSession CreateChatSession(string? systemPrompt = null)
     {
-        var (forward, _, _) = CreateInferenceResources();
+        var (forward, _) = CreateInferenceResources();
         var renderer = new ChatTemplateRenderer(ChatTemplate);
         var stopSequences = ChatTemplate.GetStopSequences();
 

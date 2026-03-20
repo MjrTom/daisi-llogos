@@ -30,7 +30,9 @@ public static class MmapModelLoader
             var layers = new LayerWeights[config.NumLayers];
             for (int i = 0; i < config.NumLayers; i++)
             {
-                if (config.IsStandardAttention(i))
+                if (config.IsBitNet)
+                    layers[i] = LoadBitNetLayer(gguf, basePtr, backend, tensorMap, i);
+                else if (config.IsStandardAttention(i))
                     layers[i] = LoadStandardAttentionLayer(gguf, basePtr, backend, tensorMap, i);
                 else
                     layers[i] = LoadDeltaNetLayer(gguf, basePtr, backend, tensorMap, i);
@@ -48,6 +50,26 @@ public static class MmapModelLoader
         {
             accessor.SafeMemoryMappedViewHandle.ReleasePointer();
         }
+    }
+
+    private static unsafe BitNetLayerWeights LoadBitNetLayer(
+        GgufFile gguf, byte* basePtr, IComputeBackend backend,
+        Dictionary<string, GgufTensorInfo> tensorMap, int i)
+    {
+        return new BitNetLayerWeights
+        {
+            AttnNorm = LoadTensor(gguf, basePtr, backend, tensorMap, $"blk.{i}.attn_norm.weight"),
+            PostAttnNorm = LoadTensor(gguf, basePtr, backend, tensorMap, $"blk.{i}.ffn_norm.weight"),
+            AttnSubNorm = LoadTensor(gguf, basePtr, backend, tensorMap, $"blk.{i}.attn_sub_norm.weight"),
+            FfnSubNorm = LoadTensor(gguf, basePtr, backend, tensorMap, $"blk.{i}.ffn_sub_norm.weight"),
+            AttnQ = LoadTensor(gguf, basePtr, backend, tensorMap, $"blk.{i}.attn_q.weight"),
+            AttnK = LoadTensor(gguf, basePtr, backend, tensorMap, $"blk.{i}.attn_k.weight"),
+            AttnV = LoadTensor(gguf, basePtr, backend, tensorMap, $"blk.{i}.attn_v.weight"),
+            AttnO = LoadTensor(gguf, basePtr, backend, tensorMap, $"blk.{i}.attn_output.weight"),
+            FfnGate = LoadTensor(gguf, basePtr, backend, tensorMap, $"blk.{i}.ffn_gate.weight"),
+            FfnUp = LoadTensor(gguf, basePtr, backend, tensorMap, $"blk.{i}.ffn_up.weight"),
+            FfnDown = LoadTensor(gguf, basePtr, backend, tensorMap, $"blk.{i}.ffn_down.weight"),
+        };
     }
 
     private static unsafe StandardAttentionWeights LoadStandardAttentionLayer(
