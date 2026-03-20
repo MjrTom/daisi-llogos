@@ -376,48 +376,51 @@ __global__ void dequant_matmul_q4_k(float* output, const float* a,
     long long bytesPerRow = (long long)sbPerRow * 144;
     const unsigned char* b_row = b + (long long)n * bytesPerRow;
 
-    // Each thread processes one chunk-half (32 elements) at a time.
-    // 8 chunk-halves per super-block × sbPerRow = total work items.
-    int totalItems = sbPerRow * 8;
+    // Each thread processes one FULL chunk (64 elements = lo + hi halves) at a time.
+    // 4 chunks per super-block × sbPerRow = total work items.
+    // Processing both halves together avoids redundant scale unpacking and byte reloads.
+    int totalChunks = sbPerRow * 4;
 
     float sum = 0.0f;
-    for (int item = tid; item < totalItems; item += blockSize)
+    for (int item = tid; item < totalChunks; item += blockSize)
     {
-        int sb = item / 8;
-        int halfIdx = item % 8;         // 0..7: which chunk-half
-        int chunk = halfIdx / 2;         // 0..3
-        int isHi = halfIdx & 1;          // 0=lo nibble, 1=hi nibble
+        int sb = item / 4;
+        int chunk = item % 4;
 
         const unsigned char* sbp = b_row + sb * 144;
-        const float* ap = a + sb * 256 + chunk * 64 + isHi * 32;
+        const float* apLo = a + sb * 256 + chunk * 64;
+        const float* apHi = apLo + 32;
 
-        float d = fp16_to_fp32(((unsigned short)sbp[1] << 8) | sbp[0]);
-        float dmin = fp16_to_fp32(((unsigned short)sbp[3] << 8) | sbp[2]);
+        float d = fp16_to_fp32(*reinterpret_cast<const unsigned short*>(sbp));
+        float dmin = fp16_to_fp32(*reinterpret_cast<const unsigned short*>(sbp + 2));
 
-        float ss, sm;
-        unpack_q4k_scales(sbp, chunk * 2 + isHi, d, dmin, ss, sm);
+        float ss0, sm0, ss1, sm1;
+        unpack_q4k_scales(sbp, chunk * 2, d, dmin, ss0, sm0);
+        unpack_q4k_scales(sbp, chunk * 2 + 1, d, dmin, ss1, sm1);
 
         const unsigned char* qs = sbp + 16 + chunk * 32;
-        const float4* ap4 = reinterpret_cast<const float4*>(ap);
+        const float4* ap4Lo = reinterpret_cast<const float4*>(apLo);
+        const float4* ap4Hi = reinterpret_cast<const float4*>(apHi);
 
-        float dot = 0.0f;
-        float asum = 0.0f;
+        float dotLo = 0.0f, dotHi = 0.0f;
+        float asumLo = 0.0f, asumHi = 0.0f;
+
         #pragma unroll
         for (int l = 0; l < 8; l++)
         {
-            float4 av = ap4[l];
-            asum += av.x + av.y + av.z + av.w;
-            int base = l * 4;
-            unsigned char p0 = qs[base], p1 = qs[base+1], p2 = qs[base+2], p3 = qs[base+3];
-            if (isHi) {
-                dot += av.x * (float)(p0 >> 4) + av.y * (float)(p1 >> 4)
-                     + av.z * (float)(p2 >> 4) + av.w * (float)(p3 >> 4);
-            } else {
-                dot += av.x * (float)(p0 & 0xF) + av.y * (float)(p1 & 0xF)
-                     + av.z * (float)(p2 & 0xF) + av.w * (float)(p3 & 0xF);
-            }
+            float4 aLo = ap4Lo[l];
+            float4 aHi = ap4Hi[l];
+            asumLo += aLo.x + aLo.y + aLo.z + aLo.w;
+            asumHi += aHi.x + aHi.y + aHi.z + aHi.w;
+
+            unsigned char p0 = qs[l*4], p1 = qs[l*4+1], p2 = qs[l*4+2], p3 = qs[l*4+3];
+
+            dotLo += aLo.x * (float)(p0 & 0xF) + aLo.y * (float)(p1 & 0xF)
+                   + aLo.z * (float)(p2 & 0xF) + aLo.w * (float)(p3 & 0xF);
+            dotHi += aHi.x * (float)(p0 >> 4) + aHi.y * (float)(p1 >> 4)
+                   + aHi.z * (float)(p2 >> 4) + aHi.w * (float)(p3 >> 4);
         }
-        sum += ss * dot - sm * asum;
+        sum += ss0 * dotLo - sm0 * asumLo + ss1 * dotHi - sm1 * asumHi;
     }
 
     sum = warp_reduce_sum(sum);
@@ -517,43 +520,41 @@ __global__ void dequant_matmul_q6_k(float* output, const float* a,
     long long bytesPerRow = (long long)sbPerRow * 210;
     const unsigned char* b_row = b + (long long)n * bytesPerRow;
 
-    // Each thread processes one 32-element group (8 groups per super-block).
-    // Groups 0-3 are in the first 128-element half, 4-7 in the second.
+    // Each thread processes one 32-element quadrant (8 quadrants per super-block).
     int totalGroups = sbPerRow * 8;
 
     float sum = 0.0f;
     for (int grp = tid; grp < totalGroups; grp += blockSize)
     {
         int sb = grp / 8;
-        int gIdx = grp % 8;             // 0..7
-        int half = gIdx / 4;            // 0 or 1
-        int quadrant = gIdx % 4;        // 0..3: which of 4 groups of 32 in this half
+        int gIdx = grp % 8;
+        int half = gIdx / 4;
+        int quadrant = gIdx % 4;
 
         const unsigned char* sbp = b_row + sb * 210;
-        float d = fp16_to_fp32(((unsigned short)sbp[209] << 8) | sbp[208]);
+        float d = fp16_to_fp32(*reinterpret_cast<const unsigned short*>(sbp + 208));
 
         const unsigned char* ql = sbp + half * 64;
         const unsigned char* qh = sbp + 128 + half * 32;
         int scIdx = half * 8;
         const float* aBase = a + sb * 256 + half * 128 + quadrant * 32;
 
-        // Each quadrant processes 32 elements from a specific q1/q2/q3/q4 group
-        const float4* ap4 = reinterpret_cast<const float4*>(aBase);
+        // Precompute scale pairs for both sub-groups (l/16 = 0 and 1)
+        float sc0 = d * (float)((signed char)sbp[192 + scIdx + 0 + quadrant * 2]);
+        float sc1 = d * (float)((signed char)sbp[192 + scIdx + 1 + quadrant * 2]);
+
+        // Bit extraction constants for this quadrant
+        int qlOff = (quadrant & 1) * 32;  // 0 for q0,q2; 32 for q1,q3
+        int qlShift = (quadrant >> 1) * 4; // 0 for q0,q1; 4 for q2,q3
+        int qhShift = quadrant * 2;        // 0,2,4,6
 
         float local = 0.0f;
         #pragma unroll
         for (int l = 0; l < 32; l++)
         {
-            int q;
-            int isc = l / 16;
-            switch (quadrant) {
-                case 0: q = ((ql[l] & 0xF)      | (((qh[l] >> 0) & 3) << 4)) - 32; break;
-                case 1: q = ((ql[l + 32] & 0xF)  | (((qh[l] >> 2) & 3) << 4)) - 32; break;
-                case 2: q = ((ql[l] >> 4)         | (((qh[l] >> 4) & 3) << 4)) - 32; break;
-                default: q = ((ql[l + 32] >> 4)   | (((qh[l] >> 6) & 3) << 4)) - 32; break;
-            }
-            float sc = (float)((signed char)sbp[192 + scIdx + isc + quadrant * 2]);
-            local += aBase[l] * (d * sc * (float)q);
+            int q = (((ql[qlOff + l] >> qlShift) & 0xF) | (((qh[l] >> qhShift) & 3) << 4)) - 32;
+            float sc = (l < 16) ? sc0 : sc1;
+            local += aBase[l] * (sc * (float)q);
         }
         sum += local;
     }
