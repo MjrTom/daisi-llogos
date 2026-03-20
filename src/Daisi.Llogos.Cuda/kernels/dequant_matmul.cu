@@ -44,7 +44,128 @@ __device__ float warp_reduce_sum(float val)
     return val;
 }
 
+// FP32 → FP16 conversion helper (used by quantize kernel)
+__device__ unsigned short matmul_fp32_to_fp16(float val)
+{
+    unsigned int f = __float_as_uint(val);
+    unsigned int sign = (f >> 16) & 0x8000;
+    int exp_val = ((f >> 23) & 0xff) - 127 + 15;
+    unsigned int mant = (f >> 13) & 0x3ff;
+    if (exp_val <= 0) return (unsigned short)sign;
+    if (exp_val >= 31) return (unsigned short)(sign | 0x7c00);
+    return (unsigned short)(sign | (exp_val << 10) | mant);
+}
+
 extern "C" {
+
+// ── Quantize FP32 activation → Q8_1 blocks for __dp4a dot products ──────────
+// Q8_1 layout: d(fp16, 2b) + s(fp16, 2b) + qs(32 × int8) = 36 bytes per block
+// Each thread processes one 32-element block.
+
+__global__ void quantize_f32_q8_1(void* __restrict__ dst,
+                                   const float* __restrict__ src, int K)
+{
+    int blk = blockIdx.x * blockDim.x + threadIdx.x;
+    int num_blocks = K / 32;
+    if (blk >= num_blocks) return;
+
+    const float* sp = src + blk * 32;
+    unsigned char* dp = (unsigned char*)dst + blk * 36;
+
+    float amax = 0.0f;
+    float sum = 0.0f;
+    #pragma unroll
+    for (int i = 0; i < 32; i++) {
+        float v = sp[i];
+        sum += v;
+        float av = fabsf(v);
+        if (av > amax) amax = av;
+    }
+
+    float d = amax / 127.0f;
+    float id = d > 0.0f ? 127.0f / amax : 0.0f;
+
+    unsigned short d_fp16 = matmul_fp32_to_fp16(d);
+    unsigned short s_fp16 = matmul_fp32_to_fp16(sum);
+    dp[0] = d_fp16 & 0xFF; dp[1] = d_fp16 >> 8;
+    dp[2] = s_fp16 & 0xFF; dp[3] = s_fp16 >> 8;
+
+    signed char* qs = (signed char*)(dp + 4);
+    #pragma unroll
+    for (int i = 0; i < 32; i++)
+        qs[i] = (signed char)__float2int_rn(sp[i] * id);
+}
+
+// ── Q8_0 × Q8_1 MatMul using __dp4a (integer dot product hardware) ──────────
+// Activation pre-quantized to Q8_1. Weight is Q8_0.
+// __dp4a does 4 × int8*int8 multiply-adds in 1 instruction = 4× throughput.
+// Grid: N blocks, Block: adaptive threads.
+
+__global__ void dequant_matmul_q8_0_q8_1(float* __restrict__ output,
+                                           const void* __restrict__ vq8_1,
+                                           const unsigned char* __restrict__ b,
+                                           int M, int K, int N)
+{
+    extern __shared__ float shared[];
+    int n = blockIdx.x;
+    int tid = threadIdx.x;
+    int blockSize = blockDim.x;
+
+    if (n >= N) return;
+
+    int blocks_per_row = K / 32;
+    long bytes_per_row = (long)blocks_per_row * 34;
+    const unsigned char* b_row = b + (long)n * bytes_per_row;
+    const unsigned char* a_q8_1 = (const unsigned char*)vq8_1;
+
+    float sum = 0.0f;
+
+    for (int blk = tid; blk < blocks_per_row; blk += blockSize)
+    {
+        // Weight Q8_0 block: 2 bytes FP16 scale + 32 int8 quants (NOT 4-byte aligned!)
+        const unsigned char* wblk = b_row + blk * 34;
+        float w_scale = fp16_to_fp32(wblk[0] | ((unsigned short)wblk[1] << 8));
+
+        // Activation Q8_1 block: 2b d + 2b s + 32 int8 quants (4-byte aligned at +4)
+        const unsigned char* ablk = a_q8_1 + blk * 36;
+        float a_scale = fp16_to_fp32(ablk[0] | ((unsigned short)ablk[1] << 8));
+        const int* a_qs = reinterpret_cast<const int*>(ablk + 4); // aligned
+
+        // Load weight quants as ints via memcpy to handle unaligned Q8_0 data
+        int w_qs[8];
+        #pragma unroll
+        for (int i = 0; i < 8; i++) {
+            const unsigned char* src = wblk + 2 + i * 4;
+            w_qs[i] = src[0] | (src[1] << 8) | (src[2] << 16) | (src[3] << 24);
+        }
+
+        // 8 × __dp4a: each processes 4 int8 pairs = 32 total multiply-adds
+        int sumi = 0;
+        sumi = __dp4a(a_qs[0], w_qs[0], sumi);
+        sumi = __dp4a(a_qs[1], w_qs[1], sumi);
+        sumi = __dp4a(a_qs[2], w_qs[2], sumi);
+        sumi = __dp4a(a_qs[3], w_qs[3], sumi);
+        sumi = __dp4a(a_qs[4], w_qs[4], sumi);
+        sumi = __dp4a(a_qs[5], w_qs[5], sumi);
+        sumi = __dp4a(a_qs[6], w_qs[6], sumi);
+        sumi = __dp4a(a_qs[7], w_qs[7], sumi);
+
+        sum += a_scale * w_scale * (float)sumi;
+    }
+
+    // Warp reduction
+    sum = warp_reduce_sum(sum);
+    int lane = tid & 31;
+    int warp = tid >> 5;
+    if (lane == 0) shared[warp] = sum;
+    __syncthreads();
+
+    int numWarps = blockSize >> 5;
+    if (tid < numWarps) sum = shared[tid]; else sum = 0.0f;
+    sum = warp_reduce_sum(sum);
+
+    if (tid == 0) output[n] = sum;
+}
 
 // ── FP32 MatMul (M=1 vector × matrix) ───────────────────────────────────────
 // One block per output neuron. Threads cooperatively compute dot product.
