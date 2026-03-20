@@ -375,9 +375,8 @@ __global__ void dequant_matmul_q4_k(float* output, const float* a,
     long long bytesPerRow = (long long)sbPerRow * 144;
     const unsigned char* b_row = b + (long long)n * bytesPerRow;
 
-    // Each thread processes one FULL chunk (64 elements = lo + hi halves) at a time.
+    // Each thread processes one FULL chunk (64 elements = lo + hi halves).
     // 4 chunks per super-block × sbPerRow = total work items.
-    // Processing both halves together avoids redundant scale unpacking and byte reloads.
     int totalChunks = sbPerRow * 4;
 
     float sum = 0.0f;
