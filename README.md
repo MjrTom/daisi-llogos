@@ -169,6 +169,7 @@ flowchart LR
 | [Vulkan Backend](docs/vulkan-backend.md) | P/Invoke design, SPIR-V shaders, cross-platform GPU compute |
 | [Long Context](docs/roadmap/phase-11-long-context.md) | Flash attention, paged KV cache, RAM offloading for 200K+ context |
 | [Tested Models](docs/tested-models.md) | Verified models, performance benchmarks, supported quantization formats |
+| [Known Issues](docs/known-issues.md) | Investigation notes on K-quant accumulation errors and DeltaNet architecture |
 
 ## Solution Structure
 
