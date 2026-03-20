@@ -149,7 +149,7 @@ public sealed class ForwardPass : IForwardPass
             else if (lw is DeltaNetWeights dnw)
                 ForwardDeltaNet(dnw, layer);
 
-            // Fused: residual add + save new residual + pre-FFN RMSNorm
+            // Fused: residual add + pre-FFN RMSNorm, then save residual
             _backend.AddRmsNorm(_normOut, _hidden, _hidden, _residual, lw.PostAttnNorm, _config.NormEps);
             _backend.CopyTensor(_residual, _hidden);
 
@@ -171,6 +171,41 @@ public sealed class ForwardPass : IForwardPass
 
         _logits.DequantizeTo(_logitsBuffer);
         return _logitsBuffer;
+    }
+
+    /// <summary>
+    /// Run forward pass and return only the argmax token ID.
+    /// For GPU backends, this avoids downloading the full logit tensor (600KB+).
+    /// </summary>
+    public int ForwardArgMax(int tokenId, int position)
+    {
+        // 1. Embedding lookup
+        _backend.EmbeddingLookup(_hidden, _weights.TokenEmbedding, tokenId);
+
+        // 2. Transformer layers
+        for (int layer = 0; layer < _config.NumLayers; layer++)
+        {
+            var lw = _weights.Layers[layer];
+            _backend.RmsNormResidual(_normOut, _residual, _hidden, lw.AttnNorm, _config.NormEps);
+            if (lw is StandardAttentionWeights saw)
+                ForwardStandardAttention(saw, position, layer);
+            else if (lw is DeltaNetWeights dnw)
+                ForwardDeltaNet(dnw, layer);
+            _backend.AddRmsNorm(_normOut, _hidden, _hidden, _residual, lw.PostAttnNorm, _config.NormEps);
+            _backend.CopyTensor(_residual, _hidden);
+            ProjectLinear(_gate, _normOut, lw.FfnGate);
+            ProjectLinear(_up, _normOut, lw.FfnUp);
+            _backend.SwiGLU(_gate, _gate, _up);
+            ProjectLinear(_hidden, _gate, lw.FfnDown);
+            _backend.ElementAdd(_hidden, _hidden, _residual);
+        }
+
+        // 3. Final RMSNorm + LM head
+        _backend.RmsNorm(_normOut, _hidden, _weights.OutputNorm, _config.NormEps);
+        ProjectLinear(_logits, _normOut, _weights.OutputWeight);
+
+        // 4. ArgMax on device — no logit download
+        return _backend.ArgMax(_logits);
     }
 
     // ── Standard Attention (Gated) ───────────────────────────────────────────

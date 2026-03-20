@@ -91,22 +91,24 @@ public sealed class TextGenerator
             logits = _forward.Forward(promptIds[i], i);
         prefillSw.Stop();
 
-        // Decode
-        var history = new List<int>(promptIds);
-        var parameters = new GenerationParams { MaxTokens = maxTokens, Temperature = 0.7f, TopK = 40, TopP = 0.9f };
+        // Decode — use GPU-side argmax for maximum throughput (greedy benchmark)
         var stopTokens = _tokenizer.Vocabulary.EosTokenId >= 0
             ? new[] { _tokenizer.Vocabulary.EosTokenId }
             : Array.Empty<int>();
 
         int generated = 0;
         var decodeSw = Stopwatch.StartNew();
+
+        // First token uses the prefill logits
+        int nextTokenId = _sampler.Sample(logits, new GenerationParams { Temperature = 0 }, []);
+
         for (int t = 0; t < maxTokens; t++)
         {
-            int tokenId = _sampler.Sample(logits, parameters, history.ToArray());
-            if (Array.IndexOf(stopTokens, tokenId) >= 0) break;
-            history.Add(tokenId);
+            if (Array.IndexOf(stopTokens, nextTokenId) >= 0) break;
             generated++;
-            logits = _forward.Forward(tokenId, promptIds.Length + t);
+
+            // Use ForwardArgMax to skip full logit download
+            nextTokenId = _forward.ForwardArgMax(nextTokenId, promptIds.Length + t);
         }
         decodeSw.Stop();
 

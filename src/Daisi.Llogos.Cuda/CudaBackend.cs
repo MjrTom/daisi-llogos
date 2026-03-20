@@ -53,8 +53,7 @@ public sealed class CudaBackend : IComputeBackend
         ulong aPtr = aT.DevicePtr;
         ulong bPtr = bT.DevicePtr;
 
-        // One block per output neuron, warps cooperate on dot product.
-        uint gridX = (uint)N;
+        uint gridX = (uint)N; // 1 neuron per block for most types
         // Adaptive block size: scale with the number of work items per row.
         // Q8_0: 1 item per 32 elements. K-quants: 1 item per 256 elements. F32/F16: 1 item per element.
         int workItemsPerRow = b.Type switch
@@ -783,6 +782,32 @@ public sealed class CudaBackend : IComputeBackend
 
         var result = cpuOut.AsFloatSpan();
         outT.UploadFrom(result);
+    }
+
+    /// <inheritdoc />
+    public unsafe int ArgMax(ITensor tensor)
+    {
+        var t = (CudaTensor)tensor;
+        ulong tPtr = t.DevicePtr;
+        int n = (int)tensor.ElementCount;
+
+        // Use a 1-element F32 tensor for the result
+        var resultBuf = new float[1];
+        using var resultTensor = new CudaTensor("argmax_result", Gguf.GgmlType.F32, [1]);
+
+        ulong rPtr = resultTensor.DevicePtr;
+        var func = _elementwiseModule.GetFunction("argmax");
+        uint sharedMem = (uint)(BlockSize * 2 * sizeof(float));
+        nint* kArgs = stackalloc nint[3];
+        kArgs[0] = (nint)(&rPtr);
+        kArgs[1] = (nint)(&tPtr);
+        kArgs[2] = (nint)(&n);
+        _stream.Launch(func, 1, 1, 1, (uint)BlockSize, 1, 1, sharedMem, kArgs);
+
+        // Download just 1 float (4 bytes) instead of full vocab tensor
+        _stream.Synchronize();
+        resultTensor.DownloadTo(resultBuf);
+        return (int)resultBuf[0];
     }
 
     // ── GPU-Native DeltaNet Operations ──────────────────────────────────────
