@@ -91,8 +91,8 @@ __global__ void matmul_f32(float* output, const float* a, const float* b,
 
 // ── Fused Q8_0 Dequant + MatMul ─────────────────────────────────────────────
 // One block per output neuron. Threads cooperatively process Q8_0 blocks.
+// Uses vectorized loads (float4/char4) for 4× fewer memory transactions.
 // Grid: N blocks, Block: 256 threads.
-// Each thread handles K/(32*blockSize) Q8_0 blocks minimum, striding over all blocks.
 
 __global__ void dequant_matmul_q8_0(float* output, const float* a,
                                      const unsigned char* b,
@@ -109,55 +109,28 @@ __global__ void dequant_matmul_q8_0(float* output, const float* a,
     long bytes_per_row = (long)blocks_per_row * 34;
     const unsigned char* b_row = b + (long)n * bytes_per_row;
 
-    // Each thread processes elements at stride, with Q8_0 block-aligned groups
     float sum = 0.0f;
 
-    // Process full Q8_0 blocks per thread for coalesced access
     for (int blk = tid; blk < blocks_per_row; blk += blockSize)
     {
         const unsigned char* block_ptr = b_row + blk * 34;
 
         // FP16 → FP32 scale
-        unsigned short scale_bits = ((unsigned short)block_ptr[1] << 8) | block_ptr[0];
-        float scale = fp16_to_fp32(scale_bits);
+        float scale = fp16_to_fp32(*reinterpret_cast<const unsigned short*>(block_ptr));
 
+        // Vectorized float4 loads for activation (aligned), scalar for quants (unaligned)
         const signed char* quants = (const signed char*)(block_ptr + 2);
-        const float* a_ptr = a + blk * 32;
+        const float4* ap = reinterpret_cast<const float4*>(a + blk * 32);
 
-        // Dot product for 32 quants (unrolled)
         float block_sum = 0.0f;
-        block_sum += a_ptr[0] * (float)quants[0];
-        block_sum += a_ptr[1] * (float)quants[1];
-        block_sum += a_ptr[2] * (float)quants[2];
-        block_sum += a_ptr[3] * (float)quants[3];
-        block_sum += a_ptr[4] * (float)quants[4];
-        block_sum += a_ptr[5] * (float)quants[5];
-        block_sum += a_ptr[6] * (float)quants[6];
-        block_sum += a_ptr[7] * (float)quants[7];
-        block_sum += a_ptr[8] * (float)quants[8];
-        block_sum += a_ptr[9] * (float)quants[9];
-        block_sum += a_ptr[10] * (float)quants[10];
-        block_sum += a_ptr[11] * (float)quants[11];
-        block_sum += a_ptr[12] * (float)quants[12];
-        block_sum += a_ptr[13] * (float)quants[13];
-        block_sum += a_ptr[14] * (float)quants[14];
-        block_sum += a_ptr[15] * (float)quants[15];
-        block_sum += a_ptr[16] * (float)quants[16];
-        block_sum += a_ptr[17] * (float)quants[17];
-        block_sum += a_ptr[18] * (float)quants[18];
-        block_sum += a_ptr[19] * (float)quants[19];
-        block_sum += a_ptr[20] * (float)quants[20];
-        block_sum += a_ptr[21] * (float)quants[21];
-        block_sum += a_ptr[22] * (float)quants[22];
-        block_sum += a_ptr[23] * (float)quants[23];
-        block_sum += a_ptr[24] * (float)quants[24];
-        block_sum += a_ptr[25] * (float)quants[25];
-        block_sum += a_ptr[26] * (float)quants[26];
-        block_sum += a_ptr[27] * (float)quants[27];
-        block_sum += a_ptr[28] * (float)quants[28];
-        block_sum += a_ptr[29] * (float)quants[29];
-        block_sum += a_ptr[30] * (float)quants[30];
-        block_sum += a_ptr[31] * (float)quants[31];
+        #pragma unroll
+        for (int i = 0; i < 8; i++)
+        {
+            float4 ai = ap[i];
+            int base = i * 4;
+            block_sum += ai.x * (float)quants[base]     + ai.y * (float)quants[base + 1]
+                       + ai.z * (float)quants[base + 2] + ai.w * (float)quants[base + 3];
+        }
 
         sum += scale * block_sum;
     }
@@ -413,16 +386,26 @@ __global__ void dequant_matmul_q4_k(float* output, const float* a,
         float dmin = fp16_to_fp32(((unsigned short)sbp[3] << 8) | sbp[2]);
 
         // 4 chunks of 32 bytes each. lo nibble → first sub-block, hi → second.
+        // Vectorized float4 loads for activation (8 loads per 32 elements).
         for (int chunk = 0; chunk < 4; chunk++)
         {
             float ss0, sm0, ss1, sm1;
             unpack_q4k_scales(sbp, chunk * 2, d, dmin, ss0, sm0);
             unpack_q4k_scales(sbp, chunk * 2 + 1, d, dmin, ss1, sm1);
-            for (int l = 0; l < 32; l++)
+            const unsigned char* qs = sbp + 16 + chunk * 32;
+            const float4* aLo = reinterpret_cast<const float4*>(ap + chunk * 64);
+            const float4* aHi = reinterpret_cast<const float4*>(ap + chunk * 64 + 32);
+            #pragma unroll
+            for (int l = 0; l < 8; l++)
             {
-                unsigned char packed = sbp[16 + chunk * 32 + l];
-                sum += ap[chunk * 64 + l]      * (ss0 * (packed & 0xF) - sm0);
-                sum += ap[chunk * 64 + l + 32] * (ss1 * (packed >> 4) - sm1);
+                float4 al = aLo[l];
+                float4 ah = aHi[l];
+                int base = l * 4;
+                unsigned char p0 = qs[base], p1 = qs[base+1], p2 = qs[base+2], p3 = qs[base+3];
+                sum += al.x * (ss0 * (p0 & 0xF) - sm0) + al.y * (ss0 * (p1 & 0xF) - sm0)
+                     + al.z * (ss0 * (p2 & 0xF) - sm0) + al.w * (ss0 * (p3 & 0xF) - sm0);
+                sum += ah.x * (ss1 * (p0 >> 4) - sm1) + ah.y * (ss1 * (p1 >> 4) - sm1)
+                     + ah.z * (ss1 * (p2 >> 4) - sm1) + ah.w * (ss1 * (p3 >> 4) - sm1);
             }
         }
     }
@@ -465,21 +448,33 @@ __global__ void dequant_matmul_q5_k(float* output, const float* a,
         float d = fp16_to_fp32(((unsigned short)sbp[1] << 8) | sbp[0]);
         float dmin = fp16_to_fp32(((unsigned short)sbp[3] << 8) | sbp[2]);
 
-        // qs[j] low nibble = element j (0..127), high nibble = element j+128 (128..255)
-        // qh bit n = 5th bit for element n (0..255)
-        for (int elem = 0; elem < 256; elem++)
+        // Chunked layout matching ggml: 4 chunks of 64 elements each.
+        // Each 32-byte qs block: low nibble → first 32, high nibble → next 32.
+        // qh bits: element n's high bit at qh[n%32] bit (n/32), using rotating bitmask.
+        const unsigned char* qh = sbp + 16;
+        const unsigned char* qs = sbp + 48;
+        int isIdx = 0;
+        unsigned char u1 = 1, u2 = 2;
+        for (int j = 0; j < 4; j++)
         {
-            int qsIdx = elem < 128 ? elem : elem - 128;
-            unsigned char qsByte = sbp[48 + qsIdx];
-            int nibble = elem < 128 ? (qsByte & 0xF) : (qsByte >> 4);
-            int hb = (sbp[16 + elem / 8] >> (elem % 8)) & 1;
-            int q5 = nibble | (hb << 4);
+            float ss0, sm0, ss1, sm1;
+            unpack_q4k_scales(sbp, isIdx, d, dmin, ss0, sm0);
+            unpack_q4k_scales(sbp, isIdx + 1, d, dmin, ss1, sm1);
 
-            int subBlock = elem / 32;
-            float ss, sm;
-            unpack_q4k_scales(sbp, subBlock, d, dmin, ss, sm);
+            for (int l = 0; l < 32; l++)
+            {
+                int lo = qs[j * 32 + l] & 0xF;
+                int hbLo = (qh[l] & u1) ? 16 : 0;
+                sum += ap[j * 64 + l] * (ss0 * (lo + hbLo) - sm0);
 
-            sum += ap[elem] * (ss * q5 - sm);
+                int hi = qs[j * 32 + l] >> 4;
+                int hbHi = (qh[l] & u2) ? 16 : 0;
+                sum += ap[j * 64 + l + 32] * (ss1 * (hi + hbHi) - sm1);
+            }
+
+            u1 <<= 2;
+            u2 <<= 2;
+            isIdx += 2;
         }
     }
 
@@ -536,10 +531,12 @@ __global__ void dequant_matmul_q6_k(float* output, const float* a,
                 int q3 = ((ql[l] >> 4)         | (((qh[l] >> 4) & 3) << 4)) - 32;
                 int q4 = ((ql[l + 32] >> 4)    | (((qh[l] >> 6) & 3) << 4)) - 32;
 
-                sum += aHalf[l]      * (d * (float)((signed char)sbp[192 + scIdx + 0]) * q1);
-                sum += aHalf[l + 32] * (d * (float)((signed char)sbp[192 + scIdx + 2]) * q2);
-                sum += aHalf[l + 64] * (d * (float)((signed char)sbp[192 + scIdx + 4]) * q3);
-                sum += aHalf[l + 96] * (d * (float)((signed char)sbp[192 + scIdx + 6]) * q4);
+                // ggml uses is = l/16 to select sub-group scales
+                int isc = l / 16;
+                sum += aHalf[l]      * (d * (float)((signed char)sbp[192 + scIdx + isc + 0]) * q1);
+                sum += aHalf[l + 32] * (d * (float)((signed char)sbp[192 + scIdx + isc + 2]) * q2);
+                sum += aHalf[l + 64] * (d * (float)((signed char)sbp[192 + scIdx + isc + 4]) * q3);
+                sum += aHalf[l + 96] * (d * (float)((signed char)sbp[192 + scIdx + isc + 6]) * q4);
             }
         }
     }
