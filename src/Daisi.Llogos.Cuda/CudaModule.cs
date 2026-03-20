@@ -32,7 +32,7 @@ internal sealed class CudaModule : IDisposable
     /// <summary>
     /// Compile CUDA C++ source to PTX using NVRTC, then load as a module.
     /// </summary>
-    public static CudaModule FromCudaSource(string cudaSource, string? name = null)
+    public static CudaModule FromCudaSource(string cudaSource, string? name = null, string[]? extraOptions = null)
     {
         // Create NVRTC program
         NvrtcApi.Check(
@@ -41,8 +41,10 @@ internal sealed class CudaModule : IDisposable
 
         try
         {
-            // Compile with fast math for performance
-            var options = new[] { "--use_fast_math" };
+            // Compile with fast math + architecture-specific options
+            var optionsList = new List<string> { "--use_fast_math" };
+            if (extraOptions != null) optionsList.AddRange(extraOptions);
+            var options = optionsList.ToArray();
             var result = NvrtcApi.CompileProgram(prog, options.Length, options);
             if (result != NvrtcResult.Success)
             {
@@ -71,14 +73,14 @@ internal sealed class CudaModule : IDisposable
     /// <summary>
     /// Load and compile a .cu file embedded as an assembly resource.
     /// </summary>
-    public static CudaModule FromEmbeddedResource(string resourceName)
+    public static CudaModule FromEmbeddedResource(string resourceName, string[]? extraOptions = null)
     {
         var assembly = Assembly.GetExecutingAssembly();
         using var stream = assembly.GetManifestResourceStream(resourceName)
             ?? throw new FileNotFoundException($"Embedded resource not found: {resourceName}");
         using var reader = new StreamReader(stream, Encoding.UTF8);
         var source = reader.ReadToEnd();
-        return FromCudaSource(source, resourceName);
+        return FromCudaSource(source, resourceName, extraOptions);
     }
 
     /// <summary>
