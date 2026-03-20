@@ -344,25 +344,22 @@ public sealed class ForwardPass : IForwardPass
     /// </summary>
     private void RepeatInterleave(ITensor tensor, int numHeads, int headDim, int factor)
     {
-        // Download, repeat, re-upload
+        // Download, repeat via tiling (ggml_repeat style), re-upload.
+        // Tiling: [h0, h1, ..., h15, h0, h1, ..., h15] — NOT interleave [h0, h0, h1, h1, ...]
+        // This matches ggml_repeat which llama.cpp uses for Q/K head expansion.
         int srcSize = numHeads * headDim;
         int dstSize = numHeads * factor * headDim;
-        var src = new float[dstSize]; // full tensor size
-        tensor.DequantizeTo(src);
+        var fullBuf = new float[dstSize]; // tensor is dstSize elements
+        tensor.DequantizeTo(fullBuf);
+        var src = new float[srcSize];
+        Array.Copy(fullBuf, 0, src, 0, srcSize);
 
-        // Work backwards to avoid overwriting
-        for (int h = numHeads - 1; h >= 0; h--)
-        {
-            int srcOff = h * headDim;
-            for (int r = factor - 1; r >= 0; r--)
-            {
-                int dstOff = (h * factor + r) * headDim;
-                Array.Copy(src, srcOff, src, dstOff, headDim);
-            }
-        }
+        var dst = new float[dstSize];
+        for (int r = 0; r < factor; r++)
+            Array.Copy(src, 0, dst, r * srcSize, srcSize);
 
         var bytes = new byte[dstSize * sizeof(float)];
-        Buffer.BlockCopy(src, 0, bytes, 0, bytes.Length);
+        Buffer.BlockCopy(dst, 0, bytes, 0, bytes.Length);
         tensor.CopyFrom(bytes);
     }
 
