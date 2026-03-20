@@ -140,11 +140,8 @@ public sealed class ForwardPass : IForwardPass
         {
             var lw = _weights.Layers[layer];
 
-            // Save residual
-            _backend.CopyTensor(_residual, _hidden);
-
-            // Pre-attention RMSNorm
-            _backend.RmsNorm(_normOut, _hidden, lw.AttnNorm, _config.NormEps);
+            // Fused: save residual + pre-attention RMSNorm
+            _backend.RmsNormResidual(_normOut, _residual, _hidden, lw.AttnNorm, _config.NormEps);
 
             // Layer-type-specific attention
             if (lw is StandardAttentionWeights saw)
@@ -152,20 +149,14 @@ public sealed class ForwardPass : IForwardPass
             else if (lw is DeltaNetWeights dnw)
                 ForwardDeltaNet(dnw, layer);
 
-            // Residual add
-            _backend.ElementAdd(_hidden, _hidden, _residual);
-
-            // Save residual
+            // Fused: residual add + save new residual + pre-FFN RMSNorm
+            _backend.AddRmsNorm(_normOut, _hidden, _hidden, _residual, lw.PostAttnNorm, _config.NormEps);
             _backend.CopyTensor(_residual, _hidden);
 
-            // Post-attention RMSNorm (= pre-FFN norm)
-            _backend.RmsNorm(_normOut, _hidden, lw.PostAttnNorm, _config.NormEps);
-
-            // SwiGLU FFN
+            // SwiGLU FFN (fused SiLU + ElementMul)
             ProjectLinear(_gate, _normOut, lw.FfnGate);
             ProjectLinear(_up, _normOut, lw.FfnUp);
-            _backend.SiLU(_gate, _gate);
-            _backend.ElementMul(_gate, _gate, _up);
+            _backend.SwiGLU(_gate, _gate, _up);
             ProjectLinear(_hidden, _gate, lw.FfnDown);
 
             // Residual add
