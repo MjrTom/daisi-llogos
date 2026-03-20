@@ -64,8 +64,10 @@ public sealed class ModelConfig
 
             NumHeads = GetInt(gguf, $"{arch}.attention.head_count"),
             NumKvHeads = GetInt(gguf, $"{arch}.attention.head_count_kv"),
-            KeyLength = GetIntOrDefault(gguf, $"{arch}.attention.key_length", 0),
-            ValueLength = GetIntOrDefault(gguf, $"{arch}.attention.value_length", 0),
+            KeyLength = GetIntOrDefault(gguf, $"{arch}.attention.key_length",
+                GetInt(gguf, $"{arch}.embedding_length") / GetInt(gguf, $"{arch}.attention.head_count")),
+            ValueLength = GetIntOrDefault(gguf, $"{arch}.attention.value_length",
+                GetInt(gguf, $"{arch}.embedding_length") / GetInt(gguf, $"{arch}.attention.head_count")),
 
             RopeTheta = GetFloat(gguf, $"{arch}.rope.freq_base", 10000.0f),
             RopeDimCount = GetIntOrDefault(gguf, $"{arch}.rope.dimension_count", 0),

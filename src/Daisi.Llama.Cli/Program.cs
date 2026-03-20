@@ -37,93 +37,176 @@ IComputeBackend backend = options.Backend switch
     _ => new CpuBackend(),
 };
 
-// Use memory-mapped loading if --mmap is set (default: true)
-ModelWeights weights;
-if (options.UseMmap)
-    weights = MmapModelLoader.Load(gguf, options.ModelPath, backend, config);
-else
-    weights = ModelLoader.Load(gguf, stream, backend, config);
-
-var strategy = AttentionStrategy.Parse(options.Attention);
-int maxContext = strategy.Mode != AttentionMode.Full && strategy.CacheCapacity > 0
-    ? strategy.CacheCapacity
-    : options.MaxContext;
-IKvCache kvCache;
-if (options.Paged)
-    kvCache = new PagedKvCache(backend, config, maxSeqLen: maxContext, strategy: strategy,
-        vramPageBudget: options.OffloadPages);
-else
-    kvCache = new KvCache(backend, config, maxSeqLen: maxContext, strategy: strategy);
-var deltaState = new DeltaNetState(backend, config);
-var forward = new ForwardPass(backend, config, weights, kvCache, deltaState);
 var tokenizer = TokenizerFactory.FromGguf(gguf);
+bool isBitNet = config.Architecture.StartsWith("bitnet", StringComparison.OrdinalIgnoreCase);
 
-loadSw.Stop();
-var attnInfo = strategy.Mode switch
+if (isBitNet)
 {
-    AttentionMode.Window => $", window:{strategy.WindowSize}",
-    AttentionMode.Sinks => $", sinks:{strategy.SinkTokens},{strategy.WindowSize}",
-    _ => ""
-};
-var pagedInfo = options.Paged ? $", paged{(options.OffloadPages > 0 ? $" offload>{options.OffloadPages}" : "")}" : "";
-Console.Error.WriteLine($"Model loaded in {loadSw.Elapsed.TotalSeconds:F1}s " +
-    $"({config.Architecture}, {config.NumLayers} layers, {config.HiddenDim}d" +
-    $"{(options.UseMmap ? ", mmap" : "")}{attnInfo}{pagedInfo})");
+    // ── BitNet path ─────────────────────────────────────────────────────────
+    var weights = BitNetModelLoader.Load(gguf, stream, backend, config);
+    var kvCache = new BitNetKvCache(backend, config, maxSeqLen: options.MaxContext);
+    var forward = new BitNetForwardPass(backend, config, weights, kvCache);
 
-var generator = new TextGenerator(forward, tokenizer, options.Seed);
+    loadSw.Stop();
+    Console.Error.WriteLine($"Model loaded in {loadSw.Elapsed.TotalSeconds:F1}s " +
+        $"({config.Architecture}, {config.NumLayers} layers, {config.HiddenDim}d, BitNet)");
 
-if (options.Bench)
-{
-    // Benchmark mode
-    string benchPrompt = options.Prompt ?? "The meaning of life is";
-    Console.Error.WriteLine($"Benchmarking with prompt: \"{benchPrompt}\"");
-    Console.Error.WriteLine($"Backend: {backend.Name}, Max tokens: {options.MaxTokens}");
-    Console.Error.WriteLine();
+    var generator = new BitNetTextGenerator(forward, tokenizer, options.Seed);
+    RunGeneration(generator.Generate, options);
 
-    var result = generator.Benchmark(benchPrompt, options.MaxTokens);
-
-    Console.Error.WriteLine("=== Benchmark Results ===");
-    Console.Error.WriteLine($"  Prefill:  {result.PromptTokens,6} tokens in {result.PrefillTime.TotalMilliseconds,8:F1} ms  ({result.PrefillTokPerSec,8:F1} tok/s)");
-    Console.Error.WriteLine($"  Decode:   {result.GeneratedTokens,6} tokens in {result.DecodeTime.TotalMilliseconds,8:F1} ms  ({result.DecodeTokPerSec,8:F1} tok/s)");
-    Console.Error.WriteLine($"  Total:    {result.PromptTokens + result.GeneratedTokens,6} tokens in {result.TotalTime.TotalMilliseconds,8:F1} ms");
-    Console.Error.WriteLine($"  Load:     {loadSw.Elapsed.TotalMilliseconds,8:F1} ms");
+    forward.Dispose();
+    kvCache.Dispose();
+    weights.Dispose();
 }
 else
 {
-    // Generate mode
-    var parameters = new GenerationParams
-    {
-        MaxTokens = options.MaxTokens,
-        Temperature = options.Temperature,
-        TopK = options.TopK,
-        TopP = options.TopP,
-        RepetitionPenalty = options.RepeatPenalty,
-        Seed = options.Seed,
-    };
+    // ── Standard path (Qwen / hybrid) ───────────────────────────────────────
+    ModelWeights weights;
+    if (options.UseMmap)
+        weights = MmapModelLoader.Load(gguf, options.ModelPath, backend, config);
+    else
+        weights = ModelLoader.Load(gguf, stream, backend, config);
 
-    foreach (var token in generator.Generate(options.Prompt!, parameters))
+    var strategy = AttentionStrategy.Parse(options.Attention);
+    int maxContext = strategy.Mode != AttentionMode.Full && strategy.CacheCapacity > 0
+        ? strategy.CacheCapacity
+        : options.MaxContext;
+    IKvCache kvCache;
+    if (options.Paged)
+        kvCache = new PagedKvCache(backend, config, maxSeqLen: maxContext, strategy: strategy,
+            vramPageBudget: options.OffloadPages);
+    else
+        kvCache = new KvCache(backend, config, maxSeqLen: maxContext, strategy: strategy);
+    var deltaState = new DeltaNetState(backend, config);
+    var forward = new ForwardPass(backend, config, weights, kvCache, deltaState);
+
+    loadSw.Stop();
+    var attnInfo = strategy.Mode switch
     {
-        if (token.IsDone)
+        AttentionMode.Window => $", window:{strategy.WindowSize}",
+        AttentionMode.Sinks => $", sinks:{strategy.SinkTokens},{strategy.WindowSize}",
+        _ => ""
+    };
+    var pagedInfo = options.Paged ? $", paged{(options.OffloadPages > 0 ? $" offload>{options.OffloadPages}" : "")}" : "";
+    Console.Error.WriteLine($"Model loaded in {loadSw.Elapsed.TotalSeconds:F1}s " +
+        $"({config.Architecture}, {config.NumLayers} layers, {config.HiddenDim}d" +
+        $"{(options.UseMmap ? ", mmap" : "")}{attnInfo}{pagedInfo})");
+
+    var generator = new TextGenerator(forward, tokenizer, options.Seed);
+
+    if (options.Bench)
+    {
+        string benchPrompt = options.Prompt ?? "The meaning of life is";
+        Console.Error.WriteLine($"Benchmarking with prompt: \"{benchPrompt}\"");
+        Console.Error.WriteLine($"Backend: {backend.Name}, Max tokens: {options.MaxTokens}");
+        Console.Error.WriteLine();
+
+        var result = generator.Benchmark(benchPrompt, options.MaxTokens);
+
+        Console.Error.WriteLine("=== Benchmark Results ===");
+        Console.Error.WriteLine($"  Prefill:  {result.PromptTokens,6} tokens in {result.PrefillTime.TotalMilliseconds,8:F1} ms  ({result.PrefillTokPerSec,8:F1} tok/s)");
+        Console.Error.WriteLine($"  Decode:   {result.GeneratedTokens,6} tokens in {result.DecodeTime.TotalMilliseconds,8:F1} ms  ({result.DecodeTokPerSec,8:F1} tok/s)");
+        Console.Error.WriteLine($"  Total:    {result.PromptTokens + result.GeneratedTokens,6} tokens in {result.TotalTime.TotalMilliseconds,8:F1} ms");
+        Console.Error.WriteLine($"  Load:     {loadSw.Elapsed.TotalMilliseconds,8:F1} ms");
+    }
+    else
+    {
+        var parameters = new GenerationParams
         {
-            Console.Error.WriteLine();
-            Console.Error.WriteLine($"\n[prefill: {token.PrefillTokens} tokens, {token.PrefillTokensPerSecond:F1} tok/s | " +
-                $"decode: {token.TotalTokens} tokens, {token.TokensPerSecond:F1} tok/s]");
-        }
-        else
+            MaxTokens = options.MaxTokens,
+            Temperature = options.Temperature,
+            TopK = options.TopK,
+            TopP = options.TopP,
+            RepetitionPenalty = options.RepeatPenalty,
+            Seed = options.Seed,
+        };
+
+        foreach (var token in generator.Generate(options.Prompt!, parameters))
         {
-            Console.Write(token.Text);
+            if (token.IsDone)
+            {
+                Console.Error.WriteLine();
+                Console.Error.WriteLine($"\n[prefill: {token.PrefillTokens} tokens, {token.PrefillTokensPerSecond:F1} tok/s | " +
+                    $"decode: {token.TotalTokens} tokens, {token.TokensPerSecond:F1} tok/s]");
+            }
+            else
+            {
+                Console.Write(token.Text);
+            }
         }
     }
+
+    forward.Dispose();
+    deltaState.Dispose();
+    kvCache.Dispose();
+    weights.Dispose();
 }
 
-// Cleanup
-forward.Dispose();
-deltaState.Dispose();
-kvCache.Dispose();
-weights.Dispose();
 backend.Dispose();
 
 return 0;
+
+// ── Shared generation / bench logic ──────────────────────────────────────────
+
+static void RunGeneration(
+    Func<string, GenerationParams, IEnumerable<GenerationToken>> generateFn,
+    CliArgs options)
+{
+    if (options.Bench)
+    {
+        string benchPrompt = options.Prompt ?? "The meaning of life is";
+        Console.Error.WriteLine($"Benchmarking with prompt: \"{benchPrompt}\"");
+        Console.Error.WriteLine($"Max tokens: {options.MaxTokens}");
+        Console.Error.WriteLine();
+
+        var parameters = new GenerationParams
+        {
+            MaxTokens = options.MaxTokens,
+            Temperature = 0.7f,
+            TopK = 40,
+            TopP = 0.9f,
+        };
+        var sw = Stopwatch.StartNew();
+        int totalTokens = 0;
+        foreach (var token in generateFn(benchPrompt, parameters))
+        {
+            if (token.IsDone)
+            {
+                Console.Error.WriteLine("=== Benchmark Results ===");
+                Console.Error.WriteLine($"  Prefill:  {token.PrefillTokens,6} tokens ({token.PrefillTokensPerSecond,8:F1} tok/s)");
+                Console.Error.WriteLine($"  Decode:   {token.TotalTokens,6} tokens ({token.TokensPerSecond,8:F1} tok/s)");
+                Console.Error.WriteLine($"  Total:    {sw.Elapsed.TotalMilliseconds,8:F1} ms");
+            }
+            totalTokens++;
+        }
+    }
+    else
+    {
+        var parameters = new GenerationParams
+        {
+            MaxTokens = options.MaxTokens,
+            Temperature = options.Temperature,
+            TopK = options.TopK,
+            TopP = options.TopP,
+            RepetitionPenalty = options.RepeatPenalty,
+            Seed = options.Seed,
+        };
+
+        foreach (var token in generateFn(options.Prompt!, parameters))
+        {
+            if (token.IsDone)
+            {
+                Console.Error.WriteLine();
+                Console.Error.WriteLine($"\n[prefill: {token.PrefillTokens} tokens, {token.PrefillTokensPerSecond:F1} tok/s | " +
+                    $"decode: {token.TotalTokens} tokens, {token.TokensPerSecond:F1} tok/s]");
+            }
+            else
+            {
+                Console.Write(token.Text);
+            }
+        }
+    }
+}
 
 // ── Argument parsing ─────────────────────────────────────────────────────────
 

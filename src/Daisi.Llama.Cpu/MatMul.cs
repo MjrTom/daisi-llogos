@@ -75,6 +75,50 @@ internal static class MatMul
         }
     }
 
+    /// <summary>
+    /// FP32 × FP16 matrix multiply. b is [N×K] stored as Half.
+    /// Used for tied embeddings (F16 token_embd as output weight).
+    /// </summary>
+    public static unsafe void MultiplyF16(Span<float> output, ReadOnlySpan<float> a, ReadOnlySpan<Half> b, int M, int K, int N)
+    {
+        fixed (float* aPtr = a)
+        fixed (Half* bPtr = b)
+        fixed (float* oPtr = output)
+        {
+            nint bBase = (nint)bPtr;
+
+            for (int i = 0; i < M; i++)
+            {
+                float* aRow = aPtr + i * K;
+                float* oRow = oPtr + i * N;
+
+                if (N >= ParallelThreshold)
+                {
+                    nint bCapture = bBase;
+                    Parallel.For(0, N, j =>
+                    {
+                        Half* bRow = (Half*)bCapture + j * K;
+                        float sum = 0;
+                        for (int k = 0; k < K; k++)
+                            sum += aRow[k] * (float)bRow[k];
+                        oRow[j] = sum;
+                    });
+                }
+                else
+                {
+                    for (int j = 0; j < N; j++)
+                    {
+                        Half* bRow = bPtr + j * K;
+                        float sum = 0;
+                        for (int k = 0; k < K; k++)
+                            sum += aRow[k] * (float)bRow[k];
+                        oRow[j] = sum;
+                    }
+                }
+            }
+        }
+    }
+
     // ── FP32 Scalar ──────────────────────────────────────────────────────────
 
     private static void MultiplyScalar(Span<float> output, ReadOnlySpan<float> a, ReadOnlySpan<float> b, int M, int K, int N)
