@@ -21,16 +21,27 @@ public sealed class DeltaNetState : IDisposable
     private readonly int _qkvDim;
     private readonly int _convKernel;
 
-    public DeltaNetState(IComputeBackend backend, ModelConfig config)
+    public DeltaNetState(IComputeBackend backend, ModelConfig config, ModelWeights? weights = null)
     {
         _backend = backend;
         _groupCount = config.SsmGroupCount;
         _headDim = config.SsmHeadDim;
-        // Conv buffer needs to hold channels × (kernelSize-1) elements.
-        // The actual conv channel count comes from the weight tensor, but we don't have
-        // weights at DeltaNetState construction time. Use innerSize*3 as upper bound.
-        _qkvDim = config.SsmInnerSize * 3;
         _convKernel = config.SsmConvKernel;
+
+        // Derive actual QKV output dim from weight tensors if available.
+        // SsmInnerSize * 3 is wrong when Q/K/V have unequal sizes (e.g. 9B: 2048+2048+4096=8192 vs 3*2048=6144).
+        _qkvDim = config.SsmInnerSize * 3; // default fallback
+        if (weights != null)
+        {
+            for (int i = 0; i < config.NumLayers; i++)
+            {
+                if (!config.IsStandardAttention(i) && weights.Layers[i] is DeltaNetWeights dw)
+                {
+                    _qkvDim = (int)dw.AttnQkv.Dimensions[1]; // actual QKV output dimension
+                    break;
+                }
+            }
+        }
 
         var deltaLayers = new List<int>();
         for (int i = 0; i < config.NumLayers; i++)
@@ -45,7 +56,23 @@ public sealed class DeltaNetState : IDisposable
 
         if (_layerIndices.Length > 0)
         {
-            int stateSize = _groupCount * _headDim * _headDim;
+            // Derive actual head count from weights when available (metadata SsmGroupCount may differ).
+            int actualGroupCount = _groupCount;
+            int actualHeadDim = _headDim;
+            if (weights != null)
+            {
+                for (int i = 0; i < config.NumLayers; i++)
+                {
+                    if (!config.IsStandardAttention(i) && weights.Layers[i] is DeltaNetWeights dw)
+                    {
+                        actualGroupCount = (int)dw.SsmAlpha.Dimensions[1]; // num_v_heads
+                        actualHeadDim = config.SsmStateSize > 0 ? config.SsmStateSize : config.SsmHeadDim;
+                        break;
+                    }
+                }
+            }
+            int stateSize = Math.Max(_groupCount * _headDim * _headDim,
+                                     actualGroupCount * actualHeadDim * actualHeadDim);
             int convBufSize = (_convKernel - 1) * _qkvDim;
 
             for (int i = 0; i < _layerIndices.Length; i++)

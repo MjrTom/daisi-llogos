@@ -77,7 +77,7 @@ else
             vramPageBudget: options.OffloadPages);
     else
         kvCache = new KvCache(backend, config, maxSeqLen: maxContext, strategy: strategy);
-    var deltaState = new DeltaNetState(backend, config);
+    var deltaState = new DeltaNetState(backend, config, weights);
     var forward = new ForwardPass(backend, config, weights, kvCache, deltaState);
 
     loadSw.Stop();

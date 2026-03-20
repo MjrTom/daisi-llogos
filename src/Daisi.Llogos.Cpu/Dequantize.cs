@@ -217,23 +217,34 @@ public static class Dequantize
             int qhOff = srcOff + 16;  // 32 bytes (256 bits) of high bits
             int qsOff = srcOff + 48;  // 128 bytes of packed low nibbles
 
-            // Dequantize all 256 elements
-            for (int n = 0; n < 256; n++)
+            // Dequantize all 256 elements in chunks of 64 (matching ggml layout).
+            // Each 32-byte qs chunk serves 64 elements: low nibble → first 32, high nibble → next 32.
+            // qh bits: element n's high bit is at qh[n % 32] bit (n / 32).
+            int isIdx = 0;
+            int qlPtr = qsOff;
+            byte u1 = 1, u2 = 2;
+            for (int j = 0; j < 4; j++)
             {
-                // Get 4-bit low nibble
-                int qsIdx = n < 128 ? n : n - 128;
-                byte qsByte = source[qsOff + qsIdx];
-                int nibble = n < 128 ? (qsByte & 0xF) : (qsByte >> 4);
+                float d1 = d * scales[isIdx];
+                float m1 = dmin * mins[isIdx];
+                float d2 = d * scales[isIdx + 1];
+                float m2 = dmin * mins[isIdx + 1];
 
-                // Get high (5th) bit
-                int hb = (source[qhOff + n / 8] >> (n % 8)) & 1;
+                for (int l = 0; l < 32; l++)
+                {
+                    int lo = source[qlPtr + l] & 0xF;
+                    int hbLo = (source[qhOff + l] & u1) != 0 ? 16 : 0;
+                    destination[dstOff + j * 64 + l] = d1 * (lo + hbLo) - m1;
 
-                // 5-bit unsigned value [0..31]
-                int q5 = nibble | (hb << 4);
+                    int hi = source[qlPtr + l] >> 4;
+                    int hbHi = (source[qhOff + l] & u2) != 0 ? 16 : 0;
+                    destination[dstOff + j * 64 + l + 32] = d2 * (hi + hbHi) - m2;
+                }
 
-                // Scale and min for this element's sub-block
-                int subBlock = n / 32;
-                destination[dstOff + n] = d * scales[subBlock] * q5 - dmin * mins[subBlock];
+                qlPtr += 32;
+                u1 <<= 2;
+                u2 <<= 2;
+                isIdx += 2;
             }
         }
     }
@@ -279,10 +290,12 @@ public static class Dequantize
                     int q3 = ((source[qlOff + l] >> 4) | (((source[qhOff + l] >> 4) & 3) << 4)) - 32;
                     int q4 = ((source[qlOff + l + 32] >> 4) | (((source[qhOff + l] >> 6) & 3) << 4)) - 32;
 
-                    destination[yOff + l] = d * (sbyte)source[scBase + scIdx + 0] * q1;
-                    destination[yOff + l + 32] = d * (sbyte)source[scBase + scIdx + 2] * q2;
-                    destination[yOff + l + 64] = d * (sbyte)source[scBase + scIdx + 4] * q3;
-                    destination[yOff + l + 96] = d * (sbyte)source[scBase + scIdx + 6] * q4;
+                    // ggml uses is = l/16 to select sub-group scales within each 32-element loop
+                    int isc = l / 16;
+                    destination[yOff + l] = d * (sbyte)source[scBase + scIdx + isc + 0] * q1;
+                    destination[yOff + l + 32] = d * (sbyte)source[scBase + scIdx + isc + 2] * q2;
+                    destination[yOff + l + 64] = d * (sbyte)source[scBase + scIdx + isc + 4] * q3;
+                    destination[yOff + l + 96] = d * (sbyte)source[scBase + scIdx + isc + 6] * q4;
                 }
             }
         }
@@ -291,71 +304,85 @@ public static class Dequantize
     // ── Q3_K ─────────────────────────────────────────────────────────────────
 
     private const int Q3_KSuperBlockSize = 256;
-    private const int Q3_KTypeSize = 108; // 64 + 32 + 12 = 108 actually... let me check
-    // In ggml: hmask[32] + qs[128/2=64] + scales[12] + d[2] = 32+64+12+... no
-    // Actually: struct block_q3_K { half d; uint8_t hmask[32]; uint8_t qs[64]; uint8_t scales[12]; }
-    // = 2 + 32 + 64 + 12 = 110? No, the type size is 108 for 256 elements.
-    // Let me use the constant from GgmlTypeInfo: TypeSize(Q3_K) = 108
+    private const int Q3_KTypeSize = 110; // half d (2) + hmask[32] + qs[64] + scales[12] = 110
 
     /// <summary>
     /// Dequantize Q3_K data to FP32.
+    /// block_q3_K: { half d; uint8_t hmask[32]; uint8_t qs[64]; uint8_t scales[12]; }
+    /// Each element is 3 bits: 2 bits from qs + 1 bit from hmask.
+    /// 16 scales packed into 12 bytes using a complex bit-field scheme.
     /// </summary>
     public static void DequantizeQ3_K(ReadOnlySpan<byte> source, Span<float> destination)
     {
         int sbCount = source.Length / Q3_KTypeSize;
+        Span<int> scales = stackalloc int[16];
 
         for (int sb = 0; sb < sbCount; sb++)
         {
             int srcOff = sb * Q3_KTypeSize;
             int dstOff = sb * Q3_KSuperBlockSize;
 
-            // block_q3_K layout: hmask[32] + qs[64] + scales[12] + d[2] = 110
-            // But TypeSize is 108... let me check the actual llama.cpp layout
-            // Actually in ggml-common.h: { half d; uint8_t hmask[QK_K/8]; uint8_t qs[QK_K/4]; uint8_t scales[12]; }
-            // = 2 + 32 + 64 + 12 = 110. But GgmlTypeInfo says 108. Let me just use what works.
-            // Actually the actual GGML type_size for Q3_K is defined as sizeof(block_q3_K) which is 110
-            // but with possible padding differences. Let me look at the constant we defined...
-            // Our GgmlTypeInfo.TypeSize(Q3_K) = 108. This might be wrong but let's use it for now.
-            // Actually checking ggml: Q3_K block size = QK_K=256, type_size = 64+32+12+2 = 110
-            // I think our constant might be wrong. Let me just hardcode 110 here for safety.
-
             float d = (float)BitConverter.ToHalf(source.Slice(srcOff, 2));
             int hmaskOff = srcOff + 2;
             int qsOff = srcOff + 2 + 32;
             int scalesOff = srcOff + 2 + 32 + 64;
 
-            // Unpack scales (12 bytes → 16 × 4-bit values, re-centered)
-            Span<int> scalesRaw = stackalloc int[16];
-            for (int i = 0; i < 12; i++)
+            // Unpack 16 scales from 12 bytes (matching ggml get_scale_min_k4 pattern for Q3_K).
+            // bytes 0..3: low 4 bits of scales 0..3 (low nibble) and 8..11 (high nibble)
+            // bytes 4..7: low 4 bits of scales 4..7 (low nibble) and 12..15 (high nibble)
+            // bytes 8..11: high 2 bits of scales 0..7 (packed)
+            // All scales are 6-bit unsigned, then re-centered by subtracting 32.
+            var sc = source.Slice(scalesOff, 12);
+            for (int i = 0; i < 4; i++)
             {
-                if (i < 8)
-                {
-                    scalesRaw[i] = (source[scalesOff + i] & 0xF) - 8;
-                    if (i < 4) // only first 8 sub-blocks use high nibble
-                        scalesRaw[i + 8] = (source[scalesOff + i] >> 4) - 8;
-                }
+                scales[i] = (sc[i] & 0xF) - 8;
+                scales[i + 8] = (sc[i] >> 4) - 8;
             }
-            // Simplified: decode all 16 scales from 12 bytes
-            // Actually Q3_K scale packing is complex. Let me use the simpler approach:
-            // Just dequant using the raw 2-bit values with no scale for correctness
-            for (int n = 0; n < Q3_KSuperBlockSize; n++)
+            for (int i = 0; i < 4; i++)
             {
-                int qs_idx = n / 4;
-                int qs_shift = (n % 4) * 2;
-                int q2 = (source[qsOff + qs_idx] >> qs_shift) & 3;
+                scales[i + 4] = (sc[i + 4] & 0xF) - 8;
+                scales[i + 12] = (sc[i + 4] >> 4) - 8;
+            }
+            // High 2 bits from bytes 8..11 (4 bytes = 32 bits total)
+            // Each scale gets 2 additional high bits, extending from 4-bit to 6-bit
+            uint aux = BitConverter.ToUInt32(source.Slice(scalesOff + 8, 4));
+            for (int i = 0; i < 4; i++)
+            {
+                int hi0 = (int)((aux >> (2 * i)) & 3);
+                int hi1 = (int)((aux >> (2 * i + 8)) & 3);
+                int hi2 = (int)((aux >> (2 * i + 16)) & 3);
+                int hi3 = (int)((aux >> (2 * i + 24)) & 3);
+                // Reconstruct full 6-bit value then re-center
+                scales[i] = ((scales[i] + 8) | (hi0 << 4)) - 32;
+                scales[i + 4] = ((scales[i + 4] + 8) | (hi1 << 4)) - 32;
+                scales[i + 8] = ((scales[i + 8] + 8) | (hi2 << 4)) - 32;
+                scales[i + 12] = ((scales[i + 12] + 8) | (hi3 << 4)) - 32;
+            }
 
-                int hmask_bit = (source[hmaskOff + n / 8] >> (n % 8)) & 1;
-                int q = q2 | (hmask_bit << 2); // 3-bit value [0..7]
-                q -= 4; // re-center to [-4..3]
+            // Dequantize 256 elements: 3-bit values from qs (2 bits) + hmask (1 bit)
+            // hmask uses a rotating bitmask like Q5_K
+            byte m = 1;
+            int qsPtr = qsOff;
+            int yPtr = dstOff;
+            for (int n = 0; n < Q3_KSuperBlockSize; n += 128)
+            {
+                for (int l = 0; l < 32; l++)
+                {
+                    int qs_val = source[qsPtr + l];
 
-                int sc_idx = n / 16;
-                // Use simplified scale extraction
-                int sc_byte_idx = sc_idx / 2;
-                int sc_nibble = (sc_idx % 2 == 0)
-                    ? (source[scalesOff + sc_byte_idx] & 0xF) - 8
-                    : (source[scalesOff + sc_byte_idx] >> 4) - 8;
+                    int q0 = (qs_val & 3) - ((source[hmaskOff + l] & m) != 0 ? 0 : 4);
+                    int q1 = ((qs_val >> 2) & 3) - ((source[hmaskOff + l] & (m << 1)) != 0 ? 0 : 4);
+                    int q2 = ((qs_val >> 4) & 3) - ((source[hmaskOff + l] & (m << 2)) != 0 ? 0 : 4);
+                    int q3 = ((qs_val >> 6) & 3) - ((source[hmaskOff + l] & (m << 3)) != 0 ? 0 : 4);
 
-                destination[dstOff + n] = d * sc_nibble * q;
+                    destination[yPtr + l + 0] = d * scales[(n / 16) + 0] * q0;
+                    destination[yPtr + l + 32] = d * scales[(n / 16) + 2] * q1;
+                    destination[yPtr + l + 64] = d * scales[(n / 16) + 4] * q2;
+                    destination[yPtr + l + 96] = d * scales[(n / 16) + 6] * q3;
+                }
+                qsPtr += 32;
+                yPtr += 128;
+                m <<= 4;
             }
         }
     }

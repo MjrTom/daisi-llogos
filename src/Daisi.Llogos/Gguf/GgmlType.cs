@@ -107,7 +107,7 @@ public static class GgmlTypeInfo
         GgmlType.Q8_0 => 34,
         GgmlType.Q8_1 => 36,
         GgmlType.Q2_K => 96,
-        GgmlType.Q3_K => 108,
+        GgmlType.Q3_K => 110,
         GgmlType.Q4_K => 144,
         GgmlType.Q5_K => 176,
         GgmlType.Q6_K => 210,
