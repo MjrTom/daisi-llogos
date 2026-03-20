@@ -179,6 +179,36 @@ __global__ void element_add(float* output, const float* a, const float* b, int n
 // ── Embedding lookup ─────────────────────────────────────────────────────────
 // Copy a single row from an FP32 embedding table to output.
 
+// Flexible Q8_0 embedding lookup that handles both 34-byte and 36-byte aligned blocks
+__global__ void embedding_lookup_q8_0_v2(float* output, const unsigned char* table,
+                                          int hidden_dim, int token_id,
+                                          int block_stride, int quant_offset)
+{
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= hidden_dim) return;
+
+    int blocks_per_row = hidden_dim / 32;
+    int bytes_per_row = blocks_per_row * block_stride;
+    const unsigned char* row = table + (long long)token_id * bytes_per_row;
+
+    int block_idx = idx / 32;
+    int elem_idx = idx % 32;
+    const unsigned char* block = row + block_idx * block_stride;
+
+    unsigned short h = ((unsigned short)block[1] << 8) | block[0];
+    // Inline FP16→FP32
+    unsigned int sign = (h >> 15) & 1;
+    unsigned int exp_val = (h >> 10) & 0x1f;
+    unsigned int mant = h & 0x3ff;
+    unsigned int f;
+    if (exp_val == 0) { f = sign << 31; }
+    else if (exp_val == 31) { f = (sign << 31) | 0x7f800000 | (mant << 13); }
+    else { f = (sign << 31) | ((exp_val - 15 + 127) << 23) | (mant << 13); }
+    float scale = *reinterpret_cast<float*>(&f);
+    signed char quant = (signed char)block[quant_offset + elem_idx];
+    output[idx] = scale * (float)quant;
+}
+
 __global__ void embedding_lookup_f32(float* output, const float* table,
                                       int hidden_dim, int token_id)
 {

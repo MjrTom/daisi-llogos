@@ -16,6 +16,7 @@ public sealed class CudaBackend : IComputeBackend
     private readonly nint _cublasHandle;
     private CudaDeviceMemory? _q8_1Scratch; // scratch for quantized activation
     private int _q8_1ScratchK; // K dimension of current scratch
+    private ulong _q8_1CachedInputPtr; // device ptr of last quantized activation (for reuse)
     private bool _disposed;
 
     private const int BlockSize = 256;
@@ -48,7 +49,34 @@ public sealed class CudaBackend : IComputeBackend
 
     /// <inheritdoc />
     public ITensor LoadTensor(string name, GgmlType type, ReadOnlySpan<long> dimensions, ReadOnlySpan<byte> data)
-        => new CudaTensor(name, type, dimensions, data);
+    {
+        // Repack Q8_0 to aligned layout: 34-byte blocks → 36-byte blocks
+        // Old: [scale(2b) | quants(32b)] = 34 bytes, quants NOT 4-byte aligned
+        // New: [scale(2b) | pad(2b) | quants(32b)] = 36 bytes, quants 4-byte aligned
+        if (type == GgmlType.Q8_0 && dimensions.Length >= 2 && dimensions[0] >= 2048)
+        {
+            // Only repack weight matrices with K >= 2048 (not small embeddings or 1D tensors)
+            int blockCount = data.Length / 34;
+            var aligned = new byte[blockCount * 36];
+            for (int i = 0; i < blockCount; i++)
+            {
+                int srcOff = i * 34;
+                int dstOff = i * 36;
+                // Copy scale (2 bytes)
+                aligned[dstOff] = data[srcOff];
+                aligned[dstOff + 1] = data[srcOff + 1];
+                // Skip 2 bytes padding (already zero)
+                // Copy quants (32 bytes)
+                data.Slice(srcOff + 2, 32).CopyTo(aligned.AsSpan(dstOff + 4, 32));
+            }
+            // Create tensor with aligned layout — mark as Q8_0 but with aligned stride
+            var tensor = new CudaTensor(name, type, dimensions, pinned: false, alignedQ8_0: true);
+            tensor.Memory.CopyFromHost(aligned);
+            return tensor;
+        }
+
+        return new CudaTensor(name, type, dimensions, data);
+    }
 
     /// <inheritdoc />
     public unsafe void MatMul(ITensor output, ITensor a, ITensor b, int M, int K, int N)
@@ -93,42 +121,56 @@ public sealed class CudaBackend : IComputeBackend
         else if (b.Type == GgmlType.Q8_0 && K >= 2048)
         {
             // dp4a path: quantize activation to int8, use integer dot product hardware.
-            // Only for K >= 2048 where quantization overhead is amortized.
+            // Cache: skip re-quantization if the same activation tensor is used again
+            // (e.g., Q/K/V projections all share normOut, gate/up share normOut).
             int numBlocks = K / 32;
-            int q8_1Bytes = numBlocks * 36; // 36 bytes per Q8_1 block
+            int q8_1Bytes = numBlocks * 36;
             if (_q8_1Scratch == null || _q8_1ScratchK < K)
             {
                 _q8_1Scratch?.Dispose();
                 _q8_1Scratch = new CudaDeviceMemory((ulong)q8_1Bytes);
                 _q8_1ScratchK = K;
+                _q8_1CachedInputPtr = 0; // invalidate cache on resize
             }
             ulong q8_1Ptr = _q8_1Scratch.DevicePtr;
 
-            var quantFunc = _matmulModule.GetFunction("quantize_f32_q8_1");
-            uint quantGrid = (uint)((numBlocks + BlockSize - 1) / BlockSize);
-            int kVal = K;
-            nint* qArgs = stackalloc nint[3];
-            qArgs[0] = (nint)(&q8_1Ptr);
-            qArgs[1] = (nint)(&aPtr);
-            qArgs[2] = (nint)(&kVal);
-            _stream.Launch(quantFunc, quantGrid, 1, 1, (uint)BlockSize, 1, 1, 0, qArgs);
+            // Only quantize if activation changed since last call
+            if (_q8_1CachedInputPtr != aPtr)
+            {
+                var quantFunc = _matmulModule.GetFunction("quantize_f32_q8_1");
+                uint quantGrid = (uint)((numBlocks + BlockSize - 1) / BlockSize);
+                int kVal = K;
+                nint* qArgs = stackalloc nint[3];
+                qArgs[0] = (nint)(&q8_1Ptr);
+                qArgs[1] = (nint)(&aPtr);
+                qArgs[2] = (nint)(&kVal);
+                _stream.Launch(quantFunc, quantGrid, 1, 1, (uint)BlockSize, 1, 1, 0, qArgs);
+                _q8_1CachedInputPtr = aPtr;
+            }
 
-            // Step 2: Q8_0 × Q8_1 matmul using __dp4a
-            var func = _matmulModule.GetFunction("dequant_matmul_q8_0_q8_1");
+            // Step 2: Q8_0 × Q8_1 matmul using __dp4a (aligned or unaligned path)
+            bool isAligned = bT is CudaTensor ct && ct.IsAlignedQ8_0;
+            var func = _matmulModule.GetFunction(isAligned
+                ? "dequant_matmul_q8_0_q8_1_aligned"
+                : "dequant_matmul_q8_0_q8_1");
             int nVal = N;
+            int kVal2 = K;
             nint* kArgs = stackalloc nint[6];
             kArgs[0] = (nint)(&outPtr);
             kArgs[1] = (nint)(&q8_1Ptr);
             kArgs[2] = (nint)(&bPtr);
             kArgs[3] = (nint)(&M);
-            kArgs[4] = (nint)(&kVal);
+            kArgs[4] = (nint)(&kVal2);
             kArgs[5] = (nint)(&nVal);
             _stream.Launch(func, gridX, 1, 1, (uint)matmulBlockSize, 1, 1, sharedMem, kArgs);
         }
         else if (b.Type == GgmlType.Q8_0)
         {
             // Float path for small K (dp4a quantization overhead not worth it)
-            var func = _matmulModule.GetFunction("dequant_matmul_q8_0");
+            // Use aligned kernel variant if weights are repacked
+            bool isSmallAligned = bT is CudaTensor ct2 && ct2.IsAlignedQ8_0;
+            var func = _matmulModule.GetFunction(isSmallAligned
+                ? "dequant_matmul_q8_0_aligned" : "dequant_matmul_q8_0");
             int nVal = N;
             nint* kArgs = stackalloc nint[6];
             kArgs[0] = (nint)(&outPtr);
@@ -404,12 +446,17 @@ public sealed class CudaBackend : IComputeBackend
         }
         else if (table.Type == GgmlType.Q8_0)
         {
-            var func = _elementwiseModule.GetFunction("embedding_lookup_q8_0");
-            nint* kArgs = stackalloc nint[4];
+            // Use block stride based on alignment (34 original, 36 repacked)
+            int blockStride = (tableT is CudaTensor ct && ct.IsAlignedQ8_0) ? 36 : 34;
+            int quantOffset = blockStride == 36 ? 4 : 2; // quants start after scale+pad or scale
+            var func = _elementwiseModule.GetFunction("embedding_lookup_q8_0_v2");
+            nint* kArgs = stackalloc nint[6];
             kArgs[0] = (nint)(&outPtr);
             kArgs[1] = (nint)(&tablePtr);
             kArgs[2] = (nint)(&hiddenDim);
             kArgs[3] = (nint)(&tokenId);
+            kArgs[4] = (nint)(&blockStride);
+            kArgs[5] = (nint)(&quantOffset);
             _stream.Launch(func, grid, 1, 1, (uint)BlockSize, 1, 1, 0, kArgs);
         }
         else if (table.Type == GgmlType.F16)
