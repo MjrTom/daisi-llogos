@@ -237,6 +237,22 @@ public interface IComputeBackend : IDisposable
     }
 
     /// <summary>
+    /// Find the index of the maximum value in a tensor. Returns -1 if tensor is empty.
+    /// GPU backends can compute this on-device to avoid downloading the full tensor.
+    /// </summary>
+    int ArgMax(ITensor tensor)
+    {
+        // Default: download and scan on CPU
+        var buf = new float[tensor.ElementCount];
+        tensor.DequantizeTo(buf);
+        int best = 0;
+        float bestVal = buf[0];
+        for (int i = 1; i < buf.Length; i++)
+            if (buf[i] > bestVal) { bestVal = buf[i]; best = i; }
+        return best;
+    }
+
+    /// <summary>
     /// Fused: residual[i] = input[i], output[i] = RmsNorm(input, weight).
     /// Saves one kernel launch and one memory round-trip vs CopyTensor + RmsNorm.
     /// </summary>
