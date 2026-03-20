@@ -192,6 +192,51 @@ public interface IComputeBackend : IDisposable
     // ── Fused Operations (optional, default to separate calls) ──────────────
 
     /// <summary>
+    /// Split QKV buffer with unequal sizes: [Q:keyDim, K:keyDim, V:valueDim].
+    /// Q and K tensors are valueDim-sized (zero-padded after keyDim elements).
+    /// </summary>
+    void SplitUnequalQKV(ITensor q, ITensor k, ITensor v, ITensor qkv, int keyDim, int valueDim)
+    {
+        // Default: download, split on CPU, re-upload (slow for GPU)
+        int totalElems = keyDim * 2 + valueDim;
+        var buf = new float[totalElems];
+        qkv.DequantizeTo(buf.AsSpan(0, totalElems));
+
+        var qBuf = new byte[q.ByteSize];
+        Buffer.BlockCopy(buf, 0, qBuf, 0, keyDim * sizeof(float));
+        q.CopyFrom(qBuf);
+
+        var kBuf = new byte[k.ByteSize];
+        Buffer.BlockCopy(buf, keyDim * sizeof(float), kBuf, 0, keyDim * sizeof(float));
+        k.CopyFrom(kBuf);
+
+        var vBuf = new byte[v.ByteSize];
+        Buffer.BlockCopy(buf, keyDim * 2 * sizeof(float), vBuf, 0, valueDim * sizeof(float));
+        v.CopyFrom(vBuf);
+    }
+
+    /// <summary>
+    /// Tile Q/K heads: [h0..hN] → [h0..hN, h0..hN, ...] repeated 'factor' times.
+    /// Tensor must be large enough for the expanded result (numHeads*factor*headDim).
+    /// Only the first numHeads*headDim elements are source data.
+    /// </summary>
+    void RepeatTile(ITensor tensor, int numHeads, int headDim, int factor)
+    {
+        // Default: download, tile on CPU, re-upload (slow for GPU)
+        int srcSize = numHeads * headDim;
+        int dstSize = numHeads * factor * headDim;
+        var fullBuf = new float[dstSize];
+        tensor.DequantizeTo(fullBuf);
+        var src = new float[srcSize];
+        Array.Copy(fullBuf, 0, src, 0, srcSize);
+        for (int r = 0; r < factor; r++)
+            Array.Copy(src, 0, fullBuf, r * srcSize, srcSize);
+        var bytes = new byte[dstSize * sizeof(float)];
+        Buffer.BlockCopy(fullBuf, 0, bytes, 0, bytes.Length);
+        tensor.CopyFrom(bytes);
+    }
+
+    /// <summary>
     /// Fused: residual[i] = input[i], output[i] = RmsNorm(input, weight).
     /// Saves one kernel launch and one memory round-trip vs CopyTensor + RmsNorm.
     /// </summary>

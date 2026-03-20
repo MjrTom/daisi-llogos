@@ -260,30 +260,22 @@ public sealed class ForwardPass : IForwardPass
         // 4. Split Q(keyDim) + K(keyDim) + V(valueDim) — possibly unequal
         if (keyDim == valueDim)
         {
-            // Equal split (0.8B model: keyDim = valueDim = innerSize)
             _backend.SplitQKV(_ssmQ, _ssmK, _ssmV, _qkvBuf, keyDim);
         }
         else
         {
-            // Unequal split (9B model: keyDim=2048, valueDim=4096)
-            // Copy Q, K from qkvBuf, then V
-            _backend.CopyTensorBytes(_ssmQ, _qkvBuf, keyDim * sizeof(float));
-
-            // K starts at offset keyDim — need a shifted copy
-            // Use the generic SplitQKV but with keyDim as the split size,
-            // then copy V separately from offset 2*keyDim
-            SplitUnequal(_qkvBuf, _ssmQ, _ssmK, _ssmV, keyDim, valueDim);
+            _backend.SplitUnequalQKV(_ssmQ, _ssmK, _ssmV, _qkvBuf, keyDim, valueDim);
         }
 
         // 5. L2-normalize Q and K (num_k_heads groups)
         _backend.L2NormGroups(_ssmQ, numKHeads, headDim);
         _backend.L2NormGroups(_ssmK, numKHeads, headDim);
 
-        // 6. Repeat-interleave Q and K from num_k_heads → num_v_heads
+        // 6. Tile Q and K from num_k_heads → num_v_heads (ggml_repeat style)
         if (repeatFactor > 1)
         {
-            RepeatInterleave(_ssmQ, numKHeads, headDim, repeatFactor);
-            RepeatInterleave(_ssmK, numKHeads, headDim, repeatFactor);
+            _backend.RepeatTile(_ssmQ, numKHeads, headDim, repeatFactor);
+            _backend.RepeatTile(_ssmK, numKHeads, headDim, repeatFactor);
         }
 
         // 7. Compute alpha and beta projections

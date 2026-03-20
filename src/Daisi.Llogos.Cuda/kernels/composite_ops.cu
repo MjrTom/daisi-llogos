@@ -390,6 +390,37 @@ __global__ void compute_decay_beta(float* decay, float* beta,
 // ── Split QKV ────────────────────────────────────────────────────────────────
 // Split [Q|K|V] concatenated buffer into separate tensors.
 
+// ── Split QKV with unequal sizes ──────────────────────────────────────────
+// Layout: [Q:keyDim, K:keyDim, V:valueDim] → separate Q, K, V tensors.
+// Q and K are valueDim-sized (zero-padded). V is valueDim-sized.
+
+__global__ void split_unequal_qkv(float* q, float* k, float* v, const float* qkv,
+                                   int keyDim, int valueDim)
+{
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+
+    // Zero Q and K first (they're valueDim-sized but only keyDim elements filled)
+    if (idx < valueDim)
+    {
+        q[idx] = idx < keyDim ? qkv[idx] : 0.0f;
+        k[idx] = idx < keyDim ? qkv[keyDim + idx] : 0.0f;
+    }
+
+    // Copy V (valueDim elements)
+    if (idx < valueDim)
+        v[idx] = qkv[keyDim * 2 + idx];
+}
+
+// ── Tile heads: [h0..hN] → [h0..hN, h0..hN] repeated factor times ───────
+// In-place: reads from first srcSize elements, tiles into full dstSize.
+
+__global__ void repeat_tile(float* data, int srcSize, int dstSize)
+{
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= dstSize || idx < srcSize) return;  // skip source region
+    data[idx] = data[idx % srcSize];
+}
+
 __global__ void split_qkv(float* q, float* k, float* v, const float* qkv, int innerSize)
 {
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
