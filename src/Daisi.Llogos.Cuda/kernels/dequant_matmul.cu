@@ -93,8 +93,9 @@ __global__ void matmul_f32(float* output, const float* a, const float* b,
 // One block per output neuron. Vectorized float4 loads for activation.
 // Grid: N blocks, Block: adaptive threads.
 
-__global__ void dequant_matmul_q8_0(float* output, const float* a,
-                                     const unsigned char* b,
+__global__ void dequant_matmul_q8_0(float* __restrict__ output,
+                                     const float* __restrict__ a,
+                                     const unsigned char* __restrict__ b,
                                      int M, int K, int N)
 {
     extern __shared__ float shared[];
@@ -106,9 +107,10 @@ __global__ void dequant_matmul_q8_0(float* output, const float* a,
 
     int blocks_per_row = K / 32;
     long bytes_per_row = (long)blocks_per_row * 34;
-    const unsigned char* b_row = b + (long)n * bytes_per_row;
+    const unsigned char* __restrict__ b_row = b + (long)n * bytes_per_row;
 
-    float sum = 0.0f;
+    // Two accumulators to reduce dependency chains
+    float sum0 = 0.0f, sum1 = 0.0f;
 
     for (int blk = tid; blk < blocks_per_row; blk += blockSize)
     {
@@ -117,17 +119,28 @@ __global__ void dequant_matmul_q8_0(float* output, const float* a,
         const signed char* quants = (const signed char*)(block_ptr + 2);
         const float4* ap = reinterpret_cast<const float4*>(a + blk * 32);
 
-        float block_sum = 0.0f;
+        float bs0 = 0.0f, bs1 = 0.0f;
         #pragma unroll
-        for (int i = 0; i < 8; i++)
+        for (int i = 0; i < 4; i++)
         {
             float4 ai = ap[i];
             int base = i * 4;
-            block_sum += ai.x * (float)quants[base]     + ai.y * (float)quants[base + 1]
-                       + ai.z * (float)quants[base + 2] + ai.w * (float)quants[base + 3];
+            bs0 += ai.x * (float)quants[base]     + ai.y * (float)quants[base + 1]
+                 + ai.z * (float)quants[base + 2] + ai.w * (float)quants[base + 3];
         }
-        sum += scale * block_sum;
+        #pragma unroll
+        for (int i = 4; i < 8; i++)
+        {
+            float4 ai = ap[i];
+            int base = i * 4;
+            bs1 += ai.x * (float)quants[base]     + ai.y * (float)quants[base + 1]
+                 + ai.z * (float)quants[base + 2] + ai.w * (float)quants[base + 3];
+        }
+        sum0 += scale * bs0;
+        sum1 += scale * bs1;
     }
+
+    float sum = sum0 + sum1;
 
     // Warp reduction
     sum = warp_reduce_sum(sum);
