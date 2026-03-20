@@ -319,6 +319,91 @@ __global__ void embedding_lookup_q4_k(float* output, const unsigned char* table,
     output[idx] = d * (float)sc * (float)nibble - dmin * (float)m;
 }
 
+// ── Fused: Residual save + RMSNorm ────────────────────────────────────────────
+// residual[i] = input[i]; output[i] = (input[i] / rms) * weight[i]
+// Saves one kernel launch + one full read/write of the hidden state.
+
+__global__ void rms_norm_residual(float* output, float* residual, const float* input,
+                                   const float* weight, int n, float eps)
+{
+    extern __shared__ float sdata[];
+    int tid = threadIdx.x;
+    int stride = blockDim.x;
+
+    // Pass 1: copy to residual + compute sum of squares
+    float sum = 0.0f;
+    for (int i = tid; i < n; i += stride)
+    {
+        float v = input[i];
+        residual[i] = v;
+        sum += v * v;
+    }
+
+    sdata[tid] = sum;
+    __syncthreads();
+
+    for (int s = blockDim.x / 2; s > 0; s >>= 1)
+    {
+        if (tid < s) sdata[tid] += sdata[tid + s];
+        __syncthreads();
+    }
+
+    float inv_rms = 1.0f / sqrtf(sdata[0] / (float)n + eps);
+
+    // Pass 2: normalize
+    for (int i = tid; i < n; i += stride)
+        output[i] = input[i] * inv_rms * weight[i];
+}
+
+// ── Fused: SwiGLU (SiLU + ElementMul) ────────────────────────────────────────
+// output[i] = (gate[i] * sigmoid(gate[i])) * up[i]
+// Saves one kernel launch + two memory round-trips.
+
+__global__ void swiglu(float* output, const float* gate, const float* up, int n)
+{
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx < n)
+    {
+        float g = gate[idx];
+        output[idx] = (g / (1.0f + expf(-g))) * up[idx];
+    }
+}
+
+// ── Fused: Element add + RMSNorm (residual add then norm) ────────────────────
+// hidden[i] = a[i] + b[i]; output[i] = (hidden[i] / rms) * weight[i]
+
+__global__ void add_rms_norm(float* output, float* hidden, const float* a, const float* b,
+                              const float* weight, int n, float eps)
+{
+    extern __shared__ float sdata[];
+    int tid = threadIdx.x;
+    int stride = blockDim.x;
+
+    // Pass 1: add + sum of squares
+    float sum = 0.0f;
+    for (int i = tid; i < n; i += stride)
+    {
+        float v = a[i] + b[i];
+        hidden[i] = v;
+        sum += v * v;
+    }
+
+    sdata[tid] = sum;
+    __syncthreads();
+
+    for (int s = blockDim.x / 2; s > 0; s >>= 1)
+    {
+        if (tid < s) sdata[tid] += sdata[tid + s];
+        __syncthreads();
+    }
+
+    float inv_rms = 1.0f / sqrtf(sdata[0] / (float)n + eps);
+
+    // Pass 2: normalize from hidden
+    for (int i = tid; i < n; i += stride)
+        output[i] = hidden[i] * inv_rms * weight[i];
+}
+
 // ── Fill tensor ───────────────────────────────────────────────────────────────
 // output[i] = value
 

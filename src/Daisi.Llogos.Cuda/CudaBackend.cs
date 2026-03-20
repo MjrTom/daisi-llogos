@@ -53,10 +53,18 @@ public sealed class CudaBackend : IComputeBackend
         ulong aPtr = aT.DevicePtr;
         ulong bPtr = bT.DevicePtr;
 
-        // One block per output neuron, one warp (32 threads) cooperates on dot product
+        // One block per output neuron, warps cooperate on dot product.
         uint gridX = (uint)N;
-        int matmulBlockSize = 32;
-        uint sharedMem = sizeof(float);
+        // Adaptive block size: scale with the number of work items per row.
+        // Q8_0: 1 item per 32 elements. K-quants: 1 item per 256 elements. F32/F16: 1 item per element.
+        int workItemsPerRow = b.Type switch
+        {
+            GgmlType.Q4_K or GgmlType.Q5_K or GgmlType.Q6_K => K / 256,
+            GgmlType.Q8_0 => K / 32,
+            _ => K / 8 // F32/F16: 8 elements per thread is fine
+        };
+        int matmulBlockSize = Math.Clamp((workItemsPerRow + 31) & ~31, 32, 256);
+        uint sharedMem = (uint)((matmulBlockSize / 32) * sizeof(float));
 
         if (b.Type == GgmlType.F32)
         {
@@ -773,6 +781,82 @@ public sealed class CudaBackend : IComputeBackend
 
         var result = cpuOut.AsFloatSpan();
         outT.UploadFrom(result);
+    }
+
+    // ── Fused Operations ─────────────────────────────────────────────────────
+
+    /// <inheritdoc />
+    public unsafe void RmsNormResidual(ITensor output, ITensor residual, ITensor input, ITensor weight, float eps)
+    {
+        var outT = (CudaTensor)output;
+        var resT = (CudaTensor)residual;
+        var inT = (CudaTensor)input;
+        var wT = (CudaTensor)weight;
+        ulong outPtr = outT.DevicePtr;
+        ulong resPtr = resT.DevicePtr;
+        ulong inPtr = inT.DevicePtr;
+        ulong wPtr = wT.DevicePtr;
+        int n = (int)input.ElementCount;
+
+        var func = _elementwiseModule.GetFunction("rms_norm_residual");
+        uint sharedMem = (uint)(BlockSize * sizeof(float));
+        nint* kArgs = stackalloc nint[6];
+        kArgs[0] = (nint)(&outPtr);
+        kArgs[1] = (nint)(&resPtr);
+        kArgs[2] = (nint)(&inPtr);
+        kArgs[3] = (nint)(&wPtr);
+        kArgs[4] = (nint)(&n);
+        kArgs[5] = (nint)(&eps);
+        _stream.Launch(func, 1, 1, 1, (uint)BlockSize, 1, 1, sharedMem, kArgs);
+    }
+
+    /// <inheritdoc />
+    public unsafe void SwiGLU(ITensor output, ITensor gate, ITensor up)
+    {
+        var outT = (CudaTensor)output;
+        var gT = (CudaTensor)gate;
+        var uT = (CudaTensor)up;
+        ulong outPtr = outT.DevicePtr;
+        ulong gPtr = gT.DevicePtr;
+        ulong uPtr = uT.DevicePtr;
+        int n = (int)gate.ElementCount;
+
+        var func = _elementwiseModule.GetFunction("swiglu");
+        uint grid = (uint)((n + BlockSize - 1) / BlockSize);
+        nint* kArgs = stackalloc nint[4];
+        kArgs[0] = (nint)(&outPtr);
+        kArgs[1] = (nint)(&gPtr);
+        kArgs[2] = (nint)(&uPtr);
+        kArgs[3] = (nint)(&n);
+        _stream.Launch(func, grid, 1, 1, (uint)BlockSize, 1, 1, 0, kArgs);
+    }
+
+    /// <inheritdoc />
+    public unsafe void AddRmsNorm(ITensor output, ITensor hidden, ITensor a, ITensor b, ITensor weight, float eps)
+    {
+        var outT = (CudaTensor)output;
+        var hidT = (CudaTensor)hidden;
+        var aT = (CudaTensor)a;
+        var bT = (CudaTensor)b;
+        var wT = (CudaTensor)weight;
+        ulong outPtr = outT.DevicePtr;
+        ulong hidPtr = hidT.DevicePtr;
+        ulong aPtr = aT.DevicePtr;
+        ulong bPtr = bT.DevicePtr;
+        ulong wPtr = wT.DevicePtr;
+        int n = (int)a.ElementCount;
+
+        var func = _elementwiseModule.GetFunction("add_rms_norm");
+        uint sharedMem = (uint)(BlockSize * sizeof(float));
+        nint* kArgs = stackalloc nint[7];
+        kArgs[0] = (nint)(&outPtr);
+        kArgs[1] = (nint)(&hidPtr);
+        kArgs[2] = (nint)(&aPtr);
+        kArgs[3] = (nint)(&bPtr);
+        kArgs[4] = (nint)(&wPtr);
+        kArgs[5] = (nint)(&n);
+        kArgs[6] = (nint)(&eps);
+        _stream.Launch(func, 1, 1, 1, (uint)BlockSize, 1, 1, sharedMem, kArgs);
     }
 
     /// <inheritdoc />

@@ -188,4 +188,36 @@ public interface IComputeBackend : IDisposable
     /// Used by BitNet b1.58 instead of SiLU.
     /// </summary>
     void SquaredReLU(ITensor data);
+
+    // ── Fused Operations (optional, default to separate calls) ──────────────
+
+    /// <summary>
+    /// Fused: residual[i] = input[i], output[i] = RmsNorm(input, weight).
+    /// Saves one kernel launch and one memory round-trip vs CopyTensor + RmsNorm.
+    /// </summary>
+    void RmsNormResidual(ITensor output, ITensor residual, ITensor input, ITensor weight, float eps)
+    {
+        CopyTensor(residual, input);
+        RmsNorm(output, input, weight, eps);
+    }
+
+    /// <summary>
+    /// Fused SwiGLU: output[i] = SiLU(gate[i]) * up[i].
+    /// Saves one kernel launch vs SiLU + ElementMul.
+    /// </summary>
+    void SwiGLU(ITensor output, ITensor gate, ITensor up)
+    {
+        SiLU(gate, gate);
+        ElementMul(output, gate, up);
+    }
+
+    /// <summary>
+    /// Fused: hidden[i] = a[i] + b[i], output[i] = RmsNorm(hidden, weight).
+    /// Saves kernel launches vs ElementAdd + CopyTensor + RmsNorm.
+    /// </summary>
+    void AddRmsNorm(ITensor output, ITensor hidden, ITensor a, ITensor b, ITensor weight, float eps)
+    {
+        ElementAdd(hidden, a, b);
+        RmsNorm(output, hidden, weight, eps);
+    }
 }
