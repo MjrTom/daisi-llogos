@@ -37,12 +37,15 @@ public sealed class ModelConfig
     public required int SsmGroupCount { get; init; }
     public required int SsmInnerSize { get; init; }
 
-    public int SsmHeadDim => SsmInnerSize / SsmGroupCount;
+    public int SsmHeadDim => SsmGroupCount > 0 ? SsmInnerSize / SsmGroupCount : 0;
+
+    /// <summary>True when the model has any DeltaNet/SSM layers.</summary>
+    public bool HasDeltaNet => SsmInnerSize > 0;
 
     /// <summary>Is the given layer a standard attention layer (vs DeltaNet)?</summary>
     public bool IsStandardAttention(int layer) =>
-        FullAttentionInterval > 0
-        && ((layer + 1) % FullAttentionInterval == 0);
+        !HasDeltaNet
+        || (FullAttentionInterval > 0 && ((layer + 1) % FullAttentionInterval == 0));
 
     public static ModelConfig FromGguf(GgufFile gguf)
     {
@@ -70,7 +73,8 @@ public sealed class ModelConfig
                 GetInt(gguf, $"{arch}.embedding_length") / GetInt(gguf, $"{arch}.attention.head_count")),
 
             RopeTheta = GetFloat(gguf, $"{arch}.rope.freq_base", 10000.0f),
-            RopeDimCount = GetIntOrDefault(gguf, $"{arch}.rope.dimension_count", 0),
+            RopeDimCount = GetIntOrDefault(gguf, $"{arch}.rope.dimension_count",
+                GetInt(gguf, $"{arch}.embedding_length") / GetInt(gguf, $"{arch}.attention.head_count")),
 
             FullAttentionInterval = GetIntOrDefault(gguf, $"{arch}.full_attention_interval", 0),
 

@@ -54,16 +54,20 @@ public static class MmapModelLoader
         GgufFile gguf, byte* basePtr, IComputeBackend backend,
         Dictionary<string, GgufTensorInfo> tensorMap, int i)
     {
+        // post_attention_norm (Qwen) falls back to ffn_norm (LLaMA/standard)
+        var postAttnNorm = TryLoadTensor(gguf, basePtr, backend, tensorMap, $"blk.{i}.post_attention_norm.weight")
+            ?? LoadTensor(gguf, basePtr, backend, tensorMap, $"blk.{i}.ffn_norm.weight");
+
         return new StandardAttentionWeights
         {
             AttnNorm = LoadTensor(gguf, basePtr, backend, tensorMap, $"blk.{i}.attn_norm.weight"),
-            PostAttnNorm = LoadTensor(gguf, basePtr, backend, tensorMap, $"blk.{i}.post_attention_norm.weight"),
+            PostAttnNorm = postAttnNorm,
             AttnQ = LoadTensor(gguf, basePtr, backend, tensorMap, $"blk.{i}.attn_q.weight"),
             AttnK = LoadTensor(gguf, basePtr, backend, tensorMap, $"blk.{i}.attn_k.weight"),
             AttnV = LoadTensor(gguf, basePtr, backend, tensorMap, $"blk.{i}.attn_v.weight"),
             AttnO = LoadTensor(gguf, basePtr, backend, tensorMap, $"blk.{i}.attn_output.weight"),
-            AttnQNorm = LoadTensor(gguf, basePtr, backend, tensorMap, $"blk.{i}.attn_q_norm.weight"),
-            AttnKNorm = LoadTensor(gguf, basePtr, backend, tensorMap, $"blk.{i}.attn_k_norm.weight"),
+            AttnQNorm = TryLoadTensor(gguf, basePtr, backend, tensorMap, $"blk.{i}.attn_q_norm.weight"),
+            AttnKNorm = TryLoadTensor(gguf, basePtr, backend, tensorMap, $"blk.{i}.attn_k_norm.weight"),
             FfnGate = LoadTensor(gguf, basePtr, backend, tensorMap, $"blk.{i}.ffn_gate.weight"),
             FfnUp = LoadTensor(gguf, basePtr, backend, tensorMap, $"blk.{i}.ffn_up.weight"),
             FfnDown = LoadTensor(gguf, basePtr, backend, tensorMap, $"blk.{i}.ffn_down.weight"),

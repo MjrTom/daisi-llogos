@@ -87,7 +87,10 @@ public sealed partial class BpeTokenizer
         }
 
         var text = sb.ToString();
-        return _useByteEncoding ? ByteDecodeString(text) : text;
+        if (_useByteEncoding)
+            return ByteDecodeString(text);
+        // SentencePiece uses ▁ (U+2581) as space marker
+        return text.Replace('\u2581', ' ');
     }
 
     // ── Direct encoding (Qwen, LLaMA 3, etc.) ──────────────────────────────

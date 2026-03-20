@@ -56,8 +56,14 @@ public sealed class StandardAttentionWeights : LayerWeights
     public required ITensor AttnK { get; init; }
     public required ITensor AttnV { get; init; }
     public required ITensor AttnO { get; init; }
-    public required ITensor AttnQNorm { get; init; }
-    public required ITensor AttnKNorm { get; init; }
+    public ITensor? AttnQNorm { get; init; }
+    public ITensor? AttnKNorm { get; init; }
+
+    /// <summary>
+    /// True when the Q projection is gated (Qwen-style: Q output is 2× head dim,
+    /// interleaved Q_attn + Q_gate). False for standard LLaMA-style attention.
+    /// </summary>
+    public bool HasGatedQ => AttnQNorm != null;
 
     public override void Dispose()
     {
@@ -66,8 +72,8 @@ public sealed class StandardAttentionWeights : LayerWeights
         AttnK.Dispose();
         AttnV.Dispose();
         AttnO.Dispose();
-        AttnQNorm.Dispose();
-        AttnKNorm.Dispose();
+        AttnQNorm?.Dispose();
+        AttnKNorm?.Dispose();
     }
 }
 

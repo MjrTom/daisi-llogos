@@ -40,16 +40,20 @@ public static class ModelLoader
         GgufFile gguf, Stream stream, IComputeBackend backend,
         Dictionary<string, GgufTensorInfo> tensorMap, int i)
     {
+        // post_attention_norm (Qwen) falls back to ffn_norm (LLaMA/standard)
+        var postAttnNorm = TryLoadTensor(gguf, stream, backend, tensorMap, $"blk.{i}.post_attention_norm.weight")
+            ?? LoadTensor(gguf, stream, backend, tensorMap, $"blk.{i}.ffn_norm.weight");
+
         return new StandardAttentionWeights
         {
             AttnNorm = LoadTensor(gguf, stream, backend, tensorMap, $"blk.{i}.attn_norm.weight"),
-            PostAttnNorm = LoadTensor(gguf, stream, backend, tensorMap, $"blk.{i}.post_attention_norm.weight"),
+            PostAttnNorm = postAttnNorm,
             AttnQ = LoadTensor(gguf, stream, backend, tensorMap, $"blk.{i}.attn_q.weight"),
             AttnK = LoadTensor(gguf, stream, backend, tensorMap, $"blk.{i}.attn_k.weight"),
             AttnV = LoadTensor(gguf, stream, backend, tensorMap, $"blk.{i}.attn_v.weight"),
             AttnO = LoadTensor(gguf, stream, backend, tensorMap, $"blk.{i}.attn_output.weight"),
-            AttnQNorm = LoadTensor(gguf, stream, backend, tensorMap, $"blk.{i}.attn_q_norm.weight"),
-            AttnKNorm = LoadTensor(gguf, stream, backend, tensorMap, $"blk.{i}.attn_k_norm.weight"),
+            AttnQNorm = TryLoadTensor(gguf, stream, backend, tensorMap, $"blk.{i}.attn_q_norm.weight"),
+            AttnKNorm = TryLoadTensor(gguf, stream, backend, tensorMap, $"blk.{i}.attn_k_norm.weight"),
             FfnGate = LoadTensor(gguf, stream, backend, tensorMap, $"blk.{i}.ffn_gate.weight"),
             FfnUp = LoadTensor(gguf, stream, backend, tensorMap, $"blk.{i}.ffn_up.weight"),
             FfnDown = LoadTensor(gguf, stream, backend, tensorMap, $"blk.{i}.ffn_down.weight"),
