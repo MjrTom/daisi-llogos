@@ -376,38 +376,48 @@ __global__ void dequant_matmul_q4_k(float* output, const float* a,
     long long bytesPerRow = (long long)sbPerRow * 144;
     const unsigned char* b_row = b + (long long)n * bytesPerRow;
 
+    // Each thread processes one chunk-half (32 elements) at a time.
+    // 8 chunk-halves per super-block × sbPerRow = total work items.
+    int totalItems = sbPerRow * 8;
+
     float sum = 0.0f;
-    for (int sb = tid; sb < sbPerRow; sb += blockSize)
+    for (int item = tid; item < totalItems; item += blockSize)
     {
+        int sb = item / 8;
+        int halfIdx = item % 8;         // 0..7: which chunk-half
+        int chunk = halfIdx / 2;         // 0..3
+        int isHi = halfIdx & 1;          // 0=lo nibble, 1=hi nibble
+
         const unsigned char* sbp = b_row + sb * 144;
-        const float* ap = a + sb * 256;
+        const float* ap = a + sb * 256 + chunk * 64 + isHi * 32;
 
         float d = fp16_to_fp32(((unsigned short)sbp[1] << 8) | sbp[0]);
         float dmin = fp16_to_fp32(((unsigned short)sbp[3] << 8) | sbp[2]);
 
-        // 4 chunks of 32 bytes each. lo nibble → first sub-block, hi → second.
-        // Vectorized float4 loads for activation (8 loads per 32 elements).
-        for (int chunk = 0; chunk < 4; chunk++)
+        float ss, sm;
+        unpack_q4k_scales(sbp, chunk * 2 + isHi, d, dmin, ss, sm);
+
+        const unsigned char* qs = sbp + 16 + chunk * 32;
+        const float4* ap4 = reinterpret_cast<const float4*>(ap);
+
+        float dot = 0.0f;
+        float asum = 0.0f;
+        #pragma unroll
+        for (int l = 0; l < 8; l++)
         {
-            float ss0, sm0, ss1, sm1;
-            unpack_q4k_scales(sbp, chunk * 2, d, dmin, ss0, sm0);
-            unpack_q4k_scales(sbp, chunk * 2 + 1, d, dmin, ss1, sm1);
-            const unsigned char* qs = sbp + 16 + chunk * 32;
-            const float4* aLo = reinterpret_cast<const float4*>(ap + chunk * 64);
-            const float4* aHi = reinterpret_cast<const float4*>(ap + chunk * 64 + 32);
-            #pragma unroll
-            for (int l = 0; l < 8; l++)
-            {
-                float4 al = aLo[l];
-                float4 ah = aHi[l];
-                int base = l * 4;
-                unsigned char p0 = qs[base], p1 = qs[base+1], p2 = qs[base+2], p3 = qs[base+3];
-                sum += al.x * (ss0 * (p0 & 0xF) - sm0) + al.y * (ss0 * (p1 & 0xF) - sm0)
-                     + al.z * (ss0 * (p2 & 0xF) - sm0) + al.w * (ss0 * (p3 & 0xF) - sm0);
-                sum += ah.x * (ss1 * (p0 >> 4) - sm1) + ah.y * (ss1 * (p1 >> 4) - sm1)
-                     + ah.z * (ss1 * (p2 >> 4) - sm1) + ah.w * (ss1 * (p3 >> 4) - sm1);
+            float4 av = ap4[l];
+            asum += av.x + av.y + av.z + av.w;
+            int base = l * 4;
+            unsigned char p0 = qs[base], p1 = qs[base+1], p2 = qs[base+2], p3 = qs[base+3];
+            if (isHi) {
+                dot += av.x * (float)(p0 >> 4) + av.y * (float)(p1 >> 4)
+                     + av.z * (float)(p2 >> 4) + av.w * (float)(p3 >> 4);
+            } else {
+                dot += av.x * (float)(p0 & 0xF) + av.y * (float)(p1 & 0xF)
+                     + av.z * (float)(p2 & 0xF) + av.w * (float)(p3 & 0xF);
             }
         }
+        sum += ss * dot - sm * asum;
     }
 
     sum = warp_reduce_sum(sum);

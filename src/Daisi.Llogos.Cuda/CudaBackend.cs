@@ -59,7 +59,8 @@ public sealed class CudaBackend : IComputeBackend
         // Q8_0: 1 item per 32 elements. K-quants: 1 item per 256 elements. F32/F16: 1 item per element.
         int workItemsPerRow = b.Type switch
         {
-            GgmlType.Q4_K or GgmlType.Q5_K or GgmlType.Q6_K => K / 256,
+            GgmlType.Q4_K => K / 256 * 8,  // 8 chunk-halves per super-block
+            GgmlType.Q5_K or GgmlType.Q6_K => K / 256,
             GgmlType.Q8_0 => K / 32,
             _ => K / 8 // F32/F16: 8 elements per thread is fine
         };
