@@ -7,7 +7,7 @@
 
 ## Overview
 
-The Vulkan backend (`Daisi.Llama.Vulkan`) provides GPU-accelerated inference on any Vulkan-capable GPU — NVIDIA, AMD, or Intel. It uses the same `IComputeBackend` / `ITensor` abstractions as the CPU and CUDA backends, making it transparent to the inference engine.
+The Vulkan backend (`Daisi.Llogos.Vulkan`) provides GPU-accelerated inference on any Vulkan-capable GPU — NVIDIA, AMD, or Intel. It uses the same `IComputeBackend` / `ITensor` abstractions as the CPU and CUDA backends, making it transparent to the inference engine.
 
 Key differences from CUDA:
 - **API style**: Vulkan uses explicit command buffer recording + fence-based synchronization instead of CUDA's imperative kernel launch model
@@ -124,7 +124,7 @@ sequenceDiagram
 ## CLI Usage
 
 ```bash
-dotnet run --project src/Daisi.Llama.Cli -- \
+dotnet run --project src/Daisi.Llogos.Cli -- \
     --model C:\GGUFS\Qwen3.5-0.8B-Q8_0.gguf \
     --prompt "Hello, world" \
     --backend vulkan

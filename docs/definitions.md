@@ -1,6 +1,6 @@
 # Definitions
 
-> Glossary of terms used throughout the daisi-llama documentation.
+> Glossary of terms used throughout the daisi-llogos documentation.
 > Linked from every doc page for quick reference.
 
 ---
@@ -167,19 +167,19 @@ sequenceDiagram
 
 | Term | Summary |
 |------|---------|
-| **Backend** | A compute provider that implements tensor operations (matmul, element-wise ops, etc.) on specific hardware. daisi-llama defines an `IComputeBackend` interface with CPU, CUDA, Vulkan, and Metal implementations. |
+| **Backend** | A compute provider that implements tensor operations (matmul, element-wise ops, etc.) on specific hardware. daisi-llogos defines an `IComputeBackend` interface with CPU, CUDA, Vulkan, and Metal implementations. |
 | **Tensor** | A multidimensional array of numbers. Model weights and intermediate activations are tensors. Each backend manages tensor memory and operations through `ITensor`. |
-| **SIMD** | Single Instruction, Multiple Data. CPU instructions that operate on multiple values simultaneously. daisi-llama's CPU backend uses .NET's `Vector256<T>` / `Vector512<T>` for AVX2/AVX-512. |
-| **AVX2** | Advanced Vector Extensions 2. Processes 256 bits (8 floats) per instruction. Available on most x64 CPUs since ~2013. The minimum SIMD tier for daisi-llama's CPU backend. |
+| **SIMD** | Single Instruction, Multiple Data. CPU instructions that operate on multiple values simultaneously. daisi-llogos's CPU backend uses .NET's `Vector256<T>` / `Vector512<T>` for AVX2/AVX-512. |
+| **AVX2** | Advanced Vector Extensions 2. Processes 256 bits (8 floats) per instruction. Available on most x64 CPUs since ~2013. The minimum SIMD tier for daisi-llogos's CPU backend. |
 | **AVX-512** | 512-bit SIMD. Processes 16 floats per instruction. Available on Intel server CPUs and recent AMD Zen 4/5. Used when available for ~2x throughput over AVX2. |
-| **CUDA** | NVIDIA's GPU compute platform. daisi-llama uses raw P/Invoke calls to the CUDA Driver API with pre-compiled .cubin kernels — no managed wrapper libraries. |
+| **CUDA** | NVIDIA's GPU compute platform. daisi-llogos uses raw P/Invoke calls to the CUDA Driver API with pre-compiled .cubin kernels — no managed wrapper libraries. |
 | **Vulkan** | Cross-platform GPU compute API. Uses SPIR-V compute shaders. Targets Windows and Linux GPUs (NVIDIA, AMD, Intel). |
 | **Metal** | Apple's GPU compute API. Uses Metal Shading Language compute kernels. Targets macOS (arm64, x64) and iOS. |
 | **Kernel** | A function that runs on the GPU. Each kernel is launched with a grid of thread blocks that execute in parallel. CUDA kernels are written in CUDA C++; Vulkan uses GLSL compute shaders; Metal uses MSL. |
 | **Fused kernel** | A single GPU kernel that combines multiple operations (e.g., dequantize + matrix multiply) to avoid intermediate memory reads/writes. Critical for performance. |
-| **P/Invoke** | Platform Invocation Services. .NET mechanism for calling native C/C++ functions from managed code. daisi-llama uses P/Invoke to call CUDA, Vulkan, and Metal APIs directly. |
+| **P/Invoke** | Platform Invocation Services. .NET mechanism for calling native C/C++ functions from managed code. daisi-llogos uses P/Invoke to call CUDA, Vulkan, and Metal APIs directly. |
 | **cubin** | Compiled CUDA binary. Pre-compiled from .cu source for specific GPU architectures (e.g., sm_120 for Blackwell). Loaded at runtime via `cuModuleLoadData`. |
-| **PTX** | Parallel Thread Execution. NVIDIA's intermediate representation for GPU code. Can be JIT-compiled to cubin at runtime, but daisi-llama prefers pre-compiled cubin for faster startup. |
+| **PTX** | Parallel Thread Execution. NVIDIA's intermediate representation for GPU code. Can be JIT-compiled to cubin at runtime, but daisi-llogos prefers pre-compiled cubin for faster startup. |
 
 ---
 

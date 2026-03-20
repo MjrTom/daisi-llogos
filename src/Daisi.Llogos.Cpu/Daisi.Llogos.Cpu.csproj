@@ -1,0 +1,14 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <RootNamespace>Daisi.Llogos.Cpu</RootNamespace>
+    <AssemblyName>Daisi.Llogos.Cpu</AssemblyName>
+  </PropertyGroup>
+  <ItemGroup>
+    <InternalsVisibleTo Include="Daisi.Llogos.Tests" />
+    <InternalsVisibleTo Include="Daisi.Llogos.Cuda" />
+    <InternalsVisibleTo Include="Daisi.Llogos.Vulkan" />
+  </ItemGroup>
+  <ItemGroup>
+    <ProjectReference Include="..\Daisi.Llogos\Daisi.Llogos.csproj" />
+  </ItemGroup>
+</Project>

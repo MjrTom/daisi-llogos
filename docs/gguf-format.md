@@ -1,13 +1,13 @@
 # GGUF Format Deep Dive
 
-> Complete reference for the GGUF binary format as implemented in daisi-llama.
+> Complete reference for the GGUF binary format as implemented in daisi-llogos.
 > [Definitions](definitions.md) | [Architecture](architecture.md) | [Roadmap](../README.md#roadmap)
 
 ---
 
 ## Overview
 
-GGUF (GGPT Unified Format) is a binary format for storing quantized large language model weights alongside their metadata. It replaced the earlier GGML and GGJT formats. daisi-llama supports GGUF versions 2 and 3.
+GGUF (GGPT Unified Format) is a binary format for storing quantized large language model weights alongside their metadata. It replaced the earlier GGML and GGJT formats. daisi-llogos supports GGUF versions 2 and 3.
 
 Key properties:
 - **Self-describing** — All model configuration (architecture, dimensions, vocab) is embedded as metadata KV pairs
@@ -71,7 +71,7 @@ The header is exactly 24 bytes:
 | 8 | 8 | uint64 | Tensor Count | Number of tensor info descriptors that follow |
 | 16 | 8 | uint64 | Metadata KV Count | Number of metadata KV pairs that follow |
 
-**Validation in daisi-llama:**
+**Validation in daisi-llogos:**
 - Magic must match exactly or `InvalidDataException` is thrown
 - Version must be 2 or 3; version 1 and 4+ throw `NotSupportedException`
 
@@ -114,7 +114,7 @@ flowchart LR
 | 11 | Int64 | 8 bytes LE |
 | 12 | Float64 | 8 bytes LE (IEEE 754) |
 
-**Note:** In GGUF v2+, all string lengths use uint64 (not uint32 as in v1). This is important for compatibility — daisi-llama reads string lengths as 8 bytes.
+**Note:** In GGUF v2+, all string lengths use uint64 (not uint32 as in v1). This is important for compatibility — daisi-llogos reads string lengths as 8 bytes.
 
 ### Common metadata keys
 
@@ -160,7 +160,7 @@ flowchart LR
 | Type | uint32 | GgmlType enum value |
 | Offset | uint64 | Byte offset from start of tensor data section |
 
-**Computed properties (in daisi-llama):**
+**Computed properties (in daisi-llogos):**
 - `ElementCount` = product of all dimensions
 - `ByteSize` = `GgmlTypeInfo.ByteSize(type, elementCount)` = `(elementCount / blockSize) * typeSize`
 
@@ -209,7 +209,7 @@ Individual tensor offsets within the tensor data section are relative to the sec
 absolute_tensor_offset = tensor_data_offset + tensor_info.offset
 ```
 
-daisi-llama computes this in `GgufFile.Read()` and uses it in `ReadTensorData()` to seek directly to any tensor's data on demand.
+daisi-llogos computes this in `GgufFile.Read()` and uses it in `ReadTensorData()` to seek directly to any tensor's data on demand.
 
 ---
 

@@ -7,7 +7,7 @@
 
 ## Overview
 
-The CUDA backend provides GPU-accelerated inference on NVIDIA GPUs using CUDA 13. Unlike most .NET CUDA libraries, daisi-llama uses **raw P/Invoke** to the CUDA Driver API — no managed wrappers, no CUDA Runtime API, no cuDNN. This gives full control over memory management, kernel loading, and stream orchestration.
+The CUDA backend provides GPU-accelerated inference on NVIDIA GPUs using CUDA 13. Unlike most .NET CUDA libraries, daisi-llogos uses **raw P/Invoke** to the CUDA Driver API — no managed wrappers, no CUDA Runtime API, no cuDNN. This gives full control over memory management, kernel loading, and stream orchestration.
 
 Key design choices:
 - **CUDA Driver API** (not Runtime API) — explicit context management, direct kernel loading
@@ -138,7 +138,7 @@ flowchart LR
     CU[".cu source files"]
     NVCC["nvcc compiler\n--cubin -arch=sm_120"]
     CUBIN[".cubin binary"]
-    EMBED["Embedded resource\nin Daisi.Llama.Cuda.dll"]
+    EMBED["Embedded resource\nin Daisi.Llogos.Cuda.dll"]
     LOAD["cuModuleLoadData()\nat runtime"]
     FUNC["cuModuleGetFunction()\nper kernel name"]
 
@@ -153,7 +153,7 @@ flowchart LR
 | **cubin (AOT)** | Instant (no compilation) | None | Must ship per target arch |
 | **Fat binary** | Instant | None | Larger file, multiple archs |
 
-daisi-llama ships pre-compiled cubin for target architectures (sm_120 for Blackwell, sm_89 for Ada Lovelace, sm_86 for Ampere). A fat binary approach may be used to bundle multiple architectures.
+daisi-llogos ships pre-compiled cubin for target architectures (sm_120 for Blackwell, sm_89 for Ada Lovelace, sm_86 for Ampere). A fat binary approach may be used to bundle multiple architectures.
 
 ### Target architectures
 

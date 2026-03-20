@@ -1,23 +1,23 @@
 # Architecture
 
-> High-level system design for daisi-llama.
+> High-level system design for daisi-llogos.
 > [Definitions](definitions.md) | [Roadmap](../README.md#roadmap)
 
 ---
 
 ## Solution Structure
 
-daisi-llama is organized as a multi-project .NET 10 solution. The core library has zero dependencies on any backend — backends are separate assemblies loaded by the CLI or host application.
+daisi-llogos is organized as a multi-project .NET 10 solution. The core library has zero dependencies on any backend — backends are separate assemblies loaded by the CLI or host application.
 
 ```mermaid
 graph TD
-    CLI["Daisi.Llama.Cli\n(Console app)"]
-    CORE["Daisi.Llama\n(Core library)"]
-    CPU["Daisi.Llama.Cpu\n(CPU/SIMD backend)"]
-    CUDA["Daisi.Llama.Cuda\n(CUDA backend)"]
-    VULKAN["Daisi.Llama.Vulkan\n(Vulkan backend)"]
-    METAL["Daisi.Llama.Metal\n(Metal backend)"]
-    TESTS["Daisi.Llama.Tests\n(xUnit v3)"]
+    CLI["Daisi.Llogos.Cli\n(Console app)"]
+    CORE["Daisi.Llogos\n(Core library)"]
+    CPU["Daisi.Llogos.Cpu\n(CPU/SIMD backend)"]
+    CUDA["Daisi.Llogos.Cuda\n(CUDA backend)"]
+    VULKAN["Daisi.Llogos.Vulkan\n(Vulkan backend)"]
+    METAL["Daisi.Llogos.Metal\n(Metal backend)"]
+    TESTS["Daisi.Llogos.Tests\n(xUnit v3)"]
 
     CLI --> CORE
     CLI --> CPU
@@ -44,13 +44,13 @@ graph TD
 
 | Project | Role |
 |---------|------|
-| **Daisi.Llama** | GGUF parser, model loader, tokenizer, inference engine, sampling. Defines `IComputeBackend` and `ITensor` interfaces. Contains no hardware-specific code. |
-| **Daisi.Llama.Cpu** | CPU compute backend using .NET SIMD intrinsics (`Vector256<T>`, `Vector512<T>`). Implements dequantization, matmul, RMSNorm, softmax, SiLU, RoPE. |
-| **Daisi.Llama.Cuda** | NVIDIA GPU backend. Raw P/Invoke to CUDA Driver API, pre-compiled .cubin kernels, fused dequant+matmul. |
-| **Daisi.Llama.Vulkan** | Cross-platform GPU backend using Vulkan compute shaders (SPIR-V). Targets Windows and Linux. |
-| **Daisi.Llama.Metal** | Apple GPU backend using Metal compute shaders. Targets macOS (arm64/x64) and iOS via XCFramework. |
-| **Daisi.Llama.Cli** | Command-line interface. Model loading, text generation, interactive chat. Selects backend based on available hardware. |
-| **Daisi.Llama.Tests** | Unit and integration tests. Uses a real Qwen 3.5 0.8B Q8_0 model for integration validation. |
+| **Daisi.Llogos** | GGUF parser, model loader, tokenizer, inference engine, sampling. Defines `IComputeBackend` and `ITensor` interfaces. Contains no hardware-specific code. |
+| **Daisi.Llogos.Cpu** | CPU compute backend using .NET SIMD intrinsics (`Vector256<T>`, `Vector512<T>`). Implements dequantization, matmul, RMSNorm, softmax, SiLU, RoPE. |
+| **Daisi.Llogos.Cuda** | NVIDIA GPU backend. Raw P/Invoke to CUDA Driver API, pre-compiled .cubin kernels, fused dequant+matmul. |
+| **Daisi.Llogos.Vulkan** | Cross-platform GPU backend using Vulkan compute shaders (SPIR-V). Targets Windows and Linux. |
+| **Daisi.Llogos.Metal** | Apple GPU backend using Metal compute shaders. Targets macOS (arm64/x64) and iOS via XCFramework. |
+| **Daisi.Llogos.Cli** | Command-line interface. Model loading, text generation, interactive chat. Selects backend based on available hardware. |
+| **Daisi.Llogos.Tests** | Unit and integration tests. Uses a real Qwen 3.5 0.8B Q8_0 model for integration validation. |
 
 ---
 

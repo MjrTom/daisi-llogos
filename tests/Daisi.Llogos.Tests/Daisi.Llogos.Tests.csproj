@@ -1,0 +1,18 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <IsPackable>false</IsPackable>
+    <IsTestProject>true</IsTestProject>
+    <RootNamespace>Daisi.Llogos.Tests</RootNamespace>
+  </PropertyGroup>
+  <ItemGroup>
+    <PackageReference Include="xunit.v3" Version="3.*" />
+    <PackageReference Include="xunit.runner.visualstudio" Version="3.*" />
+    <PackageReference Include="Microsoft.NET.Test.Sdk" Version="17.*" />
+  </ItemGroup>
+  <ItemGroup>
+    <ProjectReference Include="..\..\src\Daisi.Llogos\Daisi.Llogos.csproj" />
+    <ProjectReference Include="..\..\src\Daisi.Llogos.Cpu\Daisi.Llogos.Cpu.csproj" />
+    <ProjectReference Include="..\..\src\Daisi.Llogos.Cuda\Daisi.Llogos.Cuda.csproj" />
+    <ProjectReference Include="..\..\src\Daisi.Llogos.Vulkan\Daisi.Llogos.Vulkan.csproj" />
+  </ItemGroup>
+</Project>

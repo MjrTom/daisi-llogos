@@ -13,7 +13,7 @@ Wire everything together: load a GGUF model into backend tensors and run a compl
 
 ## What Gets Built
 
-### Core library (`Daisi.Llama`)
+### Core library (`Daisi.Llogos`)
 
 | File | Contents |
 |------|----------|

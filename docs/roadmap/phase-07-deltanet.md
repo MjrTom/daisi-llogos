@@ -7,13 +7,13 @@
 
 ## Goal
 
-Implement the DeltaNet linear attention mechanism and integrate it into the forward pass as an alternative to standard softmax attention. After this phase, daisi-llama correctly runs models that use the hybrid DeltaNet/standard architecture (like Qwen 3.5).
+Implement the DeltaNet linear attention mechanism and integrate it into the forward pass as an alternative to standard softmax attention. After this phase, daisi-llogos correctly runs models that use the hybrid DeltaNet/standard architecture (like Qwen 3.5).
 
 ---
 
 ## What Gets Built
 
-### Core library (`Daisi.Llama`)
+### Core library (`Daisi.Llogos`)
 
 | File | Contents |
 |------|----------|
@@ -29,13 +29,13 @@ Implement the DeltaNet linear attention mechanism and integrate it into the forw
 | `OuterProduct` | Vector outer product for state update |
 | `Sigmoid` | Element-wise sigmoid for gate β |
 
-### CPU backend (`Daisi.Llama.Cpu`)
+### CPU backend (`Daisi.Llogos.Cpu`)
 
 | File | Contents |
 |------|----------|
 | `DeltaNetOps.cs` | CPU SIMD implementation of DeltaNet-specific operations |
 
-### CUDA backend (`Daisi.Llama.Cuda`)
+### CUDA backend (`Daisi.Llogos.Cuda`)
 
 | File | Contents |
 |------|----------|
@@ -106,7 +106,7 @@ The model's GGUF metadata encodes which layers use DeltaNet. Detection approache
 2. **Tensor presence:** If layer `i` has `blk.{i}.attn_beta.weight`, it's a DeltaNet layer
 3. **Architecture-specific:** Some architectures define a fixed pattern
 
-daisi-llama uses approach 2 (tensor presence) as the primary detection method, with metadata as an override.
+daisi-llogos uses approach 2 (tensor presence) as the primary detection method, with metadata as an override.
 
 ### DeltaNet State Matrix
 

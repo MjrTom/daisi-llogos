@@ -1,4 +1,4 @@
-# daisi-llama
+# daisi-llogos
 
 A ground-up C# reimplementation of llama.cpp targeting .NET 10. Native performance through direct hardware access — SIMD intrinsics on CPU, raw P/Invoke to CUDA/Vulkan/Metal on GPU. No managed wrapper libraries, no ONNX, no Python.
 
@@ -25,30 +25,30 @@ dotnet build
 dotnet test
 
 # Generate text (CPU)
-dotnet run --project src/Daisi.Llama.Cli -- \
+dotnet run --project src/Daisi.Llogos.Cli -- \
     --model C:\GGUFS\Qwen3.5-0.8B-Q8_0.gguf \
     --prompt "Hello, world"
 
 # Generate text (CUDA GPU)
-dotnet run --project src/Daisi.Llama.Cli -- \
+dotnet run --project src/Daisi.Llogos.Cli -- \
     --model C:\GGUFS\Qwen3.5-0.8B-Q8_0.gguf \
     --prompt "Hello, world" \
     --backend cuda
 
 # Generate text (Vulkan GPU — NVIDIA/AMD/Intel)
-dotnet run --project src/Daisi.Llama.Cli -- \
+dotnet run --project src/Daisi.Llogos.Cli -- \
     --model C:\GGUFS\Qwen3.5-0.8B-Q8_0.gguf \
     --prompt "Hello, world" \
     --backend vulkan
 
 # Sliding window + attention sinks (fixed memory, infinite streaming)
-dotnet run --project src/Daisi.Llama.Cli -- \
+dotnet run --project src/Daisi.Llogos.Cli -- \
     --model C:\GGUFS\Qwen3.5-0.8B-Q8_0.gguf \
     --prompt "Hello, world" \
     --attention sinks:64,4096
 
 # Benchmark (prefill + decode timing)
-dotnet run --project src/Daisi.Llama.Cli -- \
+dotnet run --project src/Daisi.Llogos.Cli -- \
     --model C:\GGUFS\Qwen3.5-0.8B-Q8_0.gguf \
     --bench --backend cuda
 ```
@@ -168,16 +168,16 @@ flowchart LR
 ## Solution Structure
 
 ```
-daisi-llama/
+daisi-llogos/
 ├── src/
-│   ├── Daisi.Llama/            Core library (GGUF, model, inference, tokenizer)
-│   ├── Daisi.Llama.Cpu/        CPU compute backend (SIMD)
-│   ├── Daisi.Llama.Cuda/       NVIDIA CUDA backend
-│   ├── Daisi.Llama.Vulkan/     Vulkan compute backend (SPIR-V shaders)
-│   ├── Daisi.Llama.Metal/      Apple Metal backend
-│   └── Daisi.Llama.Cli/        Command-line interface
+│   ├── Daisi.Llogos/            Core library (GGUF, model, inference, tokenizer)
+│   ├── Daisi.Llogos.Cpu/        CPU compute backend (SIMD)
+│   ├── Daisi.Llogos.Cuda/       NVIDIA CUDA backend
+│   ├── Daisi.Llogos.Vulkan/     Vulkan compute backend (SPIR-V shaders)
+│   ├── Daisi.Llogos.Metal/      Apple Metal backend
+│   └── Daisi.Llogos.Cli/        Command-line interface
 ├── tests/
-│   └── Daisi.Llama.Tests/      Unit and integration tests
+│   └── Daisi.Llogos.Tests/      Unit and integration tests
 └── docs/                        Architecture and roadmap documentation
 ```
 

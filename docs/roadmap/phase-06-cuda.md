@@ -9,13 +9,13 @@
 
 Implement the CUDA compute backend: P/Invoke bindings to the CUDA Driver API, device memory management with SafeHandle wrappers, pre-compiled .cubin kernels for all inference operations, and fused dequant+matmul for Q8_0/Q4_0/Q4_K.
 
-After this phase, daisi-llama runs inference on NVIDIA GPUs with significant speedup over CPU.
+After this phase, daisi-llogos runs inference on NVIDIA GPUs with significant speedup over CPU.
 
 ---
 
 ## What Gets Built
 
-### CUDA backend (`Daisi.Llama.Cuda`)
+### CUDA backend (`Daisi.Llogos.Cuda`)
 
 | File | Contents |
 |------|----------|

@@ -15,14 +15,14 @@ This phase bridges the gap between "we can parse GGUF files" and "we can do math
 
 ## What Gets Built
 
-### Core library (`Daisi.Llama`)
+### Core library (`Daisi.Llogos`)
 
 | File | Contents |
 |------|----------|
 | `IComputeBackend.cs` | Interface defining all compute operations |
 | `ITensor.cs` | Interface for tensor storage and access |
 
-### CPU backend (`Daisi.Llama.Cpu`)
+### CPU backend (`Daisi.Llogos.Cpu`)
 
 | File | Contents |
 |------|----------|
@@ -36,12 +36,12 @@ This phase bridges the gap between "we can parse GGUF files" and "we can do math
 
 ```mermaid
 flowchart TD
-    subgraph Core["Daisi.Llama (interfaces)"]
+    subgraph Core["Daisi.Llogos (interfaces)"]
         IB["IComputeBackend"]
         IT["ITensor"]
     end
 
-    subgraph Cpu["Daisi.Llama.Cpu"]
+    subgraph Cpu["Daisi.Llogos.Cpu"]
         CB["CpuBackend"]
         CT["CpuTensor\n(float[] for FP32,\nbyte[] for quantized)"]
         DQ["Dequantize\n(Q8_0, Q4_0, Q4_K → FP32)"]
