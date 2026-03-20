@@ -14,6 +14,8 @@ public sealed class CudaBackend : IComputeBackend
     private readonly CudaModule _compositeModule;
     private readonly CudaStream _stream;
     private readonly nint _cublasHandle;
+    private CudaDeviceMemory? _q8_1Scratch; // scratch for quantized activation
+    private int _q8_1ScratchK; // K dimension of current scratch
     private bool _disposed;
 
     private const int BlockSize = 256;
@@ -88,8 +90,44 @@ public sealed class CudaBackend : IComputeBackend
                 &beta,
                 outPtr, 1), "cublasSgemv"); // y = output, incy = 1
         }
+        else if (b.Type == GgmlType.Q8_0 && K >= 2048)
+        {
+            // dp4a path: quantize activation to int8, use integer dot product hardware.
+            // Only for K >= 2048 where quantization overhead is amortized.
+            int numBlocks = K / 32;
+            int q8_1Bytes = numBlocks * 36; // 36 bytes per Q8_1 block
+            if (_q8_1Scratch == null || _q8_1ScratchK < K)
+            {
+                _q8_1Scratch?.Dispose();
+                _q8_1Scratch = new CudaDeviceMemory((ulong)q8_1Bytes);
+                _q8_1ScratchK = K;
+            }
+            ulong q8_1Ptr = _q8_1Scratch.DevicePtr;
+
+            var quantFunc = _matmulModule.GetFunction("quantize_f32_q8_1");
+            uint quantGrid = (uint)((numBlocks + BlockSize - 1) / BlockSize);
+            int kVal = K;
+            nint* qArgs = stackalloc nint[3];
+            qArgs[0] = (nint)(&q8_1Ptr);
+            qArgs[1] = (nint)(&aPtr);
+            qArgs[2] = (nint)(&kVal);
+            _stream.Launch(quantFunc, quantGrid, 1, 1, (uint)BlockSize, 1, 1, 0, qArgs);
+
+            // Step 2: Q8_0 × Q8_1 matmul using __dp4a
+            var func = _matmulModule.GetFunction("dequant_matmul_q8_0_q8_1");
+            int nVal = N;
+            nint* kArgs = stackalloc nint[6];
+            kArgs[0] = (nint)(&outPtr);
+            kArgs[1] = (nint)(&q8_1Ptr);
+            kArgs[2] = (nint)(&bPtr);
+            kArgs[3] = (nint)(&M);
+            kArgs[4] = (nint)(&kVal);
+            kArgs[5] = (nint)(&nVal);
+            _stream.Launch(func, gridX, 1, 1, (uint)matmulBlockSize, 1, 1, sharedMem, kArgs);
+        }
         else if (b.Type == GgmlType.Q8_0)
         {
+            // Float path for small K (dp4a quantization overhead not worth it)
             var func = _matmulModule.GetFunction("dequant_matmul_q8_0");
             int nVal = N;
             nint* kArgs = stackalloc nint[6];
@@ -942,6 +980,7 @@ public sealed class CudaBackend : IComputeBackend
     {
         if (!_disposed)
         {
+            _q8_1Scratch?.Dispose();
             if (_cublasHandle != 0) CublasApi.Destroy(_cublasHandle);
             _stream.Dispose();
             _matmulModule.Dispose();
