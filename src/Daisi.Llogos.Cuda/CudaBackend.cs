@@ -60,7 +60,8 @@ public sealed class CudaBackend : IComputeBackend
         int workItemsPerRow = b.Type switch
         {
             GgmlType.Q4_K => K / 256 * 8,  // 8 chunk-halves per super-block
-            GgmlType.Q5_K or GgmlType.Q6_K => K / 256,
+            GgmlType.Q5_K => K / 256 * 8,  // 8 chunk-halves per super-block
+            GgmlType.Q6_K => K / 256 * 8,  // 8 groups per super-block
             GgmlType.Q8_0 => K / 32,
             _ => K / 8 // F32/F16: 8 elements per thread is fine
         };

@@ -517,38 +517,45 @@ __global__ void dequant_matmul_q6_k(float* output, const float* a,
     long long bytesPerRow = (long long)sbPerRow * 210;
     const unsigned char* b_row = b + (long long)n * bytesPerRow;
 
-    float sum = 0.0f;
-    for (int sb = tid; sb < sbPerRow; sb += blockSize)
-    {
-        const unsigned char* sbp = b_row + sb * 210;
-        const float* ap = a + sb * 256;
+    // Each thread processes one 32-element group (8 groups per super-block).
+    // Groups 0-3 are in the first 128-element half, 4-7 in the second.
+    int totalGroups = sbPerRow * 8;
 
-        // ql at 0, qh at 128, sc at 192, d at 208
+    float sum = 0.0f;
+    for (int grp = tid; grp < totalGroups; grp += blockSize)
+    {
+        int sb = grp / 8;
+        int gIdx = grp % 8;             // 0..7
+        int half = gIdx / 4;            // 0 or 1
+        int quadrant = gIdx % 4;        // 0..3: which of 4 groups of 32 in this half
+
+        const unsigned char* sbp = b_row + sb * 210;
         float d = fp16_to_fp32(((unsigned short)sbp[209] << 8) | sbp[208]);
 
-        // Process two 128-element halves with interleaved ql/qh layout
-        for (int half = 0; half < 2; half++)
+        const unsigned char* ql = sbp + half * 64;
+        const unsigned char* qh = sbp + 128 + half * 32;
+        int scIdx = half * 8;
+        const float* aBase = a + sb * 256 + half * 128 + quadrant * 32;
+
+        // Each quadrant processes 32 elements from a specific q1/q2/q3/q4 group
+        const float4* ap4 = reinterpret_cast<const float4*>(aBase);
+
+        float local = 0.0f;
+        #pragma unroll
+        for (int l = 0; l < 32; l++)
         {
-            const unsigned char* ql = sbp + half * 64;
-            const unsigned char* qh = sbp + 128 + half * 32;
-            int scIdx = half * 8;
-            const float* aHalf = ap + half * 128;
-
-            for (int l = 0; l < 32; l++)
-            {
-                int q1 = ((ql[l] & 0xF)      | (((qh[l] >> 0) & 3) << 4)) - 32;
-                int q2 = ((ql[l + 32] & 0xF)  | (((qh[l] >> 2) & 3) << 4)) - 32;
-                int q3 = ((ql[l] >> 4)         | (((qh[l] >> 4) & 3) << 4)) - 32;
-                int q4 = ((ql[l + 32] >> 4)    | (((qh[l] >> 6) & 3) << 4)) - 32;
-
-                // ggml uses is = l/16 to select sub-group scales
-                int isc = l / 16;
-                sum += aHalf[l]      * (d * (float)((signed char)sbp[192 + scIdx + isc + 0]) * q1);
-                sum += aHalf[l + 32] * (d * (float)((signed char)sbp[192 + scIdx + isc + 2]) * q2);
-                sum += aHalf[l + 64] * (d * (float)((signed char)sbp[192 + scIdx + isc + 4]) * q3);
-                sum += aHalf[l + 96] * (d * (float)((signed char)sbp[192 + scIdx + isc + 6]) * q4);
+            int q;
+            int isc = l / 16;
+            switch (quadrant) {
+                case 0: q = ((ql[l] & 0xF)      | (((qh[l] >> 0) & 3) << 4)) - 32; break;
+                case 1: q = ((ql[l + 32] & 0xF)  | (((qh[l] >> 2) & 3) << 4)) - 32; break;
+                case 2: q = ((ql[l] >> 4)         | (((qh[l] >> 4) & 3) << 4)) - 32; break;
+                default: q = ((ql[l + 32] >> 4)   | (((qh[l] >> 6) & 3) << 4)) - 32; break;
             }
+            float sc = (float)((signed char)sbp[192 + scIdx + isc + quadrant * 2]);
+            local += aBase[l] * (d * sc * (float)q);
         }
+        sum += local;
     }
 
     sum = warp_reduce_sum(sum);
