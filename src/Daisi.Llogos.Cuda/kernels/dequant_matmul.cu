@@ -101,6 +101,64 @@ __global__ void quantize_f32_q8_1(void* __restrict__ dst,
 // __dp4a does 4 × int8*int8 multiply-adds in 1 instruction = 4× throughput.
 // Grid: N blocks, Block: adaptive threads.
 
+// Aligned Q8_0 variant: weights repacked to 36-byte blocks [scale(2) + pad(2) + quants(32)]
+// Quants are 4-byte aligned, enabling direct int* loads for __dp4a.
+__global__ void dequant_matmul_q8_0_q8_1_aligned(float* __restrict__ output,
+                                                    const void* __restrict__ vq8_1,
+                                                    const unsigned char* __restrict__ b,
+                                                    int M, int K, int N)
+{
+    extern __shared__ float shared[];
+    int n = blockIdx.x;
+    int tid = threadIdx.x;
+    int blockSize = blockDim.x;
+
+    if (n >= N) return;
+
+    int blocks_per_row = K / 32;
+    long bytes_per_row = (long)blocks_per_row * 36;  // 36-byte aligned blocks
+    const unsigned char* b_row = b + (long)n * bytes_per_row;
+    const unsigned char* a_q8_1 = (const unsigned char*)vq8_1;
+
+    float sum = 0.0f;
+
+    for (int blk = tid; blk < blocks_per_row; blk += blockSize)
+    {
+        // Aligned Q8_0: scale at +0, quants at +4 (4-byte aligned!)
+        const unsigned char* wblk = b_row + blk * 36;
+        float w_scale = fp16_to_fp32(*reinterpret_cast<const unsigned short*>(wblk));
+        const int* w_qs = reinterpret_cast<const int*>(wblk + 4); // ALIGNED
+
+        const unsigned char* ablk = a_q8_1 + blk * 36;
+        float a_scale = fp16_to_fp32(*reinterpret_cast<const unsigned short*>(ablk));
+        const int* a_qs = reinterpret_cast<const int*>(ablk + 4); // ALIGNED
+
+        int sumi = 0;
+        sumi = __dp4a(a_qs[0], w_qs[0], sumi);
+        sumi = __dp4a(a_qs[1], w_qs[1], sumi);
+        sumi = __dp4a(a_qs[2], w_qs[2], sumi);
+        sumi = __dp4a(a_qs[3], w_qs[3], sumi);
+        sumi = __dp4a(a_qs[4], w_qs[4], sumi);
+        sumi = __dp4a(a_qs[5], w_qs[5], sumi);
+        sumi = __dp4a(a_qs[6], w_qs[6], sumi);
+        sumi = __dp4a(a_qs[7], w_qs[7], sumi);
+
+        sum += a_scale * w_scale * (float)sumi;
+    }
+
+    // Warp reduction
+    sum = warp_reduce_sum(sum);
+    int lane = tid & 31;
+    int warp = tid >> 5;
+    if (lane == 0) shared[warp] = sum;
+    __syncthreads();
+    int numWarps = blockSize >> 5;
+    if (tid < numWarps) sum = shared[tid]; else sum = 0.0f;
+    sum = warp_reduce_sum(sum);
+    if (tid == 0) output[n] = sum;
+}
+
+// Unaligned Q8_0 variant (fallback for non-repacked data)
 __global__ void dequant_matmul_q8_0_q8_1(float* __restrict__ output,
                                            const void* __restrict__ vq8_1,
                                            const unsigned char* __restrict__ b,
@@ -122,16 +180,13 @@ __global__ void dequant_matmul_q8_0_q8_1(float* __restrict__ output,
 
     for (int blk = tid; blk < blocks_per_row; blk += blockSize)
     {
-        // Weight Q8_0 block: 2 bytes FP16 scale + 32 int8 quants (NOT 4-byte aligned!)
         const unsigned char* wblk = b_row + blk * 34;
         float w_scale = fp16_to_fp32(wblk[0] | ((unsigned short)wblk[1] << 8));
 
-        // Activation Q8_1 block: 2b d + 2b s + 32 int8 quants (4-byte aligned at +4)
         const unsigned char* ablk = a_q8_1 + blk * 36;
         float a_scale = fp16_to_fp32(ablk[0] | ((unsigned short)ablk[1] << 8));
-        const int* a_qs = reinterpret_cast<const int*>(ablk + 4); // aligned
+        const int* a_qs = reinterpret_cast<const int*>(ablk + 4);
 
-        // Load weight quants as ints via memcpy to handle unaligned Q8_0 data
         int w_qs[8];
         #pragma unroll
         for (int i = 0; i < 8; i++) {
@@ -139,7 +194,6 @@ __global__ void dequant_matmul_q8_0_q8_1(float* __restrict__ output,
             w_qs[i] = src[0] | (src[1] << 8) | (src[2] << 16) | (src[3] << 24);
         }
 
-        // 8 × __dp4a: each processes 4 int8 pairs = 32 total multiply-adds
         int sumi = 0;
         sumi = __dp4a(a_qs[0], w_qs[0], sumi);
         sumi = __dp4a(a_qs[1], w_qs[1], sumi);
@@ -210,10 +264,56 @@ __global__ void matmul_f32(float* output, const float* a, const float* b,
         output[n] = sum;
 }
 
-// ── Fused Q8_0 Dequant + MatMul ─────────────────────────────────────────────
-// One block per output neuron. Vectorized float4 loads for activation.
-// Grid: N blocks, Block: adaptive threads.
+// ── Fused Q8_0 Dequant + MatMul (aligned 36-byte blocks) ────────────────────
+__global__ void dequant_matmul_q8_0_aligned(float* __restrict__ output,
+                                              const float* __restrict__ a,
+                                              const unsigned char* __restrict__ b,
+                                              int M, int K, int N)
+{
+    extern __shared__ float shared[];
+    int n = blockIdx.x;
+    int tid = threadIdx.x;
+    int blockSize = blockDim.x;
+    if (n >= N) return;
 
+    int blocks_per_row = K / 32;
+    long bytes_per_row = (long)blocks_per_row * 36;  // aligned blocks
+    const unsigned char* b_row = b + (long)n * bytes_per_row;
+
+    float sum0 = 0.0f, sum1 = 0.0f;
+    for (int blk = tid; blk < blocks_per_row; blk += blockSize)
+    {
+        const unsigned char* block_ptr = b_row + blk * 36;
+        float scale = fp16_to_fp32(*reinterpret_cast<const unsigned short*>(block_ptr));
+        const signed char* quants = (const signed char*)(block_ptr + 4); // ALIGNED at +4
+        const float4* ap = reinterpret_cast<const float4*>(a + blk * 32);
+        float bs0 = 0.0f, bs1 = 0.0f;
+        #pragma unroll
+        for (int i = 0; i < 4; i++) {
+            float4 ai = ap[i]; int base = i * 4;
+            bs0 += ai.x*(float)quants[base] + ai.y*(float)quants[base+1]
+                 + ai.z*(float)quants[base+2] + ai.w*(float)quants[base+3];
+        }
+        #pragma unroll
+        for (int i = 4; i < 8; i++) {
+            float4 ai = ap[i]; int base = i * 4;
+            bs1 += ai.x*(float)quants[base] + ai.y*(float)quants[base+1]
+                 + ai.z*(float)quants[base+2] + ai.w*(float)quants[base+3];
+        }
+        sum0 += scale * bs0; sum1 += scale * bs1;
+    }
+    float sum = sum0 + sum1;
+    sum = warp_reduce_sum(sum);
+    int lane = tid & 31; int warp = tid >> 5;
+    if (lane == 0) shared[warp] = sum;
+    __syncthreads();
+    int numWarps = blockSize >> 5;
+    if (tid < numWarps) sum = shared[tid]; else sum = 0.0f;
+    sum = warp_reduce_sum(sum);
+    if (tid == 0) output[n] = sum;
+}
+
+// ── Fused Q8_0 Dequant + MatMul (original 34-byte blocks) ──────────────────
 __global__ void dequant_matmul_q8_0(float* __restrict__ output,
                                      const float* __restrict__ a,
                                      const unsigned char* __restrict__ b,
