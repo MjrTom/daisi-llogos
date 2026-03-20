@@ -785,6 +785,49 @@ public sealed class CudaBackend : IComputeBackend
         outT.UploadFrom(result);
     }
 
+    // ── GPU-Native DeltaNet Operations ──────────────────────────────────────
+
+    /// <inheritdoc />
+    public unsafe void SplitUnequalQKV(ITensor q, ITensor k, ITensor v, ITensor qkv, int keyDim, int valueDim)
+    {
+        var qT = (CudaTensor)q;
+        var kT = (CudaTensor)k;
+        var vT = (CudaTensor)v;
+        var qkvT = (CudaTensor)qkv;
+        ulong qPtr = qT.DevicePtr;
+        ulong kPtr = kT.DevicePtr;
+        ulong vPtr = vT.DevicePtr;
+        ulong qkvPtr = qkvT.DevicePtr;
+
+        var func = _compositeModule.GetFunction("split_unequal_qkv");
+        uint grid = (uint)((valueDim + BlockSize - 1) / BlockSize);
+        nint* kArgs = stackalloc nint[6];
+        kArgs[0] = (nint)(&qPtr);
+        kArgs[1] = (nint)(&kPtr);
+        kArgs[2] = (nint)(&vPtr);
+        kArgs[3] = (nint)(&qkvPtr);
+        kArgs[4] = (nint)(&keyDim);
+        kArgs[5] = (nint)(&valueDim);
+        _stream.Launch(func, grid, 1, 1, (uint)BlockSize, 1, 1, 0, kArgs);
+    }
+
+    /// <inheritdoc />
+    public unsafe void RepeatTile(ITensor tensor, int numHeads, int headDim, int factor)
+    {
+        var t = (CudaTensor)tensor;
+        ulong ptr = t.DevicePtr;
+        int srcSize = numHeads * headDim;
+        int dstSize = numHeads * factor * headDim;
+
+        var func = _compositeModule.GetFunction("repeat_tile");
+        uint grid = (uint)((dstSize + BlockSize - 1) / BlockSize);
+        nint* kArgs = stackalloc nint[3];
+        kArgs[0] = (nint)(&ptr);
+        kArgs[1] = (nint)(&srcSize);
+        kArgs[2] = (nint)(&dstSize);
+        _stream.Launch(func, grid, 1, 1, (uint)BlockSize, 1, 1, 0, kArgs);
+    }
+
     // ── Fused Operations ─────────────────────────────────────────────────────
 
     /// <inheritdoc />

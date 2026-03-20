@@ -7,10 +7,17 @@ namespace Daisi.Llogos.Inference;
 public sealed class Sampler
 {
     private readonly Random _rng;
+    private float[] _workBuffer = [];
 
     public Sampler(int? seed = null)
     {
         _rng = seed.HasValue ? new Random(seed.Value) : new Random();
+    }
+
+    private void EnsureWorkBuffer(int size)
+    {
+        if (_workBuffer.Length < size)
+            _workBuffer = new float[size];
     }
 
     /// <summary>
@@ -20,17 +27,20 @@ public sealed class Sampler
     {
         int vocabSize = logits.Length;
 
-        // Copy logits so we can mutate
-        Span<float> work = vocabSize <= 8192
-            ? stackalloc float[vocabSize]
-            : new float[vocabSize];
-        logits.CopyTo(work);
+        // Greedy shortcut: no copy needed, just find argmax
+        if (p.Temperature == 0 && p.RepetitionPenalty == 1.0f)
+            return ArgMax(logits);
+
+        // Copy logits so we can mutate (reuse buffer to avoid GC pressure)
+        EnsureWorkBuffer(vocabSize);
+        logits.CopyTo(_workBuffer);
+        var work = _workBuffer.AsSpan(0, vocabSize);
 
         // 1. Repetition penalty
         if (p.RepetitionPenalty != 1.0f)
             ApplyRepetitionPenalty(work, previousTokens, p.RepetitionPenalty);
 
-        // 2. Greedy shortcut
+        // 2. Greedy shortcut (after penalty)
         if (p.Temperature == 0)
             return ArgMax(work);
 
@@ -39,19 +49,19 @@ public sealed class Sampler
         for (int i = 0; i < vocabSize; i++)
             work[i] *= invTemp;
 
-        // 4. Top-k
-        if (p.TopK > 0 && p.TopK < vocabSize)
-            ApplyTopK(work, p.TopK);
+        // 4. Top-k: collect indices of top-k candidates
+        int effectiveK = (p.TopK > 0 && p.TopK < vocabSize) ? p.TopK : vocabSize;
+        var candidates = CollectTopK(work, effectiveK);
 
-        // 5. Softmax
-        Softmax(work);
+        // 5. Softmax over candidates only (not full vocab)
+        SoftmaxCandidates(work, candidates);
 
-        // 6. Top-p (nucleus) — applied after softmax on probabilities
+        // 6. Top-p (nucleus) over candidates
         if (p.TopP > 0 && p.TopP < 1.0f)
-            ApplyTopP(work, p.TopP);
+            ApplyTopPCandidates(work, candidates, p.TopP);
 
-        // 7. Weighted random sample
-        return SampleFromDistribution(work);
+        // 7. Weighted random sample from candidates
+        return SampleFromCandidates(work, candidates);
     }
 
     private static void ApplyRepetitionPenalty(Span<float> logits, ReadOnlySpan<int> previousTokens, float penalty)
@@ -83,88 +93,80 @@ public sealed class Sampler
         return best;
     }
 
-    private static void ApplyTopK(Span<float> logits, int k)
+    /// <summary>
+    /// Collect indices of top-k logit values. O(N*k) but k is small (typically 40).
+    /// Returns the actual number of candidates (may be less than k if vocab is small).
+    /// </summary>
+    private static int[] CollectTopK(ReadOnlySpan<float> logits, int k)
     {
-        // Find the k-th largest value using partial sort
         int n = logits.Length;
+        k = Math.Min(k, n);
+        var topIdx = new int[k];
+        var topVal = new float[k];
+        Array.Fill(topVal, float.NegativeInfinity);
 
-        // Find top-k threshold
-        float kthValue = FindKthLargest(logits, k);
-
-        // Zero out everything below threshold
         for (int i = 0; i < n; i++)
         {
-            if (logits[i] < kthValue)
-                logits[i] = float.NegativeInfinity;
-        }
-    }
-
-    private static float FindKthLargest(ReadOnlySpan<float> values, int k)
-    {
-        // Simple approach: collect top-k values
-        Span<float> topK = k <= 1024
-            ? stackalloc float[k]
-            : new float[k];
-        topK.Fill(float.NegativeInfinity);
-
-        for (int i = 0; i < values.Length; i++)
-        {
-            float v = values[i];
-            if (v > topK[k - 1])
+            float v = logits[i];
+            if (v > topVal[k - 1])
             {
-                topK[k - 1] = v;
+                topVal[k - 1] = v;
+                topIdx[k - 1] = i;
                 // Bubble up
                 for (int j = k - 2; j >= 0; j--)
                 {
-                    if (topK[j + 1] > topK[j])
-                        (topK[j], topK[j + 1]) = (topK[j + 1], topK[j]);
-                    else
-                        break;
+                    if (topVal[j + 1] > topVal[j])
+                    {
+                        (topVal[j], topVal[j + 1]) = (topVal[j + 1], topVal[j]);
+                        (topIdx[j], topIdx[j + 1]) = (topIdx[j + 1], topIdx[j]);
+                    }
+                    else break;
                 }
             }
         }
-
-        return topK[k - 1];
+        return topIdx;
     }
 
-    private static void Softmax(Span<float> values)
+    /// <summary>
+    /// Softmax over only the candidate indices. Much faster than full-vocab softmax.
+    /// </summary>
+    private static void SoftmaxCandidates(Span<float> logits, int[] candidates)
     {
         float max = float.NegativeInfinity;
-        for (int i = 0; i < values.Length; i++)
-            if (values[i] > max) max = values[i];
+        for (int i = 0; i < candidates.Length; i++)
+            if (logits[candidates[i]] > max) max = logits[candidates[i]];
 
         float sum = 0;
-        for (int i = 0; i < values.Length; i++)
+        for (int i = 0; i < candidates.Length; i++)
         {
-            values[i] = MathF.Exp(values[i] - max);
-            sum += values[i];
+            float e = MathF.Exp(logits[candidates[i]] - max);
+            logits[candidates[i]] = e;
+            sum += e;
         }
 
         float invSum = 1.0f / sum;
-        for (int i = 0; i < values.Length; i++)
-            values[i] *= invSum;
+        for (int i = 0; i < candidates.Length; i++)
+            logits[candidates[i]] *= invSum;
     }
 
-    private static void ApplyTopP(Span<float> probs, float p)
+    /// <summary>
+    /// Apply top-p filtering over candidates only. O(k log k) sort instead of O(N log N).
+    /// </summary>
+    private static void ApplyTopPCandidates(Span<float> probs, int[] candidates, float p)
     {
-        // Build (index, prob) pairs and sort descending
-        int n = probs.Length;
-        Span<(int idx, float prob)> sorted = n <= 8192
-            ? stackalloc (int, float)[n]
-            : new (int, float)[n];
+        // Sort candidates by probability descending
+        // Extract probs into a small array to avoid Span capture issue
+        var cp = new float[candidates.Length];
+        for (int i = 0; i < candidates.Length; i++) cp[i] = probs[candidates[i]];
+        Array.Sort(cp, candidates);
+        Array.Reverse(candidates); // descending
+        Array.Reverse(cp);
 
-        for (int i = 0; i < n; i++)
-            sorted[i] = (i, probs[i]);
-
-        // Sort descending by probability
-        sorted.Sort((a, b) => b.prob.CompareTo(a.prob));
-
-        // Find cumulative threshold
         float cumulative = 0;
-        int cutoff = n;
-        for (int i = 0; i < n; i++)
+        int cutoff = candidates.Length;
+        for (int i = 0; i < candidates.Length; i++)
         {
-            cumulative += sorted[i].prob;
+            cumulative += probs[candidates[i]];
             if (cumulative > p)
             {
                 cutoff = i + 1;
@@ -173,34 +175,31 @@ public sealed class Sampler
         }
 
         // Zero out tokens beyond cutoff
-        for (int i = cutoff; i < n; i++)
-            probs[sorted[i].idx] = 0;
+        for (int i = cutoff; i < candidates.Length; i++)
+            probs[candidates[i]] = 0;
 
         // Renormalize
         float sum = 0;
-        for (int i = 0; i < n; i++)
-            sum += probs[i];
+        for (int i = 0; i < cutoff; i++)
+            sum += probs[candidates[i]];
         if (sum > 0)
         {
             float invSum = 1.0f / sum;
-            for (int i = 0; i < n; i++)
-                probs[i] *= invSum;
+            for (int i = 0; i < cutoff; i++)
+                probs[candidates[i]] *= invSum;
         }
     }
 
-    private int SampleFromDistribution(ReadOnlySpan<float> probs)
+    private int SampleFromCandidates(ReadOnlySpan<float> probs, int[] candidates)
     {
         float r = (float)_rng.NextDouble();
         float cumulative = 0;
-        for (int i = 0; i < probs.Length; i++)
+        for (int i = 0; i < candidates.Length; i++)
         {
-            cumulative += probs[i];
+            cumulative += probs[candidates[i]];
             if (r < cumulative)
-                return i;
+                return candidates[i];
         }
-        // Fallback: return last non-zero
-        for (int i = probs.Length - 1; i >= 0; i--)
-            if (probs[i] > 0) return i;
-        return 0;
+        return candidates[0];
     }
 }
