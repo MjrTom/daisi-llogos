@@ -326,7 +326,8 @@ __global__ void gated_attention(float* output,
 
 // ── Causal Conv1d ────────────────────────────────────────────────────────────
 // Depthwise causal conv1d with shift buffer.
-// qkv: [channels], convBuffer: [(kernelSize-1) × channels], convWeight: [channels × kernelSize]
+// qkv: [channels], convBuffer: [(kernelSize-1) × channels], convWeight: [kernelSize × channels]
+// GGUF dim layout: [kernelSize, channels] → row-major = channels × kernelSize.
 // Updates convBuffer (shift left, append new) and writes conv output back to qkv.
 
 __global__ void causal_conv1d(float* qkv, float* convBuffer, const float* convWeight,

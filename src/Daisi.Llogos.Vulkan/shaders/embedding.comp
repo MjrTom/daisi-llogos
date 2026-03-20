@@ -9,7 +9,7 @@ layout(local_size_x = 256) in;
 layout(push_constant) uniform PushConstants {
     uint hiddenDim;
     int tokenId;
-    uint tableType; // 0=F32, 1=Q8_0, 2=F16
+    uint tableType; // 0=F32, 1=Q8_0, 2=F16, 3=Q4_K
 };
 
 layout(set = 0, binding = 0) buffer OutputBuf { float output_data[]; };
@@ -37,10 +37,46 @@ void main() {
         float scale = unpackHalf2x16(scaleBits).x;
         int8_t q = int8_t(table_data[blockByteOff + 2 + blockOffset]);
         output_data[idx] = scale * float(q);
-    } else {
+    } else if (tableType == 2) {
         // F16: each element is 2 bytes
         uint byteOff = (uint(tokenId) * hiddenDim + idx) * 2;
         uint bits = uint(table_data[byteOff]) | (uint(table_data[byteOff + 1]) << 8);
         output_data[idx] = unpackHalf2x16(bits).x;
+    } else if (tableType == 3) {
+        // Q4_K: super block = 256 elements, 144 bytes
+        // Layout: 2b d + 2b dmin + 12b packed scales/mins + 128b nibbles
+        uint blocksPerRow = hiddenDim / 256;
+        uint bytesPerRow = blocksPerRow * 144;
+        uint rowOff = uint(tokenId) * bytesPerRow;
+
+        uint sbIdx = idx / 256;
+        uint elemInSb = idx % 256;
+        uint sbOff = rowOff + sbIdx * 144;
+
+        uint dBits = uint(table_data[sbOff]) | (uint(table_data[sbOff + 1]) << 8);
+        uint dminBits = uint(table_data[sbOff + 2]) | (uint(table_data[sbOff + 3]) << 8);
+        float d = unpackHalf2x16(dBits).x;
+        float dmin = unpackHalf2x16(dminBits).x;
+
+        // Chunk layout: 4 chunks of 64 elements, 32 qs bytes each
+        uint chunk = elemInSb / 64;
+        uint posInChunk = elemInSb % 64;
+        uint l = posInChunk % 32;
+        uint isHi = posInChunk / 32;
+        uint j = chunk * 2 + isHi;
+
+        int sc, m;
+        if (j < 4) {
+            sc = int(table_data[sbOff + 4 + j]) & 63;
+            m  = int(table_data[sbOff + 4 + j + 4]) & 63;
+        } else {
+            sc = (int(table_data[sbOff + 4 + j + 4]) & 0xF) | ((int(table_data[sbOff + 4 + j - 4]) >> 6) << 4);
+            m  = (int(table_data[sbOff + 4 + j + 4]) >> 4)  | ((int(table_data[sbOff + 4 + j])     >> 6) << 4);
+        }
+
+        uint packed = uint(table_data[sbOff + 16 + chunk * 32 + l]);
+        uint nibble = (isHi != 0u) ? (packed >> 4) : (packed & 0xFu);
+
+        output_data[idx] = d * float(sc) * float(nibble) - dmin * float(m);
     }
 }

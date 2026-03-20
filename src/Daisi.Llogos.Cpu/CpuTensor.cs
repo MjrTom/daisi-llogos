@@ -92,6 +92,37 @@ public sealed class CpuTensor : ITensor
             case GgmlType.Q4_K:
                 Dequantize.DequantizeQ4_K(_data, destination);
                 break;
+            case GgmlType.Q5_K:
+                Dequantize.DequantizeQ5_K(_data, destination);
+                break;
+            case GgmlType.Q6_K:
+                Dequantize.DequantizeQ6_K(_data, destination);
+                break;
+            case GgmlType.Q3_K:
+                Dequantize.DequantizeQ3_K(_data, destination);
+                break;
+            case GgmlType.Q2_K:
+                Dequantize.DequantizeQ2_K(_data, destination);
+                break;
+            case GgmlType.Q4_1:
+                Dequantize.DequantizeQ4_1(_data, destination);
+                break;
+            case GgmlType.Q5_0:
+                Dequantize.DequantizeQ5_0(_data, destination);
+                break;
+            case GgmlType.Q5_1:
+                Dequantize.DequantizeQ5_1(_data, destination);
+                break;
+            case GgmlType.F16:
+            {
+                var halfs = MemoryMarshal.Cast<byte, Half>(_data);
+                for (int i = 0; i < (int)ElementCount; i++)
+                    destination[i] = (float)halfs[i];
+                break;
+            }
+            case GgmlType.BF16:
+                Dequantize.DequantizeBF16(_data, destination);
+                break;
             case GgmlType.TQ1_0:
                 TernaryMatMul.Dequantize(_data, destination);
                 break;

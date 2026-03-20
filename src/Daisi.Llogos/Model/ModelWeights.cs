@@ -60,10 +60,23 @@ public sealed class StandardAttentionWeights : LayerWeights
     public ITensor? AttnKNorm { get; init; }
 
     /// <summary>
-    /// True when the Q projection is gated (Qwen-style: Q output is 2× head dim,
-    /// interleaved Q_attn + Q_gate). False for standard LLaMA-style attention.
+    /// True when the Q projection is gated (Qwen3.5-style: Q output is 2× expected dim,
+    /// interleaved Q_attn + Q_gate). Detected by checking if Q output exceeds the
+    /// hidden dim (gated Q outputs 2× NumHeads × HeadDim which exceeds hiddenDim).
     /// </summary>
-    public bool HasGatedQ => AttnQNorm != null;
+    public bool HasGatedQ
+    {
+        get
+        {
+            if (AttnQNorm == null) return false;
+            long qOutDim = AttnQ.Dimensions.Length > 1 ? AttnQ.Dimensions[1] : AttnQ.ElementCount;
+            long hiddenDim = AttnQ.Dimensions[0]; // input dim = hidden dim
+            // Gated Q: qOutDim = 2 × numHeads × headDim > hiddenDim
+            // Non-gated Q: qOutDim = numHeads × headDim = hiddenDim (for non-GQA) or > hiddenDim (for GQA with large heads)
+            // The safest check: gated Q always doubles the output, so qOutDim > hiddenDim
+            return qOutDim > hiddenDim;
+        }
+    }
 
     public override void Dispose()
     {

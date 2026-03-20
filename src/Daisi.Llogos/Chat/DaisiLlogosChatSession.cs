@@ -11,7 +11,7 @@ namespace Daisi.Llogos.Chat;
 /// </summary>
 public sealed class DaisiLlogosChatSession : IDisposable
 {
-    private readonly ForwardPass _forward;
+    private readonly IForwardPass _forward;
     private readonly BpeTokenizer _tokenizer;
     private readonly Sampler _sampler;
     private readonly ChatTemplateRenderer _renderer;
@@ -30,7 +30,7 @@ public sealed class DaisiLlogosChatSession : IDisposable
     public IReadOnlyList<ChatMessage> History => _history;
 
     public DaisiLlogosChatSession(
-        ForwardPass forward,
+        IForwardPass forward,
         BpeTokenizer tokenizer,
         ChatTemplateRenderer renderer,
         string[] stopSequences,
@@ -73,8 +73,7 @@ public sealed class DaisiLlogosChatSession : IDisposable
         if (commonPrefix < _cachedTokenCount)
         {
             // KV cache is stale beyond commonPrefix — reset and re-prefill
-            _forward.KvCache.Reset();
-            _forward.DeltaState.Reset();
+            _forward.ResetState();
             _cachedTokenCount = 0;
             commonPrefix = 0;
         }

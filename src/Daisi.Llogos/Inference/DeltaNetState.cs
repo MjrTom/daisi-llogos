@@ -26,6 +26,9 @@ public sealed class DeltaNetState : IDisposable
         _backend = backend;
         _groupCount = config.SsmGroupCount;
         _headDim = config.SsmHeadDim;
+        // Conv buffer needs to hold channels × (kernelSize-1) elements.
+        // The actual conv channel count comes from the weight tensor, but we don't have
+        // weights at DeltaNetState construction time. Use innerSize*3 as upper bound.
         _qkvDim = config.SsmInnerSize * 3;
         _convKernel = config.SsmConvKernel;
 

@@ -56,7 +56,26 @@ public sealed class VulkanBackend : IComputeBackend
         var aT = (VulkanTensor)a;
         var bT = (VulkanTensor)b;
 
-        uint weightType = b.Type == GgmlType.Q8_0 ? 1u : 0u;
+        // Check if this type has a GPU shader implementation
+        uint? weightTypeOpt = b.Type switch
+        {
+            GgmlType.F32 => 0u,
+            GgmlType.Q8_0 => 1u,
+            GgmlType.TQ1_0 => 2u,
+            GgmlType.I2_S => 3u,
+            GgmlType.F16 => 4u,
+            GgmlType.Q4_K => 5u,
+            GgmlType.Q6_K => 6u,
+            _ => null,
+        };
+
+        if (weightTypeOpt == null)
+        {
+            GenericCpuFallbackMatMul(outT, aT, bT, M, K, N);
+            return;
+        }
+
+        uint weightType = weightTypeOpt.Value;
 
         var buffers = new VulkanBuffer[] { outT.DeviceBuffer, aT.DeviceBuffer, bT.DeviceBuffer };
         var ds = _matmulPipeline.AllocateDescriptorSet(buffers);
@@ -184,12 +203,22 @@ public sealed class VulkanBackend : IComputeBackend
         var buffers = new VulkanBuffer[] { outT.DeviceBuffer, tableT.DeviceBuffer };
         var ds = _embeddingPipeline.AllocateDescriptorSet(buffers);
 
-        uint tableType = table.Type switch
+        uint? tableTypeOpt = table.Type switch
         {
+            GgmlType.F32 => 0u,
             GgmlType.Q8_0 => 1u,
             GgmlType.F16 => 2u,
-            _ => 0u, // F32
+            GgmlType.Q4_K => 3u,
+            _ => null,
         };
+
+        if (tableTypeOpt == null)
+        {
+            GenericCpuFallbackEmbeddingLookup(outT, tableT, hiddenDim, tokenId);
+            return;
+        }
+
+        uint tableType = tableTypeOpt.Value;
         uint* pc = stackalloc uint[3];
         pc[0] = (uint)hiddenDim;
         *(int*)&pc[1] = tokenId;
@@ -477,6 +506,41 @@ public sealed class VulkanBackend : IComputeBackend
                 VulkanApi.CmdCopyBuffer(cmd, src.Buffer, dst.Buffer, 1, &region);
             }
         });
+    }
+
+    // ── Generic CPU Fallback ──────────────────────────────────────────────────
+
+    private void GenericCpuFallbackMatMul(VulkanTensor outT, VulkanTensor aT, VulkanTensor bT, int M, int K, int N)
+    {
+        var aBytes = new byte[aT.ByteSize];
+        aT.DownloadToHost(aBytes);
+        var bBytes = new byte[bT.ByteSize];
+        bT.DownloadToHost(bBytes);
+
+        using var cpu = new Cpu.CpuBackend();
+        using var cpuA = cpu.LoadTensor("a", GgmlType.F32, [M * K], aBytes);
+        using var cpuB = cpu.LoadTensor("b", bT.Type, bT.Dimensions, bBytes);
+        using var cpuOut = cpu.CreateTensor("out", GgmlType.F32, [M * N]);
+        cpu.MatMul(cpuOut, cpuA, cpuB, M, K, N);
+
+        var resultBytes = new byte[M * N * 4];
+        Buffer.BlockCopy(cpuOut.AsFloatSpan().ToArray(), 0, resultBytes, 0, resultBytes.Length);
+        outT.UploadFromHost(resultBytes);
+    }
+
+    private void GenericCpuFallbackEmbeddingLookup(VulkanTensor outT, VulkanTensor tableT, int hiddenDim, int tokenId)
+    {
+        var tableBytes = new byte[tableT.ByteSize];
+        tableT.DownloadToHost(tableBytes);
+
+        using var cpu = new Cpu.CpuBackend();
+        using var cpuTable = cpu.LoadTensor("t", tableT.Type, tableT.Dimensions, tableBytes);
+        using var cpuOut = cpu.CreateTensor("out", GgmlType.F32, [hiddenDim]);
+        cpu.EmbeddingLookup(cpuOut, cpuTable, tokenId);
+
+        var resultBytes = new byte[hiddenDim * 4];
+        Buffer.BlockCopy(cpuOut.AsFloatSpan().ToArray(), 0, resultBytes, 0, resultBytes.Length);
+        outT.UploadFromHost(resultBytes);
     }
 
     public void Dispose()

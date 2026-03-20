@@ -251,6 +251,74 @@ __global__ void embedding_lookup_f16(float* output, const unsigned char* table,
     output[idx] = val;
 }
 
+// FP16 → FP32 helper
+__device__ float fp16_to_fp32_emb(unsigned short h)
+{
+    unsigned int sign = (h >> 15) & 1;
+    unsigned int exp_val = (h >> 10) & 0x1f;
+    unsigned int mant = h & 0x3ff;
+    unsigned int f;
+    if (exp_val == 0) {
+        if (mant == 0) f = sign << 31;
+        else {
+            exp_val = 1;
+            while (!(mant & 0x400)) { mant <<= 1; exp_val--; }
+            mant &= 0x3ff;
+            f = (sign << 31) | ((exp_val + 127 - 15) << 23) | (mant << 13);
+        }
+    } else if (exp_val == 31)
+        f = (sign << 31) | 0x7f800000 | (mant << 13);
+    else
+        f = (sign << 31) | ((exp_val - 15 + 127) << 23) | (mant << 13);
+    return *reinterpret_cast<float*>(&f);
+}
+
+// ── Q4_K embedding lookup ─────────────────────────────────────────────────────
+// Q4_K super block: 256 elements, 144 bytes.
+// Layout: 2b d (fp16) + 2b dmin (fp16) + 12b packed scales/mins + 128b nibbles.
+
+__global__ void embedding_lookup_q4_k(float* output, const unsigned char* table,
+                                       int hidden_dim, int token_id)
+{
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= hidden_dim) return;
+
+    int blocks_per_row = hidden_dim / 256;
+    int bytes_per_row = blocks_per_row * 144;
+    const unsigned char* row = table + (long long)token_id * bytes_per_row;
+
+    int sb_idx = idx / 256;
+    int elem_in_sb = idx % 256;
+    const unsigned char* sb = row + sb_idx * 144;
+
+    unsigned short d_bits = ((unsigned short)sb[1] << 8) | sb[0];
+    unsigned short dmin_bits = ((unsigned short)sb[3] << 8) | sb[2];
+    float d = fp16_to_fp32_emb(d_bits);
+    float dmin = fp16_to_fp32_emb(dmin_bits);
+
+    // Chunk layout: 4 chunks of 64 elements, 32 qs bytes each.
+    // lo nibble → first 32 elems, hi nibble → second 32 elems.
+    int chunk = elem_in_sb / 64;
+    int pos_in_chunk = elem_in_sb % 64;
+    int l = pos_in_chunk % 32;
+    int is_hi = pos_in_chunk / 32; // 0 for first sub-block, 1 for second
+
+    int j = chunk * 2 + is_hi; // sub-block index for scales
+    int sc, m;
+    if (j < 4) {
+        sc = sb[4 + j] & 63;
+        m  = sb[4 + j + 4] & 63;
+    } else {
+        sc = (sb[4 + j + 4] & 0xF) | ((sb[4 + j - 4] >> 6) << 4);
+        m  = (sb[4 + j + 4] >> 4)  | ((sb[4 + j]     >> 6) << 4);
+    }
+
+    unsigned char packed = sb[16 + chunk * 32 + l];
+    int nibble = is_hi ? (packed >> 4) : (packed & 0xF);
+
+    output[idx] = d * (float)sc * (float)nibble - dmin * (float)m;
+}
+
 // ── Fill tensor ───────────────────────────────────────────────────────────────
 // output[i] = value
 
