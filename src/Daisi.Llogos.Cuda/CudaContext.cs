@@ -10,6 +10,8 @@ internal sealed class CudaContext : IDisposable
 
     public int DeviceOrdinal { get; }
     public string DeviceName { get; }
+    public int ComputeCapabilityMajor { get; }
+    public int ComputeCapabilityMinor { get; }
 
     public CudaContext(int deviceOrdinal = 0)
     {
@@ -21,6 +23,12 @@ internal sealed class CudaContext : IDisposable
         var nameBuffer = new byte[256];
         CudaApi.Check(CudaApi.DeviceGetName(nameBuffer, 256, device), "cuDeviceGetName");
         DeviceName = System.Text.Encoding.ASCII.GetString(nameBuffer).TrimEnd('\0');
+
+        // Query compute capability for architecture-specific compilation
+        CudaApi.Check(CudaApi.DeviceGetAttribute(out int ccMajor, 75, device), "cuDeviceGetAttribute(CC_MAJOR)");
+        CudaApi.Check(CudaApi.DeviceGetAttribute(out int ccMinor, 76, device), "cuDeviceGetAttribute(CC_MINOR)");
+        ComputeCapabilityMajor = ccMajor;
+        ComputeCapabilityMinor = ccMinor;
 
         CudaApi.Check(CudaApi.CtxCreate(out _handle, 0, device), "cuCtxCreate");
     }

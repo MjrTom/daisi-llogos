@@ -27,10 +27,11 @@ public sealed class CudaBackend : IComputeBackend
         CublasApi.Check(CublasApi.Create(out _cublasHandle), "cublasCreate");
         CublasApi.Check(CublasApi.SetStream(_cublasHandle, _stream.Handle), "cublasSetStream");
 
-        // Load kernels from embedded .cu resources (JIT compiled as PTX by the driver)
-        _elementwiseModule = CudaModule.FromEmbeddedResource("elementwise.cu");
-        _matmulModule = CudaModule.FromEmbeddedResource("dequant_matmul.cu");
-        _compositeModule = CudaModule.FromEmbeddedResource("composite_ops.cu");
+        // Load kernels with architecture-specific compilation for best codegen
+        var archOpts = new[] { $"--gpu-architecture=compute_{_context.ComputeCapabilityMajor}{_context.ComputeCapabilityMinor}" };
+        _elementwiseModule = CudaModule.FromEmbeddedResource("elementwise.cu", archOpts);
+        _matmulModule = CudaModule.FromEmbeddedResource("dequant_matmul.cu", archOpts);
+        _compositeModule = CudaModule.FromEmbeddedResource("composite_ops.cu", archOpts);
 
         // Set the active stream so D2H transfers sync properly
         CudaTensor.ActiveStream = _stream;
