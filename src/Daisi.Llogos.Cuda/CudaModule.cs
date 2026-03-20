@@ -80,7 +80,56 @@ internal sealed class CudaModule : IDisposable
             ?? throw new FileNotFoundException($"Embedded resource not found: {resourceName}");
         using var reader = new StreamReader(stream, Encoding.UTF8);
         var source = reader.ReadToEnd();
-        return FromCudaSource(source, resourceName, extraOptions);
+
+        // PTX cache: hash source + options, store in temp directory
+        var cacheKey = ComputeCacheKey(source, extraOptions);
+        var cacheDir = Path.Combine(Path.GetTempPath(), "daisi-llogos-ptx-cache");
+        var cachePath = Path.Combine(cacheDir, $"{cacheKey}.ptx");
+
+        if (File.Exists(cachePath))
+        {
+            try
+            {
+                var cachedPtx = File.ReadAllBytes(cachePath);
+                return FromPtx(cachedPtx);
+            }
+            catch { /* cache miss — recompile */ }
+        }
+
+        var module = FromCudaSource(source, resourceName, extraOptions);
+
+        // Save compiled PTX to cache (best-effort)
+        try
+        {
+            Directory.CreateDirectory(cacheDir);
+            // Re-compile to get PTX bytes for caching
+            NvrtcApi.Check(NvrtcApi.CreateProgram(out nint prog, source, resourceName, 0, 0, 0), "nvrtcCreateProgram");
+            try
+            {
+                var optionsList = new List<string> { "--use_fast_math" };
+                if (extraOptions != null) optionsList.AddRange(extraOptions);
+                var options = optionsList.ToArray();
+                if (NvrtcApi.CompileProgram(prog, options.Length, options) == NvrtcResult.Success)
+                {
+                    NvrtcApi.GetPTXSize(prog, out nuint ptxSize);
+                    var ptxBytes = new byte[(int)ptxSize];
+                    NvrtcApi.GetPTX(prog, ptxBytes);
+                    File.WriteAllBytes(cachePath, ptxBytes);
+                }
+            }
+            finally { NvrtcApi.DestroyProgram(ref prog); }
+        }
+        catch { /* cache write failure is non-fatal */ }
+
+        return module;
+    }
+
+    private static string ComputeCacheKey(string source, string[]? options)
+    {
+        using var sha = System.Security.Cryptography.SHA256.Create();
+        var input = source + "|" + string.Join(",", options ?? []);
+        var hash = sha.ComputeHash(Encoding.UTF8.GetBytes(input));
+        return Convert.ToHexString(hash)[..32];
     }
 
     /// <summary>
