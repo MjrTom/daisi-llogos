@@ -13,6 +13,7 @@ public sealed class CudaBackend : IComputeBackend
     private readonly CudaModule _matmulModule;
     private readonly CudaModule _compositeModule;
     private readonly CudaStream _stream;
+    private readonly nint _cublasHandle;
     private bool _disposed;
 
     private const int BlockSize = 256;
@@ -21,6 +22,10 @@ public sealed class CudaBackend : IComputeBackend
     {
         _context = new CudaContext(deviceOrdinal);
         _stream = new CudaStream();
+
+        // Initialize cuBLAS
+        CublasApi.Check(CublasApi.Create(out _cublasHandle), "cublasCreate");
+        CublasApi.Check(CublasApi.SetStream(_cublasHandle, _stream.Handle), "cublasSetStream");
 
         // Load kernels from embedded .cu resources (JIT compiled as PTX by the driver)
         _elementwiseModule = CudaModule.FromEmbeddedResource("elementwise.cu");
@@ -65,20 +70,22 @@ public sealed class CudaBackend : IComputeBackend
             _ => K / 8 // F32/F16: 8 elements per thread is fine
         };
         int matmulBlockSize = Math.Clamp((workItemsPerRow + 31) & ~31, 32, 256);
-        uint sharedMem = (uint)((matmulBlockSize / 32) * sizeof(float));
+        int warpReductionBytes = (matmulBlockSize / 32) * sizeof(float);
+        uint sharedMem = (uint)warpReductionBytes;
 
         if (b.Type == GgmlType.F32)
         {
-            var func = _matmulModule.GetFunction("matmul_f32");
-            int nVal = N;
-            nint* kArgs = stackalloc nint[6];
-            kArgs[0] = (nint)(&outPtr);
-            kArgs[1] = (nint)(&aPtr);
-            kArgs[2] = (nint)(&bPtr);
-            kArgs[3] = (nint)(&M);
-            kArgs[4] = (nint)(&K);
-            kArgs[5] = (nint)(&nVal);
-            _stream.Launch(func, gridX, 1, 1, (uint)matmulBlockSize, 1, 1, sharedMem, kArgs);
+            // cuBLAS SGEMV: y = alpha * A^T * x + beta * y
+            // A is [K × N] row-major = [N × K] column-major, so transpose to get [K × N]
+            float alpha = 1.0f, beta = 0.0f;
+            CublasApi.Check(CublasApi.Sgemv(_cublasHandle,
+                CublasApi.CUBLAS_OP_T,     // transpose: b is [N×K] row-major
+                K, N,                       // m=K, n=N (column-major dimensions)
+                &alpha,
+                bPtr, K,                    // A = weights, lda = K
+                aPtr, 1,                    // x = activation, incx = 1
+                &beta,
+                outPtr, 1), "cublasSgemv"); // y = output, incy = 1
         }
         else if (b.Type == GgmlType.Q8_0)
         {
@@ -934,6 +941,7 @@ public sealed class CudaBackend : IComputeBackend
     {
         if (!_disposed)
         {
+            if (_cublasHandle != 0) CublasApi.Destroy(_cublasHandle);
             _stream.Dispose();
             _matmulModule.Dispose();
             _elementwiseModule.Dispose();

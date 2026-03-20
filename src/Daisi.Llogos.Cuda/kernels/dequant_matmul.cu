@@ -90,8 +90,7 @@ __global__ void matmul_f32(float* output, const float* a, const float* b,
 }
 
 // ── Fused Q8_0 Dequant + MatMul ─────────────────────────────────────────────
-// One block per output neuron. Threads cooperatively process Q8_0 blocks.
-// Uses vectorized float4 loads for activation.
+// One block per output neuron. Vectorized float4 loads for activation.
 // Grid: N blocks, Block: adaptive threads.
 
 __global__ void dequant_matmul_q8_0(float* output, const float* a,
