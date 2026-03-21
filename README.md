@@ -71,12 +71,12 @@ Measured on AMD Ryzen 9 9900X + NVIDIA RTX 5080, 128 decode tokens, FP16 KV cach
 
 | Model | Llogos CUDA | llama.cpp CUDA | Llogos Vulkan | llama.cpp Vulkan |
 |-------|--------:|--------:|--------:|--------:|
-| Qwen3.5-0.8B Q8_0 | 229 | 423 | 151 | 476 |
-| Qwen3-8B Q8_0 | 70 | 93 | 55 | 97 |
-| Qwen3-8B Q4_K_M | 69 | 139 | 53 | 142 |
-| Qwen3.5-9B Q8_0 | 68 | 85 | 51 | 89 |
+| Qwen3.5-0.8B Q8_0 | 249 | 423 | 151 | 476 |
+| Qwen3-8B Q8_0 | 78 | 91 | 55 | 97 |
+| Qwen3-8B Q4_K_M | 81 | 139 | 53 | 142 |
+| Qwen3.5-9B Q8_0 | 73 | 83 | 51 | 89 |
 
-CUDA: multi-row activation reuse, aligned Q8_0 repacking, cuBLAS F32 GEMV, fused kernels (RmsNormResidual, SwiGLU, AddRmsNorm), GPU-side argmax, NVRTC with PTX disk cache.
+CUDA: PTX inline asm for fp16↔fp32 conversion, `__ldg` read-only cache hints, uint32 weight reads, multi-row activation reuse, aligned Q8_0 repacking, cuBLAS F32 GEMV, fused kernels, GPU-side argmax, NVRTC with PTX disk cache.
 
 Vulkan: uint32 buffer views for coalesced reads, aligned Q8_0 repacking, 8-row workgroups, subgroup arithmetic reduction, fused composite ops (RmsNormResidual, AddRmsNorm, SplitSwiGLU, RepeatTile, ArgMax), Vulkan 1.2 with SPIR-V 1.3.
 

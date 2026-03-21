@@ -8,32 +8,12 @@
 // Architecture: One block per output neuron. Threads cooperatively compute
 // the dot product with warp-level reduction. This maximizes SM occupancy.
 
-// FP16 → FP32 conversion using bit manipulation
+// FP16 → FP32 conversion via PTX cvt instruction (single hardware instruction, no cuda_fp16.h needed)
 __device__ __forceinline__ float fp16_to_fp32(unsigned short h)
 {
-    unsigned int sign = (h >> 15) & 1;
-    unsigned int exp_val = (h >> 10) & 0x1f;
-    unsigned int mant = h & 0x3ff;
-
-    unsigned int f;
-    if (exp_val == 0)
-    {
-        if (mant == 0)
-            f = sign << 31;
-        else
-        {
-            exp_val = 1;
-            while (!(mant & 0x400)) { mant <<= 1; exp_val--; }
-            mant &= 0x3ff;
-            f = (sign << 31) | ((exp_val + 127 - 15) << 23) | (mant << 13);
-        }
-    }
-    else if (exp_val == 31)
-        f = (sign << 31) | 0x7f800000 | (mant << 13);
-    else
-        f = (sign << 31) | ((exp_val - 15 + 127) << 23) | (mant << 13);
-
-    return *reinterpret_cast<float*>(&f);
+    float result;
+    asm("cvt.f32.f16 %0, %1;" : "=f"(result) : "h"(h));
+    return result;
 }
 
 // Warp-level reduction using shuffle
@@ -44,8 +24,16 @@ __device__ __forceinline__ float warp_reduce_sum(float val)
     return val;
 }
 
-// FP32 → FP16 conversion helper (used by quantize kernel)
-__device__ unsigned short matmul_fp32_to_fp16(float val)
+// FP32 → FP16 conversion via PTX
+__device__ __forceinline__ unsigned short matmul_fp32_to_fp16(float val)
+{
+    unsigned short result;
+    asm("cvt.rn.f16.f32 %0, %1;" : "=h"(result) : "f"(val));
+    return result;
+}
+
+#if 0 // Old software fallback (replaced by PTX)
+__device__ unsigned short matmul_fp32_to_fp16_sw(float val)
 {
     unsigned int f = __float_as_uint(val);
     unsigned int sign = (f >> 16) & 0x8000;
@@ -55,6 +43,7 @@ __device__ unsigned short matmul_fp32_to_fp16(float val)
     if (exp_val >= 31) return (unsigned short)(sign | 0x7c00);
     return (unsigned short)(sign | (exp_val << 10) | mant);
 }
+#endif
 
 extern "C" {
 
@@ -289,10 +278,11 @@ __global__ void dequant_matmul_q8_0_aligned(float* __restrict__ output,
 
     for (int blk = tid; blk < blocks_per_row; blk += blockSize)
     {
+        // Use __ldg for read-only activation loads (texture cache path)
         const float4* ap = reinterpret_cast<const float4*>(a + blk * 32);
         float4 a_cache[8];
         #pragma unroll
-        for (int i = 0; i < 8; i++) a_cache[i] = ap[i];
+        for (int i = 0; i < 8; i++) a_cache[i] = __ldg(&ap[i]);
 
         #pragma unroll
         for (int r = 0; r < Q8_ROWS_PER_BLOCK; r++)
@@ -300,14 +290,18 @@ __global__ void dequant_matmul_q8_0_aligned(float* __restrict__ output,
             int n = n_base + r;
             if (n >= N) break;
             const unsigned char* block_ptr = b + (long)n * bytes_per_row + blk * 36;
-            float scale = fp16_to_fp32(*reinterpret_cast<const unsigned short*>(block_ptr));
-            const signed char* quants = (const signed char*)(block_ptr + 4);
+            float scale = fp16_to_fp32(__ldg(reinterpret_cast<const unsigned short*>(block_ptr)));
+            // Native uint reads via __ldg for read-only weight data
+            const unsigned int* q32 = reinterpret_cast<const unsigned int*>(block_ptr + 4);
             float bs = 0.0f;
             #pragma unroll
             for (int i = 0; i < 8; i++) {
-                float4 ai = a_cache[i]; int base = i * 4;
-                bs += ai.x*(float)quants[base] + ai.y*(float)quants[base+1]
-                    + ai.z*(float)quants[base+2] + ai.w*(float)quants[base+3];
+                float4 ai = a_cache[i];
+                unsigned int packed = __ldg(&q32[i]);
+                bs += ai.x*(float)(int)((signed char)(packed))
+                    + ai.y*(float)(int)((signed char)(packed >> 8))
+                    + ai.z*(float)(int)((signed char)(packed >> 16))
+                    + ai.w*(float)(int)((signed char)(packed >> 24));
             }
             sums[r] += scale * bs;
         }
@@ -351,13 +345,12 @@ __global__ void dequant_matmul_q8_0(float* __restrict__ output,
 
     for (int blk = tid; blk < blocks_per_row; blk += blockSize)
     {
-        // Load activation once (shared across all rows)
+        // Load activation via __ldg (read-only cache)
         const float4* ap = reinterpret_cast<const float4*>(a + blk * 32);
         float4 a_cache[8];
         #pragma unroll
-        for (int i = 0; i < 8; i++) a_cache[i] = ap[i];
+        for (int i = 0; i < 8; i++) a_cache[i] = __ldg(&ap[i]);
 
-        // Process each row with the cached activation
         #pragma unroll
         for (int r = 0; r < Q8_ROWS_PER_BLOCK; r++)
         {
@@ -365,7 +358,7 @@ __global__ void dequant_matmul_q8_0(float* __restrict__ output,
             if (n >= N) break;
 
             const unsigned char* block_ptr = b + (long)n * bytes_per_row + blk * 34;
-            float scale = fp16_to_fp32(*reinterpret_cast<const unsigned short*>(block_ptr));
+            float scale = fp16_to_fp32(__ldg(reinterpret_cast<const unsigned short*>(block_ptr)));
             const signed char* quants = (const signed char*)(block_ptr + 2);
 
             float bs = 0.0f;
@@ -603,8 +596,8 @@ __device__ __forceinline__ void unpack_q4k_scales(const unsigned char* sb,
     sub_min = dmin * (float)m;
 }
 
-// Multi-row Q4_K: 2 output neurons per block with activation reuse
-#define Q4K_ROWS_PER_BLOCK 4
+// Multi-row Q4_K: 8 output neurons per block with activation reuse + uint reads
+#define Q4K_ROWS_PER_BLOCK 8
 
 __global__ void dequant_matmul_q4_k(float* output, const float* a,
                                      const unsigned char* b,
@@ -620,7 +613,9 @@ __global__ void dequant_matmul_q4_k(float* output, const float* a,
     long long bytesPerRow = (long long)sbPerRow * 144;
     int totalChunks = sbPerRow * 4;
 
-    float sums[Q4K_ROWS_PER_BLOCK] = {0};
+    float sums[Q4K_ROWS_PER_BLOCK];
+    #pragma unroll
+    for (int r = 0; r < Q4K_ROWS_PER_BLOCK; r++) sums[r] = 0.0f;
 
     for (int item = tid; item < totalChunks; item += blockSize)
     {
@@ -637,8 +632,8 @@ __global__ void dequant_matmul_q4_k(float* output, const float* a,
         float asumLo = 0.0f, asumHi = 0.0f;
         #pragma unroll
         for (int l = 0; l < 8; l++) {
-            aLoCache[l] = ap4Lo[l];
-            aHiCache[l] = ap4Hi[l];
+            aLoCache[l] = __ldg(&ap4Lo[l]);
+            aHiCache[l] = __ldg(&ap4Hi[l]);
             asumLo += aLoCache[l].x + aLoCache[l].y + aLoCache[l].z + aLoCache[l].w;
             asumHi += aHiCache[l].x + aHiCache[l].y + aHiCache[l].z + aHiCache[l].w;
         }
@@ -651,23 +646,26 @@ __global__ void dequant_matmul_q4_k(float* output, const float* a,
             if (n >= N) break;
 
             const unsigned char* sbp = b + (long long)n * bytesPerRow + sb * 144;
-            float d = fp16_to_fp32(*reinterpret_cast<const unsigned short*>(sbp));
-            float dmin = fp16_to_fp32(*reinterpret_cast<const unsigned short*>(sbp + 2));
+            // Read d + dmin as single uint via __ldg
+            unsigned int d_dmin = __ldg(reinterpret_cast<const unsigned int*>(sbp));
+            float d = fp16_to_fp32((unsigned short)(d_dmin & 0xFFFF));
+            float dmin = fp16_to_fp32((unsigned short)(d_dmin >> 16));
 
             float ss0, sm0, ss1, sm1;
             unpack_q4k_scales(sbp, chunk * 2, d, dmin, ss0, sm0);
             unpack_q4k_scales(sbp, chunk * 2 + 1, d, dmin, ss1, sm1);
 
-            const unsigned char* qs = sbp + 16 + chunk * 32;
+            // Read quants as uint via __ldg for read-only cache
+            const unsigned int* qs32 = reinterpret_cast<const unsigned int*>(sbp + 16 + chunk * 32);
             float dotLo = 0.0f, dotHi = 0.0f;
 
             #pragma unroll
             for (int l = 0; l < 8; l++) {
-                unsigned char p0 = qs[l*4], p1 = qs[l*4+1], p2 = qs[l*4+2], p3 = qs[l*4+3];
-                dotLo += aLoCache[l].x*(float)(p0&0xF) + aLoCache[l].y*(float)(p1&0xF)
-                       + aLoCache[l].z*(float)(p2&0xF) + aLoCache[l].w*(float)(p3&0xF);
-                dotHi += aHiCache[l].x*(float)(p0>>4) + aHiCache[l].y*(float)(p1>>4)
-                       + aHiCache[l].z*(float)(p2>>4) + aHiCache[l].w*(float)(p3>>4);
+                unsigned int packed = __ldg(&qs32[l]);
+                dotLo += aLoCache[l].x*(float)(packed      &0xF) + aLoCache[l].y*(float)((packed>>8) &0xF)
+                       + aLoCache[l].z*(float)((packed>>16)&0xF) + aLoCache[l].w*(float)((packed>>24)&0xF);
+                dotHi += aHiCache[l].x*(float)((packed>>4) &0xF) + aHiCache[l].y*(float)((packed>>12)&0xF)
+                       + aHiCache[l].z*(float)((packed>>20)&0xF) + aHiCache[l].w*(float)((packed>>28)&0xF);
             }
             sums[r] += ss0 * dotLo - sm0 * asumLo + ss1 * dotHi - sm1 * asumHi;
         }
@@ -789,7 +787,7 @@ __global__ void dequant_matmul_q6_k(float* output, const float* a,
         // Load activation once (shared across rows)
         float a_vals[32];
         #pragma unroll
-        for (int l = 0; l < 32; l++) a_vals[l] = aBase[l];
+        for (int l = 0; l < 32; l++) a_vals[l] = __ldg(&aBase[l]);
 
         int qlOff = (quadrant & 1) * 32;
         int qlShift = (quadrant >> 1) * 4;
