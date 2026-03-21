@@ -47,9 +47,10 @@ void main() {
             uint scaleBits = uint(weight_data[blockOff]) | (uint(weight_data[blockOff + 1]) << 8);
             float scale = unpackHalf2x16(scaleBits).x;
             float blockSum = 0.0;
+            uint aBase = b * 32;
             for (uint i = 0; i < 32; i++) {
                 int8_t q = int8_t(weight_data[blockOff + 2 + i]);
-                blockSum += float(q) * input_data[b * 32 + i];
+                blockSum += float(q) * input_data[aBase + i];
             }
             acc += scale * blockSum;
         }
