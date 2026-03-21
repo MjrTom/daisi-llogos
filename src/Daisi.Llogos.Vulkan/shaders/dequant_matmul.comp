@@ -214,14 +214,15 @@ void main() {
             uint chunk = item % 4;
             uint aBase = sb * 256 + chunk * 64;
 
-            // Load activation once for this chunk (shared across rows)
-            float a_lo[32], a_hi[32];
+            // Load activation as vec4s (8 × vec4 per 32-element half)
+            vec4 a_lo4[8], a_hi4[8];
             float sum_lo = 0.0, sum_hi = 0.0;
-            for (uint l = 0; l < 32; l++) {
-                a_lo[l] = input_data[aBase + l];
-                a_hi[l] = input_data[aBase + l + 32];
-                sum_lo += a_lo[l];
-                sum_hi += a_hi[l];
+            for (uint l = 0; l < 8; l++) {
+                uint idx = aBase + l * 4;
+                a_lo4[l] = vec4(input_data[idx], input_data[idx+1], input_data[idx+2], input_data[idx+3]);
+                a_hi4[l] = vec4(input_data[idx+32], input_data[idx+33], input_data[idx+34], input_data[idx+35]);
+                sum_lo += a_lo4[l].x + a_lo4[l].y + a_lo4[l].z + a_lo4[l].w;
+                sum_hi += a_hi4[l].x + a_hi4[l].y + a_hi4[l].z + a_hi4[l].w;
             }
 
             for (uint r = 0; r < Q4K_ROWS; r++) {
@@ -246,17 +247,18 @@ void main() {
                 float ss0 = d * float(sc0), sm0 = dmin * float(m0);
                 float ss1 = d * float(sc1), sm1 = dmin * float(m1);
 
-                // Quants at bytes 16-143 = words 4-35. Use uint32 reads for 4 nibbles at once
+                // Quants: 8 uint32s per chunk, each uint has 4 bytes with lo+hi nibbles
                 float dotLo = 0.0, dotHi = 0.0;
-                uint qWordBase = sbWord + 4 + chunk * 8; // 32 bytes = 8 uint32s per chunk
+                uint qWordBase = sbWord + 4 + chunk * 8;
                 for (uint l = 0; l < 8; l++) {
                     uint packed4 = weight_u32[qWordBase + l];
-                    // 4 bytes = 8 nibbles, lo 4 and hi 4 from each byte
-                    for (uint nb = 0; nb < 4; nb++) {
-                        uint byte_val = (packed4 >> (nb * 8)) & 0xFFu;
-                        dotLo += a_lo[l*4+nb] * float(byte_val & 0xFu);
-                        dotHi += a_hi[l*4+nb] * float(byte_val >> 4);
-                    }
+                    // Extract lo nibbles and dot with activation vec4
+                    vec4 lo = vec4(float(packed4 & 0xFu), float((packed4>>8)&0xFu),
+                                   float((packed4>>16)&0xFu), float((packed4>>24)&0xFu));
+                    vec4 hi = vec4(float((packed4>>4)&0xFu), float((packed4>>12)&0xFu),
+                                   float((packed4>>20)&0xFu), float((packed4>>28)&0xFu));
+                    dotLo += dot(a_lo4[l], lo);
+                    dotHi += dot(a_hi4[l], hi);
                 }
                 accs_q4k[r] += ss0 * dotLo - sm0 * sum_lo + ss1 * dotHi - sm1 * sum_hi;
             }
