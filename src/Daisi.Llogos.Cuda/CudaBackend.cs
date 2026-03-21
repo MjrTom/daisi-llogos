@@ -51,6 +51,7 @@ public sealed class CudaBackend : IComputeBackend
     /// <summary>Begin recording operations into a CUDA graph (if enabled).</summary>
     public void BeginCommands()
     {
+        EnsureContext();
         if (!_graphEnabled) return;
         // Start stream capture — all subsequent launches are recorded, not executed
         var result = CudaApi.StreamBeginCapture(_stream.Handle, 0); // 0 = CU_STREAM_CAPTURE_MODE_GLOBAL
@@ -91,13 +92,25 @@ public sealed class CudaBackend : IComputeBackend
         CudaApi.Check(CudaApi.GraphLaunch(_graphExec, _stream.Handle), "cuGraphLaunch");
     }
 
+    /// <summary>
+    /// Ensure the CUDA context is current on the calling thread.
+    /// Required because minion tasks run on threadpool threads that may not
+    /// have the context bound. The GpuInferenceGate serializes access, so
+    /// this is safe — only one thread calls CUDA at a time.
+    /// </summary>
+    private void EnsureContext() => _context.MakeCurrent();
+
     /// <inheritdoc />
     public ITensor CreateTensor(string name, GgmlType type, ReadOnlySpan<long> dimensions)
-        => new CudaTensor(name, type, dimensions);
+    {
+        EnsureContext();
+        return new CudaTensor(name, type, dimensions);
+    }
 
     /// <inheritdoc />
     public ITensor LoadTensor(string name, GgmlType type, ReadOnlySpan<long> dimensions, ReadOnlySpan<byte> data)
     {
+        EnsureContext();
         // Repack Q8_0 to aligned layout: 34-byte blocks → 36-byte blocks
         // Old: [scale(2b) | quants(32b)] = 34 bytes, quants NOT 4-byte aligned
         // New: [scale(2b) | pad(2b) | quants(32b)] = 36 bytes, quants 4-byte aligned
@@ -855,8 +868,11 @@ public sealed class CudaBackend : IComputeBackend
     }
 
     /// <inheritdoc />
-    public ITensor CreateHostTensor(string name, GgmlType type, ReadOnlySpan<long> dimensions) =>
-        new CudaTensor(name, type, dimensions, pinned: true);
+    public ITensor CreateHostTensor(string name, GgmlType type, ReadOnlySpan<long> dimensions)
+    {
+        EnsureContext();
+        return new CudaTensor(name, type, dimensions, pinned: true);
+    }
 
     /// <inheritdoc />
     public unsafe void FillTensor(ITensor tensor, float value)
@@ -1183,6 +1199,7 @@ public sealed class CudaBackend : IComputeBackend
     {
         if (!_disposed)
         {
+            _context.MakeCurrent();
             if (_graphExec != 0) CudaApi.GraphExecDestroy(_graphExec);
             _argmaxResult?.Dispose();
             _q8_1Scratch?.Dispose();
