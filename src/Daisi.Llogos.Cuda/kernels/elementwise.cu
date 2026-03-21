@@ -473,6 +473,169 @@ __global__ void argmax(float* output, const float* input, int n)
         output[0] = sidxs[0];
 }
 
+// ── Fused: Split gate+up + SwiGLU ─────────────────────────────────────────────
+// input is [gate(N) | up(N)], output[i] = SiLU(gate[i]) * up[i]
+// Replaces 2 CopyTensorRegion + 1 SwiGLU = 3 launches → 1.
+
+__global__ void split_swiglu(float* output, const float* fused_input, int N)
+{
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx < N)
+    {
+        float g = fused_input[idx];         // gate region
+        float u = fused_input[N + idx];     // up region
+        output[idx] = (g / (1.0f + expf(-g))) * u;
+    }
+}
+
+// post_qkv_norm_rope_cache removed — KV cache state management too complex for single kernel
+
+#if 0
+// DISABLED: kept for reference
+__global__ void post_qkv_norm_rope_cache_DISABLED(
+    float* qOut, float* kOut, float* vOut,
+    const float* fusedQkv,
+    void* kCache, void* vCache,
+    int qDim, int kDim, int vDim,
+    int numHeads, int numKvHeads, int headDim, int ropeDim,
+    int position, float ropeTheta, float normEps,
+    int maxSeqLen, int cacheIsFp16,
+    const float* qNormWeight, const float* kNormWeight)
+{
+    int tid = threadIdx.x;
+    int stride = blockDim.x;
+    int head = blockIdx.x;
+    int headsPerGroup = numHeads / numKvHeads;
+
+    if (head < numHeads)
+    {
+        // --- Q head processing ---
+        int qOff = head * headDim;
+        // Copy from fused output
+        for (int i = tid; i < headDim; i += stride)
+            qOut[qOff + i] = fusedQkv[qOff + i];
+
+        __syncthreads();
+
+        // Per-head RmsNorm (if norm weights provided)
+        if (qNormWeight != 0)
+        {
+            extern __shared__ float sdata[];
+            float sumSq = 0;
+            for (int i = tid; i < headDim; i += stride)
+                sumSq += qOut[qOff + i] * qOut[qOff + i];
+            sdata[tid] = sumSq;
+            __syncthreads();
+            for (int s = blockDim.x/2; s > 0; s >>= 1) {
+                if (tid < s) sdata[tid] += sdata[tid + s];
+                __syncthreads();
+            }
+            float invRms = 1.0f / sqrtf(sdata[0] / (float)headDim + normEps);
+            for (int i = tid; i < headDim; i += stride)
+                qOut[qOff + i] = qOut[qOff + i] * invRms * qNormWeight[i];
+            __syncthreads();
+        }
+
+        // RoPE on Q
+        int halfRope = ropeDim / 2;
+        for (int pair = tid; pair < headDim/2; pair += stride)
+        {
+            if (pair < halfRope)
+            {
+                float freq = 1.0f / powf(ropeTheta, (float)(2*pair) / (float)ropeDim);
+                float angle = (float)position * freq;
+                float cos_a = cosf(angle), sin_a = sinf(angle);
+                int bi = qOff + pair * 2;
+                float v0 = qOut[bi], v1 = qOut[bi + 1];
+                qOut[bi]     = v0 * cos_a - v1 * sin_a;
+                qOut[bi + 1] = v0 * sin_a + v1 * cos_a;
+            }
+        }
+    }
+
+    // --- K/V head processing (only numKvHeads blocks do this) ---
+    int kvHead = head / headsPerGroup;
+    bool isFirstInGroup = (head % headsPerGroup == 0);
+
+    if (isFirstInGroup && kvHead < numKvHeads)
+    {
+        int kOff = kvHead * headDim;
+        int kSrc = qDim + kOff;  // K starts after Q in fused output
+
+        // Copy K from fused output
+        for (int i = tid; i < headDim; i += stride)
+            kOut[kOff + i] = fusedQkv[kSrc + i];
+
+        // Copy V from fused output
+        int vOff = kvHead * headDim; // assuming valLen == headDim
+        int vSrc = qDim + kDim + vOff;
+        for (int i = tid; i < headDim; i += stride)
+            vOut[vOff + i] = fusedQkv[vSrc + i];
+
+        __syncthreads();
+
+        // Per-head RmsNorm on K
+        if (kNormWeight != 0)
+        {
+            extern __shared__ float sdata[];
+            float sumSq = 0;
+            for (int i = tid; i < headDim; i += stride)
+                sumSq += kOut[kOff + i] * kOut[kOff + i];
+            sdata[tid] = sumSq;
+            __syncthreads();
+            for (int s = blockDim.x/2; s > 0; s >>= 1) {
+                if (tid < s) sdata[tid] += sdata[tid + s];
+                __syncthreads();
+            }
+            float invRms = 1.0f / sqrtf(sdata[0] / (float)headDim + normEps);
+            for (int i = tid; i < headDim; i += stride)
+                kOut[kOff + i] = kOut[kOff + i] * invRms * kNormWeight[i];
+            __syncthreads();
+        }
+
+        // RoPE on K
+        int halfRope = ropeDim / 2;
+        for (int pair = tid; pair < headDim/2; pair += stride)
+        {
+            if (pair < halfRope)
+            {
+                float freq = 1.0f / powf(ropeTheta, (float)(2*pair) / (float)ropeDim);
+                float angle = (float)position * freq;
+                float cos_a = cosf(angle), sin_a = sinf(angle);
+                int bi = kOff + pair * 2;
+                float v0 = kOut[bi], v1 = kOut[bi + 1];
+                kOut[bi]     = v0 * cos_a - v1 * sin_a;
+                kOut[bi + 1] = v0 * sin_a + v1 * cos_a;
+            }
+        }
+
+        __syncthreads();
+
+        // KV cache write
+        int keyLength = headDim;
+        int valueLength = headDim;
+        int kCacheOff = kvHead * maxSeqLen * keyLength + position * keyLength;
+        int vCacheOff = kvHead * maxSeqLen * valueLength + position * valueLength;
+
+        if (cacheIsFp16)
+        {
+            for (int i = tid; i < keyLength; i += stride)
+                ((unsigned short*)kCache)[kCacheOff + i] = fp32_to_fp16(kOut[kOff + i]);
+            for (int i = tid; i < valueLength; i += stride)
+                ((unsigned short*)vCache)[vCacheOff + i] = fp32_to_fp16(vOut[vOff + i]);
+        }
+        else
+        {
+            for (int i = tid; i < keyLength; i += stride)
+                ((float*)kCache)[kCacheOff + i] = kOut[kOff + i];
+            for (int i = tid; i < valueLength; i += stride)
+                ((float*)vCache)[vCacheOff + i] = vOut[vOff + i];
+        }
+    }
+}
+
+#endif // post_qkv disabled
+
 // ── Fill tensor ───────────────────────────────────────────────────────────────
 // output[i] = value
 
