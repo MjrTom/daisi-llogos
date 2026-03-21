@@ -26,6 +26,9 @@ public sealed class DaisiLlogosModelHandle : IDisposable
     private readonly int _contextSize;
     private readonly int? _seed;
 
+    /// <summary>The context size this model was loaded with.</summary>
+    public int ContextSize => _contextSize;
+
     internal DaisiLlogosModelHandle(
         string modelId,
         string filePath,
@@ -52,21 +55,28 @@ public sealed class DaisiLlogosModelHandle : IDisposable
     }
 
     /// <summary>
-    /// Create a new forward pass + KV cache for a new session.
+    /// Create a new forward pass + KV cache for a new session using the default context size.
     /// Detects BitNet architecture and creates the appropriate types.
     /// Each session gets its own inference state while sharing the model weights.
     /// </summary>
     public (IForwardPass forward, IKvCache kvCache) CreateInferenceResources()
+        => CreateInferenceResources(_contextSize);
+
+    /// <summary>
+    /// Create a new forward pass + KV cache with a custom context size.
+    /// Use this for minion sessions that need smaller context windows to fit more sessions in VRAM.
+    /// </summary>
+    public (IForwardPass forward, IKvCache kvCache) CreateInferenceResources(int contextSize)
     {
         if (Config.IsBitNet)
         {
-            var kvCache = new BitNetKvCache(Backend, Config, _contextSize);
+            var kvCache = new BitNetKvCache(Backend, Config, contextSize);
             var forward = new BitNetForwardPass(Backend, Config, Weights, kvCache);
             return (forward, kvCache);
         }
         else
         {
-            var kvCache = new KvCache(Backend, Config, _contextSize);
+            var kvCache = new KvCache(Backend, Config, contextSize);
             var deltaState = new DeltaNetState(Backend, Config, Weights);
             var forward = new ForwardPass(Backend, Config, Weights, kvCache, deltaState);
             return (forward, kvCache);
@@ -74,13 +84,21 @@ public sealed class DaisiLlogosModelHandle : IDisposable
     }
 
     /// <summary>
-    /// Create a chat session using this model handle.
+    /// Create a chat session using this model handle with the default context size.
+    /// Optionally provide a custom chat renderer to override the default template-based rendering.
     /// </summary>
-    public DaisiLlogosChatSession CreateChatSession(string? systemPrompt = null)
+    public DaisiLlogosChatSession CreateChatSession(string? systemPrompt = null, IChatRenderer? customRenderer = null)
+        => CreateChatSession(_contextSize, systemPrompt, customRenderer);
+
+    /// <summary>
+    /// Create a chat session with a custom context size.
+    /// Use this for minion sessions that need smaller context windows.
+    /// </summary>
+    public DaisiLlogosChatSession CreateChatSession(int contextSize, string? systemPrompt = null, IChatRenderer? customRenderer = null)
     {
-        var (forward, _) = CreateInferenceResources();
-        var renderer = new ChatTemplateRenderer(ChatTemplate);
-        var stopSequences = ChatTemplate.GetStopSequences();
+        var (forward, _) = CreateInferenceResources(contextSize);
+        var renderer = customRenderer ?? new ChatTemplateRenderer(ChatTemplate);
+        var stopSequences = renderer.GetStopSequences();
 
         var session = new DaisiLlogosChatSession(forward, Tokenizer, renderer, stopSequences, _seed);
 

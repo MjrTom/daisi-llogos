@@ -3,7 +3,7 @@ namespace Daisi.Llogos.Chat;
 /// <summary>
 /// Renders a list of chat messages into a prompt string using the detected chat template format.
 /// </summary>
-public sealed class ChatTemplateRenderer
+public sealed class ChatTemplateRenderer : IChatRenderer
 {
     private readonly ChatTemplate _template;
 
@@ -12,11 +12,10 @@ public sealed class ChatTemplateRenderer
         _template = template;
     }
 
-    /// <summary>
-    /// Render messages into a prompt string.
-    /// </summary>
-    /// <param name="messages">The conversation messages.</param>
-    /// <param name="addGenerationPrompt">If true, append the assistant turn prefix so the model continues generating.</param>
+    /// <inheritdoc />
+    public string[] GetStopSequences() => _template.GetStopSequences();
+
+    /// <inheritdoc />
     public string Render(IReadOnlyList<ChatMessage> messages, bool addGenerationPrompt = true)
     {
         return _template.Format switch

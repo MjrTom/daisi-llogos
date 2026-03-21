@@ -14,7 +14,7 @@ public sealed class DaisiLlogosChatSession : IDisposable
     private readonly IForwardPass _forward;
     private readonly BpeTokenizer _tokenizer;
     private readonly Sampler _sampler;
-    private readonly ChatTemplateRenderer _renderer;
+    private readonly IChatRenderer _renderer;
     private readonly string[] _stopSequences;
     private readonly List<ChatMessage> _history = [];
 
@@ -29,10 +29,13 @@ public sealed class DaisiLlogosChatSession : IDisposable
 
     public IReadOnlyList<ChatMessage> History => _history;
 
+    /// <summary>Number of tokens currently in the KV cache (total context usage).</summary>
+    public int CachedTokenCount => _cachedTokenCount;
+
     public DaisiLlogosChatSession(
         IForwardPass forward,
         BpeTokenizer tokenizer,
-        ChatTemplateRenderer renderer,
+        IChatRenderer renderer,
         string[] stopSequences,
         int? seed = null)
     {
