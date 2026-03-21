@@ -131,17 +131,19 @@ internal sealed class VulkanPipeline : IDisposable
             Marshal.FreeHGlobal(entryPoint);
         }
 
-        // Create descriptor pool — only 1 set needed since operations are synchronous
+        // Create descriptor pool — enough for batched command buffer recording
+        // (multiple dispatches per submit, each needing its own descriptor set)
+        const uint maxBatchSets = 1024;
         var poolSize = new VkDescriptorPoolSize
         {
             type = VkConst.DescriptorTypeStorageBuffer,
-            descriptorCount = (uint)bindingCount,
+            descriptorCount = (uint)bindingCount * maxBatchSets,
         };
         var poolInfo = new VkDescriptorPoolCreateInfo
         {
             sType = 33,
             flags = 0,
-            maxSets = 1,
+            maxSets = maxBatchSets,
             poolSizeCount = 1,
             pPoolSizes = (nint)(&poolSize),
         };
@@ -153,12 +155,18 @@ internal sealed class VulkanPipeline : IDisposable
     /// <summary>
     /// Allocate a descriptor set and bind buffers to it.
     /// </summary>
+    /// <summary>Reset the descriptor pool (call at start of each batch).</summary>
+    public void ResetDescriptorPool()
+    {
+        VulkanApi.ResetDescriptorPool(_vkDevice.Device, _descriptorPool, 0);
+    }
+
     public unsafe ulong AllocateDescriptorSet(ReadOnlySpan<VulkanBuffer> buffers)
     {
         if (buffers.Length != BindingCount)
             throw new ArgumentException($"Expected {BindingCount} buffers, got {buffers.Length}.");
 
-        // Reset pool — safe because all dispatches are synchronous (SubmitAndWait)
+        // Reset pool — safe because dispatches are submitted synchronously (SubmitAndWait)
         VulkanApi.ResetDescriptorPool(_vkDevice.Device, _descriptorPool, 0);
 
         ulong dsLayout = _descriptorSetLayout;

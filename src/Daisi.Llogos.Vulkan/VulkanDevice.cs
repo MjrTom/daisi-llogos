@@ -207,6 +207,67 @@ internal sealed class VulkanDevice : IDisposable
 
     public nint CommandBuffer => _commandBuffer;
 
+    // ── Batched submission ─────────────────────────────────────────────────
+    private bool _batchRecording;
+
+    /// <summary>
+    /// Begin recording a batch of commands. Dispatches will be recorded
+    /// without submitting until EndBatch() is called.
+    /// </summary>
+    public unsafe void BeginBatch()
+    {
+        if (_batchRecording) return;
+        _batchRecording = true;
+
+        VulkanApi.Check(VulkanApi.ResetCommandBuffer(_commandBuffer, 0), "vkResetCommandBuffer");
+        var beginInfo = new VkCommandBufferBeginInfo
+        {
+            sType = 42,
+            flags = VkConst.CommandBufferUsageOneTimeSubmitBit,
+        };
+        VulkanApi.Check(VulkanApi.BeginCommandBuffer(_commandBuffer, &beginInfo), "vkBeginCommandBuffer");
+    }
+
+    /// <summary>
+    /// End recording and submit the batch. Waits for all commands to complete.
+    /// </summary>
+    public unsafe void EndBatch()
+    {
+        if (!_batchRecording) return;
+        _batchRecording = false;
+
+        VulkanApi.Check(VulkanApi.EndCommandBuffer(_commandBuffer), "vkEndCommandBuffer");
+
+        nint cmdBufLocal = _commandBuffer;
+        var submitInfo = new VkSubmitInfo
+        {
+            sType = 4,
+            commandBufferCount = 1,
+            pCommandBuffers = (nint)(&cmdBufLocal),
+        };
+        ulong fenceLocal = _fence;
+        VulkanApi.Check(VulkanApi.ResetFences(_device, 1, &fenceLocal), "vkResetFences");
+        VulkanApi.Check(VulkanApi.QueueSubmit(_queue, 1, &submitInfo, _fence), "vkQueueSubmit");
+        VulkanApi.Check(VulkanApi.WaitForFences(_device, 1, &fenceLocal, 1, ulong.MaxValue), "vkWaitForFences");
+    }
+
+    /// <summary>
+    /// Record a dispatch into the current batch (or submit immediately if not batching).
+    /// </summary>
+    public unsafe void RecordOrSubmit(Action<nint> recordCommands)
+    {
+        if (_batchRecording)
+        {
+            // Just record into the open command buffer
+            recordCommands(_commandBuffer);
+        }
+        else
+        {
+            // Legacy: submit-and-wait for each dispatch
+            SubmitAndWait(recordCommands);
+        }
+    }
+
     public void Dispose()
     {
         if (!_disposed)

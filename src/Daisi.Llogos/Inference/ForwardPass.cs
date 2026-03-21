@@ -160,6 +160,7 @@ public sealed class ForwardPass : IForwardPass
         // Final RMSNorm + LM head + logit download
         _backend.RmsNorm(_normOut, _hidden, _weights.OutputNorm, _config.NormEps);
         ProjectLinear(_logits, _normOut, _weights.OutputWeight);
+        _backend.FlushCommands(); // submit all batched commands before readback
         _logits.DequantizeTo(_logitsBuffer);
         return _logitsBuffer;
     }
@@ -178,6 +179,9 @@ public sealed class ForwardPass : IForwardPass
     /// </summary>
     private void ForwardTransformer(int tokenId, int position)
     {
+        // Begin batching GPU commands (Vulkan: record without submitting)
+        _backend.BeginCommands();
+
         // 1. Embedding lookup
         _backend.EmbeddingLookup(_hidden, _weights.TokenEmbedding, tokenId);
 
@@ -211,6 +215,7 @@ public sealed class ForwardPass : IForwardPass
             ProjectLinear(_hidden, _gate, lw.FfnDown);
 
             _backend.ElementAdd(_hidden, _hidden, _residual);
+
         }
     }
 
