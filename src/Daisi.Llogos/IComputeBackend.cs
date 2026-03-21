@@ -247,6 +247,50 @@ public interface IComputeBackend : IDisposable
     }
 
     /// <summary>
+    /// Fused: split gate+up from fused matmul output and compute SwiGLU in one pass.
+    /// fusedInput is [gate(N) | up(N)], output[i] = SiLU(gate[i]) * up[i].
+    /// </summary>
+    void SplitSwiGLU(ITensor output, ITensor fusedInput, int N)
+    {
+        // Default: download, split+silu*mul on CPU, upload
+        var buf = new float[N * 2];
+        fusedInput.DequantizeTo(buf);
+        var result = new float[N];
+        for (int i = 0; i < N; i++)
+        {
+            float g = buf[i];
+            float u = buf[N + i];
+            result[i] = (g / (1.0f + MathF.Exp(-g))) * u;
+        }
+        var bytes = new byte[N * sizeof(float)];
+        Buffer.BlockCopy(result, 0, bytes, 0, bytes.Length);
+        output.CopyFrom(bytes);
+    }
+
+    /// <summary>
+    /// Fused: split fused QKV, per-head norms, RoPE, KV cache write — all in one launch.
+    /// </summary>
+    void PostQkvNormRopeCache(ITensor qOut, ITensor kOut, ITensor vOut,
+        ITensor fusedQkv, ITensor kCache, ITensor vCache,
+        int qDim, int kDim, int vDim,
+        int numHeads, int numKvHeads, int headDim, int ropeDim,
+        int position, float ropeTheta, float normEps,
+        int maxSeqLen, int seqLen, ITensor? qNormWeight, ITensor? kNormWeight)
+    {
+        // Default: separate operations
+        CopyTensorRegion(qOut, fusedQkv, 0, qDim);
+        CopyTensorRegion(kOut, fusedQkv, qDim, kDim);
+        CopyTensorRegion(vOut, fusedQkv, qDim + kDim, vDim);
+        if (qNormWeight != null)
+        {
+            PerHeadRmsNorm(qOut, qNormWeight, numHeads, headDim, normEps);
+            PerHeadRmsNorm(kOut, kNormWeight!, numKvHeads, headDim, normEps);
+        }
+        RoPE(qOut, kOut, headDim, ropeDim, position, ropeTheta);
+        KvCacheWrite(kCache, vCache, kOut, vOut, numKvHeads, headDim, headDim, maxSeqLen, position);
+    }
+
+    /// <summary>
     /// Find the index of the maximum value in a tensor. Returns -1 if tensor is empty.
     /// GPU backends can compute this on-device to avoid downloading the full tensor.
     /// </summary>

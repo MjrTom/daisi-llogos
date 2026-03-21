@@ -176,20 +176,20 @@ public sealed class ForwardPass : IForwardPass
             _backend.AddRmsNorm(_normOut, _hidden, _hidden, _residual, lw.PostAttnNorm, _config.NormEps);
             _backend.CopyTensor(_residual, _hidden);
 
-            // SwiGLU FFN — fused gate+up matmul when available
+            // SwiGLU FFN — fused gate+up matmul + fused split+SwiGLU when available
             if (lw is StandardAttentionWeights sawFfn && sawFfn.FusedGateUp != null && _fusedGateUpOut != null)
             {
                 int gateDim = _config.IntermediateDim;
                 ProjectLinear(_fusedGateUpOut, _normOut, sawFfn.FusedGateUp);
-                _backend.CopyTensorRegion(_gate, _fusedGateUpOut, 0, gateDim);
-                _backend.CopyTensorRegion(_up, _fusedGateUpOut, gateDim, gateDim);
+                // Fused split + SwiGLU: reads [gate|up], writes SiLU(gate)*up
+                _backend.SplitSwiGLU(_gate, _fusedGateUpOut, gateDim);
             }
             else
             {
                 ProjectLinear(_gate, _normOut, lw.FfnGate);
                 ProjectLinear(_up, _normOut, lw.FfnUp);
+                _backend.SwiGLU(_gate, _gate, _up);
             }
-            _backend.SwiGLU(_gate, _gate, _up);
             ProjectLinear(_hidden, _gate, lw.FfnDown);
 
             // Residual add
@@ -230,15 +230,14 @@ public sealed class ForwardPass : IForwardPass
             {
                 int gateDim = _config.IntermediateDim;
                 ProjectLinear(_fusedGateUpOut, _normOut, sawFfn2.FusedGateUp);
-                _backend.CopyTensorRegion(_gate, _fusedGateUpOut, 0, gateDim);
-                _backend.CopyTensorRegion(_up, _fusedGateUpOut, gateDim, gateDim);
+                _backend.SplitSwiGLU(_gate, _fusedGateUpOut, gateDim);
             }
             else
             {
                 ProjectLinear(_gate, _normOut, lw.FfnGate);
                 ProjectLinear(_up, _normOut, lw.FfnUp);
+                _backend.SwiGLU(_gate, _gate, _up);
             }
-            _backend.SwiGLU(_gate, _gate, _up);
             ProjectLinear(_hidden, _gate, lw.FfnDown);
             _backend.ElementAdd(_hidden, _hidden, _residual);
         }
@@ -270,7 +269,7 @@ public sealed class ForwardPass : IForwardPass
             int kDim = numKvHeads * keyLen;
             int vDim = numKvHeads * valLen;
             ProjectLinear(_fusedQkvOut, _normOut, w.FusedQKV);
-            // Split fused output → Q, K, V (lightweight D2D copies)
+            // Split fused output → Q, K, V
             _backend.CopyTensorRegion(_qAttn, _fusedQkvOut, 0, qDim);
             _backend.CopyTensorRegion(_kProj, _fusedQkvOut, qDim, kDim);
             _backend.CopyTensorRegion(_vProj, _fusedQkvOut, qDim + kDim, vDim);

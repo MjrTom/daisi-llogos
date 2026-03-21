@@ -956,6 +956,71 @@ public sealed class CudaBackend : IComputeBackend
         _stream.Launch(func, grid, 1, 1, (uint)BlockSize, 1, 1, 0, kArgs);
     }
 
+    /// <inheritdoc />
+    public unsafe void SplitSwiGLU(ITensor output, ITensor fusedInput, int N)
+    {
+        var outT = (CudaTensor)output;
+        var inT = (CudaTensor)fusedInput;
+        ulong outPtr = outT.DevicePtr;
+        ulong inPtr = inT.DevicePtr;
+
+        var func = _elementwiseModule.GetFunction("split_swiglu");
+        uint grid = (uint)((N + BlockSize - 1) / BlockSize);
+        nint* kArgs = stackalloc nint[3];
+        kArgs[0] = (nint)(&outPtr);
+        kArgs[1] = (nint)(&inPtr);
+        kArgs[2] = (nint)(&N);
+        _stream.Launch(func, grid, 1, 1, (uint)BlockSize, 1, 1, 0, kArgs);
+    }
+
+    /// <inheritdoc />
+    public unsafe void PostQkvNormRopeCache(ITensor qOut, ITensor kOut, ITensor vOut,
+        ITensor fusedQkv, ITensor kCache, ITensor vCache,
+        int qDim, int kDim, int vDim,
+        int numHeads, int numKvHeads, int headDim, int ropeDim,
+        int position, float ropeTheta, float normEps,
+        int maxSeqLen, int seqLen, ITensor? qNormWeight, ITensor? kNormWeight)
+    {
+        var qT = (CudaTensor)qOut; var kT = (CudaTensor)kOut; var vT = (CudaTensor)vOut;
+        var fT = (CudaTensor)fusedQkv;
+        var kcT = (CudaTensor)kCache; var vcT = (CudaTensor)vCache;
+
+        ulong qPtr = qT.DevicePtr, kPtr = kT.DevicePtr, vPtr = vT.DevicePtr;
+        ulong fPtr = fT.DevicePtr;
+        ulong kcPtr = kcT.DevicePtr, vcPtr = vcT.DevicePtr;
+        ulong qnPtr = qNormWeight != null ? ((CudaTensor)qNormWeight).DevicePtr : 0;
+        ulong knPtr = kNormWeight != null ? ((CudaTensor)kNormWeight).DevicePtr : 0;
+        int cacheIsFp16 = kCache.Type == Gguf.GgmlType.F16 ? 1 : 0;
+
+        var func = _elementwiseModule.GetFunction("post_qkv_norm_rope_cache");
+        uint sharedMem = (uint)(BlockSize * sizeof(float));
+        nint* kArgs = stackalloc nint[18];
+        kArgs[0] = (nint)(&qPtr);
+        kArgs[1] = (nint)(&kPtr);
+        kArgs[2] = (nint)(&vPtr);
+        kArgs[3] = (nint)(&fPtr);
+        kArgs[4] = (nint)(&kcPtr);
+        kArgs[5] = (nint)(&vcPtr);
+        kArgs[6] = (nint)(&qDim);
+        kArgs[7] = (nint)(&kDim);
+        kArgs[8] = (nint)(&vDim);
+        kArgs[9] = (nint)(&numHeads);
+        kArgs[10] = (nint)(&numKvHeads);
+        kArgs[11] = (nint)(&headDim);
+        kArgs[12] = (nint)(&ropeDim);
+        kArgs[13] = (nint)(&position);
+        kArgs[14] = (nint)(&ropeTheta);
+        kArgs[15] = (nint)(&normEps);
+        kArgs[16] = (nint)(&maxSeqLen);
+        kArgs[17] = (nint)(&cacheIsFp16);
+        // qNormWeight and kNormWeight as additional args
+        nint* allArgs = stackalloc nint[20];
+        for (int i = 0; i < 18; i++) allArgs[i] = kArgs[i];
+        allArgs[18] = (nint)(&qnPtr);
+        allArgs[19] = (nint)(&knPtr);
+        _stream.Launch(func, (uint)numHeads, 1, 1, (uint)BlockSize, 1, 1, sharedMem, allArgs);
+    }
+
     // ── Fused Operations ─────────────────────────────────────────────────────
 
     /// <inheritdoc />
