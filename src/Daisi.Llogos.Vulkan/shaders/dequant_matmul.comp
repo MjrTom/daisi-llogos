@@ -22,9 +22,9 @@ layout(set = 0, binding = 2) buffer WeightBuf { uint8_t weight_data[]; };
 shared float sdata[8]; // one per subgroup for subgroup-based reduction
 
 void main() {
-    // Q8_0 (weightType 1): each workgroup handles 4 rows, grid = N/4
-    // All others: 1 row per workgroup, grid = N
-    uint row = (weightType == 1u) ? gl_WorkGroupID.x * 4 : gl_WorkGroupID.x;
+    // Multi-row: Q8_0 = 4 rows, Q4_K = 2 rows, others = 1 row per workgroup
+    uint rowsPerWg = (weightType == 1u) ? 4u : ((weightType == 5u) ? 2u : 1u);
+    uint row = gl_WorkGroupID.x * rowsPerWg;
     uint tid = gl_LocalInvocationID.x;
     uint blockSize = gl_WorkGroupSize.x; // 256
     if (row >= N) return;
@@ -185,42 +185,73 @@ void main() {
         }
     } else if (weightType == 5u) {
         // Q4_K: 256 elements, 144 bytes per super-block
+        // Multi-row: 2 rows per workgroup with activation reuse
+        const uint Q4K_ROWS = 2;
         uint sbPerRow = K / 256;
         uint bytesPerRow = sbPerRow * 144;
-        // Each thread processes one full chunk (64 elements = lo + hi halves)
         uint totalChunks = sbPerRow * 4;
+
+        float accs_q4k[Q4K_ROWS];
+        for (uint r = 0; r < Q4K_ROWS; r++) accs_q4k[r] = 0.0;
+
         for (uint item = tid; item < totalChunks; item += blockSize) {
             uint sb = item / 4;
             uint chunk = item % 4;
-            uint sbOff = row * bytesPerRow + sb * 144;
             uint aBase = sb * 256 + chunk * 64;
-            uint dBits = uint(weight_data[sbOff]) | (uint(weight_data[sbOff+1]) << 8);
-            uint dminBits = uint(weight_data[sbOff+2]) | (uint(weight_data[sbOff+3]) << 8);
-            float d = unpackHalf2x16(dBits).x;
-            float dmin = unpackHalf2x16(dminBits).x;
-            uint j0 = chunk * 2;
-            uint j1 = chunk * 2 + 1;
-            int sc0, m0, sc1, m1;
-            if (j0 < 4) { sc0 = int(weight_data[sbOff+4+j0]) & 63; m0 = int(weight_data[sbOff+8+j0]) & 63; }
-            else { sc0 = (int(weight_data[sbOff+4+j0+4]) & 0xF) | ((int(weight_data[sbOff+4+j0-4]) >> 6) << 4);
-                   m0 = (int(weight_data[sbOff+4+j0+4]) >> 4) | ((int(weight_data[sbOff+4+j0]) >> 6) << 4); }
-            if (j1 < 4) { sc1 = int(weight_data[sbOff+4+j1]) & 63; m1 = int(weight_data[sbOff+8+j1]) & 63; }
-            else { sc1 = (int(weight_data[sbOff+4+j1+4]) & 0xF) | ((int(weight_data[sbOff+4+j1-4]) >> 6) << 4);
-                   m1 = (int(weight_data[sbOff+4+j1+4]) >> 4) | ((int(weight_data[sbOff+4+j1]) >> 6) << 4); }
-            float ss0 = d * float(sc0); float sm0 = dmin * float(m0);
-            float ss1 = d * float(sc1); float sm1 = dmin * float(m1);
-            float dotLo = 0.0, dotHi = 0.0, asumLo = 0.0, asumHi = 0.0;
+
+            // Load activation once for this chunk (shared across rows)
+            float a_lo[32], a_hi[32];
+            float sum_lo = 0.0, sum_hi = 0.0;
             for (uint l = 0; l < 32; l++) {
-                uint packed = uint(weight_data[sbOff+16+chunk*32+l]);
-                float aLo = input_data[aBase + l];
-                float aHi = input_data[aBase + l + 32];
-                dotLo += aLo * float(packed & 0xFu);
-                dotHi += aHi * float(packed >> 4);
-                asumLo += aLo;
-                asumHi += aHi;
+                a_lo[l] = input_data[aBase + l];
+                a_hi[l] = input_data[aBase + l + 32];
+                sum_lo += a_lo[l];
+                sum_hi += a_hi[l];
             }
-            acc += ss0 * dotLo - sm0 * asumLo + ss1 * dotHi - sm1 * asumHi;
+
+            for (uint r = 0; r < Q4K_ROWS; r++) {
+                uint rn = row + r;
+                if (rn >= N) break;
+
+                uint sbOff = rn * bytesPerRow + sb * 144;
+                uint dBits = uint(weight_data[sbOff]) | (uint(weight_data[sbOff+1]) << 8);
+                uint dminBits = uint(weight_data[sbOff+2]) | (uint(weight_data[sbOff+3]) << 8);
+                float d = unpackHalf2x16(dBits).x;
+                float dmin = unpackHalf2x16(dminBits).x;
+                uint j0 = chunk * 2, j1 = chunk * 2 + 1;
+                int sc0, m0, sc1, m1;
+                if (j0 < 4) { sc0 = int(weight_data[sbOff+4+j0]) & 63; m0 = int(weight_data[sbOff+8+j0]) & 63; }
+                else { sc0 = (int(weight_data[sbOff+4+j0+4]) & 0xF) | ((int(weight_data[sbOff+4+j0-4]) >> 6) << 4);
+                       m0 = (int(weight_data[sbOff+4+j0+4]) >> 4) | ((int(weight_data[sbOff+4+j0]) >> 6) << 4); }
+                if (j1 < 4) { sc1 = int(weight_data[sbOff+4+j1]) & 63; m1 = int(weight_data[sbOff+8+j1]) & 63; }
+                else { sc1 = (int(weight_data[sbOff+4+j1+4]) & 0xF) | ((int(weight_data[sbOff+4+j1-4]) >> 6) << 4);
+                       m1 = (int(weight_data[sbOff+4+j1+4]) >> 4) | ((int(weight_data[sbOff+4+j1]) >> 6) << 4); }
+                float ss0 = d * float(sc0), sm0 = dmin * float(m0);
+                float ss1 = d * float(sc1), sm1 = dmin * float(m1);
+
+                float dotLo = 0.0, dotHi = 0.0;
+                for (uint l = 0; l < 32; l++) {
+                    uint packed = uint(weight_data[sbOff+16+chunk*32+l]);
+                    dotLo += a_lo[l] * float(packed & 0xFu);
+                    dotHi += a_hi[l] * float(packed >> 4);
+                }
+                accs_q4k[r] += ss0 * dotLo - sm0 * sum_lo + ss1 * dotHi - sm1 * sum_hi;
+            }
         }
+
+        // Reduce and write each row
+        for (uint r = 0; r < Q4K_ROWS; r++) {
+            float val = subgroupAdd(accs_q4k[r]);
+            if (gl_SubgroupInvocationID == 0) sdata[gl_SubgroupID] = val;
+            barrier();
+            if (gl_SubgroupID == 0) {
+                val = (gl_SubgroupInvocationID < gl_NumSubgroups) ? sdata[gl_SubgroupInvocationID] : 0.0;
+                val = subgroupAdd(val);
+                if (gl_SubgroupInvocationID == 0 && row + r < N) output_data[row + r] = val;
+            }
+            barrier();
+        }
+        return;
     } else if (weightType == 6u) {
         // Q6_K: 256 elements, 210 bytes. With l/16 scale sub-indexing fix.
         uint sbPerRow = K / 256;

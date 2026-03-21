@@ -129,8 +129,9 @@ public sealed class VulkanBackend : IComputeBackend
         pc[2] = (uint)N;
         pc[3] = weightType;
 
-        // Q8_0: 4 rows per workgroup (activation reuse), others: 1 row per workgroup
-        uint grid = (weightType == 1) ? ((uint)N + 3) / 4 : (uint)N;
+        // Multi-row: Q8_0 = 4 rows, Q4_K = 2 rows, others = 1 row per workgroup
+        uint rowsPerWg = (weightType == 1) ? 4u : ((weightType == 5) ? 2u : 1u);
+        uint grid = ((uint)N + rowsPerWg - 1) / rowsPerWg;
         Dispatch(_matmulPipeline, ds, pc, 16, grid, 1, 1);
     }
 
