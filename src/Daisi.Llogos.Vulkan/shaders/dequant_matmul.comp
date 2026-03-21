@@ -54,12 +54,13 @@ void main() {
         for (uint b = tid; b < blocksPerRow; b += blockSize) {
             uint aBase = b * 32;
 
-            // Load activation values for this block (shared across all rows)
-            float a_vals[32];
-            for (uint i = 0; i < 32; i++)
-                a_vals[i] = input_data[aBase + i];
+            // Load activation as vec4s (shared across all rows)
+            vec4 a4[8];
+            for (uint i = 0; i < 8; i++)
+                a4[i] = vec4(input_data[aBase+i*4], input_data[aBase+i*4+1],
+                             input_data[aBase+i*4+2], input_data[aBase+i*4+3]);
 
-            // Process each row
+            // Process each row using vec4 dot products (4 MADs per instruction)
             for (uint r = 0; r < ROWS_PER_WG; r++) {
                 uint rn = row + r;
                 if (rn >= N) break;
@@ -69,9 +70,13 @@ void main() {
                 float scale = unpackHalf2x16(scaleBits).x;
 
                 float blockSum = 0.0;
-                for (uint i = 0; i < 32; i++) {
-                    int8_t q = int8_t(weight_data[blockOff + 2 + i]);
-                    blockSum += float(q) * a_vals[i];
+                for (uint i = 0; i < 8; i++) {
+                    uint qBase = blockOff + 2 + i * 4;
+                    vec4 q4 = vec4(float(int8_t(weight_data[qBase])),
+                                   float(int8_t(weight_data[qBase+1])),
+                                   float(int8_t(weight_data[qBase+2])),
+                                   float(int8_t(weight_data[qBase+3])));
+                    blockSum += dot(a4[i], q4);
                 }
                 accs[r] += scale * blockSum;
             }
