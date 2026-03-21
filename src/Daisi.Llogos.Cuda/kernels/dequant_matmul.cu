@@ -604,7 +604,7 @@ __device__ void unpack_q4k_scales(const unsigned char* sb,
 }
 
 // Multi-row Q4_K: 2 output neurons per block with activation reuse
-#define Q4K_ROWS_PER_BLOCK 2
+#define Q4K_ROWS_PER_BLOCK 4
 
 __global__ void dequant_matmul_q4_k(float* output, const float* a,
                                      const unsigned char* b,
