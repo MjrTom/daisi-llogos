@@ -11,6 +11,8 @@ internal static class VkConst
     public const uint BufferUsageStorageBufferBit = 0x00000020;
     public const uint BufferUsageTransferSrcBit = 0x00000001;
     public const uint BufferUsageTransferDstBit = 0x00000002;
+    public const uint BufferUsageShaderDeviceAddressBit = 0x00020000;
+    public const uint MemoryAllocateDeviceAddressBit = 0x00000002;
     public const uint MemoryPropertyDeviceLocalBit = 0x00000001;
     public const uint MemoryPropertyHostVisibleBit = 0x00000002;
     public const uint MemoryPropertyHostCoherentBit = 0x00000004;
@@ -236,8 +238,13 @@ internal unsafe struct VkPhysicalDeviceVulkan12Features
     public uint shaderSharedInt64Atomics;
     public uint shaderFloat16;                   // useful for FP16
     public uint shaderInt8;                      // we need this
-    // Many more fields follow — all default to 0 (VK_FALSE)
-    public fixed uint remaining[38]; // pad to full struct size
+    // Fields 9-25 (descriptor indexing, etc.) — all default to 0
+    public fixed uint fields9to25[17];
+    public uint bufferDeviceAddress;             // index 26 — we need this
+    public uint bufferDeviceAddressCaptureReplay;
+    public uint bufferDeviceAddressMultiDevice;
+    // Fields 29-46
+    public fixed uint fields29to46[18];
 }
 
 [StructLayout(LayoutKind.Sequential)]
@@ -460,4 +467,21 @@ internal struct VkBufferCopy
     public ulong srcOffset;
     public ulong dstOffset;
     public ulong size;
+}
+
+[StructLayout(LayoutKind.Sequential)]
+internal struct VkBufferDeviceAddressInfo
+{
+    public uint sType; // VK_STRUCTURE_TYPE_BUFFER_DEVICE_ADDRESS_INFO = 1000244001
+    public nint pNext;
+    public ulong buffer;
+}
+
+[StructLayout(LayoutKind.Sequential)]
+internal struct VkMemoryAllocateFlagsInfo
+{
+    public uint sType; // VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_FLAGS_INFO = 1000060000
+    public nint pNext;
+    public uint flags;
+    public uint deviceMask;
 }

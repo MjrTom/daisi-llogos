@@ -244,6 +244,136 @@ void op_squared_relu() {
     data0[idx] = x * x;
 }
 
+// ── Opcode 11: Split SwiGLU ─────────────────────────────────────────────────
+// data0 = output, data1 = fusedInput [gate(N) | up(N)]
+// param0 = N (half the fused size)
+void op_split_swiglu() {
+    uint idx = gl_GlobalInvocationID.x;
+    if (idx >= param0) return;
+    float g = data1[idx];
+    float u = data1[param0 + idx];
+    data0[idx] = (g / (1.0 + exp(-g))) * u;
+}
+
+// ── Opcode 12: RmsNormResidual ──────────────────────────────────────────────
+// data0 = normOutput, data1 = residualOutput, data2 = input, data3 = weight
+// param0 = n, param1 = float eps bits
+// Fused: residual[i] = input[i]; normOutput[i] = RmsNorm(input, weight)
+void op_rms_norm_residual() {
+    uint tid = gl_LocalInvocationID.x;
+    float eps = uintBitsToFloat(param1);
+
+    float local_sum = 0.0;
+    for (uint i = tid; i < param0; i += 256) {
+        float v = data2[i];
+        data1[i] = v;  // residual = input
+        local_sum += v * v;
+    }
+    sdata[tid] = local_sum;
+    barrier();
+
+    for (uint s = 128; s > 0; s >>= 1) {
+        if (tid < s) sdata[tid] += sdata[tid + s];
+        barrier();
+    }
+
+    float inv_rms = 1.0 / sqrt(sdata[0] / float(param0) + eps);
+    for (uint i = tid; i < param0; i += 256)
+        data0[i] = data2[i] * inv_rms * data3[i];
+}
+
+// ── Opcode 13: AddRmsNorm ───────────────────────────────────────────────────
+// data0 = normOutput, data1 = hidden (written: a+b), data2 = a, data3 = b, data4 = weight
+// param0 = n, param1 = float eps bits
+// Fused: hidden[i] = a[i]+b[i]; normOutput[i] = RmsNorm(hidden, weight)
+void op_add_rms_norm() {
+    uint tid = gl_LocalInvocationID.x;
+    float eps = uintBitsToFloat(param1);
+
+    float local_sum = 0.0;
+    for (uint i = tid; i < param0; i += 256) {
+        float v = data2[i] + data3[i];
+        data1[i] = v;  // hidden = a + b
+        local_sum += v * v;
+    }
+    sdata[tid] = local_sum;
+    barrier();
+
+    for (uint s = 128; s > 0; s >>= 1) {
+        if (tid < s) sdata[tid] += sdata[tid + s];
+        barrier();
+    }
+
+    float inv_rms = 1.0 / sqrt(sdata[0] / float(param0) + eps);
+    for (uint i = tid; i < param0; i += 256)
+        data0[i] = data1[i] * inv_rms * data4[i];
+}
+
+// ── Opcode 14: ArgMax ────────────────────────────────────────────────────────
+// data0 = input tensor, data1 = output (single int, stored as float bits)
+// param0 = n (element count)
+// One workgroup, 256 threads. Each thread finds local max, then reduce in shared memory.
+void op_argmax() {
+    uint tid = gl_LocalInvocationID.x;
+    uint n = param0;
+
+    // Each thread finds its local max
+    float localMax = -1.0/0.0;
+    uint localIdx = 0;
+    for (uint i = tid; i < n; i += 256) {
+        float v = data0[i];
+        if (v > localMax) { localMax = v; localIdx = i; }
+    }
+
+    // Store value and index in shared memory for reduction
+    sdata[tid] = localMax;
+    barrier();
+
+    // Parallel reduction to find global max
+    // Use shared memory for both value and index
+    // We'll use sdata[0..255] for values and encode index in a separate pass
+    for (uint s = 128; s > 0; s >>= 1) {
+        if (tid < s) {
+            if (sdata[tid + s] > sdata[tid]) {
+                sdata[tid] = sdata[tid + s];
+            }
+        }
+        barrier();
+    }
+
+    // sdata[0] now has the max value. Find which thread had it.
+    float maxVal = sdata[0];
+    barrier();
+
+    // Each thread checks if its local max matches the global max
+    sdata[tid] = (localMax == maxVal) ? uintBitsToFloat(localIdx) : uintBitsToFloat(0xFFFFFFFFu);
+    barrier();
+
+    // Find minimum index among matches (handles ties)
+    for (uint s = 128; s > 0; s >>= 1) {
+        if (tid < s) {
+            uint a = floatBitsToUint(sdata[tid]);
+            uint b = floatBitsToUint(sdata[tid + s]);
+            sdata[tid] = uintBitsToFloat(min(a, b));
+        }
+        barrier();
+    }
+
+    if (tid == 0) data1[0] = sdata[0]; // output: argmax index as uint bits stored in float
+}
+
+// ── Opcode 15: RepeatTile ────────────────────────────────────────────────────
+// data0 = tensor (in-place), param0 = srcSize (numHeads*headDim), param1 = factor
+// Tiles [0..srcSize) into [srcSize..srcSize*factor)
+void op_repeat_tile() {
+    uint idx = gl_GlobalInvocationID.x;
+    uint total = param0 * param1;
+    if (idx >= total) return;
+    uint srcIdx = idx % param0;
+    // Only write to positions beyond the source (copies 1..factor-1)
+    if (idx >= param0) data0[idx] = data0[srcIdx];
+}
+
 void main() {
     switch (opcode) {
         case 0: op_silu_inplace(); break;
@@ -257,5 +387,10 @@ void main() {
         case 8: op_causal_conv1d(); break;
         case 9: op_fill_tensor(); break;
         case 10: op_squared_relu(); break;
+        case 11: op_split_swiglu(); break;
+        case 12: op_rms_norm_residual(); break;
+        case 13: op_add_rms_norm(); break;
+        case 14: op_argmax(); break;
+        case 15: op_repeat_tile(); break;
     }
 }

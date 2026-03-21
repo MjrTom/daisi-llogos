@@ -15,7 +15,7 @@
     <EmbeddedResource Include="shaders\compiled\*.spv" LogicalName="%(Filename)%(Extension)" />
   </ItemGroup>
   <Target Name="CompileShaders" BeforeTargets="PrepareForBuild" Condition="Exists('$(MSBuildProjectDirectory)\shaders') AND '$(VulkanSdkPath)' != ''">
-    <Exec Command="&quot;$(VulkanSdkPath)\Bin\glslc.exe&quot; &quot;%(CompShaders.FullPath)&quot; -o &quot;$(MSBuildProjectDirectory)\shaders\compiled\%(CompShaders.Filename).spv&quot; --target-env=vulkan1.0"
+    <Exec Command="&quot;$(VulkanSdkPath)\Bin\glslc.exe&quot; &quot;%(CompShaders.FullPath)&quot; -o &quot;$(MSBuildProjectDirectory)\shaders\compiled\%(CompShaders.Filename).spv&quot; --target-env=vulkan1.2 --target-spv=spv1.3"
           WorkingDirectory="$(MSBuildProjectDirectory)" />
   </Target>
   <ItemGroup>

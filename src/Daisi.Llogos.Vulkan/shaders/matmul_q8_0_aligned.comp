@@ -1,0 +1,67 @@
+#version 450
+#extension GL_KHR_shader_subgroup_arithmetic : enable
+
+// Dedicated Q8_0 aligned matmul: 36-byte blocks, native uint32 reads, 8 rows/workgroup
+layout(local_size_x = 64) in;
+
+layout(push_constant) uniform PushConstants {
+    uint K;
+    uint N;
+};
+
+layout(set = 0, binding = 0) buffer OutputBuf { float output_data[]; };
+layout(set = 0, binding = 1) buffer InputBuf { float input_data[]; };
+layout(set = 0, binding = 2) buffer WeightU32Buf { uint weight_u32[]; };
+
+shared float sdata[2];
+
+void main() {
+    const uint ROWS = 8;
+    uint row = gl_WorkGroupID.x * ROWS;
+    uint tid = gl_LocalInvocationID.x;
+    if (row >= N) return;
+
+    uint blocksPerRow = K >> 5;
+    float accs[ROWS];
+    for (uint r = 0; r < ROWS; r++) accs[r] = 0.0;
+
+    for (uint b = tid; b < blocksPerRow; b += 64) {
+        uint aBase = b << 5;
+
+        vec4 a4[8];
+        for (uint i = 0; i < 8; i++)
+            a4[i] = vec4(input_data[aBase+i*4], input_data[aBase+i*4+1],
+                         input_data[aBase+i*4+2], input_data[aBase+i*4+3]);
+
+        for (uint r = 0; r < ROWS; r++) {
+            uint rn = row + r;
+            if (rn >= N) break;
+
+            uint wordBase = (rn * blocksPerRow + b) * 9;
+            float scale = unpackHalf2x16(weight_u32[wordBase] & 0xFFFFu).x;
+
+            float blockSum = 0.0;
+            for (uint i = 0; i < 8; i++) {
+                uint packed = weight_u32[wordBase + 1 + i];
+                vec4 q4 = vec4(float(int(packed << 24) >> 24),
+                               float(int(packed << 16) >> 24),
+                               float(int(packed << 8) >> 24),
+                               float(int(packed) >> 24));
+                blockSum += dot(a4[i], q4);
+            }
+            accs[r] += scale * blockSum;
+        }
+    }
+
+    for (uint r = 0; r < ROWS; r++) {
+        float val = subgroupAdd(accs[r]);
+        if (gl_SubgroupInvocationID == 0) sdata[gl_SubgroupID] = val;
+        barrier();
+        if (gl_SubgroupID == 0) {
+            val = (gl_SubgroupInvocationID < gl_NumSubgroups) ? sdata[gl_SubgroupInvocationID] : 0.0;
+            val = subgroupAdd(val);
+            if (gl_SubgroupInvocationID == 0 && row + r < N) output_data[row + r] = val;
+        }
+        barrier();
+    }
+}
