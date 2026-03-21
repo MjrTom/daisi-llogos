@@ -230,17 +230,33 @@ internal sealed class VulkanPipeline : IDisposable
     /// <summary>Reset the descriptor pool (call at start of each batch).</summary>
     public void ResetDescriptorPool()
     {
-        VulkanApi.ResetDescriptorPool(_vkDevice.Device, _descriptorPool, 0);
+        // Only reset if cache is not valid (first run or overflow)
+        // With caching, descriptor sets persist across batches since buffer bindings don't change
+        if (!_dsCacheValid)
+        {
+            VulkanApi.ResetDescriptorPool(_vkDevice.Device, _descriptorPool, 0);
+            _dsCache.Clear();
+        }
     }
+
+    // Cache descriptor sets by buffer handle combination (same buffers = same descriptor set)
+    private readonly Dictionary<long, ulong> _dsCache = new();
+    private bool _dsCacheValid; // false after pool reset
 
     public unsafe ulong AllocateDescriptorSet(ReadOnlySpan<VulkanBuffer> buffers)
     {
         if (buffers.Length != BindingCount)
             throw new ArgumentException($"Expected {BindingCount} buffers, got {buffers.Length}.");
 
-        // Pool reset is handled by FlushCommands after batch completion
-        // Don't reset here — sets must remain valid while command buffer is pending
+        // Build a cache key from buffer handles (XOR-hash for speed)
+        long key = BindingCount;
+        for (int i = 0; i < buffers.Length; i++)
+            key = key * 31 + (long)buffers[i].Buffer;
 
+        if (_dsCacheValid && _dsCache.TryGetValue(key, out var cached))
+            return cached;
+
+        // Allocate new descriptor set
         ulong dsLayout = _descriptorSetLayout;
         var allocInfo = new VkDescriptorSetAllocateInfo
         {
@@ -285,6 +301,8 @@ internal sealed class VulkanPipeline : IDisposable
                 VulkanApi.UpdateDescriptorSets(_vkDevice.Device, (uint)BindingCount, pWrites, 0, 0);
         }
 
+        _dsCache[key] = descriptorSet;
+        _dsCacheValid = true;
         return descriptorSet;
     }
 
