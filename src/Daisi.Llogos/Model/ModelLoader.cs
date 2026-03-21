@@ -32,11 +32,10 @@ public static class ModelLoader
         {
             if (layers[i] is StandardAttentionWeights saw)
             {
-                // QKV fusion disabled pending correctness investigation
-                // saw.FusedQKV = TryFuseFromGguf(gguf, stream, backend, tensorMap, i,
-                //     "attn_q", "attn_k", "attn_v");
-                // saw.FusedGateUp = TryFuseFromGguf(gguf, stream, backend, tensorMap, i,
-                //     "ffn_gate", "ffn_up");
+                saw.FusedQKV = TryFuseFromGguf(gguf, stream, backend, tensorMap, i,
+                    "attn_q", "attn_k", "attn_v");
+                saw.FusedGateUp = TryFuseFromGguf(gguf, stream, backend, tensorMap, i,
+                    "ffn_gate", "ffn_up");
             }
         }
 
