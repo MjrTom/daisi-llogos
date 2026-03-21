@@ -209,6 +209,37 @@ internal struct VkDeviceCreateInfo
     public nint pEnabledFeatures;
 }
 
+// Vulkan 1.1 physical device features (sType = 49)
+[StructLayout(LayoutKind.Sequential)]
+internal unsafe struct VkPhysicalDeviceVulkan11Features
+{
+    public uint sType; // 49
+    public nint pNext;
+    // All fields are VkBool32 — we only need to set a few
+    public fixed uint features[12]; // storageBuffer16BitAccess, etc. (unused, set to 0)
+}
+
+// Vulkan 1.2 physical device features (sType = 51)
+// Large struct — only the fields we need, rest are zero-initialized
+[StructLayout(LayoutKind.Sequential)]
+internal unsafe struct VkPhysicalDeviceVulkan12Features
+{
+    public uint sType; // 51
+    public nint pNext;
+    // Offset fields (VkBool32 each, see vulkan spec for order):
+    public uint samplerMirrorClampToEdge;
+    public uint drawIndirectCount;
+    public uint storageBuffer8BitAccess;        // we need this
+    public uint uniformAndStorageBuffer8BitAccess; // we need this
+    public uint storagePushConstant8;
+    public uint shaderBufferInt64Atomics;
+    public uint shaderSharedInt64Atomics;
+    public uint shaderFloat16;                   // useful for FP16
+    public uint shaderInt8;                      // we need this
+    // Many more fields follow — all default to 0 (VK_FALSE)
+    public fixed uint remaining[38]; // pad to full struct size
+}
+
 [StructLayout(LayoutKind.Sequential)]
 internal struct VkMemoryAllocateInfo
 {
