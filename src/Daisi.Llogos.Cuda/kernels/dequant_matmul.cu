@@ -759,68 +759,81 @@ __global__ void dequant_matmul_q5_k(float* output, const float* a,
 // Q6_K super block: 256 elements, 210 bytes.
 // Layout: ql[128] + qh[64] + sc[16] + d[2].
 
+// Multi-row Q6_K: 2 output neurons per block with activation reuse
+#define Q6K_ROWS_PER_BLOCK 2
+
 __global__ void dequant_matmul_q6_k(float* output, const float* a,
                                      const unsigned char* b,
                                      int M, int K, int N)
 {
     extern __shared__ float shared[];
-    int n = blockIdx.x;
+    int n_base = blockIdx.x * Q6K_ROWS_PER_BLOCK;
     int tid = threadIdx.x;
     int blockSize = blockDim.x;
-    if (n >= N) return;
+    if (n_base >= N) return;
 
     int sbPerRow = K / 256;
     long long bytesPerRow = (long long)sbPerRow * 210;
-    const unsigned char* b_row = b + (long long)n * bytesPerRow;
-
-    // Each thread processes one 32-element quadrant (8 quadrants per super-block).
     int totalGroups = sbPerRow * 8;
 
-    float sum = 0.0f;
+    float sums[Q6K_ROWS_PER_BLOCK] = {0};
+
     for (int grp = tid; grp < totalGroups; grp += blockSize)
     {
         int sb = grp / 8;
         int gIdx = grp % 8;
-        int half = gIdx / 4;
+        int halfIdx = gIdx / 4;
         int quadrant = gIdx % 4;
+        const float* aBase = a + sb * 256 + halfIdx * 128 + quadrant * 32;
 
-        const unsigned char* sbp = b_row + sb * 210;
-        float d = fp16_to_fp32(*reinterpret_cast<const unsigned short*>(sbp + 208));
-
-        const unsigned char* ql = sbp + half * 64;
-        const unsigned char* qh = sbp + 128 + half * 32;
-        int scIdx = half * 8;
-        const float* aBase = a + sb * 256 + half * 128 + quadrant * 32;
-
-        // Precompute scale pairs for both sub-groups (l/16 = 0 and 1)
-        float sc0 = d * (float)((signed char)sbp[192 + scIdx + 0 + quadrant * 2]);
-        float sc1 = d * (float)((signed char)sbp[192 + scIdx + 1 + quadrant * 2]);
-
-        // Bit extraction constants for this quadrant
-        int qlOff = (quadrant & 1) * 32;  // 0 for q0,q2; 32 for q1,q3
-        int qlShift = (quadrant >> 1) * 4; // 0 for q0,q1; 4 for q2,q3
-        int qhShift = quadrant * 2;        // 0,2,4,6
-
-        float local = 0.0f;
+        // Load activation once (shared across rows)
+        float a_vals[32];
         #pragma unroll
-        for (int l = 0; l < 32; l++)
+        for (int l = 0; l < 32; l++) a_vals[l] = aBase[l];
+
+        int qlOff = (quadrant & 1) * 32;
+        int qlShift = (quadrant >> 1) * 4;
+        int qhShift = quadrant * 2;
+
+        #pragma unroll
+        for (int r = 0; r < Q6K_ROWS_PER_BLOCK; r++)
         {
-            int q = (((ql[qlOff + l] >> qlShift) & 0xF) | (((qh[l] >> qhShift) & 3) << 4)) - 32;
-            float sc = (l < 16) ? sc0 : sc1;
-            local += aBase[l] * (sc * (float)q);
+            int n = n_base + r;
+            if (n >= N) break;
+
+            const unsigned char* sbp = b + (long long)n * bytesPerRow + sb * 210;
+            float d = fp16_to_fp32(*reinterpret_cast<const unsigned short*>(sbp + 208));
+            const unsigned char* ql = sbp + halfIdx * 64;
+            const unsigned char* qh = sbp + 128 + halfIdx * 32;
+            int scIdx = halfIdx * 8;
+
+            float sc0 = d * (float)((signed char)sbp[192 + scIdx + 0 + quadrant * 2]);
+            float sc1 = d * (float)((signed char)sbp[192 + scIdx + 1 + quadrant * 2]);
+
+            float local = 0.0f;
+            #pragma unroll
+            for (int l = 0; l < 32; l++) {
+                int q = (((ql[qlOff + l] >> qlShift) & 0xF) | (((qh[l] >> qhShift) & 3) << 4)) - 32;
+                float sc = (l < 16) ? sc0 : sc1;
+                local += a_vals[l] * (sc * (float)q);
+            }
+            sums[r] += local;
         }
-        sum += local;
     }
 
-    sum = warp_reduce_sum(sum);
-    int lane = tid & 31;
-    int warp = tid >> 5;
-    if (lane == 0) shared[warp] = sum;
-    __syncthreads();
     int numWarps = blockSize >> 5;
-    if (tid < numWarps) sum = shared[tid]; else sum = 0.0f;
-    sum = warp_reduce_sum(sum);
-    if (tid == 0) output[n] = sum;
+    #pragma unroll
+    for (int r = 0; r < Q6K_ROWS_PER_BLOCK; r++) {
+        float sum = warp_reduce_sum(sums[r]);
+        int lane = tid & 31;
+        int warp = tid >> 5;
+        if (lane == 0) shared[warp] = sum;
+        __syncthreads();
+        if (tid < numWarps) sum = shared[tid]; else sum = 0.0f;
+        sum = warp_reduce_sum(sum);
+        if (tid == 0 && n_base + r < N) output[n_base + r] = sum;
+        __syncthreads();
+    }
 }
 
 } // extern "C"
