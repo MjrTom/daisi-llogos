@@ -129,7 +129,9 @@ public sealed class VulkanBackend : IComputeBackend
         pc[2] = (uint)N;
         pc[3] = weightType;
 
-        Dispatch(_matmulPipeline, ds, pc, 16, (uint)N, 1, 1);
+        // Q8_0: 4 rows per workgroup (activation reuse), others: 1 row per workgroup
+        uint grid = (weightType == 1) ? ((uint)N + 3) / 4 : (uint)N;
+        Dispatch(_matmulPipeline, ds, pc, 16, grid, 1, 1);
     }
 
     public unsafe void RmsNorm(ITensor output, ITensor input, ITensor weight, float eps)
