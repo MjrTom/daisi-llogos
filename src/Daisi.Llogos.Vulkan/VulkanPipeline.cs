@@ -166,8 +166,8 @@ internal sealed class VulkanPipeline : IDisposable
         if (buffers.Length != BindingCount)
             throw new ArgumentException($"Expected {BindingCount} buffers, got {buffers.Length}.");
 
-        // Reset pool — safe because dispatches are submitted synchronously (SubmitAndWait)
-        VulkanApi.ResetDescriptorPool(_vkDevice.Device, _descriptorPool, 0);
+        // Pool reset is handled by FlushCommands after batch completion
+        // Don't reset here — sets must remain valid while command buffer is pending
 
         ulong dsLayout = _descriptorSetLayout;
         var allocInfo = new VkDescriptorSetAllocateInfo

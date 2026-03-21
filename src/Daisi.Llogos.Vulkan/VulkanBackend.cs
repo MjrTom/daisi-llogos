@@ -44,7 +44,13 @@ public sealed class VulkanBackend : IComputeBackend
 
     public void BeginCommands()
     {
-        // Reset all descriptor pools so they can be re-allocated during this batch
+        _device.BeginBatch();
+    }
+
+    public void FlushCommands()
+    {
+        _device.EndBatch();
+        // Reset pools AFTER batch completes (sets must stay valid during execution)
         _rmsNormPipeline.ResetDescriptorPool();
         _softmaxPipeline.ResetDescriptorPool();
         _siluPipeline.ResetDescriptorPool();
@@ -55,9 +61,7 @@ public sealed class VulkanBackend : IComputeBackend
         _compositePipeline.ResetDescriptorPool();
         _attentionPipeline.ResetDescriptorPool();
         _deltanetPipeline.ResetDescriptorPool();
-        _device.BeginBatch();
     }
-    public void FlushCommands() => _device.EndBatch();
 
     public ITensor CreateTensor(string name, GgmlType type, ReadOnlySpan<long> dimensions) =>
         new VulkanTensor(_device, name, type, dimensions);
@@ -474,7 +478,7 @@ public sealed class VulkanBackend : IComputeBackend
     private unsafe void Dispatch(VulkanPipeline pipeline, ulong descriptorSet, void* pushConstants,
         uint pushConstantSize, uint groupX, uint groupY, uint groupZ)
     {
-        _device.SubmitAndWait(cmd =>
+        _device.RecordOrSubmit(cmd =>
         {
             VulkanApi.CmdBindPipeline(cmd, VkConst.PipelineBindPointCompute, pipeline.Pipeline);
 
@@ -537,7 +541,7 @@ public sealed class VulkanBackend : IComputeBackend
 
     private void CopyBuffer(VulkanBuffer src, VulkanBuffer dst, ulong byteCount)
     {
-        _device.SubmitAndWait(cmd =>
+        _device.RecordOrSubmit(cmd =>
         {
             unsafe
             {
