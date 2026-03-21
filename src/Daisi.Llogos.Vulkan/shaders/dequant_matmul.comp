@@ -22,7 +22,9 @@ layout(set = 0, binding = 2) buffer WeightBuf { uint8_t weight_data[]; };
 shared float sdata[8]; // one per subgroup for subgroup-based reduction
 
 void main() {
-    uint row = gl_WorkGroupID.x; // output neuron
+    // Q8_0 (weightType 1): each workgroup handles 4 rows, grid = N/4
+    // All others: 1 row per workgroup, grid = N
+    uint row = (weightType == 1u) ? gl_WorkGroupID.x * 4 : gl_WorkGroupID.x;
     uint tid = gl_LocalInvocationID.x;
     uint blockSize = gl_WorkGroupSize.x; // 256
     if (row >= N) return;
@@ -41,19 +43,55 @@ void main() {
         }
     } else if (weightType == 1u) {
         // Q8_0: 34-byte blocks (2b FP16 scale + 32 int8 quants)
+        // Multi-row: each workgroup processes ROWS_PER_WG output neurons
+        // Activation is loaded once and reused across all rows
+        const uint ROWS_PER_WG = 4;
         uint blocksPerRow = K / 32;
+
+        float accs[ROWS_PER_WG];
+        for (uint r = 0; r < ROWS_PER_WG; r++) accs[r] = 0.0;
+
         for (uint b = tid; b < blocksPerRow; b += blockSize) {
-            uint blockOff = (row * blocksPerRow + b) * 34;
-            uint scaleBits = uint(weight_data[blockOff]) | (uint(weight_data[blockOff + 1]) << 8);
-            float scale = unpackHalf2x16(scaleBits).x;
-            float blockSum = 0.0;
             uint aBase = b * 32;
-            for (uint i = 0; i < 32; i++) {
-                int8_t q = int8_t(weight_data[blockOff + 2 + i]);
-                blockSum += float(q) * input_data[aBase + i];
+
+            // Load activation values for this block (shared across all rows)
+            float a_vals[32];
+            for (uint i = 0; i < 32; i++)
+                a_vals[i] = input_data[aBase + i];
+
+            // Process each row
+            for (uint r = 0; r < ROWS_PER_WG; r++) {
+                uint rn = row + r;
+                if (rn >= N) break;
+
+                uint blockOff = (rn * blocksPerRow + b) * 34;
+                uint scaleBits = uint(weight_data[blockOff]) | (uint(weight_data[blockOff + 1]) << 8);
+                float scale = unpackHalf2x16(scaleBits).x;
+
+                float blockSum = 0.0;
+                for (uint i = 0; i < 32; i++) {
+                    int8_t q = int8_t(weight_data[blockOff + 2 + i]);
+                    blockSum += float(q) * a_vals[i];
+                }
+                accs[r] += scale * blockSum;
             }
-            acc += scale * blockSum;
         }
+
+        // Reduce and write each row
+        for (uint r = 0; r < ROWS_PER_WG; r++) {
+            float val = subgroupAdd(accs[r]);
+            if (gl_SubgroupInvocationID == 0)
+                sdata[gl_SubgroupID] = val;
+            barrier();
+            if (gl_SubgroupID == 0) {
+                val = (gl_SubgroupInvocationID < gl_NumSubgroups) ? sdata[gl_SubgroupInvocationID] : 0.0;
+                val = subgroupAdd(val);
+                if (gl_SubgroupInvocationID == 0 && row + r < N)
+                    output_data[row + r] = val;
+            }
+            barrier();
+        }
+        return;
     } else if (weightType == 2u) {
         // TQ1_0: 256 elements per block, 54 bytes
         uint blocksPerRow = K / 256;
