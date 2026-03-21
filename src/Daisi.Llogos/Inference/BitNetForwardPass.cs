@@ -79,47 +79,40 @@ public sealed class BitNetForwardPass : IForwardPass
 
     public ReadOnlySpan<float> Forward(int tokenId, int position)
     {
-        // 1. Embedding lookup
+        ForwardTransformer(tokenId, position);
+
+        // Final RMSNorm + LM head + logit download
+        _backend.RmsNorm(_normOut, _hidden, _weights.OutputNorm, _config.NormEps);
+        ProjectLinear(_logits, _normOut, _weights.OutputWeight);
+        _logits.DequantizeTo(_logitsBuffer);
+        return _logitsBuffer;
+    }
+
+    public void ForwardHidden(int tokenId, int position)
+    {
+        ForwardTransformer(tokenId, position);
+    }
+
+    private void ForwardTransformer(int tokenId, int position)
+    {
+        // Embedding lookup
         _backend.EmbeddingLookup(_hidden, _weights.TokenEmbedding, tokenId);
 
-        // 2. Transformer layers
+        // Transformer layers
         for (int layer = 0; layer < _config.NumLayers; layer++)
         {
             var lw = (BitNetLayerWeights)_weights.Layers[layer];
 
-            // Save residual
             _backend.CopyTensor(_residual, _hidden);
-
-            // Pre-attention RMSNorm
             _backend.RmsNorm(_normOut, _hidden, lw.AttnNorm, _config.NormEps);
-
-            // Attention
             ForwardAttention(lw, position, layer);
-
-            // Residual add
             _backend.ElementAdd(_hidden, _hidden, _residual);
 
-            // Save residual
             _backend.CopyTensor(_residual, _hidden);
-
-            // Post-attention RMSNorm (ffn_norm in the GGUF)
             _backend.RmsNorm(_normOut, _hidden, lw.PostAttnNorm, _config.NormEps);
-
-            // BitNet FFN: Squared ReLU instead of SwiGLU
             ForwardFFN(lw);
-
-            // Residual add
             _backend.ElementAdd(_hidden, _hidden, _residual);
         }
-
-        // 3. Final RMSNorm
-        _backend.RmsNorm(_normOut, _hidden, _weights.OutputNorm, _config.NormEps);
-
-        // 4. LM head (tied embeddings)
-        ProjectLinear(_logits, _normOut, _weights.OutputWeight);
-
-        _logits.DequantizeTo(_logitsBuffer);
-        return _logitsBuffer;
     }
 
     private void ForwardAttention(BitNetLayerWeights w, int position, int layer)
