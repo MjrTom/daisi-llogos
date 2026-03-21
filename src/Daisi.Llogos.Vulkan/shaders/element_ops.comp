@@ -4,7 +4,7 @@ layout(local_size_x = 256) in;
 
 layout(push_constant) uniform PushConstants {
     uint n;
-    uint op; // 0 = mul, 1 = add
+    uint op; // 0 = mul, 1 = add, 2 = copy (output = a)
 };
 
 layout(set = 0, binding = 0) buffer OutputBuf { float output_data[]; };
@@ -16,6 +16,8 @@ void main() {
     if (idx >= n) return;
     if (op == 0)
         output_data[idx] = a_data[idx] * b_data[idx];
-    else
+    else if (op == 1)
         output_data[idx] = a_data[idx] + b_data[idx];
+    else
+        output_data[idx] = a_data[idx]; // copy
 }
