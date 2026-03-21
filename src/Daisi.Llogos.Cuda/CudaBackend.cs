@@ -89,7 +89,8 @@ public sealed class CudaBackend : IComputeBackend
         ulong aPtr = aT.DevicePtr;
         ulong bPtr = bT.DevicePtr;
 
-        uint gridX = (uint)N; // 1 neuron per block for most types
+        // Q8_0: 4 rows per block (multi-row activation reuse). Others: 1 row per block.
+        uint gridX = (b.Type == GgmlType.Q8_0) ? ((uint)N + 3) / 4 : (uint)N;
         // Adaptive block size: scale with the number of work items per row.
         // Q8_0: 1 item per 32 elements. K-quants: 1 item per 256 elements. F32/F16: 1 item per element.
         int workItemsPerRow = b.Type switch
