@@ -595,8 +595,8 @@ __device__ __forceinline__ void unpack_q4k_scales(const unsigned char* sb,
     sub_min = dmin * (float)m;
 }
 
-// Multi-row Q4_K: 8 output neurons per block with activation reuse + uint reads
-#define Q4K_ROWS_PER_BLOCK 8
+// Multi-row Q4_K: output neurons per block with activation reuse + uint reads
+#define Q4K_ROWS_PER_BLOCK 4
 
 __global__ void dequant_matmul_q4_k(float* output, const float* a,
                                      const unsigned char* b,
@@ -622,10 +622,8 @@ __global__ void dequant_matmul_q4_k(float* output, const float* a,
         int chunk = item % 4;
 
         // Load activation once (shared across rows)
-        const float* apLo = a + sb * 256 + chunk * 64;
-        const float* apHi = apLo + 32;
-        const float4* ap4Lo = reinterpret_cast<const float4*>(apLo);
-        const float4* ap4Hi = reinterpret_cast<const float4*>(apHi);
+        const float4* ap4Lo = reinterpret_cast<const float4*>(a + sb * 256 + chunk * 64);
+        const float4* ap4Hi = reinterpret_cast<const float4*>(a + sb * 256 + chunk * 64 + 32);
 
         float4 aLoCache[8], aHiCache[8];
         float asumLo = 0.0f, asumHi = 0.0f;
@@ -645,7 +643,6 @@ __global__ void dequant_matmul_q4_k(float* output, const float* a,
             if (n >= N) break;
 
             const unsigned char* sbp = b + (long long)n * bytesPerRow + sb * 144;
-            // Read d + dmin as single uint via __ldg
             unsigned int d_dmin = __ldg(reinterpret_cast<const unsigned int*>(sbp));
             float d = fp16_to_fp32((unsigned short)(d_dmin & 0xFFFF));
             float dmin = fp16_to_fp32((unsigned short)(d_dmin >> 16));
@@ -654,7 +651,6 @@ __global__ void dequant_matmul_q4_k(float* output, const float* a,
             unpack_q4k_scales(sbp, chunk * 2, d, dmin, ss0, sm0);
             unpack_q4k_scales(sbp, chunk * 2 + 1, d, dmin, ss1, sm1);
 
-            // Read quants as uint via __ldg for read-only cache
             const unsigned int* qs32 = reinterpret_cast<const unsigned int*>(sbp + 16 + chunk * 32);
             float dotLo = 0.0f, dotHi = 0.0f;
 
