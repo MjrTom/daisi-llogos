@@ -2,6 +2,7 @@
 #extension GL_KHR_shader_subgroup_arithmetic : enable
 
 // Dedicated Q8_0 aligned matmul: 36-byte blocks, native uint32 reads, 8 rows/workgroup
+// Activation loaded via vec4 (128-bit), quants via 2 × uvec4 (2 × 128-bit = 32 bytes)
 layout(local_size_x = 64) in;
 
 layout(push_constant) uniform PushConstants {
@@ -10,7 +11,7 @@ layout(push_constant) uniform PushConstants {
 };
 
 layout(set = 0, binding = 0) buffer OutputBuf { float output_data[]; };
-layout(set = 0, binding = 1) buffer InputBuf { float input_data[]; };
+layout(set = 0, binding = 1) buffer InputBuf { vec4 input_v4[]; }; // vec4 view for 128-bit activation loads
 layout(set = 0, binding = 2) buffer WeightU32Buf { uint weight_u32[]; };
 
 shared float sdata[2];
@@ -26,20 +27,21 @@ void main() {
     for (uint r = 0; r < ROWS; r++) accs[r] = 0.0;
 
     for (uint b = tid; b < blocksPerRow; b += 64) {
-        uint aBase = b << 5;
-
+        // Load activation as 8 × vec4 via 128-bit aligned reads
+        uint a4Base = b << 3; // b * 32 / 4 = b * 8
         vec4 a4[8];
         for (uint i = 0; i < 8; i++)
-            a4[i] = vec4(input_data[aBase+i*4], input_data[aBase+i*4+1],
-                         input_data[aBase+i*4+2], input_data[aBase+i*4+3]);
+            a4[i] = input_v4[a4Base + i];
 
         for (uint r = 0; r < ROWS; r++) {
             uint rn = row + r;
             if (rn >= N) break;
 
+            // 36 bytes = 9 uint32s per block. Scale at word 0, quants at words 1-8.
             uint wordBase = (rn * blocksPerRow + b) * 9;
             float scale = unpackHalf2x16(weight_u32[wordBase] & 0xFFFFu).x;
 
+            // Read 32 quant bytes as 8 uint32s, unpack int8→float, vec4 dot product
             float blockSum = 0.0;
             for (uint i = 0; i < 8; i++) {
                 uint packed = weight_u32[wordBase + 1 + i];
