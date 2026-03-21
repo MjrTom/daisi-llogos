@@ -1,33 +1,19 @@
 // daisi-llogos CUDA kernels: composite operations for forward pass
 // These support the IComputeBackend composite operations used by ForwardPass.
 
-// FP16 ↔ FP32 conversion using bit manipulation (no cuda_fp16.h needed for NVRTC)
+// FP16 ↔ FP32 via PTX (single instruction, no cuda_fp16.h needed for NVRTC)
 __device__ float fp16_to_fp32(unsigned short h)
 {
-    unsigned int sign = (h >> 15) & 1;
-    unsigned int exp_val = (h >> 10) & 0x1f;
-    unsigned int mant = h & 0x3ff;
-    unsigned int f;
-    if (exp_val == 0) {
-        if (mant == 0) f = sign << 31;
-        else { exp_val = 1; while (!(mant & 0x400)) { mant <<= 1; exp_val--; } mant &= 0x3ff; f = (sign << 31) | ((exp_val + 127 - 15) << 23) | (mant << 13); }
-    } else if (exp_val == 31) {
-        f = (sign << 31) | 0x7f800000 | (mant << 13);
-    } else {
-        f = (sign << 31) | ((exp_val + 127 - 15) << 23) | (mant << 13);
-    }
-    return *reinterpret_cast<float*>(&f);
+    float result;
+    asm("cvt.f32.f16 %0, %1;" : "=f"(result) : "h"(h));
+    return result;
 }
 
 __device__ unsigned short fp32_to_fp16(float val)
 {
-    unsigned int f = *reinterpret_cast<unsigned int*>(&val);
-    unsigned int sign = (f >> 16) & 0x8000;
-    int exp_val = ((f >> 23) & 0xff) - 127 + 15;
-    unsigned int mant = (f >> 13) & 0x3ff;
-    if (exp_val <= 0) return (unsigned short)sign;  // flush to zero
-    if (exp_val >= 31) return (unsigned short)(sign | 0x7c00);  // infinity
-    return (unsigned short)(sign | (exp_val << 10) | mant);
+    unsigned short result;
+    asm("cvt.rn.f16.f32 %0, %1;" : "=h"(result) : "f"(val));
+    return result;
 }
 
 // Helper to load float from either FP32 or FP16 cache
