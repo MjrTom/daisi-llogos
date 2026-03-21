@@ -133,7 +133,7 @@ internal sealed class VulkanPipeline : IDisposable
 
         // Create descriptor pool — enough for batched command buffer recording
         // (multiple dispatches per submit, each needing its own descriptor set)
-        const uint maxBatchSets = 1024;
+        const uint maxBatchSets = 4096;
         var poolSize = new VkDescriptorPoolSize
         {
             type = VkConst.DescriptorTypeStorageBuffer,

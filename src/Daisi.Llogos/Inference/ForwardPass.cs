@@ -172,6 +172,7 @@ public sealed class ForwardPass : IForwardPass
     public void ForwardHidden(int tokenId, int position)
     {
         ForwardTransformer(tokenId, position);
+        _backend.FlushCommands(); // submit batch and reset pools before next token
     }
 
     /// <summary>
@@ -179,13 +180,15 @@ public sealed class ForwardPass : IForwardPass
     /// </summary>
     private void ForwardTransformer(int tokenId, int position)
     {
+        // Batch entire forward pass into single command buffer submission
+        _backend.BeginCommands();
+
         // 1. Embedding lookup
         _backend.EmbeddingLookup(_hidden, _weights.TokenEmbedding, tokenId);
 
-        // 2. Transformer layers (per-layer batching)
+        // 2. Transformer layers
         for (int layer = 0; layer < _config.NumLayers; layer++)
         {
-            _backend.BeginCommands();
             var lw = _weights.Layers[layer];
             bool isDeltaNet = lw is DeltaNetWeights;
 
@@ -214,7 +217,6 @@ public sealed class ForwardPass : IForwardPass
             ProjectLinear(_hidden, _gate, lw.FfnDown);
 
             _backend.ElementAdd(_hidden, _hidden, _residual);
-            _backend.FlushCommands();
         }
     }
 
@@ -227,6 +229,7 @@ public sealed class ForwardPass : IForwardPass
         ForwardTransformer(tokenId, position);
         _backend.RmsNorm(_normOut, _hidden, _weights.OutputNorm, _config.NormEps);
         ProjectLinear(_logits, _normOut, _weights.OutputWeight);
+        _backend.FlushCommands(); // submit batch before argmax readback
         return _backend.ArgMax(_logits);
     }
 
