@@ -135,6 +135,12 @@ public sealed class CpuTensor : ITensor
     }
 
     /// <inheritdoc />
+    public void CopyRawTo(Span<byte> destination)
+    {
+        _data.AsSpan().CopyTo(destination);
+    }
+
+    /// <inheritdoc />
     public void Dispose()
     {
         if (!_disposed)

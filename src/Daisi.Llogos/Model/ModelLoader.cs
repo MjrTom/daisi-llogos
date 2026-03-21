@@ -27,6 +27,19 @@ public static class ModelLoader
                 layers[i] = LoadDeltaNetLayer(gguf, stream, backend, tensorMap, i);
         }
 
+        // Fuse Q+K+V and gate+up weights from raw GGUF data (before GPU repacking)
+        for (int i = 0; i < config.NumLayers; i++)
+        {
+            if (layers[i] is StandardAttentionWeights saw)
+            {
+                // QKV fusion disabled pending correctness investigation
+                // saw.FusedQKV = TryFuseFromGguf(gguf, stream, backend, tensorMap, i,
+                //     "attn_q", "attn_k", "attn_v");
+                // saw.FusedGateUp = TryFuseFromGguf(gguf, stream, backend, tensorMap, i,
+                //     "ffn_gate", "ffn_up");
+            }
+        }
+
         return new ModelWeights
         {
             TokenEmbedding = tokenEmbedding,
@@ -34,6 +47,51 @@ public static class ModelLoader
             Output = output,
             Layers = layers,
         };
+    }
+
+    /// <summary>
+    /// Try to fuse multiple weight tensors from raw GGUF data (before any GPU repacking).
+    /// Returns null if tensor types differ or any tensor is missing.
+    /// </summary>
+    private static ITensor? TryFuseFromGguf(GgufFile gguf, Stream stream, IComputeBackend backend,
+        Dictionary<string, GgufTensorInfo> tensorMap, int layer, params string[] suffixes)
+    {
+        // Gather tensor infos and check all have same type
+        var infos = new GgufTensorInfo[suffixes.Length];
+        for (int i = 0; i < suffixes.Length; i++)
+        {
+            string name = $"blk.{layer}.{suffixes[i]}.weight";
+            if (!tensorMap.TryGetValue(name, out var info)) return null;
+            infos[i] = info;
+            if (i > 0 && info.Type != infos[0].Type) return null;
+        }
+
+        var type = infos[0].Type;
+        long K = (long)infos[0].Dimensions[0];
+        long totalN = 0;
+        long totalBytes = 0;
+        foreach (var info in infos)
+        {
+            totalN += info.NDimensions > 1 ? (long)info.Dimensions[1] : 1;
+            var dims = ConvertDimensions(info);
+            long elemCount = 1;
+            foreach (var d in dims) elemCount *= d;
+            totalBytes += (long)Gguf.GgmlTypeInfo.ByteSize(type, (ulong)elemCount);
+        }
+
+        // Read and concatenate raw GGUF bytes (original format, no repacking)
+        var fused = new byte[totalBytes];
+        int offset = 0;
+        foreach (var info in infos)
+        {
+            var data = gguf.ReadTensorData(stream, info);
+            data.CopyTo(fused.AsSpan(offset));
+            offset += data.Length;
+        }
+
+        // LoadTensor will handle any repacking (e.g., Q8_0 → aligned 36-byte blocks)
+        return backend.LoadTensor($"blk.{layer}.fused_{string.Join("_", suffixes)}",
+            type, [K, totalN], fused);
     }
 
     private static StandardAttentionWeights LoadStandardAttentionLayer(

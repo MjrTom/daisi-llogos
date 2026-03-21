@@ -46,6 +46,10 @@ public sealed class ForwardPass : IForwardPass
     private readonly ITensor _gate;
     private readonly ITensor _up;
 
+    // Fused projection scratch (allocated if any layer has fused weights)
+    private readonly ITensor? _fusedQkvOut;
+    private readonly ITensor? _fusedGateUpOut;
+
     public ForwardPass(IComputeBackend backend, ModelConfig config, ModelWeights weights,
         IKvCache kvCache, DeltaNetState deltaState)
     {
@@ -115,6 +119,25 @@ public sealed class ForwardPass : IForwardPass
 
         _gate = CreateF32("scratch_ffn_gate", config.IntermediateDim);
         _up = CreateF32("scratch_ffn_up", config.IntermediateDim);
+
+        // Fused projection scratch — check if any standard attention layer has fused weights
+        for (int i = 0; i < config.NumLayers; i++)
+        {
+            if (weights.Layers[i] is StandardAttentionWeights saw)
+            {
+                if (saw.FusedQKV != null && _fusedQkvOut == null)
+                {
+                    int fusedN = (int)saw.FusedQKV.Dimensions[1];
+                    _fusedQkvOut = CreateF32("scratch_fused_qkv", fusedN);
+                }
+                if (saw.FusedGateUp != null && _fusedGateUpOut == null)
+                {
+                    int fusedN = (int)saw.FusedGateUp.Dimensions[1];
+                    _fusedGateUpOut = CreateF32("scratch_fused_gateup", fusedN);
+                }
+                if (_fusedQkvOut != null && _fusedGateUpOut != null) break;
+            }
+        }
     }
 
     public IKvCache KvCache => _kvCache;
@@ -153,9 +176,19 @@ public sealed class ForwardPass : IForwardPass
             _backend.AddRmsNorm(_normOut, _hidden, _hidden, _residual, lw.PostAttnNorm, _config.NormEps);
             _backend.CopyTensor(_residual, _hidden);
 
-            // SwiGLU FFN (fused SiLU + ElementMul)
-            ProjectLinear(_gate, _normOut, lw.FfnGate);
-            ProjectLinear(_up, _normOut, lw.FfnUp);
+            // SwiGLU FFN — fused gate+up matmul when available
+            if (lw is StandardAttentionWeights sawFfn && sawFfn.FusedGateUp != null && _fusedGateUpOut != null)
+            {
+                int gateDim = _config.IntermediateDim;
+                ProjectLinear(_fusedGateUpOut, _normOut, sawFfn.FusedGateUp);
+                _backend.CopyTensorRegion(_gate, _fusedGateUpOut, 0, gateDim);
+                _backend.CopyTensorRegion(_up, _fusedGateUpOut, gateDim, gateDim);
+            }
+            else
+            {
+                ProjectLinear(_gate, _normOut, lw.FfnGate);
+                ProjectLinear(_up, _normOut, lw.FfnUp);
+            }
             _backend.SwiGLU(_gate, _gate, _up);
             ProjectLinear(_hidden, _gate, lw.FfnDown);
 
@@ -187,14 +220,24 @@ public sealed class ForwardPass : IForwardPass
         {
             var lw = _weights.Layers[layer];
             _backend.RmsNormResidual(_normOut, _residual, _hidden, lw.AttnNorm, _config.NormEps);
-            if (lw is StandardAttentionWeights saw)
-                ForwardStandardAttention(saw, position, layer);
+            if (lw is StandardAttentionWeights saw2)
+                ForwardStandardAttention(saw2, position, layer);
             else if (lw is DeltaNetWeights dnw)
                 ForwardDeltaNet(dnw, layer);
             _backend.AddRmsNorm(_normOut, _hidden, _hidden, _residual, lw.PostAttnNorm, _config.NormEps);
             _backend.CopyTensor(_residual, _hidden);
-            ProjectLinear(_gate, _normOut, lw.FfnGate);
-            ProjectLinear(_up, _normOut, lw.FfnUp);
+            if (lw is StandardAttentionWeights sawFfn2 && sawFfn2.FusedGateUp != null && _fusedGateUpOut != null)
+            {
+                int gateDim = _config.IntermediateDim;
+                ProjectLinear(_fusedGateUpOut, _normOut, sawFfn2.FusedGateUp);
+                _backend.CopyTensorRegion(_gate, _fusedGateUpOut, 0, gateDim);
+                _backend.CopyTensorRegion(_up, _fusedGateUpOut, gateDim, gateDim);
+            }
+            else
+            {
+                ProjectLinear(_gate, _normOut, lw.FfnGate);
+                ProjectLinear(_up, _normOut, lw.FfnUp);
+            }
             _backend.SwiGLU(_gate, _gate, _up);
             ProjectLinear(_hidden, _gate, lw.FfnDown);
             _backend.ElementAdd(_hidden, _hidden, _residual);
@@ -219,27 +262,40 @@ public sealed class ForwardPass : IForwardPass
         int ropeDim = _config.RopeDimCount;
         float scale = 1.0f / MathF.Sqrt(keyLen);
 
-        // K/V projections (same for gated and non-gated)
-        ProjectLinear(_kProj, _normOut, w.AttnK);
-        ProjectLinear(_vProj, _normOut, w.AttnV);
-
-        if (w.HasGatedQ)
+        // Q/K/V projections — fused into single matmul when possible
+        if (!w.HasGatedQ && w.FusedQKV != null && _fusedQkvOut != null)
         {
-            // Qwen3.5-style: Q projects to 2× dim (interleaved Q_attn + Q_gate)
+            // Single fused matmul: [normOut] × [Q|K|V weights] → [Q|K|V output]
+            int qDim = numHeads * keyLen;
+            int kDim = numKvHeads * keyLen;
+            int vDim = numKvHeads * valLen;
+            ProjectLinear(_fusedQkvOut, _normOut, w.FusedQKV);
+            // Split fused output → Q, K, V (lightweight D2D copies)
+            _backend.CopyTensorRegion(_qAttn, _fusedQkvOut, 0, qDim);
+            _backend.CopyTensorRegion(_kProj, _fusedQkvOut, qDim, kDim);
+            _backend.CopyTensorRegion(_vProj, _fusedQkvOut, qDim + kDim, vDim);
+
+            if (w.AttnQNorm != null)
+            {
+                _backend.PerHeadRmsNorm(_qAttn, w.AttnQNorm, numHeads, keyLen, _config.NormEps);
+                _backend.PerHeadRmsNorm(_kProj, w.AttnKNorm!, numKvHeads, keyLen, _config.NormEps);
+            }
+        }
+        else if (w.HasGatedQ)
+        {
+            ProjectLinear(_kProj, _normOut, w.AttnK);
+            ProjectLinear(_vProj, _normOut, w.AttnV);
             ProjectLinear(_qFull!, _normOut, w.AttnQ);
             _backend.DeInterleaveQ(_qAttn, _qGate, _qFull!, numHeads, keyLen);
-
-            // Per-head Q/K norms
             _backend.PerHeadRmsNorm(_qAttn, w.AttnQNorm!, numHeads, keyLen, _config.NormEps);
             _backend.PerHeadRmsNorm(_kProj, w.AttnKNorm!, numKvHeads, keyLen, _config.NormEps);
         }
         else
         {
-            // Standard Q projection (no gating)
             ProjectLinear(_qAttn, _normOut, w.AttnQ);
-            // _qGate already filled with 88.0 (sigmoid=1.0) in constructor
+            ProjectLinear(_kProj, _normOut, w.AttnK);
+            ProjectLinear(_vProj, _normOut, w.AttnV);
 
-            // Apply per-head Q/K norms if present (Qwen3-style: norms without gating)
             if (w.AttnQNorm != null)
             {
                 _backend.PerHeadRmsNorm(_qAttn, w.AttnQNorm, numHeads, keyLen, _config.NormEps);

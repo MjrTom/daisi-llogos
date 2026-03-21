@@ -59,6 +59,12 @@ public sealed class StandardAttentionWeights : LayerWeights
     public ITensor? AttnQNorm { get; init; }
     public ITensor? AttnKNorm { get; init; }
 
+    /// <summary>Fused Q+K+V weight tensor (concatenated rows). Null if types differ.</summary>
+    public ITensor? FusedQKV { get; set; }
+
+    /// <summary>Fused FFN gate+up weight tensor. Null if types differ.</summary>
+    public ITensor? FusedGateUp { get; set; }
+
     /// <summary>
     /// True when the Q projection is gated (Qwen3.5-style: Q output is 2× expected dim,
     /// interleaved Q_attn + Q_gate). Detected by checking if Q output exceeds the
@@ -87,6 +93,8 @@ public sealed class StandardAttentionWeights : LayerWeights
         AttnO.Dispose();
         AttnQNorm?.Dispose();
         AttnKNorm?.Dispose();
+        FusedQKV?.Dispose();
+        FusedGateUp?.Dispose();
     }
 }
 

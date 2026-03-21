@@ -155,6 +155,16 @@ public sealed class CudaTensor : ITensor
     }
 
     /// <inheritdoc />
+    public void CopyRawTo(Span<byte> destination)
+    {
+        ActiveStream?.Synchronize();
+        if (IsPinned)
+            _pinnedMemory!.CopyToHost(destination);
+        else
+            _memory!.CopyToHost(destination);
+    }
+
+    /// <inheritdoc />
     public void Dispose()
     {
         if (!_disposed)
