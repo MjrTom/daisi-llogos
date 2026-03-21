@@ -14,6 +14,7 @@ internal sealed class VulkanBuffer : IDisposable
     public ulong Buffer => _buffer;
     public ulong Memory => _memory;
     public bool IsHostVisible { get; }
+    public ulong DeviceAddress { get; private set; }
 
     public unsafe VulkanBuffer(VulkanDevice vkDevice, ulong byteSize, bool hostVisible, bool transferSrc = false, bool transferDst = true)
     {
@@ -45,7 +46,6 @@ internal sealed class VulkanBuffer : IDisposable
             : VkConst.MemoryPropertyDeviceLocalBit;
         uint memTypeIdx = vkDevice.FindMemoryType(memReqs.memoryTypeBits, memProps);
 
-        // Allocate memory
         var allocInfo = new VkMemoryAllocateInfo
         {
             sType = 5,
@@ -56,6 +56,8 @@ internal sealed class VulkanBuffer : IDisposable
 
         // Bind memory to buffer
         VulkanApi.Check(VulkanApi.BindBufferMemory(vkDevice.Device, _buffer, _memory, 0), "vkBindBufferMemory");
+
+        DeviceAddress = 0; // BDA not currently used
     }
 
     /// <summary>

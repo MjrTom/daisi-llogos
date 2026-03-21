@@ -28,6 +28,78 @@ internal sealed class VulkanPipeline : IDisposable
     }
 
     /// <summary>
+    /// Create a compute pipeline using buffer device addresses (no descriptor sets).
+    /// Push constants carry buffer addresses + parameters.
+    /// </summary>
+    public static unsafe VulkanPipeline FromEmbeddedSpirVBda(VulkanDevice vkDevice, string resourceName, uint pushConstantSize)
+    {
+        var assembly = Assembly.GetExecutingAssembly();
+        using var stream = assembly.GetManifestResourceStream(resourceName)
+            ?? throw new FileNotFoundException($"Embedded resource not found: {resourceName}");
+        var spirvBytes = new byte[stream.Length];
+        stream.ReadExactly(spirvBytes);
+
+        var pipeline = new VulkanPipeline(vkDevice, 0);
+        nint device = vkDevice.Device;
+
+        fixed (byte* pCode = spirvBytes)
+        {
+            var moduleInfo = new VkShaderModuleCreateInfo
+            {
+                sType = 16,
+                codeSize = (nuint)spirvBytes.Length,
+                pCode = (nint)pCode,
+            };
+            VulkanApi.Check(VulkanApi.CreateShaderModule(device, &moduleInfo, 0, out pipeline._shaderModule), "vkCreateShaderModule");
+        }
+
+        // No descriptor set layout — push constants only
+        var pushRange = new VkPushConstantRange
+        {
+            stageFlags = VkConst.ShaderStageComputeBit,
+            offset = 0,
+            size = pushConstantSize,
+        };
+
+        var pipelineLayoutInfo = new VkPipelineLayoutCreateInfo
+        {
+            sType = 30,
+            setLayoutCount = 0,
+            pSetLayouts = 0,
+            pushConstantRangeCount = 1,
+            pPushConstantRanges = (nint)(&pushRange),
+        };
+        VulkanApi.Check(VulkanApi.CreatePipelineLayout(device, &pipelineLayoutInfo, 0, out pipeline._pipelineLayout), "vkCreatePipelineLayout");
+
+        var entryPoint = Marshal.StringToHGlobalAnsi("main");
+        try
+        {
+            var stageInfo = new VkPipelineShaderStageCreateInfo
+            {
+                sType = 18,
+                stage = VkConst.ShaderStageComputeBit,
+                module = pipeline._shaderModule,
+                pName = entryPoint,
+            };
+            var computeInfo = new VkComputePipelineCreateInfo
+            {
+                sType = 29,
+                stage = stageInfo,
+                layout = pipeline._pipelineLayout,
+            };
+            ulong pipelineHandle;
+            VulkanApi.Check(VulkanApi.CreateComputePipelines(device, 0, 1, &computeInfo, 0, &pipelineHandle), "vkCreateComputePipelines");
+            pipeline._pipeline = pipelineHandle;
+        }
+        finally
+        {
+            Marshal.FreeHGlobal(entryPoint);
+        }
+
+        return pipeline;
+    }
+
+    /// <summary>
     /// Create a compute pipeline from an embedded SPIR-V resource.
     /// </summary>
     public static unsafe VulkanPipeline FromEmbeddedSpirV(VulkanDevice vkDevice, string resourceName, int bindingCount, uint pushConstantSize = 0)

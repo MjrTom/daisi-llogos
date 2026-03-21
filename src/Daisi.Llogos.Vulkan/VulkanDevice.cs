@@ -31,7 +31,7 @@ internal sealed class VulkanDevice : IDisposable
         var appInfo = new VkApplicationInfo
         {
             sType = 0, // VK_STRUCTURE_TYPE_APPLICATION_INFO
-            apiVersion = (1u << 22) | (0u << 12) | 0u, // Vulkan 1.0
+            apiVersion = (1u << 22) | (2u << 12) | 0u, // Vulkan 1.2
         };
 
         var instanceInfo = new VkInstanceCreateInfo
@@ -101,7 +101,7 @@ internal sealed class VulkanDevice : IDisposable
         if (ComputeQueueFamily == uint.MaxValue)
             throw new VulkanException("No compute queue family found.");
 
-        // Create logical device with one compute queue
+        // Create logical device with one compute queue + Vulkan 1.2 features
         float queuePriority = 1.0f;
         var queueCreateInfo = new VkDeviceQueueCreateInfo
         {
@@ -111,9 +111,21 @@ internal sealed class VulkanDevice : IDisposable
             pQueuePriorities = (nint)(&queuePriority),
         };
 
+        // Enable Vulkan 1.2 features: int8, fp16, buffer device address
+        var vk12Features = new VkPhysicalDeviceVulkan12Features
+        {
+            sType = 51,
+            storageBuffer8BitAccess = 1,
+            uniformAndStorageBuffer8BitAccess = 1,
+            shaderInt8 = 1,
+            shaderFloat16 = 1,
+            // bufferDeviceAddress not needed currently — may add overhead on some drivers
+        };
+
         var deviceCreateInfo = new VkDeviceCreateInfo
         {
             sType = 3,
+            pNext = (nint)(&vk12Features),
             queueCreateInfoCount = 1,
             pQueueCreateInfos = (nint)(&queueCreateInfo),
         };
@@ -209,6 +221,7 @@ internal sealed class VulkanDevice : IDisposable
 
     // ── Batched submission ─────────────────────────────────────────────────
     private bool _batchRecording;
+    public bool IsBatchRecording => _batchRecording;
 
     /// <summary>
     /// Begin recording a batch of commands. Dispatches will be recorded
