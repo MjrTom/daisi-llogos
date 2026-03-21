@@ -1,4 +1,4 @@
-using Daisi.Llogos.Gguf;
+﻿using Daisi.Llogos.Gguf;
 
 namespace Daisi.Llogos.Cuda;
 
@@ -21,7 +21,7 @@ public sealed class CudaBackend : IComputeBackend
 
     private const int BlockSize = 256;
 
-    // ── CUDA Graph capture state ─────────────────────────────────────────────
+    // â”€â”€ CUDA Graph capture state â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
     private bool _capturing;          // true while stream is in capture mode
     private nint _graphExec;          // reusable graph executable (0 = none)
     private bool _graphEnabled = true; // set false to disable graphs (debugging)
@@ -53,7 +53,7 @@ public sealed class CudaBackend : IComputeBackend
     {
         EnsureContext();
         if (!_graphEnabled) return;
-        // Start stream capture — all subsequent launches are recorded, not executed
+        // Start stream capture â€” all subsequent launches are recorded, not executed
         var result = CudaApi.StreamBeginCapture(_stream.Handle, 0); // 0 = CU_STREAM_CAPTURE_MODE_GLOBAL
         if (result == CuResult.Success)
             _capturing = true;
@@ -63,42 +63,52 @@ public sealed class CudaBackend : IComputeBackend
     /// <summary>End recording, instantiate/update graph, and launch.</summary>
     public unsafe void FlushCommands()
     {
+        EnsureContext();
         if (!_capturing) return;
         _capturing = false;
 
-        // End capture — get the recorded graph
+        // End capture â€” get the recorded graph
         CudaApi.Check(CudaApi.StreamEndCapture(_stream.Handle, out nint graph), "cuStreamEndCapture");
 
         if (_graphExec != 0)
         {
-            // Try to update existing executable with new graph (fast path — same topology, new params)
+            // Try to update existing executable with new graph (fast path â€” same topology, new params)
             var updateResult = CudaApi.GraphExecUpdate(_graphExec, graph, null);
             if (updateResult != CuResult.Success)
             {
-                // Topology changed — re-instantiate
+                // Topology changed â€” re-instantiate
                 CudaApi.GraphExecDestroy(_graphExec);
                 CudaApi.Check(CudaApi.GraphInstantiate(out _graphExec, graph, 0, 0, 0), "cuGraphInstantiate");
             }
         }
         else
         {
-            // First capture — instantiate
+            // First capture â€” instantiate
             CudaApi.Check(CudaApi.GraphInstantiate(out _graphExec, graph, 0, 0, 0), "cuGraphInstantiate");
         }
 
         CudaApi.GraphDestroy(graph); // graph object no longer needed after instantiation
 
-        // Launch the graph — executes all captured operations in one submission
+        // Launch the graph â€” executes all captured operations in one submission
         CudaApi.Check(CudaApi.GraphLaunch(_graphExec, _stream.Handle), "cuGraphLaunch");
     }
 
     /// <summary>
     /// Ensure the CUDA context is current on the calling thread.
-    /// Required because minion tasks run on threadpool threads that may not
-    /// have the context bound. The GpuInferenceGate serializes access, so
-    /// this is safe — only one thread calls CUDA at a time.
+    /// Required because minion tasks and ReloadModel run on threadpool threads
+    /// that may not have the context bound. Tracks per-thread to skip redundant
+    /// cuCtxSetCurrent syscalls within the same backend instance.
     /// </summary>
-    private void EnsureContext() => _context.MakeCurrent();
+    [ThreadStatic] private static nint _boundContextHandle;
+    private void EnsureContext()
+    {
+        var handle = _context.Handle;
+        if (_boundContextHandle != handle)
+        {
+            _context.MakeCurrent();
+            _boundContextHandle = handle;
+        }
+    }
 
     /// <inheritdoc />
     public ITensor CreateTensor(string name, GgmlType type, ReadOnlySpan<long> dimensions)
@@ -111,7 +121,7 @@ public sealed class CudaBackend : IComputeBackend
     public ITensor LoadTensor(string name, GgmlType type, ReadOnlySpan<long> dimensions, ReadOnlySpan<byte> data)
     {
         EnsureContext();
-        // Repack Q8_0 to aligned layout: 34-byte blocks → 36-byte blocks
+        // Repack Q8_0 to aligned layout: 34-byte blocks â†’ 36-byte blocks
         // Old: [scale(2b) | quants(32b)] = 34 bytes, quants NOT 4-byte aligned
         // New: [scale(2b) | pad(2b) | quants(32b)] = 36 bytes, quants 4-byte aligned
         if (type == GgmlType.Q8_0 && dimensions.Length >= 2 && dimensions[0] >= 2048)
@@ -130,7 +140,7 @@ public sealed class CudaBackend : IComputeBackend
                 // Copy quants (32 bytes)
                 data.Slice(srcOff + 2, 32).CopyTo(aligned.AsSpan(dstOff + 4, 32));
             }
-            // Create tensor with aligned layout — mark as Q8_0 but with aligned stride
+            // Create tensor with aligned layout â€” mark as Q8_0 but with aligned stride
             var tensor = new CudaTensor(name, type, dimensions, pinned: false, alignedQ8_0: true);
             tensor.Memory.CopyFromHost(aligned);
             return tensor;
@@ -142,6 +152,7 @@ public sealed class CudaBackend : IComputeBackend
     /// <inheritdoc />
     public unsafe void MatMul(ITensor output, ITensor a, ITensor b, int M, int K, int N)
     {
+        EnsureContext();
         var outT = (CudaTensor)output;
         var aT = (CudaTensor)a;
         var bT = (CudaTensor)b;
@@ -175,10 +186,10 @@ public sealed class CudaBackend : IComputeBackend
         if (b.Type == GgmlType.F32)
         {
             // cuBLAS SGEMV: y = alpha * A^T * x + beta * y
-            // A is [K × N] row-major = [N × K] column-major, so transpose to get [K × N]
+            // A is [K Ã— N] row-major = [N Ã— K] column-major, so transpose to get [K Ã— N]
             float alpha = 1.0f, beta = 0.0f;
             CublasApi.Check(CublasApi.Sgemv(_cublasHandle,
-                CublasApi.CUBLAS_OP_T,     // transpose: b is [N×K] row-major
+                CublasApi.CUBLAS_OP_T,     // transpose: b is [NÃ—K] row-major
                 K, N,                       // m=K, n=N (column-major dimensions)
                 &alpha,
                 bPtr, K,                    // A = weights, lda = K
@@ -188,7 +199,7 @@ public sealed class CudaBackend : IComputeBackend
         }
         else if (false) // dp4a removed: Q8_1 quantization error compounds across layers
         {
-            // dp4a path — disabled due to precision loss in activation quantization
+            // dp4a path â€” disabled due to precision loss in activation quantization
             // Cache: skip re-quantization if the same activation tensor is used again
             // (e.g., Q/K/V projections all share normOut, gate/up share normOut).
             int numBlocks = K / 32;
@@ -216,7 +227,7 @@ public sealed class CudaBackend : IComputeBackend
                 _q8_1CachedInputPtr = aPtr;
             }
 
-            // Step 2: Q8_0 × Q8_1 matmul using __dp4a (aligned or unaligned path)
+            // Step 2: Q8_0 Ã— Q8_1 matmul using __dp4a (aligned or unaligned path)
             bool isAligned = bT is CudaTensor ct && ct.IsAlignedQ8_0;
             var func = _matmulModule.GetFunction(isAligned
                 ? "dequant_matmul_q8_0_q8_1_aligned"
@@ -339,6 +350,7 @@ public sealed class CudaBackend : IComputeBackend
     /// <inheritdoc />
     public unsafe void RmsNorm(ITensor output, ITensor input, ITensor weight, float eps)
     {
+        EnsureContext();
         var outT = (CudaTensor)output;
         var inT = (CudaTensor)input;
         var wT = (CudaTensor)weight;
@@ -364,6 +376,7 @@ public sealed class CudaBackend : IComputeBackend
     /// <inheritdoc />
     public unsafe void Softmax(ITensor output, ITensor input)
     {
+        EnsureContext();
         var outT = (CudaTensor)output;
         var inT = (CudaTensor)input;
 
@@ -385,6 +398,7 @@ public sealed class CudaBackend : IComputeBackend
     /// <inheritdoc />
     public unsafe void SiLU(ITensor output, ITensor input)
     {
+        EnsureContext();
         var outT = (CudaTensor)output;
         var inT = (CudaTensor)input;
 
@@ -406,6 +420,7 @@ public sealed class CudaBackend : IComputeBackend
     /// <inheritdoc />
     public unsafe void RoPE(ITensor q, ITensor k, int headDim, int ropeDim, int positionOffset, float ropeTheta)
     {
+        EnsureContext();
         var qT = (CudaTensor)q;
         var kT = (CudaTensor)k;
 
@@ -445,6 +460,7 @@ public sealed class CudaBackend : IComputeBackend
     /// <inheritdoc />
     public unsafe void ElementMul(ITensor output, ITensor a, ITensor b)
     {
+        EnsureContext();
         var outT = (CudaTensor)output;
         var aT = (CudaTensor)a;
         var bT = (CudaTensor)b;
@@ -469,6 +485,7 @@ public sealed class CudaBackend : IComputeBackend
     /// <inheritdoc />
     public unsafe void ElementAdd(ITensor output, ITensor a, ITensor b)
     {
+        EnsureContext();
         var outT = (CudaTensor)output;
         var aT = (CudaTensor)a;
         var bT = (CudaTensor)b;
@@ -493,6 +510,7 @@ public sealed class CudaBackend : IComputeBackend
     /// <inheritdoc />
     public unsafe void EmbeddingLookup(ITensor output, ITensor table, int tokenId)
     {
+        EnsureContext();
         var outT = (CudaTensor)output;
         var tableT = (CudaTensor)table;
 
@@ -554,11 +572,12 @@ public sealed class CudaBackend : IComputeBackend
 
     }
 
-    // ── Composite Operations ───────────────────────────────────────────────────
+    // â”€â”€ Composite Operations â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
     /// <inheritdoc />
     public void CopyTensor(ITensor dst, ITensor src)
     {
+        EnsureContext();
         var dstT = (CudaTensor)dst;
         var srcT = (CudaTensor)src;
         CudaApi.Check(CudaApi.MemcpyDtoDAsync(dstT.DevicePtr, srcT.DevicePtr, (ulong)src.ByteSize, _stream.Handle),
@@ -568,6 +587,7 @@ public sealed class CudaBackend : IComputeBackend
     /// <inheritdoc />
     public unsafe void SiLUInPlace(ITensor data)
     {
+        EnsureContext();
         var dT = (CudaTensor)data;
         ulong dPtr = dT.DevicePtr;
         int n = (int)data.ElementCount;
@@ -584,6 +604,7 @@ public sealed class CudaBackend : IComputeBackend
     /// <inheritdoc />
     public unsafe void L2NormGroups(ITensor data, int numGroups, int groupDim)
     {
+        EnsureContext();
         var dT = (CudaTensor)data;
         ulong dPtr = dT.DevicePtr;
 
@@ -600,6 +621,7 @@ public sealed class CudaBackend : IComputeBackend
     /// <inheritdoc />
     public unsafe void PerHeadRmsNorm(ITensor data, ITensor weight, int numHeads, int headDim, float eps)
     {
+        EnsureContext();
         var dT = (CudaTensor)data;
         var wT = (CudaTensor)weight;
         ulong dPtr = dT.DevicePtr;
@@ -620,6 +642,7 @@ public sealed class CudaBackend : IComputeBackend
     /// <inheritdoc />
     public unsafe void DeInterleaveQ(ITensor qAttn, ITensor qGate, ITensor qFull, int numHeads, int headDim)
     {
+        EnsureContext();
         var qaT = (CudaTensor)qAttn;
         var qgT = (CudaTensor)qGate;
         var qfT = (CudaTensor)qFull;
@@ -644,6 +667,7 @@ public sealed class CudaBackend : IComputeBackend
     public unsafe void KvCacheWrite(ITensor kCache, ITensor vCache, ITensor k, ITensor v,
         int nKvHeads, int keyLength, int valueLength, int maxSeqLen, int position)
     {
+        EnsureContext();
         var kcT = (CudaTensor)kCache;
         var vcT = (CudaTensor)vCache;
         var kT = (CudaTensor)k;
@@ -678,6 +702,7 @@ public sealed class CudaBackend : IComputeBackend
         int numHeads, int numKvHeads, int keyLength, int valueLength,
         int maxSeqLen, int seqLen, float scale)
     {
+        EnsureContext();
         var outT = (CudaTensor)output;
         var qaT = (CudaTensor)qAttn;
         var qgT = (CudaTensor)qGate;
@@ -715,6 +740,7 @@ public sealed class CudaBackend : IComputeBackend
     /// <inheritdoc />
     public unsafe void CausalConv1d(ITensor qkv, ITensor convBuffer, ITensor convWeight, int channels, int kernelSize)
     {
+        EnsureContext();
         var qkvT = (CudaTensor)qkv;
         var cbT = (CudaTensor)convBuffer;
         var cwT = (CudaTensor)convWeight;
@@ -738,6 +764,7 @@ public sealed class CudaBackend : IComputeBackend
     public unsafe void ComputeDecayBeta(ITensor decay, ITensor beta, ITensor alphaProj, ITensor betaProj,
         ITensor ssmA, ITensor dtBias, int groupCount)
     {
+        EnsureContext();
         var decT = (CudaTensor)decay;
         var betT = (CudaTensor)beta;
         var apT = (CudaTensor)alphaProj;
@@ -770,6 +797,7 @@ public sealed class CudaBackend : IComputeBackend
         ITensor state, ITensor decay, ITensor beta,
         ITensor normWeight, int groupCount, int headDim, float scale, float normEps)
     {
+        EnsureContext();
         var outT = (CudaTensor)output;
         var qT = (CudaTensor)q;
         var kT = (CudaTensor)k;
@@ -809,6 +837,7 @@ public sealed class CudaBackend : IComputeBackend
     /// <inheritdoc />
     public unsafe void SplitQKV(ITensor q, ITensor k, ITensor v, ITensor qkv, int innerSize)
     {
+        EnsureContext();
         var qT = (CudaTensor)q;
         var kT = (CudaTensor)k;
         var vT = (CudaTensor)v;
@@ -833,6 +862,7 @@ public sealed class CudaBackend : IComputeBackend
     /// <inheritdoc />
     public unsafe void SiLUGate(ITensor output, ITensor data, ITensor gate)
     {
+        EnsureContext();
         var outT = (CudaTensor)output;
         var dT = (CudaTensor)data;
         var gT = (CudaTensor)gate;
@@ -855,6 +885,7 @@ public sealed class CudaBackend : IComputeBackend
     /// <inheritdoc />
     public void ZeroTensor(ITensor tensor)
     {
+        EnsureContext();
         var t = (CudaTensor)tensor;
         CudaApi.Check(CudaApi.MemsetD8(t.DevicePtr, 0, (ulong)t.ByteSize), "cuMemsetD8");
     }
@@ -862,6 +893,7 @@ public sealed class CudaBackend : IComputeBackend
     /// <inheritdoc />
     public void CopyTensorBytes(ITensor dst, ITensor src, long byteCount)
     {
+        EnsureContext();
         var dstT = (CudaTensor)dst;
         var srcT = (CudaTensor)src;
         CudaApi.Check(CudaApi.MemcpyDtoD(dstT.DevicePtr, srcT.DevicePtr, (ulong)byteCount), "cuMemcpyDtoD");
@@ -877,6 +909,7 @@ public sealed class CudaBackend : IComputeBackend
     /// <inheritdoc />
     public unsafe void FillTensor(ITensor tensor, float value)
     {
+        EnsureContext();
         var t = (CudaTensor)tensor;
         ulong ptr = t.DevicePtr;
         int n = (int)tensor.ElementCount;
@@ -893,6 +926,7 @@ public sealed class CudaBackend : IComputeBackend
     /// <inheritdoc />
     public unsafe void SquaredReLU(ITensor data)
     {
+        EnsureContext();
         var dT = (CudaTensor)data;
         ulong dPtr = dT.DevicePtr;
         int n = (int)data.ElementCount;
@@ -905,7 +939,7 @@ public sealed class CudaBackend : IComputeBackend
         _stream.Launch(func, grid, 1, 1, (uint)BlockSize, 1, 1, 0, kArgs);
     }
 
-    // ── Generic CPU Fallback ──────────────────────────────────────────────────
+    // â”€â”€ Generic CPU Fallback â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
     private unsafe void GenericCpuFallbackMatMul(CudaTensor outT, CudaTensor aT, CudaTensor bT, int M, int K, int N)
     {
@@ -955,6 +989,7 @@ public sealed class CudaBackend : IComputeBackend
     /// <inheritdoc />
     public unsafe int ArgMax(ITensor tensor)
     {
+        EnsureContext();
         var t = (CudaTensor)tensor;
         ulong tPtr = t.DevicePtr;
         int n = (int)tensor.ElementCount;
@@ -979,6 +1014,7 @@ public sealed class CudaBackend : IComputeBackend
     /// <inheritdoc />
     public void CopyTensorRegion(ITensor dst, ITensor src, int srcOffset, int count)
     {
+        EnsureContext();
         var dstT = (CudaTensor)dst;
         var srcT = (CudaTensor)src;
         ulong srcPtr = srcT.DevicePtr + (ulong)(srcOffset * sizeof(float));
@@ -986,11 +1022,12 @@ public sealed class CudaBackend : IComputeBackend
             (ulong)(count * sizeof(float)), _stream.Handle), "cuMemcpyDtoDAsync");
     }
 
-    // ── GPU-Native DeltaNet Operations ──────────────────────────────────────
+    // â”€â”€ GPU-Native DeltaNet Operations â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
     /// <inheritdoc />
     public unsafe void SplitUnequalQKV(ITensor q, ITensor k, ITensor v, ITensor qkv, int keyDim, int valueDim)
     {
+        EnsureContext();
         var qT = (CudaTensor)q;
         var kT = (CudaTensor)k;
         var vT = (CudaTensor)v;
@@ -1015,6 +1052,7 @@ public sealed class CudaBackend : IComputeBackend
     /// <inheritdoc />
     public unsafe void RepeatTile(ITensor tensor, int numHeads, int headDim, int factor)
     {
+        EnsureContext();
         var t = (CudaTensor)tensor;
         ulong ptr = t.DevicePtr;
         int srcSize = numHeads * headDim;
@@ -1032,6 +1070,7 @@ public sealed class CudaBackend : IComputeBackend
     /// <inheritdoc />
     public unsafe void SplitSwiGLU(ITensor output, ITensor fusedInput, int N)
     {
+        EnsureContext();
         var outT = (CudaTensor)output;
         var inT = (CudaTensor)fusedInput;
         ulong outPtr = outT.DevicePtr;
@@ -1054,6 +1093,7 @@ public sealed class CudaBackend : IComputeBackend
         int position, float ropeTheta, float normEps,
         int maxSeqLen, int seqLen, ITensor? qNormWeight, ITensor? kNormWeight)
     {
+        EnsureContext();
         var qT = (CudaTensor)qOut; var kT = (CudaTensor)kOut; var vT = (CudaTensor)vOut;
         var fT = (CudaTensor)fusedQkv;
         var kcT = (CudaTensor)kCache; var vcT = (CudaTensor)vCache;
@@ -1094,11 +1134,12 @@ public sealed class CudaBackend : IComputeBackend
         _stream.Launch(func, (uint)numHeads, 1, 1, (uint)BlockSize, 1, 1, sharedMem, allArgs);
     }
 
-    // ── Fused Operations ─────────────────────────────────────────────────────
+    // â”€â”€ Fused Operations â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
     /// <inheritdoc />
     public unsafe void RmsNormResidual(ITensor output, ITensor residual, ITensor input, ITensor weight, float eps)
     {
+        EnsureContext();
         var outT = (CudaTensor)output;
         var resT = (CudaTensor)residual;
         var inT = (CudaTensor)input;
@@ -1124,6 +1165,7 @@ public sealed class CudaBackend : IComputeBackend
     /// <inheritdoc />
     public unsafe void SwiGLU(ITensor output, ITensor gate, ITensor up)
     {
+        EnsureContext();
         var outT = (CudaTensor)output;
         var gT = (CudaTensor)gate;
         var uT = (CudaTensor)up;
@@ -1145,6 +1187,7 @@ public sealed class CudaBackend : IComputeBackend
     /// <inheritdoc />
     public unsafe void AddRmsNormResidual(ITensor output, ITensor hidden, ITensor residual, ITensor b, ITensor weight, float eps)
     {
+        EnsureContext();
         var outT = (CudaTensor)output;
         var hidT = (CudaTensor)hidden;
         var resT = (CudaTensor)residual;
@@ -1169,6 +1212,7 @@ public sealed class CudaBackend : IComputeBackend
 
     public unsafe void AddRmsNorm(ITensor output, ITensor hidden, ITensor a, ITensor b, ITensor weight, float eps)
     {
+        EnsureContext();
         var outT = (CudaTensor)output;
         var hidT = (CudaTensor)hidden;
         var aT = (CudaTensor)a;
@@ -1197,6 +1241,7 @@ public sealed class CudaBackend : IComputeBackend
     /// <inheritdoc />
     public void Dispose()
     {
+        EnsureContext();
         if (!_disposed)
         {
             _context.MakeCurrent();
