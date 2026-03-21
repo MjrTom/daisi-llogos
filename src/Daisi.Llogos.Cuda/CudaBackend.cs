@@ -21,6 +21,11 @@ public sealed class CudaBackend : IComputeBackend
 
     private const int BlockSize = 256;
 
+    // ── CUDA Graph capture state ─────────────────────────────────────────────
+    private bool _capturing;          // true while stream is in capture mode
+    private nint _graphExec;          // reusable graph executable (0 = none)
+    private bool _graphEnabled = true; // set false to disable graphs (debugging)
+
     public CudaBackend(int deviceOrdinal = 0)
     {
         _context = new CudaContext(deviceOrdinal);
@@ -42,6 +47,49 @@ public sealed class CudaBackend : IComputeBackend
 
     /// <inheritdoc />
     public string Name => $"CUDA ({_context.DeviceName})";
+
+    /// <summary>Begin recording operations into a CUDA graph (if enabled).</summary>
+    public void BeginCommands()
+    {
+        if (!_graphEnabled) return;
+        // Start stream capture — all subsequent launches are recorded, not executed
+        var result = CudaApi.StreamBeginCapture(_stream.Handle, 0); // 0 = CU_STREAM_CAPTURE_MODE_GLOBAL
+        if (result == CuResult.Success)
+            _capturing = true;
+        // If capture fails (e.g., stream busy), fall through to normal execution
+    }
+
+    /// <summary>End recording, instantiate/update graph, and launch.</summary>
+    public unsafe void FlushCommands()
+    {
+        if (!_capturing) return;
+        _capturing = false;
+
+        // End capture — get the recorded graph
+        CudaApi.Check(CudaApi.StreamEndCapture(_stream.Handle, out nint graph), "cuStreamEndCapture");
+
+        if (_graphExec != 0)
+        {
+            // Try to update existing executable with new graph (fast path — same topology, new params)
+            var updateResult = CudaApi.GraphExecUpdate(_graphExec, graph, null);
+            if (updateResult != CuResult.Success)
+            {
+                // Topology changed — re-instantiate
+                CudaApi.GraphExecDestroy(_graphExec);
+                CudaApi.Check(CudaApi.GraphInstantiate(out _graphExec, graph, 0, 0, 0), "cuGraphInstantiate");
+            }
+        }
+        else
+        {
+            // First capture — instantiate
+            CudaApi.Check(CudaApi.GraphInstantiate(out _graphExec, graph, 0, 0, 0), "cuGraphInstantiate");
+        }
+
+        CudaApi.GraphDestroy(graph); // graph object no longer needed after instantiation
+
+        // Launch the graph — executes all captured operations in one submission
+        CudaApi.Check(CudaApi.GraphLaunch(_graphExec, _stream.Handle), "cuGraphLaunch");
+    }
 
     /// <inheritdoc />
     public ITensor CreateTensor(string name, GgmlType type, ReadOnlySpan<long> dimensions)
@@ -1135,6 +1183,7 @@ public sealed class CudaBackend : IComputeBackend
     {
         if (!_disposed)
         {
+            if (_graphExec != 0) CudaApi.GraphExecDestroy(_graphExec);
             _argmaxResult?.Dispose();
             _q8_1Scratch?.Dispose();
             if (_cublasHandle != 0) CublasApi.Destroy(_cublasHandle);

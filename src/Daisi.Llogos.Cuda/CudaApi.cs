@@ -126,6 +126,10 @@ internal static partial class CudaApi
     [LibraryImport(Lib, EntryPoint = "cuGraphExecDestroy")]
     internal static partial CuResult GraphExecDestroy(nint graphExec);
 
+    // Update an existing graph executable with a new graph (fast if topology matches)
+    [LibraryImport(Lib, EntryPoint = "cuGraphExecUpdate_v2")]
+    internal static unsafe partial CuResult GraphExecUpdate(nint graphExec, nint graph, nint* resultInfo);
+
     // ── Helpers ──────────────────────────────────────────────────────────────
 
     internal static void Check(CuResult result, string operation)
