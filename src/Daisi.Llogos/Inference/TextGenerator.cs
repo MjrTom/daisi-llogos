@@ -38,10 +38,13 @@ public sealed class TextGenerator
         var history = new List<int>(promptIds);
 
         // Prefill: process all prompt tokens
+        // Use ForwardHidden for intermediate tokens (no logit download needed)
         var prefillSw = Stopwatch.StartNew();
         ReadOnlySpan<float> logits = default;
-        for (int i = 0; i < promptIds.Length; i++)
-            logits = _forward.Forward(promptIds[i], i);
+        for (int i = 0; i < promptIds.Length - 1; i++)
+            _forward.ForwardHidden(promptIds[i], i);
+        // Only the last prefill token needs full logit output
+        logits = _forward.Forward(promptIds[^1], promptIds.Length - 1);
         prefillSw.Stop();
 
         int position = promptIds.Length;
@@ -84,11 +87,12 @@ public sealed class TextGenerator
         if (promptIds.Length == 0)
             return default;
 
-        // Prefill
+        // Prefill — skip logit download for intermediate tokens
         var prefillSw = Stopwatch.StartNew();
         ReadOnlySpan<float> logits = default;
-        for (int i = 0; i < promptIds.Length; i++)
-            logits = _forward.Forward(promptIds[i], i);
+        for (int i = 0; i < promptIds.Length - 1; i++)
+            _forward.ForwardHidden(promptIds[i], i);
+        logits = _forward.Forward(promptIds[^1], promptIds.Length - 1);
         prefillSw.Stop();
 
         // Decode — use GPU-side argmax for maximum throughput (greedy benchmark)
