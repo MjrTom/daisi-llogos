@@ -192,6 +192,16 @@ public interface IComputeBackend : IDisposable
     // ── Fused Operations (optional, default to separate calls) ──────────────
 
     /// <summary>
+    /// Copy a region of floats from source to destination tensor.
+    /// Copies 'count' floats starting at 'srcOffset' in source to start of destination.
+    /// </summary>
+    void CopyTensorRegion(ITensor dst, ITensor src, int srcOffset, int count)
+    {
+        CopyTensorBytes(dst, src, (long)count * sizeof(float));
+        // Default implementation doesn't handle offset — backends override for efficiency
+    }
+
+    /// <summary>
     /// Split QKV buffer with unequal sizes: [Q:keyDim, K:keyDim, V:valueDim].
     /// Q and K tensors are valueDim-sized (zero-padded after keyDim elements).
     /// </summary>

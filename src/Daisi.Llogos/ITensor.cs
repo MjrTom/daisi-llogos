@@ -51,4 +51,11 @@ public interface ITensor : IDisposable
     /// Get a writable float span over the tensor data. Only valid for F32 tensors.
     /// </summary>
     Span<float> AsFloatSpan();
+
+    /// <summary>
+    /// Copy raw bytes from this tensor's backing store to a host buffer.
+    /// Used for weight tensor fusion (concatenating raw quantized data).
+    /// </summary>
+    void CopyRawTo(Span<byte> destination) =>
+        throw new NotSupportedException($"CopyRawTo not implemented for {GetType().Name}");
 }
