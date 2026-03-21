@@ -559,6 +559,7 @@ public sealed class CudaBackend : IComputeBackend
     /// <inheritdoc />
     public void CopyTensor(ITensor dst, ITensor src)
     {
+        EnsureContext();
         var dstT = (CudaTensor)dst;
         var srcT = (CudaTensor)src;
         CudaApi.Check(CudaApi.MemcpyDtoDAsync(dstT.DevicePtr, srcT.DevicePtr, (ulong)src.ByteSize, _stream.Handle),
@@ -855,7 +856,7 @@ public sealed class CudaBackend : IComputeBackend
     /// <inheritdoc />
     public void ZeroTensor(ITensor tensor)
     {
-        _context.MakeCurrent();
+        EnsureContext();
         var t = (CudaTensor)tensor;
         CudaApi.Check(CudaApi.MemsetD8(t.DevicePtr, 0, (ulong)t.ByteSize), "cuMemsetD8");
     }
@@ -863,6 +864,7 @@ public sealed class CudaBackend : IComputeBackend
     /// <inheritdoc />
     public void CopyTensorBytes(ITensor dst, ITensor src, long byteCount)
     {
+        EnsureContext();
         var dstT = (CudaTensor)dst;
         var srcT = (CudaTensor)src;
         CudaApi.Check(CudaApi.MemcpyDtoD(dstT.DevicePtr, srcT.DevicePtr, (ulong)byteCount), "cuMemcpyDtoD");
@@ -956,6 +958,7 @@ public sealed class CudaBackend : IComputeBackend
     /// <inheritdoc />
     public unsafe int ArgMax(ITensor tensor)
     {
+        EnsureContext();
         var t = (CudaTensor)tensor;
         ulong tPtr = t.DevicePtr;
         int n = (int)tensor.ElementCount;
@@ -980,6 +983,7 @@ public sealed class CudaBackend : IComputeBackend
     /// <inheritdoc />
     public void CopyTensorRegion(ITensor dst, ITensor src, int srcOffset, int count)
     {
+        EnsureContext();
         var dstT = (CudaTensor)dst;
         var srcT = (CudaTensor)src;
         ulong srcPtr = srcT.DevicePtr + (ulong)(srcOffset * sizeof(float));
