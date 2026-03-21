@@ -884,6 +884,10 @@ public sealed class CudaBackend : IComputeBackend
         outT.UploadFrom(result);
     }
 
+    // Persistent argmax result buffer (avoid per-token CUDA alloc/dealloc)
+    private CudaTensor? _argmaxResult;
+    private readonly float[] _argmaxHostBuf = new float[1];
+
     /// <inheritdoc />
     public unsafe int ArgMax(ITensor tensor)
     {
@@ -891,11 +895,9 @@ public sealed class CudaBackend : IComputeBackend
         ulong tPtr = t.DevicePtr;
         int n = (int)tensor.ElementCount;
 
-        // Use a 1-element F32 tensor for the result
-        var resultBuf = new float[1];
-        using var resultTensor = new CudaTensor("argmax_result", Gguf.GgmlType.F32, [1]);
+        _argmaxResult ??= new CudaTensor("argmax_result", Gguf.GgmlType.F32, [1]);
 
-        ulong rPtr = resultTensor.DevicePtr;
+        ulong rPtr = _argmaxResult.DevicePtr;
         var func = _elementwiseModule.GetFunction("argmax");
         uint sharedMem = (uint)(BlockSize * 2 * sizeof(float));
         nint* kArgs = stackalloc nint[3];
@@ -906,8 +908,8 @@ public sealed class CudaBackend : IComputeBackend
 
         // Download just 1 float (4 bytes) instead of full vocab tensor
         _stream.Synchronize();
-        resultTensor.DownloadTo(resultBuf);
-        return (int)resultBuf[0];
+        _argmaxResult.DownloadTo(_argmaxHostBuf);
+        return (int)_argmaxHostBuf[0];
     }
 
     /// <inheritdoc />
@@ -1133,6 +1135,7 @@ public sealed class CudaBackend : IComputeBackend
     {
         if (!_disposed)
         {
+            _argmaxResult?.Dispose();
             _q8_1Scratch?.Dispose();
             if (_cublasHandle != 0) CublasApi.Destroy(_cublasHandle);
             _stream.Dispose();
