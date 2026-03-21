@@ -68,6 +68,8 @@ public sealed class VulkanTensor : ITensor
     /// </summary>
     internal void DownloadToHost(Span<byte> destination)
     {
+        // Flush any pending batch before reading back
+        _vkDevice.EndBatch();
         ulong size = (ulong)destination.Length;
         CopyDeviceToStaging(size);
         StagingBuffer.Download(destination);

@@ -189,6 +189,19 @@ public interface IComputeBackend : IDisposable
     /// </summary>
     void SquaredReLU(ITensor data);
 
+    /// <summary>
+    /// Begin batching GPU commands. Dispatches will be recorded without
+    /// submitting until FlushCommands() is called. No-op for backends
+    /// that don't support batching (CPU, CUDA with async streams).
+    /// </summary>
+    void BeginCommands() { }
+
+    /// <summary>
+    /// Submit all batched commands and wait for completion.
+    /// Called automatically before any GPU→CPU readback.
+    /// </summary>
+    void FlushCommands() { }
+
     // ── Fused Operations (optional, default to separate calls) ──────────────
 
     /// <summary>
