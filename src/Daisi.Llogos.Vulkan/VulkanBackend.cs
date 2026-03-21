@@ -42,6 +42,23 @@ public sealed class VulkanBackend : IComputeBackend
 
     public string Name => $"Vulkan ({_device.DeviceName})";
 
+    public void BeginCommands()
+    {
+        // Reset all descriptor pools so they can be re-allocated during this batch
+        _rmsNormPipeline.ResetDescriptorPool();
+        _softmaxPipeline.ResetDescriptorPool();
+        _siluPipeline.ResetDescriptorPool();
+        _ropePipeline.ResetDescriptorPool();
+        _elementOpsPipeline.ResetDescriptorPool();
+        _matmulPipeline.ResetDescriptorPool();
+        _embeddingPipeline.ResetDescriptorPool();
+        _compositePipeline.ResetDescriptorPool();
+        _attentionPipeline.ResetDescriptorPool();
+        _deltanetPipeline.ResetDescriptorPool();
+        _device.BeginBatch();
+    }
+    public void FlushCommands() => _device.EndBatch();
+
     public ITensor CreateTensor(string name, GgmlType type, ReadOnlySpan<long> dimensions) =>
         new VulkanTensor(_device, name, type, dimensions);
 
@@ -526,6 +543,17 @@ public sealed class VulkanBackend : IComputeBackend
             {
                 var region = new VkBufferCopy { size = byteCount };
                 VulkanApi.CmdCopyBuffer(cmd, src.Buffer, dst.Buffer, 1, &region);
+
+                // Memory barrier after copy
+                var barrier = new VkMemoryBarrier
+                {
+                    sType = 46,
+                    srcAccessMask = VkConst.AccessTransferWriteBit,
+                    dstAccessMask = VkConst.AccessShaderReadBit,
+                };
+                VulkanApi.CmdPipelineBarrier(cmd,
+                    VkConst.PipelineStageFlagTransferBit, VkConst.PipelineStageFlagComputeShaderBit,
+                    0, 1, &barrier, 0, (nint)0, 0, (nint)0);
             }
         });
     }
