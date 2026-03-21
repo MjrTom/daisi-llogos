@@ -93,7 +93,8 @@ public sealed class CudaBackend : IComputeBackend
         // Multi-row: Q8_0 = 4, Q4_K = 2, Q6_K = 2, others = 1 row per block
         uint gridX = b.Type switch {
             GgmlType.Q8_0 => ((uint)N + 3) / 4,
-            GgmlType.Q4_K or GgmlType.Q6_K => ((uint)N + 1) / 2,
+            GgmlType.Q4_K => ((uint)N + 3) / 4,  // 4 rows per block
+            GgmlType.Q6_K => ((uint)N + 1) / 2, // 2 rows per block
             _ => (uint)N
         };
         // Adaptive block size: scale with the number of work items per row.

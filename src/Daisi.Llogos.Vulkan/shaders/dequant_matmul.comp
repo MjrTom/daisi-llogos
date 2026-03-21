@@ -22,8 +22,8 @@ layout(set = 0, binding = 2) buffer WeightBuf { uint8_t weight_data[]; };
 shared float sdata[8]; // one per subgroup for subgroup-based reduction
 
 void main() {
-    // Multi-row: Q8_0 = 4 rows, Q4_K = 2 rows, others = 1 row per workgroup
-    uint rowsPerWg = (weightType == 1u) ? 4u : ((weightType == 5u) ? 2u : 1u);
+    // Multi-row: Q8_0 = 4, Q4_K = 2, Q6_K = 2, others = 1 row per workgroup
+    uint rowsPerWg = (weightType == 1u) ? 4u : ((weightType == 5u || weightType == 6u) ? 2u : 1u);
     uint row = gl_WorkGroupID.x * rowsPerWg;
     uint tid = gl_LocalInvocationID.x;
     uint blockSize = gl_WorkGroupSize.x; // 256
@@ -253,38 +253,63 @@ void main() {
         }
         return;
     } else if (weightType == 6u) {
-        // Q6_K: 256 elements, 210 bytes. With l/16 scale sub-indexing fix.
+        // Q6_K: 256 elements, 210 bytes. Multi-row: 2 rows per workgroup.
+        const uint Q6K_ROWS = 2;
         uint sbPerRow = K / 256;
         uint bytesPerRow = sbPerRow * 210;
         uint totalGroups = sbPerRow * 8;
+
+        float accs_q6k[Q6K_ROWS];
+        for (uint r = 0; r < Q6K_ROWS; r++) accs_q6k[r] = 0.0;
+
         for (uint grp = tid; grp < totalGroups; grp += blockSize) {
             uint sb = grp / 8;
             uint gIdx = grp % 8;
             uint halfIdx = gIdx / 4;
             uint quadrant = gIdx % 4;
-            uint sbOff = row * bytesPerRow + sb * 210;
             uint aBase = sb * 256 + halfIdx * 128 + quadrant * 32;
-            uint dBits = uint(weight_data[sbOff+208]) | (uint(weight_data[sbOff+209]) << 8);
-            float d = unpackHalf2x16(dBits).x;
-            uint qlOff = sbOff + halfIdx * 64;
-            uint qhOff = sbOff + 128 + halfIdx * 32;
-            uint scIdx = halfIdx * 8;
-            // Precompute scale pair for both sub-groups
-            float sc0 = d * float(int(int8_t(weight_data[sbOff+192+scIdx+0+quadrant*2])));
-            float sc1 = d * float(int(int8_t(weight_data[sbOff+192+scIdx+1+quadrant*2])));
-            // Bit extraction for this quadrant
             uint qlAdd = (quadrant & 1) * 32;
             uint qlShift = (quadrant >> 1) * 4;
             uint qhShift = quadrant * 2;
-            float local_acc = 0.0;
-            for (uint l = 0; l < 32; l++) {
-                int q = (((int(weight_data[qlOff+qlAdd+l]) >> qlShift) & 0xF) |
-                        (((int(weight_data[qhOff+l]) >> qhShift) & 3) << 4)) - 32;
-                float sc = (l < 16) ? sc0 : sc1;
-                local_acc += input_data[aBase + l] * (sc * float(q));
+
+            // Load activation once
+            float a_vals[32];
+            for (uint l = 0; l < 32; l++) a_vals[l] = input_data[aBase + l];
+
+            for (uint r = 0; r < Q6K_ROWS; r++) {
+                uint rn = row + r;
+                if (rn >= N) break;
+                uint sbOff = rn * bytesPerRow + sb * 210;
+                uint dBits = uint(weight_data[sbOff+208]) | (uint(weight_data[sbOff+209]) << 8);
+                float d = unpackHalf2x16(dBits).x;
+                uint qlOff = sbOff + halfIdx * 64;
+                uint qhOff = sbOff + 128 + halfIdx * 32;
+                uint scIdx = halfIdx * 8;
+                float sc0 = d * float(int(int8_t(weight_data[sbOff+192+scIdx+0+quadrant*2])));
+                float sc1 = d * float(int(int8_t(weight_data[sbOff+192+scIdx+1+quadrant*2])));
+                float local_acc = 0.0;
+                for (uint l = 0; l < 32; l++) {
+                    int q = (((int(weight_data[qlOff+qlAdd+l]) >> qlShift) & 0xF) |
+                            (((int(weight_data[qhOff+l]) >> qhShift) & 3) << 4)) - 32;
+                    float sc = (l < 16) ? sc0 : sc1;
+                    local_acc += a_vals[l] * (sc * float(q));
+                }
+                accs_q6k[r] += local_acc;
             }
-            acc += local_acc;
         }
+
+        for (uint r = 0; r < Q6K_ROWS; r++) {
+            float val = subgroupAdd(accs_q6k[r]);
+            if (gl_SubgroupInvocationID == 0) sdata[gl_SubgroupID] = val;
+            barrier();
+            if (gl_SubgroupID == 0) {
+                val = (gl_SubgroupInvocationID < gl_NumSubgroups) ? sdata[gl_SubgroupInvocationID] : 0.0;
+                val = subgroupAdd(val);
+                if (gl_SubgroupInvocationID == 0 && row + r < N) output_data[row + r] = val;
+            }
+            barrier();
+        }
+        return;
     }
 
     // Subgroup reduction (fast hardware shuffle)
