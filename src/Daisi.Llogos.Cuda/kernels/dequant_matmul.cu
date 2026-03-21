@@ -265,116 +265,137 @@ __global__ void matmul_f32(float* output, const float* a, const float* b,
 }
 
 // ── Fused Q8_0 Dequant + MatMul (aligned 36-byte blocks) ────────────────────
+// Multi-row constant (shared by aligned and unaligned Q8_0 kernels)
+#ifndef Q8_ROWS_PER_BLOCK
+#define Q8_ROWS_PER_BLOCK 4
+#endif
+
+// Multi-row aligned Q8_0: 4 output neurons per block with activation reuse
 __global__ void dequant_matmul_q8_0_aligned(float* __restrict__ output,
                                               const float* __restrict__ a,
                                               const unsigned char* __restrict__ b,
                                               int M, int K, int N)
 {
     extern __shared__ float shared[];
-    int n = blockIdx.x;
+    int n_base = blockIdx.x * Q8_ROWS_PER_BLOCK;
     int tid = threadIdx.x;
     int blockSize = blockDim.x;
-    if (n >= N) return;
+    if (n_base >= N) return;
 
     int blocks_per_row = K / 32;
-    long bytes_per_row = (long)blocks_per_row * 36;  // aligned blocks
-    const unsigned char* b_row = b + (long)n * bytes_per_row;
+    long bytes_per_row = (long)blocks_per_row * 36;
 
-    float sum0 = 0.0f, sum1 = 0.0f;
+    float sums[Q8_ROWS_PER_BLOCK] = {0};
+
     for (int blk = tid; blk < blocks_per_row; blk += blockSize)
     {
-        const unsigned char* block_ptr = b_row + blk * 36;
-        float scale = fp16_to_fp32(*reinterpret_cast<const unsigned short*>(block_ptr));
-        const signed char* quants = (const signed char*)(block_ptr + 4); // ALIGNED at +4
         const float4* ap = reinterpret_cast<const float4*>(a + blk * 32);
-        float bs0 = 0.0f, bs1 = 0.0f;
+        float4 a_cache[8];
         #pragma unroll
-        for (int i = 0; i < 4; i++) {
-            float4 ai = ap[i]; int base = i * 4;
-            bs0 += ai.x*(float)quants[base] + ai.y*(float)quants[base+1]
-                 + ai.z*(float)quants[base+2] + ai.w*(float)quants[base+3];
-        }
+        for (int i = 0; i < 8; i++) a_cache[i] = ap[i];
+
         #pragma unroll
-        for (int i = 4; i < 8; i++) {
-            float4 ai = ap[i]; int base = i * 4;
-            bs1 += ai.x*(float)quants[base] + ai.y*(float)quants[base+1]
-                 + ai.z*(float)quants[base+2] + ai.w*(float)quants[base+3];
+        for (int r = 0; r < Q8_ROWS_PER_BLOCK; r++)
+        {
+            int n = n_base + r;
+            if (n >= N) break;
+            const unsigned char* block_ptr = b + (long)n * bytes_per_row + blk * 36;
+            float scale = fp16_to_fp32(*reinterpret_cast<const unsigned short*>(block_ptr));
+            const signed char* quants = (const signed char*)(block_ptr + 4);
+            float bs = 0.0f;
+            #pragma unroll
+            for (int i = 0; i < 8; i++) {
+                float4 ai = a_cache[i]; int base = i * 4;
+                bs += ai.x*(float)quants[base] + ai.y*(float)quants[base+1]
+                    + ai.z*(float)quants[base+2] + ai.w*(float)quants[base+3];
+            }
+            sums[r] += scale * bs;
         }
-        sum0 += scale * bs0; sum1 += scale * bs1;
     }
-    float sum = sum0 + sum1;
-    sum = warp_reduce_sum(sum);
-    int lane = tid & 31; int warp = tid >> 5;
-    if (lane == 0) shared[warp] = sum;
-    __syncthreads();
+
     int numWarps = blockSize >> 5;
-    if (tid < numWarps) sum = shared[tid]; else sum = 0.0f;
-    sum = warp_reduce_sum(sum);
-    if (tid == 0) output[n] = sum;
+    #pragma unroll
+    for (int r = 0; r < Q8_ROWS_PER_BLOCK; r++) {
+        float sum = warp_reduce_sum(sums[r]);
+        int lane = tid & 31; int warp = tid >> 5;
+        if (lane == 0) shared[warp] = sum;
+        __syncthreads();
+        if (tid < numWarps) sum = shared[tid]; else sum = 0.0f;
+        sum = warp_reduce_sum(sum);
+        if (tid == 0 && n_base + r < N) output[n_base + r] = sum;
+        __syncthreads();
+    }
 }
 
 // ── Fused Q8_0 Dequant + MatMul (original 34-byte blocks) ──────────────────
+// Multi-row Q8_0: 4 output neurons per block with activation reuse
+#define Q8_ROWS_PER_BLOCK 4
+
 __global__ void dequant_matmul_q8_0(float* __restrict__ output,
                                      const float* __restrict__ a,
                                      const unsigned char* __restrict__ b,
                                      int M, int K, int N)
 {
     extern __shared__ float shared[];
-    int n = blockIdx.x;
+    int n_base = blockIdx.x * Q8_ROWS_PER_BLOCK;
     int tid = threadIdx.x;
     int blockSize = blockDim.x;
 
-    if (n >= N) return;
+    if (n_base >= N) return;
 
     int blocks_per_row = K / 32;
     long bytes_per_row = (long)blocks_per_row * 34;
-    const unsigned char* __restrict__ b_row = b + (long)n * bytes_per_row;
 
-    // Two accumulators to reduce dependency chains
-    float sum0 = 0.0f, sum1 = 0.0f;
+    // Accumulate all rows in registers (no sync between rows)
+    float sums[Q8_ROWS_PER_BLOCK] = {0};
 
     for (int blk = tid; blk < blocks_per_row; blk += blockSize)
     {
-        const unsigned char* block_ptr = b_row + blk * 34;
-        float scale = fp16_to_fp32(*reinterpret_cast<const unsigned short*>(block_ptr));
-        const signed char* quants = (const signed char*)(block_ptr + 2);
+        // Load activation once (shared across all rows)
         const float4* ap = reinterpret_cast<const float4*>(a + blk * 32);
+        float4 a_cache[8];
+        #pragma unroll
+        for (int i = 0; i < 8; i++) a_cache[i] = ap[i];
 
-        float bs0 = 0.0f, bs1 = 0.0f;
+        // Process each row with the cached activation
         #pragma unroll
-        for (int i = 0; i < 4; i++)
+        for (int r = 0; r < Q8_ROWS_PER_BLOCK; r++)
         {
-            float4 ai = ap[i];
-            int base = i * 4;
-            bs0 += ai.x * (float)quants[base]     + ai.y * (float)quants[base + 1]
-                 + ai.z * (float)quants[base + 2] + ai.w * (float)quants[base + 3];
+            int n = n_base + r;
+            if (n >= N) break;
+
+            const unsigned char* block_ptr = b + (long)n * bytes_per_row + blk * 34;
+            float scale = fp16_to_fp32(*reinterpret_cast<const unsigned short*>(block_ptr));
+            const signed char* quants = (const signed char*)(block_ptr + 2);
+
+            float bs = 0.0f;
+            #pragma unroll
+            for (int i = 0; i < 8; i++)
+            {
+                float4 ai = a_cache[i];
+                int base = i * 4;
+                bs += ai.x * (float)quants[base]     + ai.y * (float)quants[base + 1]
+                    + ai.z * (float)quants[base + 2] + ai.w * (float)quants[base + 3];
+            }
+            sums[r] += scale * bs;
         }
-        #pragma unroll
-        for (int i = 4; i < 8; i++)
-        {
-            float4 ai = ap[i];
-            int base = i * 4;
-            bs1 += ai.x * (float)quants[base]     + ai.y * (float)quants[base + 1]
-                 + ai.z * (float)quants[base + 2] + ai.w * (float)quants[base + 3];
-        }
-        sum0 += scale * bs0;
-        sum1 += scale * bs1;
     }
 
-    float sum = sum0 + sum1;
-
-    // Warp reduction
-    sum = warp_reduce_sum(sum);
-    int lane = tid & 31;
-    int warp = tid >> 5;
-    if (lane == 0) shared[warp] = sum;
-    __syncthreads();
-
+    // Reduce and write each row independently (no inter-row sync)
     int numWarps = blockSize >> 5;
-    if (tid < numWarps) sum = shared[tid]; else sum = 0.0f;
-    sum = warp_reduce_sum(sum);
-
-    if (tid == 0) output[n] = sum;
+    #pragma unroll
+    for (int r = 0; r < Q8_ROWS_PER_BLOCK; r++)
+    {
+        float sum = warp_reduce_sum(sums[r]);
+        int lane = tid & 31;
+        int warp = tid >> 5;
+        if (lane == 0) shared[warp] = sum;
+        __syncthreads();
+        if (tid < numWarps) sum = shared[tid]; else sum = 0.0f;
+        sum = warp_reduce_sum(sum);
+        if (tid == 0 && n_base + r < N) output[n_base + r] = sum;
+        __syncthreads();
+    }
 }
 
 // ── Fused I2_S (BitNet ternary) Dequant + MatMul ───────────────────────────
