@@ -259,9 +259,50 @@ internal static class MatMul
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
     private static unsafe float DotQ8_0Ptr(float* aVec, byte* bQ8, int blockCount)
     {
+        if (Avx512BW.IsSupported)
+            return DotQ8_0Avx512(aVec, bQ8, blockCount);
         if (Avx2.IsSupported)
             return DotQ8_0Avx2(aVec, bQ8, blockCount);
         return DotQ8_0Scalar(aVec, bQ8, blockCount);
+    }
+
+    /// <summary>
+    /// AVX-512 fused Q8_0 dot product. Processes 16 int8 → 16 float at once using 512-bit ops.
+    /// 2 groups of 16 = 32 elements per block (same as AVX2 but with wider vectors).
+    /// </summary>
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    private static unsafe float DotQ8_0Avx512(float* aVec, byte* bQ8, int blockCount)
+    {
+        var acc = Vector512<float>.Zero;
+
+        for (int b = 0; b < blockCount; b++)
+        {
+            byte* blockPtr = bQ8 + b * Q8_0TypeSize;
+            float* aPtr = aVec + b * Q8_0BlockSize;
+            sbyte* quants = (sbyte*)(blockPtr + 2);
+
+            float scale = (float)Unsafe.ReadUnaligned<Half>(blockPtr);
+            var vScale = Vector512.Create(scale);
+
+            // Load 32 int8 quants in 2 groups of 16:
+            // vpmovsxbd: 16 bytes → 16 int32 → 16 float (in 512-bit register)
+            var q0 = Avx512BW.ConvertToVector512Int32(
+                Vector128.Load(quants).AsSByte());
+            var q1 = Avx512BW.ConvertToVector512Int32(
+                Vector128.Load(quants + 16).AsSByte());
+
+            var f0 = Avx512F.ConvertToVector512Single(q0);
+            var f1 = Avx512F.ConvertToVector512Single(q1);
+
+            var a0 = Vector512.Load(aPtr);
+            var a1 = Vector512.Load(aPtr + 16);
+
+            // FMA: acc += scale * (a0*f0 + a1*f1)
+            var blockSum = Avx512F.FusedMultiplyAdd(a0, f0, a1 * f1);
+            acc = Avx512F.FusedMultiplyAdd(vScale, blockSum, acc);
+        }
+
+        return Vector512.Sum(acc);
     }
 
     /// <summary>
