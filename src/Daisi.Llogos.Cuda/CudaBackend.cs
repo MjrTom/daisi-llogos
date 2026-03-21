@@ -118,9 +118,9 @@ public sealed class CudaBackend : IComputeBackend
                 &beta,
                 outPtr, 1), "cublasSgemv"); // y = output, incy = 1
         }
-        else if (b.Type == GgmlType.Q8_0 && K >= 2048)
+        else if (false) // dp4a removed: Q8_1 quantization error compounds across layers
         {
-            // dp4a path: quantize activation to int8, use integer dot product hardware.
+            // dp4a path — disabled due to precision loss in activation quantization
             // Cache: skip re-quantization if the same activation tensor is used again
             // (e.g., Q/K/V projections all share normOut, gate/up share normOut).
             int numBlocks = K / 32;
@@ -901,6 +901,16 @@ public sealed class CudaBackend : IComputeBackend
         _stream.Synchronize();
         resultTensor.DownloadTo(resultBuf);
         return (int)resultBuf[0];
+    }
+
+    /// <inheritdoc />
+    public void CopyTensorRegion(ITensor dst, ITensor src, int srcOffset, int count)
+    {
+        var dstT = (CudaTensor)dst;
+        var srcT = (CudaTensor)src;
+        ulong srcPtr = srcT.DevicePtr + (ulong)(srcOffset * sizeof(float));
+        CudaApi.Check(CudaApi.MemcpyDtoDAsync(dstT.DevicePtr, srcPtr,
+            (ulong)(count * sizeof(float)), _stream.Handle), "cuMemcpyDtoDAsync");
     }
 
     // ── GPU-Native DeltaNet Operations ──────────────────────────────────────
