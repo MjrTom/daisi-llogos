@@ -182,12 +182,12 @@ public sealed class ForwardPass : IForwardPass
         // 1. Embedding lookup
         _backend.EmbeddingLookup(_hidden, _weights.TokenEmbedding, tokenId);
 
-        // 2. Transformer layers (per-layer batching — skip DeltaNet which crashes when batched)
+        // 2. Transformer layers (per-layer batching)
         for (int layer = 0; layer < _config.NumLayers; layer++)
         {
+            _backend.BeginCommands();
             var lw = _weights.Layers[layer];
             bool isDeltaNet = lw is DeltaNetWeights;
-            if (!isDeltaNet) _backend.BeginCommands();
 
             _backend.RmsNormResidual(_normOut, _residual, _hidden, lw.AttnNorm, _config.NormEps);
 
@@ -214,7 +214,7 @@ public sealed class ForwardPass : IForwardPass
             ProjectLinear(_hidden, _gate, lw.FfnDown);
 
             _backend.ElementAdd(_hidden, _hidden, _residual);
-            if (!isDeltaNet) _backend.FlushCommands();
+            _backend.FlushCommands();
         }
     }
 
