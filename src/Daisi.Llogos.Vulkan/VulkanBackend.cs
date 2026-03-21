@@ -68,7 +68,7 @@ public sealed class VulkanBackend : IComputeBackend
 
     public ITensor LoadTensor(string name, GgmlType type, ReadOnlySpan<long> dimensions, ReadOnlySpan<byte> data)
     {
-        // Repack Q8_0 to aligned 36-byte blocks — DISABLED: needs embedding lookup fix
+        // Aligned Q8_0 repacking tested — no Vulkan perf improvement (GLSL compiler already optimizes int8 reads)
         if (false && type == GgmlType.Q8_0 && dimensions.Length >= 2 && dimensions[0] >= 2048)
         {
             int blockCount = data.Length / 34;
@@ -246,9 +246,11 @@ public sealed class VulkanBackend : IComputeBackend
         var buffers = new VulkanBuffer[] { outT.DeviceBuffer, tableT.DeviceBuffer };
         var ds = _embeddingPipeline.AllocateDescriptorSet(buffers);
 
+        bool isAligned = tableT is VulkanTensor vt2 && vt2.IsAlignedQ8_0;
         uint? tableTypeOpt = table.Type switch
         {
             GgmlType.F32 => 0u,
+            GgmlType.Q8_0 when isAligned => 4u, // aligned 36-byte blocks
             GgmlType.Q8_0 => 1u,
             GgmlType.F16 => 2u,
             GgmlType.Q4_K => 3u,
