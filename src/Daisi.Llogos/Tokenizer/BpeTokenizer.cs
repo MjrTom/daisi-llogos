@@ -66,8 +66,6 @@ public sealed partial class BpeTokenizer
     public string Decode(ReadOnlySpan<int> tokenIds)
     {
         var sb = new StringBuilder();
-        var byteBuffer = new List<byte>(); // accumulates <0xNN> byte fallback tokens
-
         foreach (var id in tokenIds)
         {
             if (id == _vocab.BosTokenId || id == _vocab.EosTokenId || id == _vocab.PadTokenId)
@@ -76,22 +74,13 @@ public sealed partial class BpeTokenizer
             var token = _vocab.IdToToken(id);
 
             // Handle byte fallback tokens like <0x0A>
-            // Accumulate into a buffer and decode as UTF-8 when the sequence ends,
-            // so multi-byte characters (emoji, CJK, etc.) decode correctly.
             if (token.Length == 6 && token.StartsWith("<0x") && token.EndsWith('>'))
             {
                 if (byte.TryParse(token.AsSpan(3, 2), System.Globalization.NumberStyles.HexNumber, null, out var b))
                 {
-                    byteBuffer.Add(b);
+                    sb.Append((char)b);
                     continue;
                 }
-            }
-
-            // Flush any accumulated byte fallback tokens as UTF-8
-            if (byteBuffer.Count > 0)
-            {
-                sb.Append(System.Text.Encoding.UTF8.GetString(byteBuffer.ToArray()));
-                byteBuffer.Clear();
             }
 
             // Normalize fullwidth pipes (U+FF5C ｜) to ASCII pipes (U+007C |)
@@ -102,10 +91,6 @@ public sealed partial class BpeTokenizer
 
             sb.Append(token);
         }
-
-        // Flush remaining byte fallback tokens
-        if (byteBuffer.Count > 0)
-            sb.Append(System.Text.Encoding.UTF8.GetString(byteBuffer.ToArray()));
 
         var text = sb.ToString();
         if (_useByteEncoding)
