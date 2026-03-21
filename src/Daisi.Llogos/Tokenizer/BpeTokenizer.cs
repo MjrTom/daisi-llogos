@@ -83,6 +83,12 @@ public sealed partial class BpeTokenizer
                 }
             }
 
+            // Normalize fullwidth pipes (U+FF5C ｜) to ASCII pipes (U+007C |)
+            // in special tokens. Qwen models store tokens like <｜im_end｜> with
+            // fullwidth pipes, but stop sequences and prompts use ASCII pipes.
+            if (token.Contains('\uFF5C'))
+                token = token.Replace('\uFF5C', '|');
+
             sb.Append(token);
         }
 
