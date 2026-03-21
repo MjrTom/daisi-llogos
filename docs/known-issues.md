@@ -36,10 +36,10 @@ dp4a path disabled. llama.cpp handles this with a more sophisticated Q8_1 format
 
 | Model | llama.cpp CUDA | Llogos CUDA | % | llama.cpp Vulkan | Llogos Vulkan | % |
 |-------|--------:|--------:|--------:|--------:|--------:|--------:|
-| 0.8B Q8_0 | 423 | 229 | 54% | 476 | 151 | 32% |
-| 8B Q8_0 | 93 | 70 | 75% | 97 | 55 | 57% |
-| 8B Q4_K_M | 139 | 69 | 50% | 142 | 53 | 37% |
-| 9B Q8_0 | 85 | 68 | 80% | 89 | 51 | 57% |
+| 0.8B Q8_0 | 423 | 249 | 59% | 476 | 151 | 32% |
+| 8B Q8_0 | 91 | 78 | 86% | 97 | 55 | 57% |
+| 8B Q4_K_M | 139 | 81 | 58% | 142 | 53 | 37% |
+| 9B Q8_0 | 83 | 73 | 88% | 89 | 51 | 57% |
 
 ### Root Causes
 - **Matmul bandwidth utilization**: ~50% of theoretical memory bandwidth vs llama.cpp's ~85%
