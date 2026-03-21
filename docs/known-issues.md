@@ -36,16 +36,17 @@ dp4a path disabled. llama.cpp handles this with a more sophisticated Q8_1 format
 
 | Model | llama.cpp CUDA | Llogos CUDA | % | llama.cpp Vulkan | Llogos Vulkan | % |
 |-------|--------:|--------:|--------:|--------:|--------:|--------:|
-| 0.8B Q8_0 | 423 | 249 | 59% | 476 | 151 | 32% |
-| 8B Q8_0 | 91 | 78 | 86% | 97 | 55 | 57% |
-| 8B Q4_K_M | 139 | 81 | 58% | 142 | 53 | 37% |
-| 9B Q8_0 | 83 | 73 | 88% | 89 | 51 | 57% |
+| 0.8B Q8_0 | 399 | 363 | 91% | 466 | 150 | 32% |
+| 8B Q8_0 | 92 | **83** | **90%** | 96 | 54 | 56% |
+| 8B Q4_K_M | 138 | 86 | 62% | 142 | 53 | 37% |
+| 9B Q8_0 | 84 | **76** | **90%** | —* | 51 | — |
 
-### Root Causes
-- **Matmul bandwidth utilization**: ~50% of theoretical memory bandwidth vs llama.cpp's ~85%
-- **Q4_K dequant kernel efficiency**: llama.cpp's Q4_K GEMV is significantly more optimized
-- **Dispatch overhead**: Vulkan descriptor set allocation + pipeline barriers per dispatch
-- **34-byte Q8_0 blocks**: Non-power-of-2 causes suboptimal cache line utilization (mitigated with aligned 36-byte repacking)
+*llama.cpp Vulkan b8461 has a regression on DeltaNet models (~11 tok/s).
+
+### Remaining Gaps
+- **CUDA Q4_K_M** (62%): llama.cpp's Q4_K kernel is significantly more optimized (dp4a, specific memory patterns)
+- **Vulkan** (32-56%): matmul bandwidth utilization gap, descriptor set overhead vs llama.cpp's buffer device addresses
+- **CUDA Q8_0** (90%): target achieved — remaining gap is fundamental memory bandwidth efficiency
 
 ---
 

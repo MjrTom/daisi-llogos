@@ -69,16 +69,16 @@ See [Tested Models](docs/tested-models.md) for verified models, performance benc
 
 Measured on AMD Ryzen 9 9900X + NVIDIA RTX 5080, 128 decode tokens, FP16 KV cache. Compared against llama.cpp b8461.
 
-| Model | Llogos CUDA | llama.cpp CUDA | Llogos Vulkan | llama.cpp Vulkan |
-|-------|--------:|--------:|--------:|--------:|
-| Qwen3.5-0.8B Q8_0 | 249 | 423 | 151 | 476 |
-| Qwen3-8B Q8_0 | 78 | 91 | 55 | 97 |
-| Qwen3-8B Q4_K_M | 81 | 139 | 53 | 142 |
-| Qwen3.5-9B Q8_0 | 73 | 83 | 51 | 89 |
+| Model | Llogos CUDA | llama.cpp CUDA | % | Llogos Vulkan | llama.cpp Vulkan |
+|-------|--------:|--------:|--------:|--------:|--------:|
+| Qwen3.5-0.8B Q8_0 | 363 | 399 | 91% | 150 | 466 |
+| Qwen3-8B Q8_0 | **83** | 92 | **90%** | 54 | 96 |
+| Qwen3-8B Q4_K_M | 86 | 138 | 62% | 53 | 142 |
+| Qwen3.5-9B Q8_0 | **76** | 84 | **90%** | 51 | — |
 
-CUDA: PTX inline asm for fp16↔fp32 conversion, `__ldg` read-only cache hints, uint32 weight reads, multi-row activation reuse, aligned Q8_0 repacking, cuBLAS F32 GEMV, fused kernels, GPU-side argmax, NVRTC with PTX disk cache.
+CUDA: **CUDA graph capture** (single graph launch replaces ~435 kernel calls), PTX `cvt.f32.f16`/`cvt.rn.f16.f32` intrinsics, `__ldg` read-only cache hints, uint32 weight reads, multi-row activation reuse, aligned Q8_0 repacking, cuBLAS F32 GEMV, fused kernels (AddRmsNormResidual, AddRmsNorm, SplitSwiGLU), GPU-side argmax, NVRTC with PTX disk cache.
 
-Vulkan: uint32 buffer views for coalesced reads, aligned Q8_0 repacking, 8-row workgroups, subgroup arithmetic reduction, fused composite ops (RmsNormResidual, AddRmsNorm, SplitSwiGLU, RepeatTile, ArgMax), Vulkan 1.2 with SPIR-V 1.3.
+Vulkan: uint32 buffer views for coalesced reads, aligned Q8_0 repacking, 8-row workgroups, subgroup arithmetic reduction, fused composite ops (RmsNormResidual, AddRmsNormResidual, AddRmsNorm, SplitSwiGLU, RepeatTile, ArgMax), Vulkan 1.2 with SPIR-V 1.3.
 
 What works today:
 - Parse any GGUF v2/v3 file (header, metadata, tensor info)

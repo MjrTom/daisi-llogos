@@ -23,41 +23,45 @@ Measured with `--bench`, 128 decode tokens, FP16 KV cache. llama.cpp b8461 compa
 
 | Model | llama.cpp CUDA | Llogos CUDA | % of llama.cpp |
 |-------|--------:|--------:|--------:|
-| Qwen3.5-0.8B Q8_0 | 423 | 249 | 59% |
-| Qwen3-8B Q8_0 | 91 | 78 | 86% |
-| Qwen3-8B Q4_K_M | 139 | 81 | 58% |
-| Qwen3.5-9B Q8_0 | 83 | 73 | 88% |
+| Qwen3.5-0.8B Q8_0 | 399 | 363 | 91% |
+| Qwen3-8B Q8_0 | 92 | **83** | **90%** |
+| Qwen3-8B Q4_K_M | 138 | 86 | 62% |
+| Qwen3.5-9B Q8_0 | 84 | **76** | **90%** |
 
 ### Llogos vs llama.cpp — Vulkan
 
 | Model | llama.cpp Vulkan | Llogos Vulkan | % of llama.cpp |
 |-------|--------:|--------:|--------:|
-| Qwen3.5-0.8B Q8_0 | 476 | 151 | 32% |
-| Qwen3-8B Q8_0 | 97 | 55 | 57% |
+| Qwen3.5-0.8B Q8_0 | 466 | 150 | 32% |
+| Qwen3-8B Q8_0 | 96 | 54 | 56% |
 | Qwen3-8B Q4_K_M | 142 | 53 | 37% |
-| Qwen3.5-9B Q8_0 | 89 | 51 | 57% |
+| Qwen3.5-9B Q8_0 | — | 51 | — |
+
+*Note: llama.cpp Vulkan b8461 appears to have a regression on Qwen3.5-9B DeltaNet models (~11 tok/s). Llogos Vulkan handles DeltaNet correctly at 51 tok/s.*
 
 ### All Llogos Benchmarks
 
 | Model | Backend | Decode (tok/s) |
 |-------|---------|---------------:|
-| Qwen3.5-0.8B Q8_0 | CUDA | 249 |
-| Qwen3.5-0.8B Q8_0 | Vulkan | 151 |
-| Qwen3-8B Q8_0 | CUDA | 78 |
-| Qwen3-8B Q8_0 | Vulkan | 55 |
-| Qwen3-8B Q4_K_M | CUDA | 81 |
+| Qwen3.5-0.8B Q8_0 | CUDA | 363 |
+| Qwen3.5-0.8B Q8_0 | Vulkan | 150 |
+| Qwen3-8B Q8_0 | CUDA | 83 |
+| Qwen3-8B Q8_0 | Vulkan | 54 |
+| Qwen3-8B Q4_K_M | CUDA | 86 |
 | Qwen3-8B Q4_K_M | Vulkan | 53 |
-| Qwen3.5-9B Q8_0 | CUDA | 73 |
+| Qwen3.5-9B Q8_0 | CUDA | 76 |
 | Qwen3.5-9B Q8_0 | Vulkan | 51 |
 | Qwen3.5-0.8B Q8_0 | CPU | 22 |
 | TinyLlama 1.1B Q8_0 | CPU | 13 |
 
 ### CUDA Optimizations Applied
 
+- **CUDA graph capture** — single `cuGraphLaunch` replaces ~435 individual kernel launches per token
 - **PTX inline assembly** for fp16↔fp32 conversion (single `cvt` instruction vs 20-instruction software)
 - **`__ldg` read-only cache hints** on all activation and weight loads
 - **uint32 weight reads** for aligned Q8_0 blocks (native 4-byte coalesced loads)
 - **Multi-row activation reuse** — process 4-8 output neurons per block, load activation once
+- **Fused layer boundaries** — AddRmsNormResidual combines 3 ops across transformer layers
 - **Aligned Q8_0 repacking** — 36-byte blocks with 4-byte aligned quants for direct int loads
 - **cuBLAS** SGEMV for F32 matmul (part of CUDA Toolkit, no extra dependency)
 - **GPU-side argmax** — download 4 bytes instead of 600KB per token
@@ -118,8 +122,8 @@ See [known-issues.md](known-issues.md) for details. All original issues are **fi
 
 For the best experience:
 
-1. **Best quality**: [Qwen3-8B Q8_0](https://huggingface.co/unsloth/Qwen3-8B-GGUF) — 8.7 GB, 78 tok/s CUDA / 55 tok/s Vulkan
-2. **Best speed**: [Qwen3.5-0.8B Q8_0](https://huggingface.co/unsloth/Qwen3.5-0.8B-GGUF) — 812 MB, 249 tok/s CUDA / 151 tok/s Vulkan
-3. **Best value**: [Qwen3-8B Q4_K_M](https://huggingface.co/unsloth/Qwen3-8B-GGUF) — 5.0 GB, 81 tok/s CUDA / 53 tok/s Vulkan
-4. **DeltaNet hybrid**: [Qwen3.5-9B Q8_0](https://huggingface.co/unsloth/Qwen3.5-9B-GGUF) — 9.8 GB, 73 tok/s CUDA / 51 tok/s Vulkan
+1. **Best quality**: [Qwen3-8B Q8_0](https://huggingface.co/unsloth/Qwen3-8B-GGUF) — 8.7 GB, 83 tok/s CUDA / 54 tok/s Vulkan (90% of llama.cpp)
+2. **Best speed**: [Qwen3.5-0.8B Q8_0](https://huggingface.co/unsloth/Qwen3.5-0.8B-GGUF) — 812 MB, 363 tok/s CUDA / 150 tok/s Vulkan
+3. **Best value**: [Qwen3-8B Q4_K_M](https://huggingface.co/unsloth/Qwen3-8B-GGUF) — 5.0 GB, 86 tok/s CUDA / 53 tok/s Vulkan
+4. **DeltaNet hybrid**: [Qwen3.5-9B Q8_0](https://huggingface.co/unsloth/Qwen3.5-9B-GGUF) — 9.8 GB, 76 tok/s CUDA / 51 tok/s Vulkan (90% of llama.cpp)
 5. **Reasoning**: [DeepSeek R1 8B Q8_0](https://huggingface.co/unsloth/DeepSeek-R1-Distill-Llama-8B-GGUF) — 8.5 GB, ~65 tok/s CUDA
