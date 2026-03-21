@@ -190,9 +190,13 @@ public sealed class ForwardPass : IForwardPass
         for (int layer = 0; layer < _config.NumLayers; layer++)
         {
             var lw = _weights.Layers[layer];
-            bool isDeltaNet = lw is DeltaNetWeights;
 
-            _backend.RmsNormResidual(_normOut, _residual, _hidden, lw.AttnNorm, _config.NormEps);
+            // Fuse previous layer's ElementAdd with this layer's RmsNormResidual
+            // First layer: no preceding add, just do RmsNormResidual
+            if (layer == 0)
+                _backend.RmsNormResidual(_normOut, _residual, _hidden, lw.AttnNorm, _config.NormEps);
+            else
+                _backend.AddRmsNormResidual(_normOut, _hidden, _residual, _residual, lw.AttnNorm, _config.NormEps);
 
             if (lw is StandardAttentionWeights saw)
                 ForwardStandardAttention(saw, position, layer);
@@ -216,7 +220,10 @@ public sealed class ForwardPass : IForwardPass
             }
             ProjectLinear(_hidden, _gate, lw.FfnDown);
 
-            _backend.ElementAdd(_hidden, _hidden, _residual);
+            // Last layer: do ElementAdd now (no next layer to fuse with)
+            if (layer == _config.NumLayers - 1)
+                _backend.ElementAdd(_hidden, _hidden, _residual);
+            // Other layers: defer ElementAdd to fuse with next layer's RmsNormResidual
         }
     }
 

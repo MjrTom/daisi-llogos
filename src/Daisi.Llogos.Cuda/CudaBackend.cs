@@ -1077,6 +1077,30 @@ public sealed class CudaBackend : IComputeBackend
     }
 
     /// <inheritdoc />
+    public unsafe void AddRmsNormResidual(ITensor output, ITensor hidden, ITensor residual, ITensor b, ITensor weight, float eps)
+    {
+        var outT = (CudaTensor)output;
+        var hidT = (CudaTensor)hidden;
+        var resT = (CudaTensor)residual;
+        var bT = (CudaTensor)b;
+        var wT = (CudaTensor)weight;
+        ulong outPtr = outT.DevicePtr, hidPtr = hidT.DevicePtr, resPtr = resT.DevicePtr;
+        ulong bPtr = bT.DevicePtr, wPtr = wT.DevicePtr;
+        int n = (int)hidden.ElementCount;
+
+        var func = _elementwiseModule.GetFunction("add_rms_norm_residual");
+        uint sharedMem = (uint)(BlockSize * sizeof(float));
+        nint* kArgs = stackalloc nint[7];
+        kArgs[0] = (nint)(&outPtr);
+        kArgs[1] = (nint)(&hidPtr);
+        kArgs[2] = (nint)(&resPtr);
+        kArgs[3] = (nint)(&bPtr);
+        kArgs[4] = (nint)(&wPtr);
+        kArgs[5] = (nint)(&n);
+        kArgs[6] = (nint)(&eps);
+        _stream.Launch(func, 1, 1, 1, (uint)BlockSize, 1, 1, sharedMem, kArgs);
+    }
+
     public unsafe void AddRmsNorm(ITensor output, ITensor hidden, ITensor a, ITensor b, ITensor weight, float eps)
     {
         var outT = (CudaTensor)output;

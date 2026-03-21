@@ -374,6 +374,29 @@ void op_repeat_tile() {
     if (idx >= param0) data0[idx] = data0[srcIdx];
 }
 
+// ── Opcode 16: AddRmsNormResidual ───────────────────────────────────────────
+// Fused: hidden += b; residual = hidden; normOut = RmsNorm(hidden, weight)
+void op_add_rms_norm_residual() {
+    uint tid = gl_LocalInvocationID.x;
+    float eps = uintBitsToFloat(param1);
+    float local_sum = 0.0;
+    for (uint i = tid; i < param0; i += 256) {
+        float v = data1[i] + data3[i];
+        data1[i] = v;
+        data2[i] = v;
+        local_sum += v * v;
+    }
+    sdata[tid] = local_sum;
+    barrier();
+    for (uint s = 128; s > 0; s >>= 1) {
+        if (tid < s) sdata[tid] += sdata[tid + s];
+        barrier();
+    }
+    float inv_rms = 1.0 / sqrt(sdata[0] / float(param0) + eps);
+    for (uint i = tid; i < param0; i += 256)
+        data0[i] = data1[i] * inv_rms * data4[i];
+}
+
 void main() {
     switch (opcode) {
         case 0: op_silu_inplace(); break;
@@ -392,5 +415,6 @@ void main() {
         case 13: op_add_rms_norm(); break;
         case 14: op_argmax(); break;
         case 15: op_repeat_tile(); break;
+        case 16: op_add_rms_norm_residual(); break;
     }
 }
