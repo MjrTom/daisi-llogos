@@ -67,19 +67,18 @@ See [Tested Models](docs/tested-models.md) for verified models, performance benc
 
 ### Benchmarks
 
-Measured on AMD Ryzen 9 9900X + NVIDIA RTX 5080, FP16 KV cache.
+Measured on AMD Ryzen 9 9900X + NVIDIA RTX 5080, 128 decode tokens, FP16 KV cache. Compared against llama.cpp b8461.
 
-| Model | Backend | Prefill (tok/s) | Decode (tok/s) |
-|-------|---------|----------------:|---------------:|
-| Qwen3.5-0.8B Q8_0 | CUDA | 115 | 218 |
-| Qwen3-8B Q8_0 | CUDA | 67 | 68 |
-| Qwen3-8B Q4_K_M | CUDA | 49 | 50 |
-| Qwen3.5-9B Q8_0 | CUDA | 57 | 62 |
-| Qwen3.5-0.8B Q8_0 | CPU | 15 | 22 |
-| TinyLlama 1.1B Q8_0 | CPU | 5 | 13 |
-| Vulkan (0.8B Q8_0) | Vulkan | 21 | 17 |
+| Model | Llogos CUDA | llama.cpp CUDA | Llogos Vulkan | llama.cpp Vulkan |
+|-------|--------:|--------:|--------:|--------:|
+| Qwen3.5-0.8B Q8_0 | 229 | 423 | 151 | 476 |
+| Qwen3-8B Q8_0 | 70 | 93 | 55 | 97 |
+| Qwen3-8B Q4_K_M | 69 | 139 | 53 | 142 |
+| Qwen3.5-9B Q8_0 | 68 | 85 | 51 | 89 |
 
-CUDA performance optimizations: `__dp4a` integer dot products for Q8_0 (llama.cpp inspired), aligned Q8_0 weight repacking, cuBLAS for F32 GEMV, fused forward pass kernels (RmsNormResidual, SwiGLU, AddRmsNorm), GPU-side argmax, candidate-based sampler, architecture-specific NVRTC compilation with PTX disk cache.
+CUDA: multi-row activation reuse, aligned Q8_0 repacking, cuBLAS F32 GEMV, fused kernels (RmsNormResidual, SwiGLU, AddRmsNorm), GPU-side argmax, NVRTC with PTX disk cache.
+
+Vulkan: uint32 buffer views for coalesced reads, aligned Q8_0 repacking, 8-row workgroups, subgroup arithmetic reduction, fused composite ops (RmsNormResidual, AddRmsNorm, SplitSwiGLU, RepeatTile, ArgMax), Vulkan 1.2 with SPIR-V 1.3.
 
 What works today:
 - Parse any GGUF v2/v3 file (header, metadata, tensor info)

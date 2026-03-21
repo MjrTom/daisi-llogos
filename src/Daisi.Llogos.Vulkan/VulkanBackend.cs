@@ -15,6 +15,8 @@ public sealed class VulkanBackend : IComputeBackend
     private readonly VulkanPipeline _ropePipeline;
     private readonly VulkanPipeline _elementOpsPipeline;
     private readonly VulkanPipeline _matmulPipeline;
+    private readonly VulkanPipeline _matmulBdaPipeline;
+    private readonly VulkanPipeline _matmulQ8AlignedPipeline;
     private readonly VulkanPipeline _embeddingPipeline;
     private readonly VulkanPipeline _compositePipeline;
     private readonly VulkanPipeline _attentionPipeline;
@@ -33,7 +35,10 @@ public sealed class VulkanBackend : IComputeBackend
         _siluPipeline = VulkanPipeline.FromEmbeddedSpirV(_device, "silu.spv", 2, pushConstantSize: 4);
         _ropePipeline = VulkanPipeline.FromEmbeddedSpirV(_device, "rope.spv", 2, pushConstantSize: 24);
         _elementOpsPipeline = VulkanPipeline.FromEmbeddedSpirV(_device, "element_ops.spv", 3, pushConstantSize: 8);
-        _matmulPipeline = VulkanPipeline.FromEmbeddedSpirV(_device, "dequant_matmul.spv", 3, pushConstantSize: 16);
+        _matmulPipeline = VulkanPipeline.FromEmbeddedSpirV(_device, "dequant_matmul.spv", 4, pushConstantSize: 16);
+        _matmulBdaPipeline = VulkanPipeline.FromEmbeddedSpirVBda(_device, "dequant_matmul_bda.spv", pushConstantSize: 40);
+        // Dedicated pipeline for aligned Q8_0: 3 bindings (output, input, weight_u32), 8 bytes push constants
+        _matmulQ8AlignedPipeline = VulkanPipeline.FromEmbeddedSpirV(_device, "matmul_q8_0_aligned.spv", 3, pushConstantSize: 8);
         _embeddingPipeline = VulkanPipeline.FromEmbeddedSpirV(_device, "embedding.spv", 2, pushConstantSize: 12);
         _compositePipeline = VulkanPipeline.FromEmbeddedSpirV(_device, "composite_ops.spv", 8, pushConstantSize: 32);
         _attentionPipeline = VulkanPipeline.FromEmbeddedSpirV(_device, "gated_attention.spv", 5, pushConstantSize: 32);
@@ -44,11 +49,13 @@ public sealed class VulkanBackend : IComputeBackend
 
     public void BeginCommands()
     {
+        _lastBoundPipeline = null;
         _device.BeginBatch();
     }
 
     public void FlushCommands()
     {
+        _lastBoundPipeline = null;
         _device.EndBatch();
         // Reset pools AFTER batch completes (sets must stay valid during execution)
         _rmsNormPipeline.ResetDescriptorPool();
@@ -57,6 +64,7 @@ public sealed class VulkanBackend : IComputeBackend
         _ropePipeline.ResetDescriptorPool();
         _elementOpsPipeline.ResetDescriptorPool();
         _matmulPipeline.ResetDescriptorPool();
+        _matmulQ8AlignedPipeline.ResetDescriptorPool();
         _embeddingPipeline.ResetDescriptorPool();
         _compositePipeline.ResetDescriptorPool();
         _attentionPipeline.ResetDescriptorPool();
@@ -68,8 +76,8 @@ public sealed class VulkanBackend : IComputeBackend
 
     public ITensor LoadTensor(string name, GgmlType type, ReadOnlySpan<long> dimensions, ReadOnlySpan<byte> data)
     {
-        // Aligned Q8_0 repacking tested — no Vulkan perf improvement (GLSL compiler already optimizes int8 reads)
-        if (false && type == GgmlType.Q8_0 && dimensions.Length >= 2 && dimensions[0] >= 2048)
+        // Aligned Q8_0: repack 34→36 bytes for native uint32 reads
+        if (type == GgmlType.Q8_0 && dimensions.Length >= 2)
         {
             int blockCount = data.Length / 34;
             var aligned = new byte[blockCount * 36];
@@ -120,19 +128,32 @@ public sealed class VulkanBackend : IComputeBackend
 
         uint weightType = weightTypeOpt.Value;
 
-        var buffers = new VulkanBuffer[] { outT.DeviceBuffer, aT.DeviceBuffer, bT.DeviceBuffer };
-        var ds = _matmulPipeline.AllocateDescriptorSet(buffers);
+        // Use dedicated pipeline for aligned Q8_0 (no branching, optimal codegen)
+        if (weightType == 7u)
+        {
+            var buffers = new VulkanBuffer[] { outT.DeviceBuffer, aT.DeviceBuffer, bT.DeviceBuffer };
+            var ds = _matmulQ8AlignedPipeline.AllocateDescriptorSet(buffers);
+            uint* pc = stackalloc uint[2];
+            pc[0] = (uint)K;
+            pc[1] = (uint)N;
+            uint grid = ((uint)N + 7) / 8; // 8 rows per workgroup
+            Dispatch(_matmulQ8AlignedPipeline, ds, pc, 8, grid, 1, 1);
+            return;
+        }
 
-        uint* pc = stackalloc uint[4];
-        pc[0] = (uint)M;
-        pc[1] = (uint)K;
-        pc[2] = (uint)N;
-        pc[3] = weightType;
+        // Generic matmul pipeline for other types
+        var buffers2 = new VulkanBuffer[] { outT.DeviceBuffer, aT.DeviceBuffer, bT.DeviceBuffer, bT.DeviceBuffer };
+        var ds2 = _matmulPipeline.AllocateDescriptorSet(buffers2);
 
-        // Multi-row: Q8_0 = 4, Q4_K = 2, Q6_K = 2, others = 1 row per workgroup
-        uint rowsPerWg = weightType switch { 1 => 4u, 5 or 6 => 2u, _ => 1u };
-        uint grid = ((uint)N + rowsPerWg - 1) / rowsPerWg;
-        Dispatch(_matmulPipeline, ds, pc, 16, grid, 1, 1);
+        uint* pc2 = stackalloc uint[4];
+        pc2[0] = (uint)M;
+        pc2[1] = (uint)K;
+        pc2[2] = (uint)N;
+        pc2[3] = weightType;
+
+        uint rowsPerWg = weightType switch { 5 or 6 => 8u, 1 => 4u, _ => 1u };
+        uint grid2 = ((uint)N + rowsPerWg - 1) / rowsPerWg;
+        Dispatch(_matmulPipeline, ds2, pc2, 16, grid2, 1, 1);
     }
 
     public unsafe void RmsNorm(ITensor output, ITensor input, ITensor weight, float eps)
@@ -428,6 +449,61 @@ public sealed class VulkanBackend : IComputeBackend
         Dispatch(_deltanetPipeline, ds, pc, 16, (uint)groupCount, 1, 1);
     }
 
+    public unsafe void SplitSwiGLU(ITensor output, ITensor fusedInput, int N)
+    {
+        uint n = (uint)N;
+        uint grid = (n + WorkGroupSize - 1) / WorkGroupSize;
+        DispatchComposite(11, n, 0, 0, 0, 0, 0, 0,
+            ((VulkanTensor)output).DeviceBuffer,
+            ((VulkanTensor)fusedInput).DeviceBuffer,
+            gridOverride: grid);
+    }
+
+    public unsafe void RmsNormResidual(ITensor output, ITensor residual, ITensor input, ITensor weight, float eps)
+    {
+        uint n = (uint)input.ElementCount;
+        uint epsBits;
+        *(float*)&epsBits = eps;
+        DispatchComposite(12, n, epsBits, 0, 0, 0, 0, 0,
+            ((VulkanTensor)output).DeviceBuffer,
+            ((VulkanTensor)residual).DeviceBuffer,
+            ((VulkanTensor)input).DeviceBuffer,
+            ((VulkanTensor)weight).DeviceBuffer,
+            gridOverride: 1);
+    }
+
+    public unsafe void AddRmsNorm(ITensor output, ITensor hidden, ITensor a, ITensor b, ITensor weight, float eps)
+    {
+        uint n = (uint)a.ElementCount;
+        uint epsBits;
+        *(float*)&epsBits = eps;
+        DispatchComposite(13, n, epsBits, 0, 0, 0, 0, 0,
+            ((VulkanTensor)output).DeviceBuffer,
+            ((VulkanTensor)hidden).DeviceBuffer,
+            ((VulkanTensor)a).DeviceBuffer,
+            ((VulkanTensor)b).DeviceBuffer,
+            ((VulkanTensor)weight).DeviceBuffer,
+            gridOverride: 1);
+    }
+
+    public void SplitUnequalQKV(ITensor q, ITensor k, ITensor v, ITensor qkv, int keyDim, int valueDim)
+    {
+        // GPU buffer copies with proper offsets — no CPU round-trip
+        CopyTensorRegion(q, qkv, 0, keyDim);
+        CopyTensorRegion(k, qkv, keyDim, keyDim);
+        CopyTensorRegion(v, qkv, keyDim * 2, valueDim);
+    }
+
+    public unsafe void RepeatTile(ITensor tensor, int numHeads, int headDim, int factor)
+    {
+        // Use compute shader to tile data (avoids same-buffer copy issues)
+        uint srcElems = (uint)(numHeads * headDim);
+        uint grid = (srcElems * (uint)factor + WorkGroupSize - 1) / WorkGroupSize;
+        DispatchComposite(15, srcElems, (uint)factor, 0, 0, 0, 0, 0,
+            ((VulkanTensor)tensor).DeviceBuffer,
+            gridOverride: grid);
+    }
+
     public unsafe void SiLUGate(ITensor output, ITensor data, ITensor gate)
     {
         uint n = (uint)data.ElementCount;
@@ -456,6 +532,28 @@ public sealed class VulkanBackend : IComputeBackend
         _device.SubmitAndWait(cmd =>
             VulkanApi.CmdFillBuffer(cmd, t.DeviceBuffer.Buffer, 0, VkConst.WholeSize, 0));
     }
+
+    public void CopyTensorRegion(ITensor dst, ITensor src, int srcOffset, int count)
+    {
+        var dstT = (VulkanTensor)dst;
+        var srcT = (VulkanTensor)src;
+        ulong srcByteOffset = (ulong)srcOffset * sizeof(float);
+        ulong byteCount = (ulong)count * sizeof(float);
+
+        // Record copy without barrier — caller or next dispatch handles dependency
+        _device.RecordOrSubmit(cmd =>
+        {
+            unsafe
+            {
+                var region = new VkBufferCopy { srcOffset = srcByteOffset, dstOffset = 0, size = byteCount };
+                VulkanApi.CmdCopyBuffer(cmd, srcT.DeviceBuffer.Buffer, dstT.DeviceBuffer.Buffer, 1, &region);
+            }
+        });
+        _pendingTransferBarrier = true;
+    }
+
+    // Track whether a transfer barrier is needed before the next compute dispatch
+    private bool _pendingTransferBarrier;
 
     public void CopyTensorBytes(ITensor dst, ITensor src, long byteCount)
     {
@@ -487,14 +585,63 @@ public sealed class VulkanBackend : IComputeBackend
             gridOverride: grid);
     }
 
+    // Persistent small buffer for ArgMax result (avoids allocation per token)
+    private VulkanBuffer? _argmaxResultBuf;
+
+    public unsafe int ArgMax(ITensor tensor)
+    {
+        var t = (VulkanTensor)tensor;
+        uint n = (uint)tensor.ElementCount;
+
+        if (_argmaxResultBuf == null)
+            _argmaxResultBuf = new VulkanBuffer(_device, 4, hostVisible: false, transferSrc: true, transferDst: true);
+
+        DispatchComposite(14, n, 0, 0, 0, 0, 0, 0,
+            t.DeviceBuffer, _argmaxResultBuf, gridOverride: 1);
+
+        // Read result: single uint32 = argmax index
+        // Need to flush batch and download
+        _device.EndBatch();
+        var staging = new VulkanBuffer(_device, 4, hostVisible: true, transferDst: true);
+        _device.SubmitAndWait(cmd =>
+        {
+            var region = new VkBufferCopy { size = 4 };
+            VulkanApi.CmdCopyBuffer(cmd, _argmaxResultBuf.Buffer, staging.Buffer, 1, &region);
+        });
+        var result = new byte[4];
+        staging.Download(result);
+        staging.Dispose();
+        return (int)BitConverter.ToUInt32(result);
+    }
+
     // ── Private Helpers ──────────────────────────────────────────────────────
+    private VulkanPipeline? _lastBoundPipeline;
 
     private unsafe void Dispatch(VulkanPipeline pipeline, ulong descriptorSet, void* pushConstants,
         uint pushConstantSize, uint groupX, uint groupY, uint groupZ)
     {
         _device.RecordOrSubmit(cmd =>
         {
-            VulkanApi.CmdBindPipeline(cmd, VkConst.PipelineBindPointCompute, pipeline.Pipeline);
+            // Insert transfer→compute barrier if transfers are pending
+            if (_pendingTransferBarrier)
+            {
+                var xferBarrier = new VkMemoryBarrier
+                {
+                    sType = 46,
+                    srcAccessMask = VkConst.AccessTransferWriteBit,
+                    dstAccessMask = VkConst.AccessShaderReadBit,
+                };
+                VulkanApi.CmdPipelineBarrier(cmd,
+                    VkConst.PipelineStageFlagTransferBit, VkConst.PipelineStageFlagComputeShaderBit,
+                    0, 1, &xferBarrier, 0, 0, 0, 0);
+                _pendingTransferBarrier = false;
+            }
+
+            if (!_device.IsBatchRecording || pipeline != _lastBoundPipeline)
+            {
+                VulkanApi.CmdBindPipeline(cmd, VkConst.PipelineBindPointCompute, pipeline.Pipeline);
+                _lastBoundPipeline = pipeline;
+            }
 
             ulong dsLocal = descriptorSet;
             VulkanApi.CmdBindDescriptorSets(cmd, VkConst.PipelineBindPointCompute, pipeline.PipelineLayout,
@@ -506,7 +653,39 @@ public sealed class VulkanBackend : IComputeBackend
 
             VulkanApi.CmdDispatch(cmd, groupX, groupY, groupZ);
 
-            // Memory barrier for compute → compute
+            // Memory barrier for compute → compute|transfer
+            var barrier = new VkMemoryBarrier
+            {
+                sType = 46,
+                srcAccessMask = VkConst.AccessShaderWriteBit,
+                dstAccessMask = VkConst.AccessShaderReadBit | VkConst.AccessTransferReadBit,
+            };
+            VulkanApi.CmdPipelineBarrier(cmd,
+                VkConst.PipelineStageFlagComputeShaderBit,
+                VkConst.PipelineStageFlagComputeShaderBit | VkConst.PipelineStageFlagTransferBit,
+                0, 1, &barrier, 0, 0, 0, 0);
+        });
+    }
+
+    /// <summary>
+    /// Dispatch using buffer device addresses (no descriptor sets).
+    /// </summary>
+    private unsafe void DispatchBda(VulkanPipeline pipeline, void* pushConstants,
+        uint pushConstantSize, uint groupX, uint groupY, uint groupZ)
+    {
+        _device.RecordOrSubmit(cmd =>
+        {
+            if (!_device.IsBatchRecording || pipeline != _lastBoundPipeline)
+            {
+                VulkanApi.CmdBindPipeline(cmd, VkConst.PipelineBindPointCompute, pipeline.Pipeline);
+                _lastBoundPipeline = pipeline;
+            }
+
+            VulkanApi.CmdPushConstants(cmd, pipeline.PipelineLayout, VkConst.ShaderStageComputeBit,
+                0, pushConstantSize, pushConstants);
+
+            VulkanApi.CmdDispatch(cmd, groupX, groupY, groupZ);
+
             var barrier = new VkMemoryBarrier
             {
                 sType = 46,
@@ -615,11 +794,14 @@ public sealed class VulkanBackend : IComputeBackend
     {
         if (!_disposed)
         {
+            _argmaxResultBuf?.Dispose();
             _conv1dTempBuf?.Dispose();
             _deltanetPipeline.Dispose();
             _attentionPipeline.Dispose();
             _compositePipeline.Dispose();
             _embeddingPipeline.Dispose();
+            _matmulQ8AlignedPipeline.Dispose();
+            _matmulBdaPipeline.Dispose();
             _matmulPipeline.Dispose();
             _elementOpsPipeline.Dispose();
             _ropePipeline.Dispose();

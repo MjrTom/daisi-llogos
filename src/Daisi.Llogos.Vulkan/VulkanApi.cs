@@ -215,6 +215,11 @@ internal static partial class VulkanApi
     [LibraryImport(Lib, EntryPoint = "vkQueueWaitIdle")]
     internal static partial VkResult QueueWaitIdle(nint queue);
 
+    // ── Buffer Device Address ──────────────────────────────────────────────────
+
+    [LibraryImport(Lib, EntryPoint = "vkGetBufferDeviceAddress")]
+    internal static unsafe partial ulong GetBufferDeviceAddress(nint device, VkBufferDeviceAddressInfo* pInfo);
+
     // ── Helpers ───────────────────────────────────────────────────────────────
 
     internal static void Check(VkResult result, string operation)
