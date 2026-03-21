@@ -278,7 +278,6 @@ __global__ void dequant_matmul_q8_0_aligned(float* __restrict__ output,
 
     for (int blk = tid; blk < blocks_per_row; blk += blockSize)
     {
-        // Use __ldg for read-only activation loads (texture cache path)
         const float4* ap = reinterpret_cast<const float4*>(a + blk * 32);
         float4 a_cache[8];
         #pragma unroll
@@ -621,7 +620,6 @@ __global__ void dequant_matmul_q4_k(float* output, const float* a,
         int sb = item / 4;
         int chunk = item % 4;
 
-        // Load activation once (shared across rows)
         const float4* ap4Lo = reinterpret_cast<const float4*>(a + sb * 256 + chunk * 64);
         const float4* ap4Hi = reinterpret_cast<const float4*>(a + sb * 256 + chunk * 64 + 32);
 
@@ -635,7 +633,6 @@ __global__ void dequant_matmul_q4_k(float* output, const float* a,
             asumHi += aHiCache[l].x + aHiCache[l].y + aHiCache[l].z + aHiCache[l].w;
         }
 
-        // Process each row
         #pragma unroll
         for (int r = 0; r < Q4K_ROWS_PER_BLOCK; r++)
         {
