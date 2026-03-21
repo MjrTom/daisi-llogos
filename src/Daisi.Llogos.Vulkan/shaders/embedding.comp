@@ -9,7 +9,7 @@ layout(local_size_x = 256) in;
 layout(push_constant) uniform PushConstants {
     uint hiddenDim;
     int tokenId;
-    uint tableType; // 0=F32, 1=Q8_0, 2=F16, 3=Q4_K
+    uint tableType; // 0=F32, 1=Q8_0, 2=F16, 3=Q4_K, 4=Q8_0_aligned
 };
 
 layout(set = 0, binding = 0) buffer OutputBuf { float output_data[]; };
@@ -78,5 +78,15 @@ void main() {
         uint nibble = (isHi != 0u) ? (packed >> 4) : (packed & 0xFu);
 
         output_data[idx] = d * float(sc) * float(nibble) - dmin * float(m);
+    } else if (tableType == 4) {
+        // Aligned Q8_0: 36-byte blocks (2b scale + 2b pad + 32 int8 quants)
+        uint blocksPerRow = hiddenDim / 32;
+        uint blockIdx = idx / 32;
+        uint blockOffset = idx % 32;
+        uint blockByteOff = (uint(tokenId) * blocksPerRow + blockIdx) * 36;
+        uint scaleBits = uint(table_data[blockByteOff]) | (uint(table_data[blockByteOff + 1]) << 8);
+        float scale = unpackHalf2x16(scaleBits).x;
+        int8_t q = int8_t(table_data[blockByteOff + 4 + blockOffset]); // quants at offset 4
+        output_data[idx] = scale * float(q);
     }
 }
