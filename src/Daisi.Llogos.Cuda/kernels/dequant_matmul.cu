@@ -291,7 +291,6 @@ __global__ void dequant_matmul_q8_0_aligned(float* __restrict__ output,
             if (n >= N) break;
             const unsigned char* block_ptr = b + (long)n * bytes_per_row + blk * 36;
             float scale = fp16_to_fp32(__ldg(reinterpret_cast<const unsigned short*>(block_ptr)));
-            // Native uint reads via __ldg for read-only weight data
             const unsigned int* q32 = reinterpret_cast<const unsigned int*>(block_ptr + 4);
             float bs = 0.0f;
             #pragma unroll

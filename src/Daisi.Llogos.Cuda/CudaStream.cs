@@ -22,11 +22,10 @@ internal sealed class CudaStream : IDisposable
                               uint blockX, uint blockY, uint blockZ,
                               uint sharedMem, nint* kernelParams)
     {
-        CudaApi.Check(
-            CudaApi.LaunchKernel(function, gridX, gridY, gridZ,
-                                 blockX, blockY, blockZ,
-                                 sharedMem, _handle, kernelParams, null),
-            "cuLaunchKernel");
+        // Skip error check on hot path — launches are fire-and-forget, errors caught at sync
+        CudaApi.LaunchKernel(function, gridX, gridY, gridZ,
+                             blockX, blockY, blockZ,
+                             sharedMem, _handle, kernelParams, null);
     }
 
     public void Synchronize()
