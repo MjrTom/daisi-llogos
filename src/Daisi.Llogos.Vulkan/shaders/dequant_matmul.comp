@@ -3,7 +3,7 @@
 #extension GL_EXT_shader_explicit_arithmetic_types_int8 : enable
 #extension GL_EXT_shader_16bit_storage : enable
 #extension GL_EXT_shader_explicit_arithmetic_types_float16 : enable
-#extension GL_KHR_shader_subgroup_arithmetic : enable
+// Subgroup ops disabled — using barrier-based reduction for compatibility
 
 layout(local_size_x = 256) in;
 
@@ -19,7 +19,7 @@ layout(set = 0, binding = 1) buffer InputBuf { float input_data[]; };
 layout(set = 0, binding = 2) buffer WeightBuf { uint8_t weight_data[]; };
 
 // Shared memory for cross-subgroup reduction
-shared float sdata[8]; // 256 threads / 32 per subgroup = 8 subgroups
+shared float sdata[256]; // one per thread for barrier-based reduction
 
 void main() {
     uint row = gl_WorkGroupID.x; // output neuron
@@ -212,22 +212,14 @@ void main() {
         }
     }
 
-    // Subgroup reduction (fast warp-level shuffle)
-    acc = subgroupAdd(acc);
-
-    // Cross-subgroup reduction via shared memory
-    uint subgroupId = gl_SubgroupID;
-    uint subgroupLane = gl_SubgroupInvocationID;
-    if (subgroupLane == 0)
-        sdata[subgroupId] = acc;
+    // Shared memory reduction (256 threads)
+    sdata[tid] = acc;
     barrier();
-
-    // First subgroup reduces across all subgroups
-    if (subgroupId == 0) {
-        uint numSubgroups = gl_NumSubgroups;
-        acc = (subgroupLane < numSubgroups) ? sdata[subgroupLane] : 0.0;
-        acc = subgroupAdd(acc);
-        if (subgroupLane == 0)
-            output_data[row] = acc;
+    for (uint s = blockSize / 2; s > 0; s >>= 1) {
+        if (tid < s) sdata[tid] += sdata[tid + s];
+        barrier();
     }
+
+    if (tid == 0)
+        output_data[row] = sdata[0];
 }
