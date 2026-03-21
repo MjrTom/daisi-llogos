@@ -855,6 +855,7 @@ public sealed class CudaBackend : IComputeBackend
     /// <inheritdoc />
     public void ZeroTensor(ITensor tensor)
     {
+        _context.MakeCurrent();
         var t = (CudaTensor)tensor;
         CudaApi.Check(CudaApi.MemsetD8(t.DevicePtr, 0, (ulong)t.ByteSize), "cuMemsetD8");
     }
