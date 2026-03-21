@@ -330,6 +330,17 @@ public interface IComputeBackend : IDisposable
     }
 
     /// <summary>
+    /// Fused: hidden[i] += b[i]; residual[i] = hidden[i]; output[i] = RmsNorm(hidden, weight).
+    /// Combines ElementAdd + CopyTensor + RmsNorm across layer boundaries (saves 2 launches).
+    /// </summary>
+    void AddRmsNormResidual(ITensor output, ITensor hidden, ITensor residual, ITensor b, ITensor weight, float eps)
+    {
+        ElementAdd(hidden, hidden, b);
+        CopyTensor(residual, hidden);
+        RmsNorm(output, hidden, weight, eps);
+    }
+
+    /// <summary>
     /// Fused SwiGLU: output[i] = SiLU(gate[i]) * up[i].
     /// Saves one kernel launch vs SiLU + ElementMul.
     /// </summary>
