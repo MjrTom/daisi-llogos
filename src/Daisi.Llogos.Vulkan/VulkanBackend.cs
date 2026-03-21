@@ -472,6 +472,20 @@ public sealed class VulkanBackend : IComputeBackend
             gridOverride: 1);
     }
 
+    public unsafe void AddRmsNormResidual(ITensor output, ITensor hidden, ITensor residual, ITensor b, ITensor weight, float eps)
+    {
+        uint n = (uint)hidden.ElementCount;
+        uint epsBits;
+        *(float*)&epsBits = eps;
+        DispatchComposite(16, n, epsBits, 0, 0, 0, 0, 0,
+            ((VulkanTensor)output).DeviceBuffer,
+            ((VulkanTensor)hidden).DeviceBuffer,
+            ((VulkanTensor)residual).DeviceBuffer,
+            ((VulkanTensor)b).DeviceBuffer,
+            ((VulkanTensor)weight).DeviceBuffer,
+            gridOverride: 1);
+    }
+
     public unsafe void AddRmsNorm(ITensor output, ITensor hidden, ITensor a, ITensor b, ITensor weight, float eps)
     {
         uint n = (uint)a.ElementCount;

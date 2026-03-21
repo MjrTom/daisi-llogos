@@ -379,6 +379,41 @@ __global__ void rms_norm_residual(float* output, float* residual, const float* i
         output[i] = input[i] * inv_rms * weight[i];
 }
 
+// ── Fused: ElementAdd + RmsNormResidual ──────────────────────────────────────
+// hidden[i] += b[i]; residual[i] = hidden[i]; output[i] = RmsNorm(hidden, weight)
+// Fuses ElementAdd + CopyTensor + RmsNorm across layer boundaries.
+__global__ void add_rms_norm_residual(float* output, float* hidden, float* residual,
+                                       const float* b, const float* weight,
+                                       int n, float eps)
+{
+    extern __shared__ float sdata[];
+    int tid = threadIdx.x;
+    int stride = blockDim.x;
+
+    float sum = 0.0f;
+    for (int i = tid; i < n; i += stride)
+    {
+        float v = hidden[i] + b[i];
+        hidden[i] = v;
+        residual[i] = v;
+        sum += v * v;
+    }
+
+    sdata[tid] = sum;
+    __syncthreads();
+
+    for (int s = blockDim.x / 2; s > 0; s >>= 1)
+    {
+        if (tid < s) sdata[tid] += sdata[tid + s];
+        __syncthreads();
+    }
+
+    float inv_rms = 1.0f / sqrtf(sdata[0] / (float)n + eps);
+
+    for (int i = tid; i < n; i += stride)
+        output[i] = hidden[i] * inv_rms * weight[i];
+}
+
 // ── Fused: SwiGLU (SiLU + ElementMul) ────────────────────────────────────────
 // output[i] = (gate[i] * sigmoid(gate[i])) * up[i]
 // Saves one kernel launch + two memory round-trips.
@@ -403,7 +438,6 @@ __global__ void add_rms_norm(float* output, float* hidden, const float* a, const
     int tid = threadIdx.x;
     int stride = blockDim.x;
 
-    // Pass 1: add + sum of squares
     float sum = 0.0f;
     for (int i = tid; i < n; i += stride)
     {
@@ -423,7 +457,6 @@ __global__ void add_rms_norm(float* output, float* hidden, const float* a, const
 
     float inv_rms = 1.0f / sqrtf(sdata[0] / (float)n + eps);
 
-    // Pass 2: normalize from hidden
     for (int i = tid; i < n; i += stride)
         output[i] = hidden[i] * inv_rms * weight[i];
 }
