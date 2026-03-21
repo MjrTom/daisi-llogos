@@ -9,7 +9,7 @@
 // the dot product with warp-level reduction. This maximizes SM occupancy.
 
 // FP16 → FP32 conversion using bit manipulation
-__device__ float fp16_to_fp32(unsigned short h)
+__device__ __forceinline__ float fp16_to_fp32(unsigned short h)
 {
     unsigned int sign = (h >> 15) & 1;
     unsigned int exp_val = (h >> 10) & 0x1f;
@@ -37,7 +37,7 @@ __device__ float fp16_to_fp32(unsigned short h)
 }
 
 // Warp-level reduction using shuffle
-__device__ float warp_reduce_sum(float val)
+__device__ __forceinline__ float warp_reduce_sum(float val)
 {
     for (int offset = 16; offset > 0; offset >>= 1)
         val += __shfl_down_sync(0xffffffff, val, offset);
@@ -588,7 +588,7 @@ __global__ void dequant_matmul_f16(float* output, const float* a,
 // Layout: 2b d(f16) + 2b dmin(f16) + 12b packed scales/mins + 128b nibbles.
 // Grid: N blocks, Block: 32 threads.
 
-__device__ void unpack_q4k_scales(const unsigned char* sb,
+__device__ __forceinline__ void unpack_q4k_scales(const unsigned char* sb,
     int j, float d, float dmin, float &sub_scale, float &sub_min)
 {
     int sc, m;
