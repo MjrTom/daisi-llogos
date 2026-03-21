@@ -45,8 +45,26 @@ public sealed class VulkanBackend : IComputeBackend
     public ITensor CreateTensor(string name, GgmlType type, ReadOnlySpan<long> dimensions) =>
         new VulkanTensor(_device, name, type, dimensions);
 
-    public ITensor LoadTensor(string name, GgmlType type, ReadOnlySpan<long> dimensions, ReadOnlySpan<byte> data) =>
-        new VulkanTensor(_device, name, type, dimensions, data);
+    public ITensor LoadTensor(string name, GgmlType type, ReadOnlySpan<long> dimensions, ReadOnlySpan<byte> data)
+    {
+        // Repack Q8_0 to aligned 36-byte blocks — DISABLED: needs embedding lookup fix
+        if (false && type == GgmlType.Q8_0 && dimensions.Length >= 2 && dimensions[0] >= 2048)
+        {
+            int blockCount = data.Length / 34;
+            var aligned = new byte[blockCount * 36];
+            for (int i = 0; i < blockCount; i++)
+            {
+                int srcOff = i * 34;
+                int dstOff = i * 36;
+                aligned[dstOff] = data[srcOff];
+                aligned[dstOff + 1] = data[srcOff + 1];
+                data.Slice(srcOff + 2, 32).CopyTo(aligned.AsSpan(dstOff + 4, 32));
+            }
+            return new VulkanTensor(_device, name, type, dimensions, aligned, isAlignedQ8_0: true);
+        }
+
+        return new VulkanTensor(_device, name, type, dimensions, data);
+    }
 
     // ── Math Operations ──────────────────────────────────────────────────────
 
@@ -57,9 +75,13 @@ public sealed class VulkanBackend : IComputeBackend
         var bT = (VulkanTensor)b;
 
         // Check if this type has a GPU shader implementation
+        // Check for aligned Q8_0 (repacked at load time)
+        bool isAlignedQ8 = bT is VulkanTensor vt && vt.IsAlignedQ8_0;
+
         uint? weightTypeOpt = b.Type switch
         {
             GgmlType.F32 => 0u,
+            GgmlType.Q8_0 when isAlignedQ8 => 7u, // aligned 36-byte blocks
             GgmlType.Q8_0 => 1u,
             GgmlType.TQ1_0 => 2u,
             GgmlType.I2_S => 3u,

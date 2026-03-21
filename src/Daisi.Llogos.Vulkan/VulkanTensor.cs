@@ -28,11 +28,24 @@ public sealed class VulkanTensor : ITensor
         StagingBuffer = new VulkanBuffer(vkDevice, bufSize, hostVisible: true, transferSrc: true, transferDst: true);
     }
 
-    internal VulkanTensor(VulkanDevice vkDevice, string name, GgmlType type, ReadOnlySpan<long> dimensions, ReadOnlySpan<byte> data)
-        : this(vkDevice, name, type, dimensions)
+    internal VulkanTensor(VulkanDevice vkDevice, string name, GgmlType type, ReadOnlySpan<long> dimensions, ReadOnlySpan<byte> data,
+        bool isAlignedQ8_0 = false)
     {
+        _vkDevice = vkDevice;
+        Name = name;
+        Type = type;
+        IsAlignedQ8_0 = isAlignedQ8_0;
+        _dimensions = dimensions.ToArray();
+        ElementCount = ComputeElementCount(dimensions);
+        ByteSize = isAlignedQ8_0 ? (ElementCount / 32) * 36 : (long)GgmlTypeInfo.ByteSize(type, (ulong)ElementCount);
+
+        ulong bufSize = (ulong)Math.Max(ByteSize, 4);
+        DeviceBuffer = new VulkanBuffer(vkDevice, bufSize, hostVisible: false, transferSrc: true, transferDst: true);
+        StagingBuffer = new VulkanBuffer(vkDevice, bufSize, hostVisible: true, transferSrc: true, transferDst: true);
         UploadFromHost(data);
     }
+
+    internal bool IsAlignedQ8_0 { get; }
 
     public string Name { get; }
     public GgmlType Type { get; }
