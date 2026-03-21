@@ -360,17 +360,26 @@ public sealed class VulkanBackend : IComputeBackend
         Dispatch(_attentionPipeline, ds, pc, 32, (uint)numHeads, 1, 1);
     }
 
+    // Persistent temp buffer for CausalConv1d (must outlive batched command buffers)
+    private VulkanBuffer? _conv1dTempBuf;
+    private int _conv1dTempSize;
+
     public unsafe void CausalConv1d(ITensor qkv, ITensor convBuffer, ITensor convWeight, int channels, int kernelSize)
     {
-        // Need a temp buffer for the conv1d
-        using var tempBuf = new VulkanBuffer(_device, (ulong)(channels * 4), hostVisible: false, transferSrc: true, transferDst: true);
+        // Use persistent temp buffer (not `using` — must survive until batch completes)
+        if (_conv1dTempBuf == null || _conv1dTempSize < channels)
+        {
+            _conv1dTempBuf?.Dispose();
+            _conv1dTempBuf = new VulkanBuffer(_device, (ulong)(channels * 4), hostVisible: false, transferSrc: true, transferDst: true);
+            _conv1dTempSize = channels;
+        }
         uint grid = ((uint)channels + WorkGroupSize - 1) / WorkGroupSize;
 
         DispatchComposite(8, (uint)channels, (uint)kernelSize, 0, 0, 0, 0, 0,
             ((VulkanTensor)qkv).DeviceBuffer,
             ((VulkanTensor)convBuffer).DeviceBuffer,
             ((VulkanTensor)convWeight).DeviceBuffer,
-            tempBuf,
+            _conv1dTempBuf,
             gridOverride: grid);
     }
 
@@ -601,6 +610,7 @@ public sealed class VulkanBackend : IComputeBackend
     {
         if (!_disposed)
         {
+            _conv1dTempBuf?.Dispose();
             _deltanetPipeline.Dispose();
             _attentionPipeline.Dispose();
             _compositePipeline.Dispose();
