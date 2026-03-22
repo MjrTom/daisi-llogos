@@ -66,7 +66,7 @@ public sealed class ForwardPass : IForwardPass
         _weights = weights;
         _kvCache = kvCache;
         _deltaState = deltaState;
-        ArgMaxVocabLimit = config.VocabSize / 4;
+        ArgMaxVocabLimit = config.VocabSize / 32;
 
         _hidden = CreateF32("scratch_hidden", config.HiddenDim);
         _residual = CreateF32("scratch_residual", config.HiddenDim);
