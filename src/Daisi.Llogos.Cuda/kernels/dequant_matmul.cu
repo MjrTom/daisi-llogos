@@ -843,7 +843,7 @@ void dequant_matmul_q4_0_q8_1(float* __restrict__ output,
     const int blocks_per_row = K / 32;
     const long bytes_per_row = (long)blocks_per_row * 20;
     const unsigned char* a_q8_1 = (const unsigned char*)vq8_1;
-    const int nwarps = Q4_0_DP4A_THREADS / 32;
+    const int nwarps = Q4_0_DP4A_THREADS 256/ 32;
 
     float sums[Q4_0_DP4A_ROWS] = {0};
 
@@ -854,6 +854,10 @@ void dequant_matmul_q4_0_q8_1(float* __restrict__ output,
         float a_d = fp16_to_fp32(*reinterpret_cast<const unsigned short*>(ablk));
         float a_s = fp16_to_fp32(*reinterpret_cast<const unsigned short*>(ablk + 2));
         const int* a_qs = reinterpret_cast<const int*>(ablk + 4);
+        // Prefetch activation quants into registers (4-byte aligned, use uint32 loads)
+        int a_q[8];
+        #pragma unroll
+        for (int i = 0; i < 8; i++) a_q[i] = a_qs[i];
 
         // Preload weight scale + nibbles for all rows (issue all reads before compute)
         float w_scales[Q4_0_DP4A_ROWS];
@@ -886,15 +890,15 @@ void dequant_matmul_q4_0_q8_1(float* __restrict__ output,
             for (int i = 0; i < 4; i++) {
                 int vi0 = (int)(w_nibs[r][i] & 0x0F0F0F0F);
                 int vi1 = (int)((w_nibs[r][i] >> 4) & 0x0F0F0F0F);
-                sumi = __dp4a(vi0, a_qs[i], sumi);
-                sumi = __dp4a(vi1, a_qs[i + 4], sumi);
+                sumi = __dp4a(vi0, a_q[i], sumi);
+                sumi = __dp4a(vi1, a_q[i + 4], sumi);
             }
             sums[r] += w_scales[r] * ((float)sumi * a_d - 8.0f * a_s);
         }
     }
 
     // Warp + cross-warp reduction
-    __shared__ float smem[Q4_0_DP4A_THREADS / 32][Q4_0_DP4A_ROWS];
+    __shared__ float smem[Q4_0_DP4A_THREADS 256/ 32][Q4_0_DP4A_ROWS];
 
     #pragma unroll
     for (int r = 0; r < Q4_0_DP4A_ROWS; r++) {
