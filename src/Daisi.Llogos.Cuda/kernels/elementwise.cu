@@ -946,4 +946,79 @@ __global__ void squared_relu(float* data, int n)
     }
 }
 
+// ── Dequantize weight tensor to FP32 (for batch matmul) ─────────────────────
+// Generic kernel that handles Q8_0, Q4_0, Q4_K, Q6_K, F16 etc.
+// Each thread dequantizes one element.
+
+__device__ float fp16_to_fp32_dq(unsigned short h)
+{
+    float result;
+    asm("cvt.f32.f16 %0, %1;" : "=f"(result) : "h"(h));
+    return result;
+}
+
+__global__ void dequant_to_f32(float* __restrict__ output,
+                                const unsigned char* __restrict__ input,
+                                int totalElements, int typeTag, int blockSizeQ)
+{
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= totalElements) return;
+
+    int blk = idx / blockSizeQ;
+    int elem = idx % blockSizeQ;
+
+    float val = 0.0f;
+
+    if (typeTag == 8) { // Q8_0: 36 bytes per 32 elements (aligned: scale+pad+quants)
+        const unsigned char* bp = input + blk * 36;
+        float scale = fp16_to_fp32_dq(((unsigned short)bp[1] << 8) | bp[0]);
+        val = scale * (float)((signed char)bp[4 + elem]);
+    }
+    else if (typeTag == 2) { // Q4_0: 20 bytes per 32 elements (aligned: scale+pad+nibbles)
+        const unsigned char* bp = input + blk * 20;
+        float scale = fp16_to_fp32_dq(((unsigned short)bp[1] << 8) | bp[0]);
+        if (elem < 16) {
+            val = scale * (float)((int)(bp[4 + elem] & 0xF) - 8);
+        } else {
+            val = scale * (float)((int)(bp[4 + elem - 16] >> 4) - 8);
+        }
+    }
+    else if (typeTag == 1) { // F16: 2 bytes per element
+        const unsigned char* bp = input + idx * 2;
+        val = fp16_to_fp32_dq(((unsigned short)bp[1] << 8) | bp[0]);
+    }
+    else if (typeTag == 12) { // Q4_K: 144 bytes per 256 elements
+        const unsigned char* sbp = input + blk * 144;
+        float d = fp16_to_fp32_dq(((unsigned short)sbp[1] << 8) | sbp[0]);
+        float dmin = fp16_to_fp32_dq(((unsigned short)sbp[3] << 8) | sbp[2]);
+        int chunk = elem / 64;
+        int pos = elem % 64;
+        int l = pos % 32;
+        int is_hi = pos / 32;
+        int j = chunk * 2 + is_hi;
+        int sc, m;
+        if (j < 4) { sc = sbp[4+j] & 63; m = sbp[8+j] & 63; }
+        else { sc = (sbp[4+j+4]&0xF)|((sbp[4+j-4]>>6)<<4); m = (sbp[4+j+4]>>4)|((sbp[4+j]>>6)<<4); }
+        unsigned char packed = sbp[16 + chunk * 32 + l];
+        int nibble = is_hi ? (packed >> 4) : (packed & 0xF);
+        val = d * (float)sc * (float)nibble - dmin * (float)m;
+    }
+    else if (typeTag == 14) { // Q6_K: 210 bytes per 256 elements
+        const unsigned char* sbp = input + blk * 210;
+        float d = fp16_to_fp32_dq(((unsigned short)sbp[209] << 8) | sbp[208]);
+        int half = elem / 128;
+        int rem = elem % 128;
+        int quadrant = rem / 32;
+        int l = rem % 32;
+        int qlOff = half * 64 + (quadrant & 1) * 32;
+        int qlShift = (quadrant >> 1) * 4;
+        int qhShift = quadrant * 2;
+        int q = (((sbp[qlOff + l] >> qlShift) & 0xF) | (((sbp[128 + half*32 + l] >> qhShift) & 3) << 4)) - 32;
+        float sc = d * (float)((signed char)sbp[192 + half*8 + quadrant*2 + l/16]);
+        val = sc * (float)q;
+    }
+
+    output[idx] = val;
+}
+
 } // extern "C"
