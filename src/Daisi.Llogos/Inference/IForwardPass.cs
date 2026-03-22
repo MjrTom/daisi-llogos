@@ -16,6 +16,20 @@ public interface IForwardPass : IDisposable
 
     IKvCache KvCache { get; }
 
+    /// <summary>Whether this model supports batched prefill.</summary>
+    bool SupportsBatchedPrefill => false;
+
+    /// <summary>
+    /// Process M tokens through all transformer layers in parallel.
+    /// Only for models that support batched prefill (pure standard attention, CUDA backend).
+    /// </summary>
+    void ForwardBatchedPrefill(int[] tokenIds, int startPosition)
+    {
+        // Default: sequential fallback
+        for (int i = 0; i < tokenIds.Length; i++)
+            ForwardHidden(tokenIds[i], startPosition + i);
+    }
+
     /// <summary>
     /// Reset all inference state (KV cache, SSM state, etc.) for a new sequence.
     /// </summary>

@@ -22,6 +22,16 @@ public interface IKvCache : IDisposable
     /// <summary>Write K/V for a position, mapped through the attention strategy.</summary>
     void Write(IComputeBackend backend, int layer, int position, ITensor k, ITensor v);
 
+    /// <summary>
+    /// Write M K/V pairs at consecutive positions [startPos..startPos+M-1].
+    /// k: [M × nKvHeads × keyLength], v: [M × nKvHeads × valueLength].
+    /// Default: sequential fallback using single-token Write.
+    /// </summary>
+    void BatchedWrite(IComputeBackend backend, int layer, int startPosition, int M, ITensor k, ITensor v)
+    {
+        throw new NotSupportedException("BatchedWrite requires a KV cache implementation that supports it (PagedKvCache).");
+    }
+
     /// <summary>Get the K cache tensor for an attention layer (contiguous, suitable for GatedAttention).</summary>
     ITensor GetKCacheTensor(int layer);
 

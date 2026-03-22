@@ -128,6 +128,43 @@ public interface IComputeBackend : IDisposable
         int maxSeqLen, int seqLen, float scale);
 
     /// <summary>
+    /// Batched RoPE: apply rotary position embedding to M tokens.
+    /// q: [M × numHeads × headDim], k: [M × numKvHeads × headDim].
+    /// Positions are [startPosition .. startPosition + M - 1].
+    /// </summary>
+    void BatchedRoPE(ITensor q, ITensor k, int headDim, int ropeDim,
+        int startPosition, float ropeTheta, int numHeads, int numKvHeads)
+    {
+        // Default: not supported, batched prefill requires CUDA backend
+        throw new NotSupportedException("BatchedRoPE requires a backend with batched prefill support (CUDA).");
+    }
+
+    /// <summary>
+    /// Write M K/V pairs at consecutive positions [startPos..startPos+M-1].
+    /// k: [M × nKvHeads × keyLength], v: [M × nKvHeads × valueLength].
+    /// </summary>
+    void BatchedKvCacheWrite(ITensor kCache, ITensor vCache, ITensor k, ITensor v,
+        int nKvHeads, int keyLength, int valueLength, int maxSeqLen, int startPosition, int M)
+    {
+        throw new NotSupportedException("BatchedKvCacheWrite requires a backend with batched prefill support (CUDA).");
+    }
+
+    /// <summary>
+    /// Batched causal attention for M query tokens.
+    /// qAttn: [M × numHeads × keyLength], qGate: [M × numHeads × keyLength].
+    /// output: [M × numHeads × valueLength].
+    /// Each query m attends to keys [0..startPosition+m] (causal mask).
+    /// KV cache must already contain all entries up to startPosition+M-1.
+    /// </summary>
+    void BatchedGatedAttention(ITensor output, ITensor qAttn, ITensor qGate,
+        ITensor kCache, ITensor vCache,
+        int numHeads, int numKvHeads, int keyLength, int valueLength,
+        int maxSeqLen, int startPosition, int M, float scale)
+    {
+        throw new NotSupportedException("BatchedGatedAttention requires a backend with batched prefill support (CUDA).");
+    }
+
+    /// <summary>
     /// Apply depthwise causal conv1d with shift buffer.
     /// Modifies qkv in-place and updates convBuffer.
     /// </summary>
@@ -212,6 +249,16 @@ public interface IComputeBackend : IDisposable
     {
         CopyTensorBytes(dst, src, (long)count * sizeof(float));
         // Default implementation doesn't handle offset — backends override for efficiency
+    }
+
+    /// <summary>
+    /// Copy 'count' floats from src at srcOffset to dst at dstOffset.
+    /// Used for placing slices into larger batched tensors.
+    /// </summary>
+    void CopyTensorSlice(ITensor dst, int dstOffset, ITensor src, int srcOffset, int count)
+    {
+        // Default: use CopyTensorRegion for srcOffset→0, then shift. Backends override.
+        throw new NotSupportedException("CopyTensorSlice requires backend support.");
     }
 
     /// <summary>

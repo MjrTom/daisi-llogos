@@ -187,6 +187,46 @@ __global__ void kv_cache_write(void* kCache, void* vCache,
     }
 }
 
+// ── Batched KV cache write ───────────────────────────────────────────────────
+// Write M K/V pairs at consecutive positions [startPos..startPos+M-1].
+// k: [M × nKvHeads × keyLength], v: [M × nKvHeads × valueLength]
+// kCache: [nKvHeads × maxSeqLen × keyLength], vCache: [nKvHeads × maxSeqLen × valueLength]
+
+__global__ void batched_kv_cache_write(void* kCache, void* vCache,
+                                        const float* k, const float* v,
+                                        int nKvHeads, int keyLength, int valueLength,
+                                        int maxSeqLen, int startPosition, int M,
+                                        int cacheIsFp16)
+{
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    int totalK = M * nKvHeads * keyLength;
+    int totalV = M * nKvHeads * valueLength;
+
+    // Write K
+    if (idx < totalK)
+    {
+        int token = idx / (nKvHeads * keyLength);
+        int rem = idx % (nKvHeads * keyLength);
+        int head = rem / keyLength;
+        int dim = rem % keyLength;
+        int position = startPosition + token;
+        int cache_idx = head * maxSeqLen * keyLength + position * keyLength + dim;
+        store_cache_val(kCache, cache_idx, k[idx], cacheIsFp16);
+    }
+
+    // Write V
+    if (idx < totalV)
+    {
+        int token = idx / (nKvHeads * valueLength);
+        int rem = idx % (nKvHeads * valueLength);
+        int head = rem / valueLength;
+        int dim = rem % valueLength;
+        int position = startPosition + token;
+        int cache_idx = head * maxSeqLen * valueLength + position * valueLength + dim;
+        store_cache_val(vCache, cache_idx, v[idx], cacheIsFp16);
+    }
+}
+
 // ── Gated Attention (Tiled / Flash) ─────────────────────────────────────────
 // One block per attention head. Uses online softmax to tile the computation,
 // so shared memory usage is O(tileSize + blockDim) regardless of context length.
@@ -228,6 +268,131 @@ __global__ void gated_attention(float* output,
     __syncthreads();
 
     // Online softmax state (same across all threads after reductions)
+    float running_max = -1e30f;
+    float running_sum = 0.0f;
+
+    // Process tiles
+    for (int tile_start = 0; tile_start < seqLen; tile_start += ATTN_TILE_SIZE)
+    {
+        int tile_end = tile_start + ATTN_TILE_SIZE;
+        if (tile_end > seqLen) tile_end = seqLen;
+        int tile_len = tile_end - tile_start;
+
+        // Compute attention scores for this tile: q @ K_tile^T * scale
+        for (int t = tid; t < tile_len; t += stride)
+        {
+            float dot = 0.0f;
+            int kOffset = kBaseOffset + (tile_start + t) * keyLength;
+            for (int d = 0; d < keyLength; d++)
+                dot += q[d] * load_cache_val(kCache, kOffset + d, cacheIsFp16);
+            scores[t] = dot * scale;
+        }
+        __syncthreads();
+
+        // Find tile max via reduction
+        float local_max = -1e30f;
+        for (int t = tid; t < tile_len; t += stride)
+            local_max = fmaxf(local_max, scores[t]);
+        temp[tid] = local_max;
+        __syncthreads();
+        for (int s = blockDim.x / 2; s > 0; s >>= 1) {
+            if (tid < s) temp[tid] = fmaxf(temp[tid], temp[tid + s]);
+            __syncthreads();
+        }
+        float tile_max = temp[0];
+        __syncthreads();
+
+        // Compute exp(scores - tile_max) and tile sum
+        float local_sum = 0.0f;
+        for (int t = tid; t < tile_len; t += stride) {
+            float val = expf(scores[t] - tile_max);
+            scores[t] = val;
+            local_sum += val;
+        }
+        temp[tid] = local_sum;
+        __syncthreads();
+        for (int s = blockDim.x / 2; s > 0; s >>= 1) {
+            if (tid < s) temp[tid] += temp[tid + s];
+            __syncthreads();
+        }
+        float tile_sum = temp[0];
+        __syncthreads();
+
+        // Online softmax merge: rescale running output
+        float new_max = fmaxf(running_max, tile_max);
+        float correction_old = expf(running_max - new_max);
+        float correction_new = expf(tile_max - new_max);
+
+        // Update output: rescale old accumulation + add new tile's weighted V
+        for (int d = tid; d < valueLength; d += stride)
+        {
+            float tile_val = 0.0f;
+            for (int t = 0; t < tile_len; t++)
+            {
+                int vIdx = vBaseOffset + (tile_start + t) * valueLength + d;
+                tile_val += scores[t] * load_cache_val(vCache, vIdx, cacheIsFp16);
+            }
+            outHead[d] = outHead[d] * correction_old + tile_val * correction_new;
+        }
+        __syncthreads();
+
+        running_sum = running_sum * correction_old + tile_sum * correction_new;
+        running_max = new_max;
+    }
+
+    // Normalize by total sum and apply sigmoid gating
+    float inv_sum = (running_sum > 0.0f) ? 1.0f / running_sum : 0.0f;
+    for (int d = tid; d < valueLength; d += stride)
+    {
+        float g = (d < keyLength) ? qg[d] : 0.0f;
+        float sig = 1.0f / (1.0f + expf(-g));
+        outHead[d] = outHead[d] * inv_sum * sig;
+    }
+}
+
+// ── Batched Gated Attention (Causal) ─────────────────────────────────────────
+// Process M query tokens in parallel with causal masking.
+// Grid: (M * numHeads) blocks. Block (m * numHeads + h) handles query token m, head h.
+// qAttn: [M × numHeads × keyLength], qGate: [M × numHeads × keyLength]
+// kCache/vCache: already contain all tokens [0..startPos+M-1].
+// Each query m attends to keys [0..startPos+m] (causal).
+
+__global__ void batched_gated_attention(float* output,
+                                         const float* qAttn, const float* qGate,
+                                         const void* kCache, const void* vCache,
+                                         int numHeads, int numKvHeads, int keyLength,
+                                         int valueLength, int maxSeqLen,
+                                         int startPosition, int M,
+                                         float scale, int cacheIsFp16)
+{
+    extern __shared__ float shared[];
+    int blockId = blockIdx.x;
+    int queryToken = blockId / numHeads;
+    int head = blockId % numHeads;
+    int tid = threadIdx.x;
+    int stride = blockDim.x;
+    int kvHead = head * numKvHeads / numHeads;
+
+    // Causal: this query sees keys [0..startPosition + queryToken]
+    int seqLen = startPosition + queryToken + 1;
+
+    const float* q = qAttn + (queryToken * numHeads + head) * keyLength;
+    const float* qg = qGate + (queryToken * numHeads + head) * keyLength;
+
+    int kBaseOffset = kvHead * maxSeqLen * keyLength;
+    int vBaseOffset = kvHead * maxSeqLen * valueLength;
+
+    // Shared memory layout: [ATTN_TILE_SIZE scores] + [blockDim.x temp for reduction]
+    float* scores = shared;
+    float* temp = shared + ATTN_TILE_SIZE;
+
+    // Initialize output to zero
+    float* outHead = output + (queryToken * numHeads + head) * valueLength;
+    for (int d = tid; d < valueLength; d += stride)
+        outHead[d] = 0.0f;
+    __syncthreads();
+
+    // Online softmax state
     float running_max = -1e30f;
     float running_sum = 0.0f;
 

@@ -93,6 +93,16 @@ public sealed class KvCache : IKvCache
         Length = _strategy.EffectiveSeqLen(position);
     }
 
+    public void BatchedWrite(IComputeBackend backend, int layer, int startPosition, int M, ITensor k, ITensor v)
+    {
+        int startSlot = _strategy.MapPosition(startPosition);
+        int idx = GetCacheIndex(layer);
+        backend.BatchedKvCacheWrite(_kCaches[idx], _vCaches[idx], k, v,
+            _nKvHeads, _keyLength, _valueLength, _maxSeqLen, startSlot, M);
+
+        Length = _strategy.EffectiveSeqLen(startPosition + M - 1);
+    }
+
     // Legacy span-based methods for backward compatibility
     public void Write(int layer, int position, ReadOnlySpan<float> k, ReadOnlySpan<float> v)
     {
