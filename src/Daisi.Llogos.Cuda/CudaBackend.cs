@@ -311,7 +311,7 @@ public sealed class CudaBackend : IComputeBackend
             var func = _matmulModule.GetFunction("dequant_matmul_q4_0_q8_1");
             int nVal = N;
             uint dp4aGrid = ((uint)N + 7) / 8; // 2 rows per block
-            uint dp4aSmem = (256 / 32) * 8 * sizeof(float); // smem[nwarps][rows]
+            uint dp4aSmem = (128 / 32) * 8 * sizeof(float); // smem[nwarps][rows]
             nint* kArgs = stackalloc nint[6];
             kArgs[0] = (nint)(&outPtr);
             kArgs[1] = (nint)(&q8_1Ptr);
@@ -319,7 +319,7 @@ public sealed class CudaBackend : IComputeBackend
             kArgs[3] = (nint)(&M);
             kArgs[4] = (nint)(&K);
             kArgs[5] = (nint)(&nVal);
-            _stream.Launch(func, dp4aGrid, 1, 1, 256, 1, 1, dp4aSmem, kArgs);
+            _stream.Launch(func, dp4aGrid, 1, 1, 128, 1, 1, dp4aSmem, kArgs);
         }
         else if (b.Type == GgmlType.Q4_0 && _context.ComputeCapabilityMajor >= 12)
         {
@@ -359,7 +359,7 @@ public sealed class CudaBackend : IComputeBackend
             var func = _matmulModule.GetFunction("dequant_matmul_q4_0_q8_1");
             int nVal = N;
             uint dp4aGrid = ((uint)N + 7) / 8; // 2 rows per block
-            uint dp4aSmem = (256 / 32) * 8 * sizeof(float); // smem[nwarps][rows]
+            uint dp4aSmem = (128 / 32) * 8 * sizeof(float); // smem[nwarps][rows]
             nint* kArgs = stackalloc nint[6];
             kArgs[0] = (nint)(&outPtr);
             kArgs[1] = (nint)(&q8_1Ptr);
@@ -367,7 +367,7 @@ public sealed class CudaBackend : IComputeBackend
             kArgs[3] = (nint)(&M);
             kArgs[4] = (nint)(&K);
             kArgs[5] = (nint)(&nVal);
-            _stream.Launch(func, dp4aGrid, 1, 1, 256, 1, 1, dp4aSmem, kArgs);
+            _stream.Launch(func, dp4aGrid, 1, 1, 128, 1, 1, dp4aSmem, kArgs);
         }
         else if (b.Type == GgmlType.Q4_1)
         {

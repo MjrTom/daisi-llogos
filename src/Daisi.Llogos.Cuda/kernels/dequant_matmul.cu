@@ -580,7 +580,7 @@ __global__ void dequant_matmul_f16(float* output, const float* a,
 // Multi-row: 2 output rows per CUDA block for weight data reuse.
 // Configurable thread count via template.
 
-#define Q4_0_DP4A_THREADS 256
+#define Q4_0_DP4A_THREADS 128
 #define Q4_0_DP4A_ROWS 8
 
 __global__ __launch_bounds__(Q4_0_DP4A_THREADS)
@@ -610,27 +610,41 @@ void dequant_matmul_q4_0_q8_1(float* __restrict__ output,
         float a_s = fp16_to_fp32(*reinterpret_cast<const unsigned short*>(ablk + 2));
         const int* a_qs = reinterpret_cast<const int*>(ablk + 4);
 
+        // Preload weight scale + nibbles for all rows (issue all reads before compute)
+        float w_scales[Q4_0_DP4A_ROWS];
+        unsigned int w_nibs[Q4_0_DP4A_ROWS][4];
+
+        #pragma unroll
+        for (int r = 0; r < Q4_0_DP4A_ROWS; r++)
+        {
+            int n = n_base + r;
+            if (n < N) {
+                const unsigned int* bw = reinterpret_cast<const unsigned int*>(
+                    b + (long)n * bytes_per_row + blk * 20);
+                w_scales[r] = fp16_to_fp32((unsigned short)(__ldg(&bw[0]) & 0xFFFF));
+                w_nibs[r][0] = __ldg(&bw[1]);
+                w_nibs[r][1] = __ldg(&bw[2]);
+                w_nibs[r][2] = __ldg(&bw[3]);
+                w_nibs[r][3] = __ldg(&bw[4]);
+            }
+        }
+
+        // Compute dp4a dot products using preloaded data
         #pragma unroll
         for (int r = 0; r < Q4_0_DP4A_ROWS; r++)
         {
             int n = n_base + r;
             if (n >= N) break;
 
-            const unsigned int* bw = reinterpret_cast<const unsigned int*>(
-                b + (long)n * bytes_per_row + blk * 20);
-            float w_d = fp16_to_fp32((unsigned short)(__ldg(&bw[0]) & 0xFFFF));
-
             int sumi = 0;
             #pragma unroll
             for (int i = 0; i < 4; i++) {
-                unsigned int packed = __ldg(&bw[1 + i]);
-                int vi0 = (int)(packed & 0x0F0F0F0F);
-                int vi1 = (int)((packed >> 4) & 0x0F0F0F0F);
+                int vi0 = (int)(w_nibs[r][i] & 0x0F0F0F0F);
+                int vi1 = (int)((w_nibs[r][i] >> 4) & 0x0F0F0F0F);
                 sumi = __dp4a(vi0, a_qs[i], sumi);
                 sumi = __dp4a(vi1, a_qs[i + 4], sumi);
             }
-            // Full block: coefficient = 8 (32 elements × 8 offset / 32 block size)
-            sums[r] += w_d * ((float)sumi * a_d - 8.0f * a_s);
+            sums[r] += w_scales[r] * ((float)sumi * a_d - 8.0f * a_s);
         }
     }
 
