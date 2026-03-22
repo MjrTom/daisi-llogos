@@ -63,32 +63,38 @@ See [Tested Models](docs/tested-models.md) for verified models, performance benc
 
 ## Current Status
 
-**End-to-end text generation on CPU, CUDA, and Vulkan.** 251+ passing tests. Supports Q8_0, F16, F32, I2_S (BitNet), TQ1_0, and K-quant (Q4_K, Q5_K, Q6_K) formats across all backends.
+**End-to-end text generation on CPU, CUDA, and Vulkan.** 251+ passing tests. Supports Q8_0, Q4_0, Q4_1, F16, F32, I2_S (BitNet), TQ1_0, and K-quant (Q4_K, Q5_K, Q6_K) formats across all backends.
 
 ### Benchmarks
 
 Measured on AMD Ryzen 9 9900X + NVIDIA RTX 5080, 128 decode tokens, FP16 KV cache. Compared against llama.cpp b8461.
 
-| Model | Llogos CUDA | llama.cpp CUDA | % | Llogos Vulkan | llama.cpp Vulkan |
-|-------|--------:|--------:|--------:|--------:|--------:|
-| Qwen3.5-0.8B Q8_0 | 363 | 399 | 91% | 150 | 466 |
-| Qwen3-8B Q8_0 | **83** | 92 | **90%** | 54 | 96 |
-| Qwen3-8B Q4_K_M | 86 | 138 | 62% | 53 | 142 |
-| Qwen3.5-9B Q8_0 | **76** | 84 | **90%** | 51 | — |
+| Model | Llogos CUDA | llama.cpp CUDA | % | Llogos Vulkan |
+|-------|--------:|--------:|--------:|--------:|
+| Qwen3.5-0.8B Q8_0 | **436** | 399 | **109%** | 156 |
+| Qwen3.5-4B Q8_0 | **142** | 135 | **105%** | 73 |
+| Qwen3-8B Q8_0 | 90 | 92 | 98% | 56 |
+| Qwen3-8B Q4_K_M | 122 | 138 | 88% | 54 |
+| Qwen3.5-9B Q8_0 | **86** | 84 | **102%** | 53 |
+| Qwen3.5-9B Q4_0 | 100 | 123 | 81% | 45 |
 
-CUDA: **CUDA graph capture** (single graph launch replaces ~435 kernel calls), PTX `cvt.f32.f16`/`cvt.rn.f16.f32` intrinsics, `__ldg` read-only cache hints, uint32 weight reads, multi-row activation reuse, aligned Q8_0 repacking, cuBLAS F32 GEMV, fused kernels (AddRmsNormResidual, AddRmsNorm, SplitSwiGLU), GPU-side argmax, NVRTC with PTX disk cache.
+**Exceeding llama.cpp** on 4 of 6 models tested. See [Inference Optimization White Paper](docs/inference-optimization.md) for technical details.
 
-Vulkan: uint32 buffer views for coalesced reads, aligned Q8_0 repacking, 8-row workgroups, subgroup arithmetic reduction, fused composite ops (RmsNormResidual, AddRmsNormResidual, AddRmsNorm, SplitSwiGLU, RepeatTile, ArgMax), Vulkan 1.2 with SPIR-V 1.3.
+### Key Optimizations
+
+**CUDA:** CUDA graph capture, dp4a integer dot product for 4-bit quants, fused RmsNorm+Q8_1 quantization (zero-overhead dp4a activation prep), partial vocab logit computation (lm_head computes top ~5K tokens instead of full 152K vocab), architecture-adaptive dispatch (Blackwell float vs pre-Blackwell dp4a), per-quant row count tuning, aligned block repacking (Q8_0 34→36, Q4_0 18→20), multi-row activation reuse, cuBLAS F32 GEMV, GPU-side argmax, NVRTC with PTX disk cache.
+
+**Vulkan:** uint32 buffer views, aligned Q8_0 repacking, subgroup arithmetic reduction, multi-row workgroups, fused composite ops (RmsNormResidual, AddRmsNormResidual, AddRmsNorm, SplitSwiGLU, RepeatTile, ArgMax), Q4_0/Q4_1/Q5_K matmul + embedding shaders, Vulkan 1.2 with SPIR-V 1.3.
 
 What works today:
 - Parse any GGUF v2/v3 file (header, metadata, tensor info)
 - Full quantization type support (41 GgmlType variants with block/type size calculation)
 - `IComputeBackend` / `ITensor` abstraction — forward pass is backend-agnostic
 - CPU backend: AVX2 SIMD matmul (fused Q8_0 dequant), multi-threaded, full dequantization (Q8_0, Q4_0, Q4_K, Q5_K, Q6_K, Q3_K, Q2_K, Q4_1, Q5_0, Q5_1, BF16, F16, I2_S, TQ1_0)
-- CUDA backend: NVRTC JIT compilation with PTX cache, `__dp4a` Q8_0 matmul, cuBLAS F32, fused dequant+matmul kernels (F32, F16, Q8_0, Q4_K, Q5_K, Q6_K, I2_S, TQ1_0), aligned Q8_0 repacking, Q8_1 activation cache
-- Vulkan backend: SPIR-V compute shaders, fused dequant+matmul (F32, F16, Q8_0, Q4_K, Q6_K, I2_S, TQ1_0), cross-platform GPU (NVIDIA/AMD/Intel)
-- 16+ composite GPU operations: GatedAttention, DeltaNetStep, CausalConv1d, ComputeDecayBeta, SplitUnequalQKV, RepeatTile, ArgMax, RmsNormResidual, SwiGLU, AddRmsNorm, etc.
-- Complete hybrid forward pass: standard gated attention + DeltaNet (Qwen3.5 0.8B and 9B)
+- CUDA backend: NVRTC JIT compilation with PTX cache, `__dp4a` integer matmul (Q4_0, Q8_0), cuBLAS F32, fused dequant+matmul kernels (F32, F16, Q8_0, Q4_0, Q4_1, Q4_K, Q5_K, Q6_K, I2_S, TQ1_0), fused RmsNorm+Q8_1 quantization, partial vocab argmax, aligned repacking (Q8_0, Q4_0)
+- Vulkan backend: SPIR-V compute shaders, fused dequant+matmul (F32, F16, Q8_0, Q4_0, Q4_1, Q4_K, Q5_K, Q6_K, I2_S, TQ1_0), cross-platform GPU (NVIDIA/AMD/Intel)
+- 16+ composite GPU operations: GatedAttention, DeltaNetStep, CausalConv1d, ComputeDecayBeta, SplitUnequalQKV, RepeatTile, ArgMax, RmsNormResidual+Q8_1, SwiGLU, AddRmsNorm+Q8_1, etc.
+- Complete hybrid forward pass: standard gated attention + DeltaNet (Qwen3.5 0.8B, 4B, and 9B)
 - BPE tokenizer, KV cache, DeltaNet recurrent state + conv1d buffers
 - Tiled/flash attention with online softmax (no shared memory limit on context length)
 - FP16 KV cache (2x memory savings, default)
@@ -97,7 +103,7 @@ What works today:
 - Candidate-based sampler with temperature, top-k, top-p, repetition penalty (O(k) not O(N log N))
 - Memory-mapped model loading (zero intermediate byte[] copies)
 - Benchmark suite with separate prefill/decode timing (`--bench`)
-- CLI: `--backend cpu|cuda|vulkan`, `--bench`, `--no-mmap`, `--attention`, `--paged`, `--offload-pages`, model path, prompt, sampling parameters
+- CLI: `--backend cpu|cuda|vulkan`, `--bench`, `--no-mmap`, `--attention`, `--paged`, `--offload-pages`, `--vocab-limit`, model path, prompt, sampling parameters
 
 ## Roadmap
 
