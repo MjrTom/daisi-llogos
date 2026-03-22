@@ -119,36 +119,38 @@ public sealed class CudaBackend : IComputeBackend
 
         bool needsDequant = bT.Type != Gguf.GgmlType.F32 && bT.Type != Gguf.GgmlType.F16;
 
-        ulong bGemmPtr;
+        ulong bF16Ptr;
         if (needsDequant)
         {
-            // Dequantize weight to FP16 buffer
             long f16Bytes = (long)K * N * 2;
+
+            // Dequantize weight to FP16 temp buffer
             if (_batchDequantBuf == null || _batchDequantBufSize < f16Bytes)
             {
                 _batchDequantBuf?.Dispose();
                 _batchDequantBuf = new CudaDeviceMemory((ulong)f16Bytes);
                 _batchDequantBufSize = f16Bytes;
             }
-            bGemmPtr = _batchDequantBuf.DevicePtr;
+            bF16Ptr = _batchDequantBuf.DevicePtr;
+            {
 
-            var func = _elementwiseModule.GetFunction("dequant_to_f16");
-            int totalElements = K * N;
-            int blockSize = Gguf.GgmlTypeInfo.BlockSize(bT.Type);
-            int typeTag = (int)bT.Type;
-            int isAligned = (bT.IsAlignedQ8_0 || bT.IsAlignedQ4_0) ? 1 : 0;
-            uint grid = (uint)((totalElements + BlockSize - 1) / BlockSize);
-            nint* dArgs = stackalloc nint[6];
-            dArgs[0] = (nint)(&bGemmPtr);
-            dArgs[1] = (nint)(&bPtr);
-            dArgs[2] = (nint)(&totalElements);
-            dArgs[3] = (nint)(&typeTag);
-            dArgs[4] = (nint)(&blockSize);
-            dArgs[5] = (nint)(&isAligned);
-            _stream.Launch(func, grid, 1, 1, (uint)BlockSize, 1, 1, 0, dArgs);
+                var func = _elementwiseModule.GetFunction("dequant_to_f16");
+                int totalElements = K * N;
+                int blockSize = Gguf.GgmlTypeInfo.BlockSize(bT.Type);
+                int typeTag = (int)bT.Type;
+                int isAligned = (bT.IsAlignedQ8_0 || bT.IsAlignedQ4_0) ? 1 : 0;
+                uint grid = (uint)((totalElements + BlockSize - 1) / BlockSize);
+                nint* dArgs = stackalloc nint[6];
+                dArgs[0] = (nint)(&bF16Ptr);
+                dArgs[1] = (nint)(&bPtr);
+                dArgs[2] = (nint)(&totalElements);
+                dArgs[3] = (nint)(&typeTag);
+                dArgs[4] = (nint)(&blockSize);
+                dArgs[5] = (nint)(&isAligned);
+                _stream.Launch(func, grid, 1, 1, (uint)BlockSize, 1, 1, 0, dArgs);
+            }
 
-            // GemmEx: FP16 weight × FP32 activation → FP32 output
-            // Convert activation to FP16 for tensor core path
+            // Convert activation from FP32 to FP16 for tensor core path
             int aElems = M * K;
             long aF16Bytes = (long)aElems * 2;
             if (_batchActivationBuf == null || _batchActivationBufSize < aF16Bytes)
@@ -172,7 +174,7 @@ public sealed class CudaBackend : IComputeBackend
             CublasApi.Check(CublasApi.GemmEx(_cublasHandle,
                 CublasApi.CUBLAS_OP_T, CublasApi.CUBLAS_OP_N,
                 N, M, K, &alpha,
-                bGemmPtr, CublasApi.CUDA_R_16F, K,
+                bF16Ptr, CublasApi.CUDA_R_16F, K,
                 aF16Ptr, CublasApi.CUDA_R_16F, K,
                 &beta, outPtr, CublasApi.CUDA_R_32F, N,
                 CublasApi.CUBLAS_COMPUTE_32F, CublasApi.CUBLAS_GEMM_DEFAULT),
@@ -180,12 +182,11 @@ public sealed class CudaBackend : IComputeBackend
         }
         else
         {
-            // FP32 or FP16 weights — use SGEMM with TF32 tensor cores (set in constructor)
-            bGemmPtr = bPtr;
+            // FP32 or FP16 weights — use SGEMM with TF32 tensor cores
             float alpha = 1.0f, beta = 0.0f;
             CublasApi.Check(CublasApi.Sgemm(_cublasHandle,
                 CublasApi.CUBLAS_OP_T, CublasApi.CUBLAS_OP_N,
-                N, M, K, &alpha, bGemmPtr, K, aPtr, K, &beta, outPtr, N),
+                N, M, K, &alpha, bPtr, K, aPtr, K, &beta, outPtr, N),
                 "cublasSgemm");
         }
     }
