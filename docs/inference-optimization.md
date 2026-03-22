@@ -4,7 +4,7 @@
 
 ## Results
 
-RTX 5080, CUDA 13, greedy sampling (temperature=0). llama.cpp b8461 CUDA.
+RTX 5080, CUDA 12, greedy sampling (temperature=0). llama.cpp b8461 CUDA.
 
 ### Decode (tok/s, 128 tokens, short prompt)
 
