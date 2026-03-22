@@ -268,7 +268,7 @@ public sealed class CudaBackend : IComputeBackend
         }
         else if (b.Type == GgmlType.Q4_0 && _context.ComputeCapabilityMajor >= 12)
         {
-            var (grid, threads, smem) = AdaptiveLaunch(N, 2, K / 32); // Q4_0_ROWS_PER_BLOCK=2
+            var (grid, threads, smem) = AdaptiveLaunch(N, 4, K / 32); // Q4_0_ROWS_PER_BLOCK=4
             var func = _matmulModule.GetFunction("dequant_matmul_q4_0");
             int nVal = N;
             nint* kArgs = stackalloc nint[6];
@@ -332,7 +332,7 @@ public sealed class CudaBackend : IComputeBackend
         }
         else if (b.Type == GgmlType.Q4_K)
         {
-            var (grid, threads, smem) = AdaptiveLaunch(N, 4, K / 256 * 4); // Q4K_ROWS_PER_BLOCK=4
+            var (grid, threads, smem) = AdaptiveLaunch(N, 3, K / 256 * 4); // Q4K_ROWS_PER_BLOCK=3
             LaunchMatMul("dequant_matmul_q4_k", outPtr, aPtr, bPtr, M, K, N, grid, threads, smem);
         }
         else if (b.Type == GgmlType.Q5_K)
@@ -342,7 +342,7 @@ public sealed class CudaBackend : IComputeBackend
         }
         else if (b.Type == GgmlType.Q6_K)
         {
-            var (grid, threads, smem) = AdaptiveLaunch(N, 2, K / 256 * 8); // Q6K_ROWS_PER_BLOCK=2
+            var (grid, threads, smem) = AdaptiveLaunch(N, 10, K / 256 * 8); // Q6K_ROWS_PER_BLOCK=10
             LaunchMatMul("dequant_matmul_q6_k", outPtr, aPtr, bPtr, M, K, N, grid, threads, smem);
         }
         else
