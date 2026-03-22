@@ -16,6 +16,13 @@ public sealed class SpeculativeDecoder
     private readonly int _specDepth;
     private readonly VocabRemapper? _remapper; // target uses remapped IDs, draft uses original
 
+    /// <summary>
+    /// When true, verify uses batched forward pass (faster, higher acceptance,
+    /// but output differs from native greedy due to FP16 GemmEx path).
+    /// When false, verify uses sequential ForwardArgMax (matches native FP, lower acceptance).
+    /// </summary>
+    public bool BatchedVerify { get; set; }
+
     public int TotalDraftTokens { get; private set; }
     public int TotalAcceptedTokens { get; private set; }
     public double AcceptanceRate => TotalDraftTokens > 0 ? (double)TotalAcceptedTokens / TotalDraftTokens : 0;
@@ -98,11 +105,25 @@ public sealed class SpeculativeDecoder
 
             TotalDraftTokens += N;
 
-            // ── Verify phase: target processes tokens (in remapped ID space) ──
-            var targetPreds = new int[N];
-            targetPreds[0] = _target.ForwardArgMax(nextToken, pos);
-            for (int d = 1; d < N; d++)
-                targetPreds[d] = _target.ForwardArgMax(draftTokensRemap[d - 1], pos + d);
+            // ── Verify phase ──────────────────────────────────────────────
+            int[] targetPreds;
+            if (BatchedVerify)
+            {
+                // Batched: one forward pass for all N tokens (faster, different FP from native)
+                var verifyInput = new int[N];
+                verifyInput[0] = nextToken;
+                for (int d = 1; d < N; d++)
+                    verifyInput[d] = draftTokensRemap[d - 1];
+                targetPreds = _target.ForwardBatchedVerify(verifyInput, pos);
+            }
+            else
+            {
+                // Sequential: N individual ForwardArgMax calls (matches native FP exactly)
+                targetPreds = new int[N];
+                targetPreds[0] = _target.ForwardArgMax(nextToken, pos);
+                for (int d = 1; d < N; d++)
+                    targetPreds[d] = _target.ForwardArgMax(draftTokensRemap[d - 1], pos + d);
+            }
             // targetPreds[i] = target's prediction for position pos+i+1
             // draftTokens[i] = draft's prediction for position pos+i+1
 

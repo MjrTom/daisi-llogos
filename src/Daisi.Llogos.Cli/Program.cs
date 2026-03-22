@@ -139,7 +139,10 @@ else
         // /4 gives ~62K tokens — generous enough for common tokens without remapper
         draftForward.ArgMaxVocabLimit = draftConfig.VocabSize / 4;
 
-        specDecoder = new SpeculativeDecoder(forward, draftForward, tokenizer, options.SpecDepth, remapper);
+        specDecoder = new SpeculativeDecoder(forward, draftForward, tokenizer, options.SpecDepth, remapper)
+        {
+            BatchedVerify = options.BatchedVerify
+        };
         Console.Error.WriteLine($"done ({draftConfig.Architecture}, {draftConfig.NumLayers}L, {draftConfig.HiddenDim}d)");
     }
 
@@ -355,6 +358,9 @@ static CliArgs ParseArgs(string[] args)
             case "--spec-depth":
                 result.SpecDepth = int.Parse(NextArg(args, ref i));
                 break;
+            case "--batched-verify":
+                result.BatchedVerify = true;
+                break;
             case "--help" or "-h":
                 result.ShowHelp = true;
                 break;
@@ -392,6 +398,7 @@ static void PrintUsage()
           --offload-pages <n>      Enable RAM offloading: keep first N pages in VRAM, rest in RAM
           --draft <path>           Draft model for speculative decoding (smaller, same family)
           --spec-depth <n>         Speculation depth (default: 5)
+          --batched-verify         Use batched verify (faster, higher acceptance, different FP from native)
           --help, -h               Show this help
         """);
 }
@@ -418,4 +425,5 @@ class CliArgs
     public bool ProfileEarlyExit;
     public string? DraftModelPath;
     public int SpecDepth = 5;
+    public bool BatchedVerify;
 }
