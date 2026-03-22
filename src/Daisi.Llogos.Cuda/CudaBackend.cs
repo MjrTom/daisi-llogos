@@ -373,16 +373,6 @@ public sealed class CudaBackend : IComputeBackend
             kArgs[5] = (nint)(&nVal);
             _stream.Launch(func, dp4aGrid, 1, 1, 256, 1, 1, dp4aSmem, kArgs);
         }
-        else if (b.Type == GgmlType.Q4_0 && _context.ComputeCapabilityMajor >= 12)
-        {
-            var (grid, threads, smem) = AdaptiveLaunch(N, 4, K / 32); // Q4_0_ROWS_PER_BLOCK=4
-            var func = _matmulModule.GetFunction("dequant_matmul_q4_0");
-            int nVal = N;
-            nint* kArgs = stackalloc nint[6];
-            kArgs[0] = (nint)(&outPtr); kArgs[1] = (nint)(&aPtr); kArgs[2] = (nint)(&bPtr);
-            kArgs[3] = (nint)(&M); kArgs[4] = (nint)(&K); kArgs[5] = (nint)(&nVal);
-            _stream.Launch(func, grid, 1, 1, threads, 1, 1, smem, kArgs);
-        }
         else if (b.Type == GgmlType.Q4_0)
         {
             // dp4a path: use fused Q8_1 from RmsNorm, or quantize on demand
@@ -439,7 +429,7 @@ public sealed class CudaBackend : IComputeBackend
         }
         else if (b.Type == GgmlType.Q4_K)
         {
-            var (grid, threads, smem) = AdaptiveLaunch(N, 3, K / 256 * 4); // Q4K_ROWS_PER_BLOCK=3
+            var (grid, threads, smem) = AdaptiveLaunch(N, 4, K / 256 * 4); // Q4K_ROWS_PER_BLOCK=4
             LaunchMatMul("dequant_matmul_q4_k", outPtr, aPtr, bPtr, M, K, N, grid, threads, smem);
         }
         else if (b.Type == GgmlType.Q5_K)
