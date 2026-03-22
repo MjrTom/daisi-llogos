@@ -175,5 +175,12 @@ backend.LoadTensor(tensor.Name, tensor.Type, tensor.Dimensions, new ReadOnlySpan
 - [ ] Batched prefill for prompt processing (deferred — requires batch MatMul support across all backends)
 - [x] KV cache quantization → deferred to [Phase 11b](phase-11-long-context.md) (FP16 KV cache with attention kernel changes)
 - [x] Multi-threaded CPU matmul with linear scaling
-- [x] CUDA kernels tuned for target architectures (block-per-neuron with warp reduction, ~44 tok/s RTX 5080)
+- [x] CUDA kernels tuned for target architectures (exceeding llama.cpp on 4/6 models, up to 436 tok/s RTX 5080)
+- [x] dp4a integer dot product for Q4_0 with fused RmsNorm+Q8_1 quantization
+- [x] Partial vocab logit computation (VocabSize/32 default, +10% greedy decode speedup)
+- [x] Per-quant row count tuning (Q8_0=2, Q4_K=3, Q6_K=10)
+- [x] Architecture-adaptive dispatch (Blackwell float vs pre-Blackwell dp4a)
+- [x] Self-contained AdaptiveLaunch dispatch (no shared grid variables)
+- [x] Aligned Q4_0 repacking (18→20 bytes)
+- [x] Q4_0, Q4_1, Q5_K native GPU kernels (CUDA + Vulkan)
 - [x] Benchmark suite reports tok/s for prefill and decode (`--bench` flag)
