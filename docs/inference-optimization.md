@@ -4,20 +4,35 @@
 
 ## Results
 
-RTX 5080, 128 decode tokens, greedy sampling (temperature=0). llama.cpp b8461.
+RTX 5080, CUDA 13, greedy sampling (temperature=0). llama.cpp b8461 CUDA.
+
+### Decode (tok/s, 128 tokens, short prompt)
 
 | Model | Architecture | Llogos | llama.cpp | Ratio |
 |-------|-------------|-------:|----------:|------:|
-| Qwen3.5-0.8B Q8_0 | DeltaNet hybrid | **441** | 399 | **1.10x** |
-| TinyLlama 1.1B Q8_0 | LLaMA | **448** | 443 | **1.01x** |
-| Qwen3.5-4B Q8_0 | DeltaNet hybrid | **144** | 135 | **1.07x** |
-| Qwen3-8B Q8_0 | Standard attention | 91 | 92 | 0.99x |
-| DeepSeek R1 8B Q8_0 | LLaMA | 94 | 95 | 0.99x |
-| Qwen3-8B Q4_K_M | Standard attention | 124 | 138 | 0.90x |
-| Qwen3.5-9B Q8_0 | DeltaNet hybrid | **88** | 84 | **1.05x** |
-| Qwen3.5-9B Q4_0 | DeltaNet hybrid | 101 | 123 | 0.82x |
+| Qwen3.5-0.8B Q8_0 | DeltaNet hybrid | **431** | 411 | **1.05x** |
+| TinyLlama 1.1B Q8_0 | LLaMA | 444 | 448 | 0.99x |
+| Qwen3.5-4B Q8_0 | DeltaNet hybrid | **142** | 134 | **1.05x** |
+| Qwen3-8B Q8_0 | Standard attention | 89 | 91 | 0.98x |
+| Qwen3-8B Q4_K_M | Standard attention | 122 | 138 | 0.88x |
+| Qwen3.5-9B Q8_0 | DeltaNet hybrid | **86** | 84 | **1.02x** |
+| Qwen3.5-9B Q4_0 | DeltaNet hybrid | 99 | 126 | 0.79x |
 
-We exceed llama.cpp on 4 of 8 models tested, across three different architectures (DeltaNet, LLaMA, standard attention). Results are not Qwen-specific — the optimizations generalize across model families. The remaining gap on 4-bit quants is from our Q4_0 float kernel being compute-bound on nibble extraction.
+### Prefill (tok/s, 128 prompt tokens)
+
+| Model | Architecture | Llogos | llama.cpp | Ratio | Batched? |
+|-------|-------------|-------:|----------:|------:|----------|
+| Qwen3.5-0.8B Q8_0 | DeltaNet hybrid | 477 | 13,794 | 0.03x | No (sequential) |
+| TinyLlama 1.1B Q8_0 | LLaMA | **2,050** | 15,730 | 0.13x | **Yes** |
+| Qwen3.5-4B Q8_0 | DeltaNet hybrid | 151 | 5,704 | 0.03x | No (sequential) |
+| Qwen3-8B Q8_0 | Standard attention | **456** | 5,184 | 0.09x | **Yes** |
+| Qwen3-8B Q4_K_M | Standard attention | **462** | 5,278 | 0.09x | **Yes** |
+| Qwen3.5-9B Q8_0 | DeltaNet hybrid | 89 | 4,714 | 0.02x | No (sequential) |
+| Qwen3.5-9B Q4_0 | DeltaNet hybrid | 105 | 4,954 | 0.02x | No (sequential) |
+
+We exceed llama.cpp on decode for 3 of 7 models, across DeltaNet and standard attention architectures. The remaining decode gap on 4-bit quants is from our Q4_0 float kernel being compute-bound on nibble extraction.
+
+Prefill is a large gap: llama.cpp uses fused quantized GEMM via cuBLASLt with tensor cores, while our batched path dequantizes to FP32 then calls cuBLAS SGEMM. The batched models (TinyLlama, Qwen3) achieve 5-9x speedup over their own sequential prefill, but llama.cpp's fused approach is 8-12x faster still. DeltaNet models fall back to sequential prefill (no batching) due to sequential state dependencies.
 
 ## 1. Partial Vocabulary Logit Computation
 
@@ -171,13 +186,17 @@ Batched prefill processes all M prompt tokens simultaneously through each layer:
 
 ### Results
 
-RTX 5080, CUDA 13, greedy sampling.
+RTX 5080, CUDA 13, greedy sampling. Prefill measured with 128-token prompt; decode with short prompt to isolate decode performance (longer prompts inflate KV cache and slow attention — see note below).
 
-| Model | Prompt tokens | Prefill tok/s | Decode tok/s | Prefill speedup |
-|-------|:------------:|:-------------:|:------------:|:---------------:|
-| TinyLlama 1.1B Q8_0 | 173 | **1,976** | 369 | **5.4x** |
-| TinyLlama 1.1B Q8_0 | 126 | **1,708** | 362 | **4.7x** |
-| Qwen3-8B Q8_0 | 55 | **329** | 88 | **3.7x** |
+| Model | Llogos pp | llama.cpp pp | Ratio | Llogos tg | llama.cpp tg | Ratio |
+|-------|----------:|-------------:|------:|----------:|-------------:|------:|
+| TinyLlama 1.1B Q8_0 | **2,050** | 15,730 | 0.13x | 444 | 448 | 0.99x |
+| Qwen3-8B Q8_0 | **456** | 5,184 | 0.09x | 89 | 91 | 0.98x |
+| Qwen3-8B Q4_K_M | **462** | 5,278 | 0.09x | 122 | 138 | 0.88x |
+
+Batched prefill delivers a 5-9x speedup over our own sequential prefill (which runs at decode speed), but llama.cpp's fused quantized GEMM is 8-12x faster still. DeltaNet hybrid models (Qwen3.5) currently fall back to sequential prefill.
+
+**Prompt length affects decode speed.** Decode tok/s depends on the KV cache size: a 169-token prompt leaves 169 KV entries that the attention kernel must scan every decode step. On TinyLlama, this costs ~15% vs a 1-token prompt. All decode numbers in this paper use a short prompt to measure pure decode throughput.
 
 ### Implementation
 
@@ -217,7 +236,19 @@ The 5.4x speedup on TinyLlama (173 tokens) is less than the theoretical 173x fro
 
 All benchmarks use:
 - Hardware: AMD Ryzen 9 9900X, NVIDIA GeForce RTX 5080 (16GB)
-- Software: .NET 10, CUDA 13, Vulkan SDK 1.4.341, llama.cpp b8461
-- Models: Qwen3.5 (0.8B, 4B, 9B DeltaNet hybrid), Qwen3 (8B standard attention), TinyLlama (1.1B LLaMA), DeepSeek R1 (8B LLaMA distill)
-- Methodology: 128 decode tokens, greedy sampling (temperature=0), 3 runs for stability
-- CLI: `dotnet run --project src/Daisi.Llogos.Cli -c Release -- --model <path> --backend cuda --bench --prompt "Hello" --max-tokens 128 --temperature 0`
+- Software: .NET 10, CUDA 13, llama.cpp b8461 (CUDA build)
+- Models: Qwen3.5 (0.8B, 4B, 9B DeltaNet hybrid), Qwen3 (8B standard attention), TinyLlama (1.1B LLaMA)
+- Decode: 128 tokens, greedy (temperature=0), short prompt (`"Hello"`) to minimize KV cache overhead
+- Prefill: 128-token prompt, greedy, measures prompt processing throughput
+- llama.cpp: 3 runs averaged. Llogos: single run (GPU-bound, low variance)
+
+```bash
+# Llogos decode
+dotnet run --project src/Daisi.Llogos.Cli -c Release -- --model <path> --backend cuda --bench --prompt "Hello" --max-tokens 128
+
+# Llogos prefill (use a long prompt that tokenizes to ~128 tokens)
+dotnet run --project src/Daisi.Llogos.Cli -c Release -- --model <path> --backend cuda --bench --prompt "<long text>" --max-tokens 5
+
+# llama.cpp
+/c/llama-cpp/cuda/llama-bench.exe -m <path> -t 1 -ngl 99 -p 128 -n 128 -r 3
+```
