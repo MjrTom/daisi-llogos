@@ -918,6 +918,91 @@ void dequant_matmul_q4_0_q8_1(float* __restrict__ output,
     }
 }
 
+// ── Q4_0 dp4a (unaligned 18-byte blocks — original GGUF format) ─────────────
+// Saves 11% bandwidth vs aligned 20-byte format by avoiding padding.
+// Uses 2-byte aligned reads for nibble data (like llama.cpp).
+
+__global__ __launch_bounds__(Q4_0_DP4A_THREADS)
+void dequant_matmul_q4_0_q8_1_unaligned(float* __restrict__ output,
+                                          const void* __restrict__ vq8_1,
+                                          const unsigned char* __restrict__ b,
+                                          int M, int K, int N)
+{
+    const int tid = threadIdx.x;
+    const int lane = tid & 31;
+    const int warp = tid >> 5;
+    const int n_base = blockIdx.x * Q4_0_DP4A_ROWS;
+    if (n_base >= N) return;
+
+    const int blocks_per_row = K / 32;
+    const long bytes_per_row = (long)blocks_per_row * 18; // 18 bytes per unaligned Q4_0 block
+    const unsigned char* a_q8_1 = (const unsigned char*)vq8_1;
+    const int nwarps = Q4_0_DP4A_THREADS / 32;
+
+    float sums[Q4_0_DP4A_ROWS] = {0};
+
+    for (int blk = tid; blk < blocks_per_row; blk += Q4_0_DP4A_THREADS)
+    {
+        // Load Q8_1 activation block
+        const unsigned char* ablk = a_q8_1 + blk * 36;
+        float a_d = fp16_to_fp32(*reinterpret_cast<const unsigned short*>(ablk));
+        float a_s = fp16_to_fp32(*reinterpret_cast<const unsigned short*>(ablk + 2));
+        int a_q[8];
+        #pragma unroll
+        for (int i = 0; i < 8; i++)
+            a_q[i] = reinterpret_cast<const int*>(ablk + 4)[i];
+
+        #pragma unroll
+        for (int r = 0; r < Q4_0_DP4A_ROWS; r++)
+        {
+            int n = n_base + r;
+            if (n >= N) break;
+
+            // Unaligned Q4_0 block: [scale(2b) | nibbles(16b)] = 18 bytes
+            // Nibbles start at offset 2 (NOT 4-byte aligned)
+            const unsigned char* bp = b + (long)n * bytes_per_row + blk * 18;
+            float w_scale = fp16_to_fp32(*reinterpret_cast<const unsigned short*>(bp));
+
+            // 2-byte aligned reads for nibble data (like llama.cpp's get_int_b2)
+            const unsigned short* qs16 = reinterpret_cast<const unsigned short*>(bp + 2);
+            unsigned int w_nibs[4];
+            #pragma unroll
+            for (int i = 0; i < 4; i++)
+                w_nibs[i] = (unsigned int)qs16[2*i] | ((unsigned int)qs16[2*i+1] << 16);
+
+            int sumi = 0;
+            #pragma unroll
+            for (int i = 0; i < 4; i++) {
+                int vi0 = (int)(w_nibs[i] & 0x0F0F0F0F);
+                int vi1 = (int)((w_nibs[i] >> 4) & 0x0F0F0F0F);
+                sumi = __dp4a(vi0, a_q[i], sumi);
+                sumi = __dp4a(vi1, a_q[i + 4], sumi);
+            }
+            sums[r] += w_scale * ((float)sumi * a_d - 8.0f * a_s);
+        }
+    }
+
+    // Warp + cross-warp reduction
+    __shared__ float smem[Q4_0_DP4A_THREADS / 32][Q4_0_DP4A_ROWS];
+
+    #pragma unroll
+    for (int r = 0; r < Q4_0_DP4A_ROWS; r++) {
+        float val = warp_reduce_sum(sums[r]);
+        if (lane == 0) smem[warp][r] = val;
+    }
+    __syncthreads();
+
+    if (warp == 0) {
+        #pragma unroll
+        for (int r = 0; r < Q4_0_DP4A_ROWS; r++) {
+            float val = (lane < nwarps) ? smem[lane][r] : 0.0f;
+            val = warp_reduce_sum(val);
+            if (lane == 0 && n_base + r < N)
+                output[n_base + r] = val;
+        }
+    }
+}
+
 // ── Fused Q4_0 Dequant + MatMul (aligned 20-byte blocks) ──────────────────
 // Q4_0 repacked: [scale(2b) + pad(2b) + nibbles(16b)] = 20 bytes, 4-byte aligned.
 // 2 output rows per block for activation reuse.
