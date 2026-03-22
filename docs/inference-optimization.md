@@ -235,7 +235,7 @@ The 5.4x speedup on TinyLlama (173 tokens) is less than the theoretical 173x fro
 ## Reproducibility
 
 All benchmarks use:
-- Hardware: AMD Ryzen 9 9900X, NVIDIA GeForce RTX 5080 (16GB)
+- Hardware: Intel Core i9-14900KF, NVIDIA GeForce RTX 5080 (16GB)
 - Software: .NET 10, CUDA 13, llama.cpp b8461 (CUDA build)
 - Models: Qwen3.5 (0.8B, 4B, 9B DeltaNet hybrid), Qwen3 (8B standard attention), TinyLlama (1.1B LLaMA)
 - Decode: 128 tokens, greedy (temperature=0), short prompt (`"Hello"`) to minimize KV cache overhead
