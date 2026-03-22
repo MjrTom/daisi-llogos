@@ -516,7 +516,7 @@ public sealed class ForwardPass : IForwardPass
     /// Whether this model supports batched prefill.
     /// Supports pure attention and DeltaNet hybrid models (DeltaNet layers run sequentially within the batch).
     /// </summary>
-    public bool SupportsBatchedPrefill => true;
+    public bool SupportsBatchedPrefill => _backend.SupportsBatchedOps;
 
     /// <summary>Disable command batching/graph capture (needed when two models share one backend).</summary>
     public void DisableGraphCapture() => _backend.DisableGraphCapture();

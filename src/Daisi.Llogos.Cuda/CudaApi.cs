@@ -58,9 +58,6 @@ internal static partial class CudaApi
     [LibraryImport(Lib, EntryPoint = "cuMemAlloc_v2")]
     internal static partial CuResult MemAlloc(out ulong dptr, ulong bytesize);
 
-    [LibraryImport(Lib, EntryPoint = "cuMemGetInfo_v2")]
-    internal static partial CuResult MemGetInfo(out ulong free, out ulong total);
-
     [LibraryImport(Lib, EntryPoint = "cuMemFree_v2")]
     internal static partial CuResult MemFree(ulong dptr);
 

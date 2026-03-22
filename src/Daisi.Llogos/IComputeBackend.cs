@@ -258,9 +258,11 @@ public interface IComputeBackend : IDisposable
     /// Copy 'count' floats from src at srcOffset to dst at dstOffset.
     /// Used for placing slices into larger batched tensors.
     /// </summary>
+    /// <summary>Whether this backend supports batched prefill operations (CopyTensorSlice, etc.).</summary>
+    bool SupportsBatchedOps => false;
+
     void CopyTensorSlice(ITensor dst, int dstOffset, ITensor src, int srcOffset, int count)
     {
-        // Default: use CopyTensorRegion for srcOffset→0, then shift. Backends override.
         throw new NotSupportedException("CopyTensorSlice requires backend support.");
     }
 
