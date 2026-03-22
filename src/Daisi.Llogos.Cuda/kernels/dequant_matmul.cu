@@ -1174,6 +1174,106 @@ __device__ __forceinline__ void unpack_q4k_scales(const unsigned char* sb,
     sub_min = dmin * (float)m;
 }
 
+// ── Q4_K dp4a (uses pre-quantized Q8_1 activation) ──────────────────────────
+// Each chunk = 64 elements = 2 sub-blocks. dp4a replaces float nibble extraction.
+#define Q4K_DP4A_ROWS 4
+#define Q4K_DP4A_THREADS 256
+
+__global__ __launch_bounds__(Q4K_DP4A_THREADS)
+void dequant_matmul_q4_k_q8_1(float* __restrict__ output,
+                                const void* __restrict__ vq8_1,
+                                const unsigned char* __restrict__ b,
+                                int M, int K, int N)
+{
+    const int tid = threadIdx.x;
+    const int lane = tid & 31;
+    const int warp = tid >> 5;
+    const int n_base = blockIdx.x * Q4K_DP4A_ROWS;
+    if (n_base >= N) return;
+
+    const int sbPerRow = K / 256;
+    const long long bytesPerRow = (long long)sbPerRow * 144;
+    const int totalChunks = sbPerRow * 4; // 4 chunks per super-block
+    const unsigned char* a_q8_1 = (const unsigned char*)vq8_1;
+    const int nwarps = Q4K_DP4A_THREADS / 32;
+
+    float sums[Q4K_DP4A_ROWS] = {0};
+
+    for (int item = tid; item < totalChunks; item += Q4K_DP4A_THREADS)
+    {
+        int sb = item / 4;
+        int chunk = item % 4;
+
+        // Load 2 Q8_1 activation blocks for this chunk (2 × 32 elements)
+        const unsigned char* ablkLo = a_q8_1 + (sb * 8 + chunk * 2) * 36;
+        const unsigned char* ablkHi = a_q8_1 + (sb * 8 + chunk * 2 + 1) * 36;
+        float a_d_lo = fp16_to_fp32(*reinterpret_cast<const unsigned short*>(ablkLo));
+        float a_s_lo = fp16_to_fp32(*reinterpret_cast<const unsigned short*>(ablkLo + 2));
+        float a_d_hi = fp16_to_fp32(*reinterpret_cast<const unsigned short*>(ablkHi));
+        float a_s_hi = fp16_to_fp32(*reinterpret_cast<const unsigned short*>(ablkHi + 2));
+        const int* aq_lo = reinterpret_cast<const int*>(ablkLo + 4);
+        const int* aq_hi = reinterpret_cast<const int*>(ablkHi + 4);
+
+        #pragma unroll
+        for (int r = 0; r < Q4K_DP4A_ROWS; r++)
+        {
+            int n = n_base + r;
+            if (n >= N) break;
+
+            const unsigned char* sbp = b + (long long)n * bytesPerRow + sb * 144;
+            unsigned int d_dmin = __ldg(reinterpret_cast<const unsigned int*>(sbp));
+            float d = fp16_to_fp32((unsigned short)(d_dmin & 0xFFFF));
+            float dmin = fp16_to_fp32((unsigned short)(d_dmin >> 16));
+
+            float ss0, sm0, ss1, sm1;
+            unpack_q4k_scales(sbp, chunk * 2, d, dmin, ss0, sm0);
+            unpack_q4k_scales(sbp, chunk * 2 + 1, d, dmin, ss1, sm1);
+
+            const unsigned int* qs32 = reinterpret_cast<const unsigned int*>(sbp + 16 + chunk * 32);
+
+            // dp4a: low nibbles × Q8_1_lo, high nibbles × Q8_1_hi
+            int sumi_lo = 0, sumi_hi = 0;
+            #pragma unroll
+            for (int i = 0; i < 4; i++) {
+                unsigned int packed = __ldg(&qs32[i]);
+                int vi0 = (int)(packed & 0x0F0F0F0F);
+                int vi1 = (int)((packed >> 4) & 0x0F0F0F0F);
+                sumi_lo = __dp4a(vi0, aq_lo[i], sumi_lo);
+                sumi_hi = __dp4a(vi1, aq_hi[i], sumi_hi);
+            }
+            #pragma unroll
+            for (int i = 0; i < 4; i++) {
+                unsigned int packed = __ldg(&qs32[4 + i]);
+                int vi0 = (int)(packed & 0x0F0F0F0F);
+                int vi1 = (int)((packed >> 4) & 0x0F0F0F0F);
+                sumi_lo = __dp4a(vi0, aq_lo[4 + i], sumi_lo);
+                sumi_hi = __dp4a(vi1, aq_hi[4 + i], sumi_hi);
+            }
+
+            sums[r] += ss0 * ((float)sumi_lo * a_d_lo) - sm0 * a_s_lo
+                     + ss1 * ((float)sumi_hi * a_d_hi) - sm1 * a_s_hi;
+        }
+    }
+
+    // Warp + cross-warp reduction
+    __shared__ float smem[Q4K_DP4A_THREADS / 32][Q4K_DP4A_ROWS];
+    #pragma unroll
+    for (int r = 0; r < Q4K_DP4A_ROWS; r++) {
+        float val = warp_reduce_sum(sums[r]);
+        if (lane == 0) smem[warp][r] = val;
+    }
+    __syncthreads();
+    if (warp == 0) {
+        #pragma unroll
+        for (int r = 0; r < Q4K_DP4A_ROWS; r++) {
+            float val = (lane < nwarps) ? smem[lane][r] : 0.0f;
+            val = warp_reduce_sum(val);
+            if (lane == 0 && n_base + r < N)
+                output[n_base + r] = val;
+        }
+    }
+}
+
 // Multi-row Q4_K: output neurons per block with activation reuse + uint reads
 #define Q4K_ROWS_PER_BLOCK 4
 

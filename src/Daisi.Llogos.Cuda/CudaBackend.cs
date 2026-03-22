@@ -20,7 +20,7 @@ public sealed class CudaBackend : IComputeBackend
     private int _q8_1CacheGeneration; // incremented by non-matmul ops to invalidate cache
     private int _q8_1CachedGeneration; // generation when cache was last written
     private bool _q8_1FusedReady; // true when Q8_1 was pre-computed by fused RmsNorm
-    private bool _hasQ4_0Weights; // true when model contains Q4_0 weight tensors
+    private bool _hasQ4_0Weights; // true when model contains Q4_0 or Q4_K weight tensors (enables fused Q8_1)
     private bool _disposed;
 
     private const int BlockSize = 256;
@@ -305,6 +305,13 @@ public sealed class CudaBackend : IComputeBackend
             return tensor;
         }
 
+        // Pre-allocate Q8_1 scratch for Q4_K dp4a path (must happen outside graph capture)
+        if (type == GgmlType.Q4_K && dimensions.Length >= 2)
+        {
+            _hasQ4_0Weights = true; // enables fused RmsNorm+Q8_1 for dp4a
+            EnsureQ8_1Scratch((int)dimensions[0]);
+        }
+
         return new CudaTensor(name, type, dimensions, data);
     }
 
@@ -441,6 +448,39 @@ public sealed class CudaBackend : IComputeBackend
         {
             var (grid, threads, smem) = AdaptiveLaunch(N, 1, K / 8);
             LaunchMatMul("dequant_matmul_f16", outPtr, aPtr, bPtr, M, K, N, grid, threads, smem);
+        }
+        else if (b.Type == GgmlType.Q4_K && _q8_1Scratch != null)
+        {
+            // dp4a path for Q4_K: quantize activation to Q8_1, then integer dot product
+            ulong q8_1Ptr = EnsureQ8_1Scratch(K);
+            if (!_q8_1FusedReady &&
+                (_q8_1CachedInputPtr != aPtr || _q8_1CachedGeneration != _q8_1CacheGeneration))
+            {
+                _q8_1CachedInputPtr = aPtr;
+                _q8_1CachedGeneration = _q8_1CacheGeneration;
+                var quantFunc = _matmulModule.GetFunction("quantize_f32_q8_1");
+                int numBlocks = K / 32;
+                uint quantGrid = (uint)((numBlocks + BlockSize - 1) / BlockSize);
+                int kVal = K;
+                nint* qArgs = stackalloc nint[3];
+                qArgs[0] = (nint)(&q8_1Ptr);
+                qArgs[1] = (nint)(&aPtr);
+                qArgs[2] = (nint)(&kVal);
+                _stream.Launch(quantFunc, quantGrid, 1, 1, (uint)BlockSize, 1, 1, 0, qArgs);
+            }
+
+            var func = _matmulModule.GetFunction("dequant_matmul_q4_k_q8_1");
+            int nVal = N;
+            uint dp4aGrid = ((uint)N + 3) / 4; // Q4K_DP4A_ROWS = 4
+            uint dp4aSmem = (256 / 32) * 4 * sizeof(float);
+            nint* kArgs = stackalloc nint[6];
+            kArgs[0] = (nint)(&outPtr);
+            kArgs[1] = (nint)(&q8_1Ptr);
+            kArgs[2] = (nint)(&bPtr);
+            kArgs[3] = (nint)(&M);
+            kArgs[4] = (nint)(&K);
+            kArgs[5] = (nint)(&nVal);
+            _stream.Launch(func, dp4aGrid, 1, 1, 256, 1, 1, dp4aSmem, kArgs);
         }
         else if (b.Type == GgmlType.Q4_K)
         {
