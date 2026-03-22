@@ -40,6 +40,10 @@ public sealed class SpeculativeDecoder
         var promptIds = _tokenizer.Encode(prompt);
         if (promptIds.Length == 0) yield break;
 
+        // Disable CUDA graph capture — two models sharing one backend corrupt the graph exec
+        _target.DisableGraphCapture();
+        _draft.DisableGraphCapture();
+
         // Prefill both models with the prompt
         var prefillSw = System.Diagnostics.Stopwatch.StartNew();
         for (int i = 0; i < promptIds.Length - 1; i++)

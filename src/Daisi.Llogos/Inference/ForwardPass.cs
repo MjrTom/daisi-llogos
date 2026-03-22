@@ -518,6 +518,9 @@ public sealed class ForwardPass : IForwardPass
     /// </summary>
     public bool SupportsBatchedPrefill => true;
 
+    /// <summary>Disable command batching/graph capture (needed when two models share one backend).</summary>
+    public void DisableGraphCapture() => _backend.DisableGraphCapture();
+
     /// <summary>
     /// Process M tokens through all transformer layers in parallel.
     /// Standard attention layers run fully batched. DeltaNet layers run

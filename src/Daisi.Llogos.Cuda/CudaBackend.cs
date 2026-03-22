@@ -29,6 +29,8 @@ public sealed class CudaBackend : IComputeBackend
     private bool _capturing;          // true while stream is in capture mode
     private nint _graphExec;          // reusable graph executable (0 = none)
     private bool _graphEnabled = true;
+    /// <summary>Disable graph capture (needed when multiple models share one backend).</summary>
+    public bool GraphEnabled { get => _graphEnabled; set => _graphEnabled = value; }
 
     public CudaBackend(int deviceOrdinal = 0)
     {
@@ -54,6 +56,9 @@ public sealed class CudaBackend : IComputeBackend
 
     /// <inheritdoc />
     public string Name => $"CUDA ({_context.DeviceName})";
+
+    /// <inheritdoc />
+    public void DisableGraphCapture() => _graphEnabled = false;
 
     /// <summary>Begin recording operations into a CUDA graph (if enabled).</summary>
     public void BeginCommands()
