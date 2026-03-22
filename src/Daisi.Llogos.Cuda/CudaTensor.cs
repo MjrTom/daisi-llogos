@@ -14,9 +14,6 @@ public sealed class CudaTensor : ITensor
     private CudaPinnedMemory? _pinnedMemory;
     private bool _disposed;
 
-    /// <summary>Cached FP16 copy for batch matmul. Lazily populated on first M>1 matmul.</summary>
-    internal CudaDeviceMemory? F16Cache { get; set; }
-
     internal CudaTensor(string name, GgmlType type, ReadOnlySpan<long> dimensions,
         bool pinned = false, bool alignedQ8_0 = false, bool alignedQ4_0 = false)
     {
@@ -183,8 +180,6 @@ public sealed class CudaTensor : ITensor
             _memory = null;
             _pinnedMemory?.Dispose();
             _pinnedMemory = null;
-            F16Cache?.Dispose();
-            F16Cache = null;
             _disposed = true;
         }
     }
