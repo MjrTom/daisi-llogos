@@ -343,6 +343,63 @@ __global__ void embedding_lookup_q4_k(float* output, const unsigned char* table,
     output[idx] = d * (float)sc * (float)nibble - dmin * (float)m;
 }
 
+// ── Q4_0 embedding lookup ─────────────────────────────────────────────────────
+// Flexible: handles both 18-byte and 20-byte (aligned) blocks via stride/offset params.
+
+__global__ void embedding_lookup_q4_0_v2(float* output, const unsigned char* table,
+                                          int hidden_dim, int token_id,
+                                          int block_stride, int nibble_offset)
+{
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= hidden_dim) return;
+
+    int blocks_per_row = hidden_dim / 32;
+    int bytes_per_row = blocks_per_row * block_stride;
+    const unsigned char* row = table + (long long)token_id * bytes_per_row;
+
+    int block_idx = idx / 32;
+    int elem_in_block = idx % 32;
+    const unsigned char* blk = row + block_idx * block_stride;
+
+    unsigned short scale_bits = ((unsigned short)blk[1] << 8) | blk[0];
+    float scale = fp16_to_fp32_emb(scale_bits);
+
+    int byte_idx = elem_in_block < 16 ? elem_in_block : (elem_in_block - 16);
+    unsigned char packed = blk[nibble_offset + byte_idx];
+    int nibble = (elem_in_block < 16) ? (packed & 0xF) : (packed >> 4);
+    output[idx] = scale * (float)(nibble - 8);
+}
+
+// ── Q4_1 embedding lookup ─────────────────────────────────────────────────────
+// Q4_1 block: 32 elements, 20 bytes.
+// Layout: 2b FP16 scale (d) + 2b FP16 min (m) + 16b packed nibbles.
+// Same nibble layout as Q4_0, but value = d * nibble + m (no subtract 8).
+
+__global__ void embedding_lookup_q4_1(float* output, const unsigned char* table,
+                                       int hidden_dim, int token_id)
+{
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= hidden_dim) return;
+
+    int blocks_per_row = hidden_dim / 32;
+    int bytes_per_row = blocks_per_row * 20;
+    const unsigned char* row = table + (long long)token_id * bytes_per_row;
+
+    int block_idx = idx / 32;
+    int elem_in_block = idx % 32;
+    const unsigned char* blk = row + block_idx * 20;
+
+    unsigned short d_bits = ((unsigned short)blk[1] << 8) | blk[0];
+    unsigned short m_bits = ((unsigned short)blk[3] << 8) | blk[2];
+    float d = fp16_to_fp32_emb(d_bits);
+    float m = fp16_to_fp32_emb(m_bits);
+
+    int byte_idx = elem_in_block < 16 ? elem_in_block : (elem_in_block - 16);
+    unsigned char packed = blk[4 + byte_idx];
+    int nibble = (elem_in_block < 16) ? (packed & 0xF) : (packed >> 4);
+    output[idx] = d * (float)nibble + m;
+}
+
 // ── Fused: Residual save + RMSNorm ────────────────────────────────────────────
 // residual[i] = input[i]; output[i] = (input[i] / rms) * weight[i]
 // Saves one kernel launch + one full read/write of the hidden state.
@@ -412,6 +469,209 @@ __global__ void add_rms_norm_residual(float* output, float* hidden, float* resid
 
     for (int i = tid; i < n; i += stride)
         output[i] = hidden[i] * inv_rms * weight[i];
+}
+
+// ── Fused: AddRmsNormResidual + Q8_1 Quantization ───────────────────────────
+// Same as add_rms_norm_residual but also outputs Q8_1 quantized version of the
+// normalized result. Eliminates separate quantize_f32_q8_1 kernel call.
+// Q8_1 layout: [d(f16,2b) + sum(f16,2b) + quants(32b)] = 36 bytes per block.
+
+__global__ void add_rms_norm_residual_q8_1(
+    float* output, float* hidden, float* residual,
+    const float* b, const float* weight,
+    void* q8_1_out, int n, float eps)
+{
+    extern __shared__ float sdata[];
+    int tid = threadIdx.x;
+    int stride = blockDim.x;
+
+    // Pass 1: hidden += b, residual = hidden, compute sum of squares
+    float sq_sum = 0.0f;
+    for (int i = tid; i < n; i += stride)
+    {
+        float v = hidden[i] + b[i];
+        hidden[i] = v;
+        residual[i] = v;
+        sq_sum += v * v;
+    }
+
+    sdata[tid] = sq_sum;
+    __syncthreads();
+    for (int s = blockDim.x / 2; s > 0; s >>= 1)
+    {
+        if (tid < s) sdata[tid] += sdata[tid + s];
+        __syncthreads();
+    }
+    float inv_rms = 1.0f / sqrtf(sdata[0] / (float)n + eps);
+
+    // Pass 2: normalize + write output + quantize to Q8_1
+    // Each thread processes elements with stride, spanning multiple Q8_1 blocks.
+    // We need per-block amax and sum, which requires block-level cooperation.
+    // Since blockDim.x >= n/32 (threads >= blocks), each thread handles ≤1 block.
+
+    int num_q8_blocks = n / 32;
+    unsigned char* q8_out = (unsigned char*)q8_1_out;
+
+    // First: normalize and write output (all threads)
+    for (int i = tid; i < n; i += stride)
+        output[i] = hidden[i] * inv_rms * weight[i];
+
+    __syncthreads(); // ensure all output values written
+
+    // Then: quantize output to Q8_1 (1 thread per Q8_1 block)
+    for (int blk = tid; blk < num_q8_blocks; blk += stride)
+    {
+        const float* sp = output + blk * 32;
+        unsigned char* dp = q8_out + blk * 36;
+
+        float amax = 0.0f;
+        float sum = 0.0f;
+        #pragma unroll
+        for (int i = 0; i < 32; i++) {
+            float v = sp[i];
+            sum += v;
+            float av = fabsf(v);
+            if (av > amax) amax = av;
+        }
+
+        float d = amax / 127.0f;
+        unsigned short d_fp16 = fp32_to_fp16(d);
+        unsigned short s_fp16 = fp32_to_fp16(sum);
+        dp[0] = d_fp16 & 0xFF; dp[1] = d_fp16 >> 8;
+        dp[2] = s_fp16 & 0xFF; dp[3] = s_fp16 >> 8;
+
+        signed char* qs = (signed char*)(dp + 4);
+        #pragma unroll
+        for (int i = 0; i < 32; i++)
+            qs[i] = (amax == 0.0f) ? 0 : (signed char)__float2int_rn(sp[i] / d);
+    }
+}
+
+// ── Fused: RmsNormResidual + Q8_1 Quantization ─────────────────────────────
+__global__ void rms_norm_residual_q8_1(
+    float* output, float* residual, const float* input,
+    const float* weight, void* q8_1_out, int n, float eps)
+{
+    extern __shared__ float sdata[];
+    int tid = threadIdx.x;
+    int stride = blockDim.x;
+
+    // Pass 1: copy to residual + compute sum of squares
+    float sq_sum = 0.0f;
+    for (int i = tid; i < n; i += stride)
+    {
+        float v = input[i];
+        residual[i] = v;
+        sq_sum += v * v;
+    }
+
+    sdata[tid] = sq_sum;
+    __syncthreads();
+    for (int s = blockDim.x / 2; s > 0; s >>= 1)
+    {
+        if (tid < s) sdata[tid] += sdata[tid + s];
+        __syncthreads();
+    }
+    float inv_rms = 1.0f / sqrtf(sdata[0] / (float)n + eps);
+
+    // Pass 2: normalize + write output
+    for (int i = tid; i < n; i += stride)
+        output[i] = input[i] * inv_rms * weight[i];
+
+    __syncthreads();
+
+    // Pass 3: quantize output to Q8_1
+    int num_q8_blocks = n / 32;
+    unsigned char* q8_out = (unsigned char*)q8_1_out;
+
+    for (int blk = tid; blk < num_q8_blocks; blk += stride)
+    {
+        const float* sp = output + blk * 32;
+        unsigned char* dp = q8_out + blk * 36;
+
+        float amax = 0.0f;
+        float sum = 0.0f;
+        #pragma unroll
+        for (int i = 0; i < 32; i++) {
+            float v = sp[i];
+            sum += v;
+            float av = fabsf(v);
+            if (av > amax) amax = av;
+        }
+
+        float d = amax / 127.0f;
+        unsigned short d_fp16 = fp32_to_fp16(d);
+        unsigned short s_fp16 = fp32_to_fp16(sum);
+        dp[0] = d_fp16 & 0xFF; dp[1] = d_fp16 >> 8;
+        dp[2] = s_fp16 & 0xFF; dp[3] = s_fp16 >> 8;
+
+        signed char* qs = (signed char*)(dp + 4);
+        #pragma unroll
+        for (int i = 0; i < 32; i++)
+            qs[i] = (amax == 0.0f) ? 0 : (signed char)__float2int_rn(sp[i] / d);
+    }
+}
+
+// ── Fused: AddRmsNorm + Q8_1 Quantization ──────────────────────────────────
+__global__ void add_rms_norm_q8_1(
+    float* output, float* hidden, const float* a, const float* b,
+    const float* weight, void* q8_1_out, int n, float eps)
+{
+    extern __shared__ float sdata[];
+    int tid = threadIdx.x;
+    int stride = blockDim.x;
+
+    float sq_sum = 0.0f;
+    for (int i = tid; i < n; i += stride)
+    {
+        float v = a[i] + b[i];
+        hidden[i] = v;
+        sq_sum += v * v;
+    }
+
+    sdata[tid] = sq_sum;
+    __syncthreads();
+    for (int s = blockDim.x / 2; s > 0; s >>= 1)
+    {
+        if (tid < s) sdata[tid] += sdata[tid + s];
+        __syncthreads();
+    }
+    float inv_rms = 1.0f / sqrtf(sdata[0] / (float)n + eps);
+
+    for (int i = tid; i < n; i += stride)
+        output[i] = hidden[i] * inv_rms * weight[i];
+
+    __syncthreads();
+
+    int num_q8_blocks = n / 32;
+    unsigned char* q8_out = (unsigned char*)q8_1_out;
+
+    for (int blk = tid; blk < num_q8_blocks; blk += stride)
+    {
+        const float* sp = output + blk * 32;
+        unsigned char* dp = q8_out + blk * 36;
+
+        float amax = 0.0f;
+        float sum = 0.0f;
+        #pragma unroll
+        for (int i = 0; i < 32; i++) {
+            float v = sp[i];
+            sum += v;
+            float av = fabsf(v);
+            if (av > amax) amax = av;
+        }
+
+        float d = amax / 127.0f;
+        unsigned short d_fp16 = fp32_to_fp16(d);
+        unsigned short s_fp16 = fp32_to_fp16(sum);
+        dp[0] = d_fp16 & 0xFF; dp[1] = d_fp16 >> 8;
+        dp[2] = s_fp16 & 0xFF; dp[3] = s_fp16 >> 8;
+
+        signed char* qs = (signed char*)(dp + 4);
+        #pragma unroll
+        for (int i = 0; i < 32; i++)
+            qs[i] = (amax == 0.0f) ? 0 : (signed char)__float2int_rn(sp[i] / d);
+    }
 }
 
 // ── Fused: SwiGLU (SiLU + ElementMul) ────────────────────────────────────────

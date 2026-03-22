@@ -59,7 +59,7 @@ __global__ void quantize_f32_q8_1(void* __restrict__ dst,
     if (blk >= num_blocks) return;
 
     const float* sp = src + blk * 32;
-    unsigned char* dp = (unsigned char*)dst + blk * 36;
+    unsigned char* dp = (unsigned char*)dst + blk * 36; // 36 bytes: [d(f16) + sum(f16) + quants(32)]
 
     float amax = 0.0f;
     float sum = 0.0f;
@@ -72,8 +72,8 @@ __global__ void quantize_f32_q8_1(void* __restrict__ dst,
     }
 
     float d = amax / 127.0f;
-    float id = d > 0.0f ? 127.0f / amax : 0.0f;
 
+    // Store d and sum as half2, matching llama.cpp exactly: make_half2(d, sum)
     unsigned short d_fp16 = matmul_fp32_to_fp16(d);
     unsigned short s_fp16 = matmul_fp32_to_fp16(sum);
     dp[0] = d_fp16 & 0xFF; dp[1] = d_fp16 >> 8;
@@ -82,7 +82,8 @@ __global__ void quantize_f32_q8_1(void* __restrict__ dst,
     signed char* qs = (signed char*)(dp + 4);
     #pragma unroll
     for (int i = 0; i < 32; i++)
-        qs[i] = (signed char)__float2int_rn(sp[i] * id);
+        qs[i] = (amax == 0.0f) ? 0 : (signed char)__float2int_rn(sp[i] / d);
+    // quants at dp + 8 (was dp + 4)
 }
 
 // ── Q8_0 × Q8_1 MatMul using __dp4a (integer dot product hardware) ──────────
@@ -574,6 +575,254 @@ __global__ void dequant_matmul_f16(float* output, const float* a,
         output[n] = sum;
 }
 
+// ── Q4_0 × Q8_1 dp4a MatMul ──────────────────────────────────────────────
+// 1 thread per Q4_0 block, 8 dp4a ops per block (full 32 elements).
+// Multi-row: 2 output rows per CUDA block for weight data reuse.
+// Configurable thread count via template.
+
+#define Q4_0_DP4A_THREADS 128
+#define Q4_0_DP4A_ROWS 8
+
+__global__ __launch_bounds__(Q4_0_DP4A_THREADS)
+void dequant_matmul_q4_0_q8_1(float* __restrict__ output,
+                                const void* __restrict__ vq8_1,
+                                const unsigned char* __restrict__ b,
+                                int M, int K, int N)
+{
+    const int tid = threadIdx.x;
+    const int lane = tid & 31;
+    const int warp = tid >> 5;
+    const int n_base = blockIdx.x * Q4_0_DP4A_ROWS;
+    if (n_base >= N) return;
+
+    const int blocks_per_row = K / 32;
+    const long bytes_per_row = (long)blocks_per_row * 20;
+    const unsigned char* a_q8_1 = (const unsigned char*)vq8_1;
+    const int nwarps = Q4_0_DP4A_THREADS / 32;
+
+    float sums[Q4_0_DP4A_ROWS] = {0};
+
+    for (int blk = tid; blk < blocks_per_row; blk += Q4_0_DP4A_THREADS)
+    {
+        // Load Q8_1 activation: [d(f16) + sum(f16) + quants(32b)] = 36 bytes
+        const unsigned char* ablk = a_q8_1 + blk * 36;
+        float a_d = fp16_to_fp32(*reinterpret_cast<const unsigned short*>(ablk));
+        float a_s = fp16_to_fp32(*reinterpret_cast<const unsigned short*>(ablk + 2));
+        const int* a_qs = reinterpret_cast<const int*>(ablk + 4);
+
+        // Preload weight scale + nibbles for all rows (issue all reads before compute)
+        float w_scales[Q4_0_DP4A_ROWS];
+        unsigned int w_nibs[Q4_0_DP4A_ROWS][4];
+
+        #pragma unroll
+        for (int r = 0; r < Q4_0_DP4A_ROWS; r++)
+        {
+            int n = n_base + r;
+            if (n < N) {
+                const unsigned int* bw = reinterpret_cast<const unsigned int*>(
+                    b + (long)n * bytes_per_row + blk * 20);
+                w_scales[r] = fp16_to_fp32((unsigned short)(__ldg(&bw[0]) & 0xFFFF));
+                w_nibs[r][0] = __ldg(&bw[1]);
+                w_nibs[r][1] = __ldg(&bw[2]);
+                w_nibs[r][2] = __ldg(&bw[3]);
+                w_nibs[r][3] = __ldg(&bw[4]);
+            }
+        }
+
+        // Compute dp4a dot products using preloaded data
+        #pragma unroll
+        for (int r = 0; r < Q4_0_DP4A_ROWS; r++)
+        {
+            int n = n_base + r;
+            if (n >= N) break;
+
+            int sumi = 0;
+            #pragma unroll
+            for (int i = 0; i < 4; i++) {
+                int vi0 = (int)(w_nibs[r][i] & 0x0F0F0F0F);
+                int vi1 = (int)((w_nibs[r][i] >> 4) & 0x0F0F0F0F);
+                sumi = __dp4a(vi0, a_qs[i], sumi);
+                sumi = __dp4a(vi1, a_qs[i + 4], sumi);
+            }
+            sums[r] += w_scales[r] * ((float)sumi * a_d - 8.0f * a_s);
+        }
+    }
+
+    // Warp + cross-warp reduction
+    __shared__ float smem[Q4_0_DP4A_THREADS / 32][Q4_0_DP4A_ROWS];
+
+    #pragma unroll
+    for (int r = 0; r < Q4_0_DP4A_ROWS; r++) {
+        float val = warp_reduce_sum(sums[r]);
+        if (lane == 0) smem[warp][r] = val;
+    }
+    __syncthreads();
+
+    if (warp == 0) {
+        #pragma unroll
+        for (int r = 0; r < Q4_0_DP4A_ROWS; r++) {
+            float val = (lane < nwarps) ? smem[lane][r] : 0.0f;
+            val = warp_reduce_sum(val);
+            if (lane == 0 && n_base + r < N)
+                output[n_base + r] = val;
+        }
+    }
+}
+
+// ── Fused Q4_0 Dequant + MatMul (aligned 20-byte blocks) ──────────────────
+// Q4_0 repacked: [scale(2b) + pad(2b) + nibbles(16b)] = 20 bytes, 4-byte aligned.
+// 2 output rows per block for activation reuse.
+#define Q4_0_ROWS_PER_BLOCK 2
+
+__global__ void dequant_matmul_q4_0(float* __restrict__ output,
+                                     const float* __restrict__ a,
+                                     const unsigned char* __restrict__ b,
+                                     int M, int K, int N)
+{
+    extern __shared__ float shared[];
+    int n_base = blockIdx.x * Q4_0_ROWS_PER_BLOCK;
+    int tid = threadIdx.x;
+    int blockSize = blockDim.x;
+    if (n_base >= N) return;
+
+    int blocks_per_row = K / 32;
+    long bytes_per_row = (long)blocks_per_row * 20;
+
+    float sums[Q4_0_ROWS_PER_BLOCK] = {0};
+
+    for (int blk = tid; blk < blocks_per_row; blk += blockSize)
+    {
+        const float4* ap = reinterpret_cast<const float4*>(a + blk * 32);
+        float4 a_cache[8];
+        float asum = 0.0f;
+        #pragma unroll
+        for (int i = 0; i < 8; i++) {
+            a_cache[i] = __ldg(&ap[i]);
+            asum += a_cache[i].x + a_cache[i].y + a_cache[i].z + a_cache[i].w;
+        }
+
+        #pragma unroll
+        for (int r = 0; r < Q4_0_ROWS_PER_BLOCK; r++)
+        {
+            int n = n_base + r;
+            if (n >= N) break;
+
+            const unsigned int* bw = reinterpret_cast<const unsigned int*>(
+                b + (long)n * bytes_per_row + blk * 20);
+            float scale = fp16_to_fp32((unsigned short)(__ldg(&bw[0]) & 0xFFFF));
+
+            float bs = 0.0f;
+            #pragma unroll
+            for (int i = 0; i < 4; i++) {
+                unsigned int packed = __ldg(&bw[1 + i]);
+                bs += a_cache[i].x * (float)(packed       & 0xF)
+                    + a_cache[i].y * (float)((packed >> 8) & 0xF)
+                    + a_cache[i].z * (float)((packed >> 16)& 0xF)
+                    + a_cache[i].w * (float)((packed >> 24)& 0xF)
+                    + a_cache[i+4].x * (float)((packed >> 4) & 0xF)
+                    + a_cache[i+4].y * (float)((packed >> 12)& 0xF)
+                    + a_cache[i+4].z * (float)((packed >> 20)& 0xF)
+                    + a_cache[i+4].w * (float)((packed >> 28)& 0xF);
+            }
+            sums[r] += scale * (bs - 8.0f * asum);
+        }
+    }
+
+    int numWarps = blockSize >> 5;
+    #pragma unroll
+    for (int r = 0; r < Q4_0_ROWS_PER_BLOCK; r++) {
+        float sum = warp_reduce_sum(sums[r]);
+        int lane = tid & 31; int warp = tid >> 5;
+        if (lane == 0) shared[warp] = sum;
+        __syncthreads();
+        if (tid < numWarps) sum = shared[tid]; else sum = 0.0f;
+        sum = warp_reduce_sum(sum);
+        if (tid == 0 && n_base + r < N) output[n_base + r] = sum;
+        __syncthreads();
+    }
+}
+
+// ── Fused Q4_1 Dequant + MatMul ────────────────────────────────────────────
+// Q4_1 block: 32 elements, 20 bytes.
+// Layout: 2b FP16 scale (d) + 2b FP16 min (m) + 16b packed nibbles.
+// Same nibble layout as Q4_0 (lo=elem[i], hi=elem[i+16]), but value = d * nibble + m.
+// Multi-row: 4 output neurons per block with activation reuse.
+#define Q4_1_ROWS_PER_BLOCK 8
+
+__global__ void dequant_matmul_q4_1(float* __restrict__ output,
+                                     const float* __restrict__ a,
+                                     const unsigned char* __restrict__ b,
+                                     int M, int K, int N)
+{
+    extern __shared__ float shared[];
+    int n_base = blockIdx.x * Q4_1_ROWS_PER_BLOCK;
+    int tid = threadIdx.x;
+    int blockSize = blockDim.x;
+    if (n_base >= N) return;
+
+    int blocks_per_row = K / 32;
+    long bytes_per_row = (long)blocks_per_row * 20;
+
+    float sums[Q4_1_ROWS_PER_BLOCK] = {0};
+
+    for (int blk = tid; blk < blocks_per_row; blk += blockSize)
+    {
+        // Load activation once (shared across rows)
+        const float4* ap = reinterpret_cast<const float4*>(a + blk * 32);
+        float4 a_cache[8];
+        float asum = 0.0f;
+        #pragma unroll
+        for (int i = 0; i < 8; i++) {
+            a_cache[i] = __ldg(&ap[i]);
+            asum += a_cache[i].x + a_cache[i].y + a_cache[i].z + a_cache[i].w;
+        }
+
+        #pragma unroll
+        for (int r = 0; r < Q4_1_ROWS_PER_BLOCK; r++)
+        {
+            int n = n_base + r;
+            if (n >= N) break;
+
+            const unsigned char* block_ptr = b + (long)n * bytes_per_row + blk * 20;
+            // Q4_1: 20 bytes = 5 uint32s, naturally 4-byte aligned
+            unsigned int d_m = __ldg(reinterpret_cast<const unsigned int*>(block_ptr));
+            float d = fp16_to_fp32((unsigned short)(d_m & 0xFFFF));
+            float m = fp16_to_fp32((unsigned short)(d_m >> 16));
+            const unsigned int* q32 = reinterpret_cast<const unsigned int*>(block_ptr + 4); // ALIGNED
+
+            float bs = 0.0f;
+            #pragma unroll
+            for (int i = 0; i < 4; i++) {
+                unsigned int packed = __ldg(&q32[i]);
+                float4 ai_lo = a_cache[i];
+                bs += ai_lo.x * (float)(packed       & 0xF)
+                    + ai_lo.y * (float)((packed >> 8) & 0xF)
+                    + ai_lo.z * (float)((packed >> 16)& 0xF)
+                    + ai_lo.w * (float)((packed >> 24)& 0xF);
+                float4 ai_hi = a_cache[i + 4];
+                bs += ai_hi.x * (float)((packed >> 4) & 0xF)
+                    + ai_hi.y * (float)((packed >> 12)& 0xF)
+                    + ai_hi.z * (float)((packed >> 20)& 0xF)
+                    + ai_hi.w * (float)((packed >> 28)& 0xF);
+            }
+            sums[r] += d * bs + m * asum;
+        }
+    }
+
+    int numWarps = blockSize >> 5;
+    #pragma unroll
+    for (int r = 0; r < Q4_1_ROWS_PER_BLOCK; r++) {
+        float sum = warp_reduce_sum(sums[r]);
+        int lane = tid & 31; int warp = tid >> 5;
+        if (lane == 0) shared[warp] = sum;
+        __syncthreads();
+        if (tid < numWarps) sum = shared[tid]; else sum = 0.0f;
+        sum = warp_reduce_sum(sum);
+        if (tid == 0 && n_base + r < N) output[n_base + r] = sum;
+        __syncthreads();
+    }
+}
+
 // ── Fused Q4_K Dequant + MatMul ────────────────────────────────────────────
 // Q4_K super block: 256 elements, 144 bytes.
 // Layout: 2b d(f16) + 2b dmin(f16) + 12b packed scales/mins + 128b nibbles.
@@ -680,69 +929,80 @@ __global__ void dequant_matmul_q4_k(float* output, const float* a,
 // ── Fused Q5_K Dequant + MatMul ────────────────────────────────────────────
 // Q5_K super block: 256 elements, 176 bytes.
 // Layout: 2b d + 2b dmin + 12b scales/mins + 32b high bits + 128b low nibbles.
+// Multi-row: 4 output neurons per block with activation reuse.
+#define Q5K_ROWS_PER_BLOCK 1
 
 __global__ void dequant_matmul_q5_k(float* output, const float* a,
                                      const unsigned char* b,
                                      int M, int K, int N)
 {
     extern __shared__ float shared[];
-    int n = blockIdx.x;
+    int n_base = blockIdx.x * Q5K_ROWS_PER_BLOCK;
     int tid = threadIdx.x;
     int blockSize = blockDim.x;
-    if (n >= N) return;
+    if (n_base >= N) return;
 
     int sbPerRow = K / 256;
     long long bytesPerRow = (long long)sbPerRow * 176;
-    const unsigned char* b_row = b + (long long)n * bytesPerRow;
 
-    float sum = 0.0f;
+    float sums[Q5K_ROWS_PER_BLOCK] = {0};
+
     for (int sb = tid; sb < sbPerRow; sb += blockSize)
     {
-        const unsigned char* sbp = b_row + sb * 176;
+        // Load activation once (shared across rows)
         const float* ap = a + sb * 256;
 
-        float d = fp16_to_fp32(((unsigned short)sbp[1] << 8) | sbp[0]);
-        float dmin = fp16_to_fp32(((unsigned short)sbp[3] << 8) | sbp[2]);
-
-        // Chunked layout matching ggml: 4 chunks of 64 elements each.
-        // Each 32-byte qs block: low nibble → first 32, high nibble → next 32.
-        // qh bits: element n's high bit at qh[n%32] bit (n/32), using rotating bitmask.
-        const unsigned char* qh = sbp + 16;
-        const unsigned char* qs = sbp + 48;
-        int isIdx = 0;
-        unsigned char u1 = 1, u2 = 2;
-        for (int j = 0; j < 4; j++)
+        #pragma unroll
+        for (int r = 0; r < Q5K_ROWS_PER_BLOCK; r++)
         {
-            float ss0, sm0, ss1, sm1;
-            unpack_q4k_scales(sbp, isIdx, d, dmin, ss0, sm0);
-            unpack_q4k_scales(sbp, isIdx + 1, d, dmin, ss1, sm1);
+            int n = n_base + r;
+            if (n >= N) break;
 
-            for (int l = 0; l < 32; l++)
+            const unsigned char* sbp = b + (long long)n * bytesPerRow + sb * 176;
+
+            float d = fp16_to_fp32(((unsigned short)sbp[1] << 8) | sbp[0]);
+            float dmin = fp16_to_fp32(((unsigned short)sbp[3] << 8) | sbp[2]);
+
+            const unsigned char* qh = sbp + 16;
+            const unsigned char* qs = sbp + 48;
+            int isIdx = 0;
+            unsigned char u1 = 1, u2 = 2;
+            for (int j = 0; j < 4; j++)
             {
-                int lo = qs[j * 32 + l] & 0xF;
-                int hbLo = (qh[l] & u1) ? 16 : 0;
-                sum += ap[j * 64 + l] * (ss0 * (lo + hbLo) - sm0);
+                float ss0, sm0, ss1, sm1;
+                unpack_q4k_scales(sbp, isIdx, d, dmin, ss0, sm0);
+                unpack_q4k_scales(sbp, isIdx + 1, d, dmin, ss1, sm1);
 
-                int hi = qs[j * 32 + l] >> 4;
-                int hbHi = (qh[l] & u2) ? 16 : 0;
-                sum += ap[j * 64 + l + 32] * (ss1 * (hi + hbHi) - sm1);
+                for (int l = 0; l < 32; l++)
+                {
+                    int lo = qs[j * 32 + l] & 0xF;
+                    int hbLo = (qh[l] & u1) ? 16 : 0;
+                    sums[r] += ap[j * 64 + l] * (ss0 * (lo + hbLo) - sm0);
+
+                    int hi = qs[j * 32 + l] >> 4;
+                    int hbHi = (qh[l] & u2) ? 16 : 0;
+                    sums[r] += ap[j * 64 + l + 32] * (ss1 * (hi + hbHi) - sm1);
+                }
+
+                u1 <<= 2;
+                u2 <<= 2;
+                isIdx += 2;
             }
-
-            u1 <<= 2;
-            u2 <<= 2;
-            isIdx += 2;
         }
     }
 
-    sum = warp_reduce_sum(sum);
-    int lane = tid & 31;
-    int warp = tid >> 5;
-    if (lane == 0) shared[warp] = sum;
-    __syncthreads();
     int numWarps = blockSize >> 5;
-    if (tid < numWarps) sum = shared[tid]; else sum = 0.0f;
-    sum = warp_reduce_sum(sum);
-    if (tid == 0) output[n] = sum;
+    #pragma unroll
+    for (int r = 0; r < Q5K_ROWS_PER_BLOCK; r++) {
+        float sum = warp_reduce_sum(sums[r]);
+        int lane = tid & 31; int warp = tid >> 5;
+        if (lane == 0) shared[warp] = sum;
+        __syncthreads();
+        if (tid < numWarps) sum = shared[tid]; else sum = 0.0f;
+        sum = warp_reduce_sum(sum);
+        if (tid == 0 && n_base + r < N) output[n_base + r] = sum;
+        __syncthreads();
+    }
 }
 
 // ── Fused Q6_K Dequant + MatMul ────────────────────────────────────────────

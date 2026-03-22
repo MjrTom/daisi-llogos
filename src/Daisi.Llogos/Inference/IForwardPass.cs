@@ -6,6 +6,14 @@ namespace Daisi.Llogos.Inference;
 public interface IForwardPass : IDisposable
 {
     ReadOnlySpan<float> Forward(int tokenId, int position);
+
+    /// <summary>
+    /// Run only the transformer layers without logit projection.
+    /// Used for prefill tokens where logits aren't needed — skips the
+    /// expensive RMSNorm + LM head + logit download.
+    /// </summary>
+    void ForwardHidden(int tokenId, int position);
+
     IKvCache KvCache { get; }
 
     /// <summary>

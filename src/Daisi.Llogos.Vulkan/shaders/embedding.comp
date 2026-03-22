@@ -9,7 +9,7 @@ layout(local_size_x = 256) in;
 layout(push_constant) uniform PushConstants {
     uint hiddenDim;
     int tokenId;
-    uint tableType; // 0=F32, 1=Q8_0, 2=F16, 3=Q4_K, 4=Q8_0_aligned
+    uint tableType; // 0=F32, 1=Q8_0, 2=F16, 3=Q4_K, 4=Q8_0_aligned, 5=Q4_0, 6=Q4_1
 };
 
 layout(set = 0, binding = 0) buffer OutputBuf { float output_data[]; };
@@ -88,5 +88,35 @@ void main() {
         float scale = unpackHalf2x16(scaleBits).x;
         int8_t q = int8_t(table_data[blockByteOff + 4 + blockOffset]); // quants at offset 4
         output_data[idx] = scale * float(q);
+    } else if (tableType == 5) {
+        // Q4_0: 32 elements, 18 bytes (2b scale + 16b nibbles)
+        // byte[i]: lo nibble = elem[i], hi nibble = elem[i+16]
+        uint blocksPerRow = hiddenDim / 32;
+        uint blkIdx = idx / 32;
+        uint elemInBlock = idx % 32;
+        uint blockByteOff = (uint(tokenId) * blocksPerRow + blkIdx) * 18;
+        uint scaleBits = uint(table_data[blockByteOff]) | (uint(table_data[blockByteOff + 1]) << 8);
+        float scale = unpackHalf2x16(scaleBits).x;
+
+        uint byteIdx = (elemInBlock < 16) ? elemInBlock : (elemInBlock - 16);
+        uint packed = uint(table_data[blockByteOff + 2 + byteIdx]);
+        uint nibble = (elemInBlock < 16) ? (packed & 0xFu) : (packed >> 4);
+        output_data[idx] = scale * float(int(nibble) - 8);
+    } else if (tableType == 6) {
+        // Q4_1: 32 elements, 20 bytes (2b d + 2b m + 16b nibbles)
+        // Same nibble layout as Q4_0, value = d * nibble + m
+        uint blocksPerRow = hiddenDim / 32;
+        uint blkIdx = idx / 32;
+        uint elemInBlock = idx % 32;
+        uint blockByteOff = (uint(tokenId) * blocksPerRow + blkIdx) * 20;
+        uint dBits = uint(table_data[blockByteOff]) | (uint(table_data[blockByteOff + 1]) << 8);
+        uint mBits = uint(table_data[blockByteOff + 2]) | (uint(table_data[blockByteOff + 3]) << 8);
+        float d = unpackHalf2x16(dBits).x;
+        float m = unpackHalf2x16(mBits).x;
+
+        uint byteIdx = (elemInBlock < 16) ? elemInBlock : (elemInBlock - 16);
+        uint packed = uint(table_data[blockByteOff + 4 + byteIdx]);
+        uint nibble = (elemInBlock < 16) ? (packed & 0xFu) : (packed >> 4);
+        output_data[idx] = d * float(nibble) + m;
     }
 }

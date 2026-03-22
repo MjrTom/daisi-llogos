@@ -82,17 +82,25 @@ public sealed class DaisiLlogosChatSession : IDisposable
         }
 
         // Prefill new tokens (delta from cached position)
+        // Use ForwardHidden for intermediate tokens — skips the expensive
+        // RMSNorm + LM head projection + logit download that's only needed
+        // for the final token where we sample.
         {
-            ReadOnlySpan<float> logits = default;
-            for (int i = commonPrefix; i < allTokenIds.Length; i++)
+            int prefillEnd = allTokenIds.Length - 1;
+            for (int i = commonPrefix; i < prefillEnd; i++)
             {
                 ct.ThrowIfCancellationRequested();
-                logits = _forward.Forward(allTokenIds[i], i);
+                _forward.ForwardHidden(allTokenIds[i], i);
             }
-            // Copy logits to heap buffer so they survive across yield
-            if (_logitsBuffer == null || _logitsBuffer.Length != logits.Length)
-                _logitsBuffer = new float[logits.Length];
-            logits.CopyTo(_logitsBuffer);
+            // Full forward on the last token to get logits for sampling
+            if (prefillEnd >= commonPrefix)
+            {
+                ct.ThrowIfCancellationRequested();
+                var logits = _forward.Forward(allTokenIds[prefillEnd], prefillEnd);
+                if (_logitsBuffer == null || _logitsBuffer.Length != logits.Length)
+                    _logitsBuffer = new float[logits.Length];
+                logits.CopyTo(_logitsBuffer);
+            }
         }
         _cachedTokenCount = allTokenIds.Length;
 
