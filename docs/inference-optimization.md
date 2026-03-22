@@ -15,7 +15,7 @@ RTX 5080, 128 decode tokens, greedy sampling (temperature=0). llama.cpp b8461.
 | Qwen3.5-9B Q4_0 | 100 | 123 | 0.81x |
 | Qwen3-8B Q4_K_M | 122 | 138 | 0.88x |
 
-We exceed llama.cpp on 4 of 6 models tested. The remaining gap on 4-bit quants is from our Q4_0 float kernel being compute-bound on nibble extraction — a known limitation that dp4a partially addresses.
+We exceed llama.cpp on 3 of 6 models and match within 2% on a fourth. The remaining gap on 4-bit quants is from our Q4_0 float kernel being compute-bound on nibble extraction — a known limitation that dp4a partially addresses.
 
 ## 1. Partial Vocabulary Logit Computation
 

@@ -22,7 +22,7 @@ Measured with `--bench`, 128 decode tokens, FP16 KV cache. llama.cpp b8461 compa
 
 ### Llogos vs llama.cpp — CUDA
 
-**Exceeding llama.cpp on 4 of 6 models tested.** See [Inference Optimization White Paper](inference-optimization.md) for technical details.
+**Exceeding llama.cpp on 3 of 6 models, matching within 2% on a fourth.** See [Inference Optimization White Paper](inference-optimization.md) for technical details.
 
 | Model | Llogos CUDA | llama.cpp CUDA | % of llama.cpp |
 |-------|--------:|--------:|--------:|
