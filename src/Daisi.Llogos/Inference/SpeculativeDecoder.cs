@@ -44,15 +44,14 @@ public sealed class SpeculativeDecoder
         _target.DisableGraphCapture();
         _draft.DisableGraphCapture();
 
-        // Prefill both models with the prompt
+        // Prefill target model first, then draft (no interleaving — shared GPU state)
         var prefillSw = System.Diagnostics.Stopwatch.StartNew();
         for (int i = 0; i < promptIds.Length - 1; i++)
-        {
             _target.ForwardHidden(promptIds[i], i);
-            _draft.ForwardHidden(promptIds[i], i);
-        }
-        // Last prompt token — get target's first prediction
         int nextToken = _target.ForwardArgMax(promptIds[^1], promptIds.Length - 1);
+
+        for (int i = 0; i < promptIds.Length - 1; i++)
+            _draft.ForwardHidden(promptIds[i], i);
         _draft.ForwardArgMax(promptIds[^1], promptIds.Length - 1);
         prefillSw.Stop();
 
@@ -86,13 +85,12 @@ public sealed class SpeculativeDecoder
             TotalDraftTokens += N;
 
             // ── Verify phase: target processes [nextToken, draftTokens[0..N-2]] ──
-            // These are the tokens at positions [pos..pos+N-1]
-            var verifyInput = new int[N];
-            verifyInput[0] = nextToken;
+            // Sequential verify: uses same M=1 compute path as native decode
+            // (batched verify uses FP16 GemmEx which produces different argmax)
+            var targetPreds = new int[N];
+            targetPreds[0] = _target.ForwardArgMax(nextToken, pos);
             for (int d = 1; d < N; d++)
-                verifyInput[d] = draftTokens[d - 1];
-
-            int[] targetPreds = _target.ForwardBatchedVerify(verifyInput, pos);
+                targetPreds[d] = _target.ForwardArgMax(draftTokens[d - 1], pos + d);
             // targetPreds[i] = target's prediction for position pos+i+1
             // draftTokens[i] = draft's prediction for position pos+i+1
 
@@ -118,8 +116,8 @@ public sealed class SpeculativeDecoder
 
             if (accepted == N)
             {
-                // All N draft tokens accepted. Both models processed up to pos+N-1.
-                // Feed the last accepted token (draftTokens[N-1]) to both models at pos+N.
+                // All N accepted. Sequential verify already processed up to pos+N-1.
+                // Feed draftTokens[N-1] at pos+N to both models.
                 nextToken = _target.ForwardArgMax(draftTokens[N - 1], pos + N);
                 _draft.ForwardArgMax(draftTokens[N - 1], pos + N);
                 pos += N + 1;
