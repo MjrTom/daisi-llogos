@@ -623,10 +623,12 @@ public sealed class VulkanBackend : IComputeBackend
     // Persistent small buffer for ArgMax result (avoids allocation per token)
     private VulkanBuffer? _argmaxResultBuf;
 
-    public unsafe int ArgMax(ITensor tensor)
+    public unsafe int ArgMax(ITensor tensor) => ArgMax(tensor, (int)tensor.ElementCount);
+
+    public unsafe int ArgMax(ITensor tensor, int count)
     {
         var t = (VulkanTensor)tensor;
-        uint n = (uint)tensor.ElementCount;
+        uint n = (uint)count;
 
         if (_argmaxResultBuf == null)
             _argmaxResultBuf = new VulkanBuffer(_device, 4, hostVisible: false, transferSrc: true, transferDst: true);
@@ -635,7 +637,6 @@ public sealed class VulkanBackend : IComputeBackend
             t.DeviceBuffer, _argmaxResultBuf, gridOverride: 1);
 
         // Read result: single uint32 = argmax index
-        // Need to flush batch and download
         _device.EndBatch();
         var staging = new VulkanBuffer(_device, 4, hostVisible: true, transferDst: true);
         _device.SubmitAndWait(cmd =>
