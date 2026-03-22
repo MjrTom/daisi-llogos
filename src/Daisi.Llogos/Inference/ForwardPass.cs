@@ -233,7 +233,59 @@ public sealed class ForwardPass : IForwardPass
             if (layer == _config.NumLayers - 1)
                 _backend.ElementAdd(_hidden, _hidden, _residual);
             // Other layers: defer ElementAdd to fuse with next layer's RmsNormResidual
+
+            // Early exit profiling: check what token each layer would predict
+            if (EarlyExitProfile && layer >= _config.NumLayers / 4)
+            {
+                _backend.FlushCommands();
+                // Temporarily compute output to see what token this layer predicts
+                var tempHidden = new float[_config.HiddenDim];
+                _hidden.DequantizeTo(tempHidden);
+                // Store for comparison
+                if (EarlyExitTokens != null)
+                    EarlyExitTokens[layer] = ComputeArgMaxFromHidden(tempHidden);
+                _backend.BeginCommands();
+            }
         }
+    }
+
+    /// <summary>Enable early exit profiling — measures token prediction at each layer.</summary>
+    public bool EarlyExitProfile { get; set; }
+
+    /// <summary>Per-layer predicted token IDs (populated when EarlyExitProfile is true).</summary>
+    public int[]? EarlyExitTokens { get; set; }
+
+    private int ComputeArgMaxFromHidden(float[] hidden)
+    {
+        // Apply output norm manually on CPU
+        float sumSq = 0;
+        for (int i = 0; i < hidden.Length; i++) sumSq += hidden[i] * hidden[i];
+        float invRms = 1.0f / MathF.Sqrt(sumSq / hidden.Length + _config.NormEps);
+
+        // Download output norm weights
+        var normW = new float[_config.HiddenDim];
+        _weights.OutputNorm.DequantizeTo(normW);
+
+        var normed = new float[hidden.Length];
+        for (int i = 0; i < hidden.Length; i++)
+            normed[i] = hidden[i] * invRms * normW[i];
+
+        // Project through output weight (CPU matmul, partial vocab)
+        int vocabLimit = Math.Min(ArgMaxVocabLimit, _config.VocabSize);
+        var outW = new float[_weights.OutputWeight.ElementCount];
+        _weights.OutputWeight.DequantizeTo(outW);
+
+        float maxVal = float.MinValue;
+        int maxIdx = 0;
+        int K = _config.HiddenDim;
+        for (int n = 0; n < vocabLimit; n++)
+        {
+            float dot = 0;
+            for (int k = 0; k < K; k++)
+                dot += normed[k] * outW[n * K + k];
+            if (dot > maxVal) { maxVal = dot; maxIdx = n; }
+        }
+        return maxIdx;
     }
 
     /// <summary>

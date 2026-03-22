@@ -129,6 +129,50 @@ The fix: each quant type's dispatch computes its own grid size, thread count, an
 
 4. **Beating llama.cpp from managed C# is possible.** The GPU kernel code is identical (CUDA C compiled via NVRTC, GLSL compiled to SPIR-V). The managed overhead is negligible — the bottleneck is always the GPU kernels and memory bandwidth. C#'s `unsafe` context and P/Invoke provide zero-overhead access to the CUDA/Vulkan driver APIs.
 
+## 8. Early Layer Exit (Investigated, Not Viable)
+
+We investigated whether tokens could be predicted before all transformer layers complete, allowing the forward pass to exit early and skip the remaining layers.
+
+### Methodology
+
+Added `--profile-early-exit` instrumentation that projects the hidden state through the output norm and lm_head at each layer checkpoint (layers 8-31 of 32), recording which token each layer would predict.
+
+### Findings
+
+| Prompt | Final token | First correct layer | % through |
+|--------|------------|:-------------------:|:---------:|
+| "The capital of France is" | `.` (period) | Layer 27 | 84% |
+| "Hello" | `I` | Layer 29 | 90% |
+| "1 2 3 4 5 6 7 8 9" | `#` | Layer 21 | 65% |
+
+**The intermediate predictions are chaotic.** Between layers 8-25, the model predicts wildly different tokens at each layer — Chinese characters, Russian text, Hindi, control tokens, random subwords. The prediction does not gradually converge; it oscillates randomly until the final few layers suddenly snap to the correct answer.
+
+Example (prompt "1 2 3 4 5 6 7 8 9", predicting next token `#`):
+```
+L8:nat  L9:ucz  L10:CIAL  L11:其他  L12:实现自己  L13:sp  L14:sär
+L15:小孩  L16:草  L17:<|repo_name|>  L18:рож  L19:卡拉  L20:ँव
+L21:# ✓  L22:th  L23:idl  L24:•  L25:不欲  L26:# ✓  L27:xeda
+L28:##  L29:Поделиться  L30:1  L31:# ✓
+```
+
+Even for this trivial number sequence, the correct prediction (`#`) first appears at layer 21 but then disappears at layers 22-25 before returning. The prediction is non-monotonic.
+
+### Conclusion
+
+**Early exit without model-specific training saves at most 10-15% of layers.** Standard transformers are not trained to produce meaningful intermediate predictions. The residual stream accumulates information across all layers, and the final layers perform critical refinements.
+
+To achieve meaningful early exit (50%+ layer skip), the model would need to be fine-tuned with auxiliary classification heads at intermediate layers and an early exit loss objective. This is a training-time change, not an inference-time optimization applicable to off-the-shelf GGUF models.
+
+## 9. Batch MatMul Foundation
+
+We added M>1 matrix-matrix multiply support using cuBLAS SGEMM with GPU-side weight dequantization. When M>1, quantized weights are expanded to FP32 via a generic `dequant_to_f32` kernel, then multiplied using cuBLAS. The M=1 path remains completely untouched.
+
+This infrastructure enables:
+- **Batched prefill** — process all prompt tokens in parallel instead of one at a time
+- **Speculative decoding** — verify N draft tokens from a small model in a single target model forward pass
+
+Both require batching all non-matmul operations (RmsNorm, attention, SiLU, DeltaNet) for M>1, which is the next implementation step.
+
 ## Reproducibility
 
 All benchmarks use:

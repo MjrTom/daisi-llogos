@@ -105,6 +105,72 @@ public sealed class CudaBackend : IComputeBackend
     /// </summary>
     private void EnsureContext() => _context.MakeCurrent();
 
+    /// <summary>
+    /// Batch MatMul for M > 1 (prefill, speculative decode verification).
+    /// Dequantizes quantized weights to FP32 temp buffer, then uses cuBLAS SGEMM.
+    /// </summary>
+    private unsafe void BatchMatMul(CudaTensor outT, CudaTensor aT, CudaTensor bT, int M, int K, int N)
+    {
+        ulong outPtr = outT.DevicePtr;
+        ulong aPtr = aT.DevicePtr;
+        ulong bPtr = bT.DevicePtr;
+
+        ulong bF32Ptr;
+        bool needsDequant = bT.Type != Gguf.GgmlType.F32;
+
+        if (needsDequant)
+        {
+            // Dequantize weight to temporary FP32 buffer
+            long f32Bytes = (long)K * N * sizeof(float);
+            if (_batchDequantBuf == null || _batchDequantBufSize < f32Bytes)
+            {
+                _batchDequantBuf?.Dispose();
+                _batchDequantBuf = new CudaDeviceMemory((ulong)f32Bytes);
+                _batchDequantBufSize = f32Bytes;
+            }
+            bF32Ptr = _batchDequantBuf.DevicePtr;
+
+            // GPU dequant kernel: expand quantized weight to FP32
+            var func = _elementwiseModule.GetFunction("dequant_to_f32");
+            int totalElements = K * N;
+            int typeSize = Gguf.GgmlTypeInfo.TypeSize(bT.Type);
+            int blockSize = Gguf.GgmlTypeInfo.BlockSize(bT.Type);
+            int typeTag = (int)bT.Type;
+            uint grid = (uint)((totalElements + BlockSize - 1) / BlockSize);
+            nint* dArgs = stackalloc nint[5];
+            dArgs[0] = (nint)(&bF32Ptr);
+            dArgs[1] = (nint)(&bPtr);
+            dArgs[2] = (nint)(&totalElements);
+            dArgs[3] = (nint)(&typeTag);
+            dArgs[4] = (nint)(&blockSize);
+            _stream.Launch(func, grid, 1, 1, (uint)BlockSize, 1, 1, 0, dArgs);
+        }
+        else
+        {
+            bF32Ptr = bPtr;
+        }
+
+        // cuBLAS SGEMM: C = alpha * A * B^T + beta * C
+        // A is [M × K] row-major = [K × M] column-major
+        // B is [N × K] row-major = [K × N] column-major, need transpose
+        // C is [M × N] row-major = [N × M] column-major
+        // In column-major: C(N×M) = B^T(N×K) × A(K×M)
+        float alpha = 1.0f, beta = 0.0f;
+        CublasApi.Check(CublasApi.Sgemm(_cublasHandle,
+            CublasApi.CUBLAS_OP_T,  // B^T
+            CublasApi.CUBLAS_OP_N,  // A as-is
+            N, M, K,               // column-major dims
+            &alpha,
+            bF32Ptr, K,            // B: [N×K] row-major → ldb = K
+            aPtr, K,               // A: [M×K] row-major → lda = K
+            &beta,
+            outPtr, N),            // C: [M×N] row-major → ldc = N
+            "cublasSgemm");
+    }
+
+    private CudaDeviceMemory? _batchDequantBuf;
+    private long _batchDequantBufSize;
+
     /// <summary>Launch a standard 6-arg matmul kernel: (output, a, b, M, K, N).</summary>
     private unsafe void LaunchMatMul(string kernelName, ulong outPtr, ulong aPtr, ulong bPtr,
         int M, int K, int N, uint grid, uint threads, uint smem)
@@ -212,6 +278,15 @@ public sealed class CudaBackend : IComputeBackend
         ulong outPtr = outT.DevicePtr;
         ulong aPtr = aT.DevicePtr;
         ulong bPtr = bT.DevicePtr;
+
+        // ── Batch MatMul (M > 1) — cuBLAS SGEMM with dequantized weights ──
+        if (M > 1)
+        {
+            BatchMatMul(outT, aT, bT, M, K, N);
+            return;
+        }
+
+        // ── Single-token MatMul (M = 1) — optimized per-quant kernels below ──
 
         // Helper: compute adaptive thread count from work items per row
         static (uint grid, uint threads, uint smem) AdaptiveLaunch(int N, int rows, int workItems)
