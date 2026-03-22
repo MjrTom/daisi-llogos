@@ -58,6 +58,9 @@ public sealed class CudaBackend : IComputeBackend
     public string Name => $"CUDA ({_context.DeviceName})";
 
     /// <inheritdoc />
+    public bool SupportsBatchedOps => true;
+
+    /// <inheritdoc />
     public void DisableGraphCapture() => _graphEnabled = false;
 
     /// <summary>Begin recording operations into a CUDA graph (if enabled).</summary>
