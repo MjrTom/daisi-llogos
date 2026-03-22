@@ -62,10 +62,10 @@ else
 {
     // ── Standard path (Qwen / hybrid) ───────────────────────────────────────
     // Build vocab remapper if partial vocab is active (vocab-limit > 1)
-    // Disable remapping AND partial vocab when using speculative decoding
-    // (remapper doesn't work across model sizes, and partial vocab without remapping
-    // selects from wrong token subset)
+    // Build vocab remapper if partial vocab is active (vocab-limit > 1)
+    // Same-family models (Qwen3.5) have identical vocabularies, so same remapper works for both
     VocabRemapper? remapper = null;
+    // Disable remapper + partial vocab for speculative decoding (both models must share same ID space)
     int vocabDivisor = options.DraftModelPath != null ? 1 : (options.VocabLimit ?? 32);
     if (vocabDivisor > 1)
     {
@@ -92,8 +92,7 @@ else
         kvCache = new KvCache(backend, config, maxSeqLen: maxContext, strategy: strategy);
     var deltaState = new DeltaNetState(backend, config, weights);
     var forward = new ForwardPass(backend, config, weights, kvCache, deltaState);
-    if (options.VocabLimit.HasValue)
-        forward.ArgMaxVocabLimit = config.VocabSize / options.VocabLimit.Value;
+    forward.ArgMaxVocabLimit = config.VocabSize / vocabDivisor;
 
     // Early exit profiling: measure at which layer the token prediction stabilizes
     if (options.ProfileEarlyExit)
@@ -125,20 +124,21 @@ else
         var draftGguf = GgufFile.Read(draftStream);
         var draftConfig = ModelConfig.FromGguf(draftGguf);
 
-        // Draft uses same backend and same vocab remapper as target (IDs must match for comparison)
+        // Draft uses NO remapper — its token IDs are in the original space.
+        // The SpeculativeDecoder translates between remapped (target) and original (draft) IDs.
         ModelWeights draftWeights;
         if (options.UseMmap)
-            draftWeights = MmapModelLoader.Load(draftGguf, options.DraftModelPath, backend, draftConfig, remapper);
+            draftWeights = MmapModelLoader.Load(draftGguf, options.DraftModelPath, backend, draftConfig, null);
         else
             draftWeights = ModelLoader.Load(draftGguf, draftStream, backend, draftConfig);
 
         var draftKvCache = new KvCache(backend, draftConfig, maxSeqLen: options.MaxContext);
         var draftDeltaState = new DeltaNetState(backend, draftConfig, draftWeights);
         draftForward = new ForwardPass(backend, draftConfig, draftWeights, draftKvCache, draftDeltaState);
-        if (options.VocabLimit.HasValue)
-            draftForward.ArgMaxVocabLimit = draftConfig.VocabSize / options.VocabLimit.Value;
+        // Draft uses full vocab (no remapper, so partial vocab selects wrong token pool)
+        draftForward.ArgMaxVocabLimit = draftConfig.VocabSize;
 
-        specDecoder = new SpeculativeDecoder(forward, draftForward, tokenizer, options.SpecDepth);
+        specDecoder = new SpeculativeDecoder(forward, draftForward, tokenizer, options.SpecDepth, remapper);
         Console.Error.WriteLine($"done ({draftConfig.Architecture}, {draftConfig.NumLayers}L, {draftConfig.HiddenDim}d)");
     }
 
