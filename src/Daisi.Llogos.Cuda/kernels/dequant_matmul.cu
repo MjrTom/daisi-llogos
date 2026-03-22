@@ -850,10 +850,19 @@ void dequant_matmul_q4_0_q8_1(float* __restrict__ output,
     for (int blk = tid; blk < blocks_per_row; blk += Q4_0_DP4A_THREADS)
     {
         // Load Q8_1 activation: [d(f16) + sum(f16) + quants(32b)] = 36 bytes
+        // Use vectorized loads for quants (32 bytes = 2 × uint4)
         const unsigned char* ablk = a_q8_1 + blk * 36;
         float a_d = fp16_to_fp32(*reinterpret_cast<const unsigned short*>(ablk));
         float a_s = fp16_to_fp32(*reinterpret_cast<const unsigned short*>(ablk + 2));
         const int* a_qs = reinterpret_cast<const int*>(ablk + 4);
+        // Prefetch activation quants into registers
+        int a_q[8];
+        {
+            const uint4 aq0 = __ldg(reinterpret_cast<const uint4*>(ablk + 4));
+            const uint4 aq1 = __ldg(reinterpret_cast<const uint4*>(ablk + 20));
+            a_q[0] = aq0.x; a_q[1] = aq0.y; a_q[2] = aq0.z; a_q[3] = aq0.w;
+            a_q[4] = aq1.x; a_q[5] = aq1.y; a_q[6] = aq1.z; a_q[7] = aq1.w;
+        }
 
         // Preload weight scale + nibbles for all rows (issue all reads before compute)
         float w_scales[Q4_0_DP4A_ROWS];
@@ -864,13 +873,14 @@ void dequant_matmul_q4_0_q8_1(float* __restrict__ output,
         {
             int n = n_base + r;
             if (n < N) {
-                const unsigned int* bw = reinterpret_cast<const unsigned int*>(
-                    b + (long)n * bytes_per_row + blk * 20);
-                w_scales[r] = fp16_to_fp32((unsigned short)(__ldg(&bw[0]) & 0xFFFF));
-                w_nibs[r][0] = __ldg(&bw[1]);
-                w_nibs[r][1] = __ldg(&bw[2]);
-                w_nibs[r][2] = __ldg(&bw[3]);
-                w_nibs[r][3] = __ldg(&bw[4]);
+                const unsigned char* bp = b + (long)n * bytes_per_row + blk * 20;
+                w_scales[r] = fp16_to_fp32(__ldg(reinterpret_cast<const unsigned short*>(bp)));
+                // Single 128-bit load for all 16 bytes of nibble data (aligned at offset 4)
+                const uint4 nibs128 = __ldg(reinterpret_cast<const uint4*>(bp + 4));
+                w_nibs[r][0] = nibs128.x;
+                w_nibs[r][1] = nibs128.y;
+                w_nibs[r][2] = nibs128.z;
+                w_nibs[r][3] = nibs128.w;
             }
         }
 
@@ -886,8 +896,8 @@ void dequant_matmul_q4_0_q8_1(float* __restrict__ output,
             for (int i = 0; i < 4; i++) {
                 int vi0 = (int)(w_nibs[r][i] & 0x0F0F0F0F);
                 int vi1 = (int)((w_nibs[r][i] >> 4) & 0x0F0F0F0F);
-                sumi = __dp4a(vi0, a_qs[i], sumi);
-                sumi = __dp4a(vi1, a_qs[i + 4], sumi);
+                sumi = __dp4a(vi0, a_q[i], sumi);
+                sumi = __dp4a(vi1, a_q[i + 4], sumi);
             }
             sums[r] += w_scales[r] * ((float)sumi * a_d - 8.0f * a_s);
         }
