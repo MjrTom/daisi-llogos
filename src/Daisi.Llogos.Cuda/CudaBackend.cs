@@ -849,6 +849,112 @@ public sealed class CudaBackend : IComputeBackend
     }
 
     /// <inheritdoc />
+    public unsafe void BatchedRoPE(ITensor q, ITensor k, int headDim, int ropeDim,
+        int startPosition, float ropeTheta, int numHeads, int numKvHeads)
+    {
+        var qT = (CudaTensor)q;
+        var kT = (CudaTensor)k;
+        ulong qPtr = qT.DevicePtr;
+        ulong kPtr = kT.DevicePtr;
+        int qTotal = (int)q.ElementCount;
+        int kTotal = (int)k.ElementCount;
+        int effectiveRopeDim = ropeDim > 0 ? ropeDim : headDim;
+
+        var func = _elementwiseModule.GetFunction("batched_rope");
+        int maxPairs = Math.Max(qTotal, kTotal) / 2;
+        uint grid = (uint)((maxPairs + BlockSize - 1) / BlockSize);
+
+        nint* kArgs = stackalloc nint[10];
+        kArgs[0] = (nint)(&qPtr);
+        kArgs[1] = (nint)(&kPtr);
+        kArgs[2] = (nint)(&qTotal);
+        kArgs[3] = (nint)(&kTotal);
+        kArgs[4] = (nint)(&headDim);
+        kArgs[5] = (nint)(&effectiveRopeDim);
+        kArgs[6] = (nint)(&startPosition);
+        kArgs[7] = (nint)(&ropeTheta);
+        kArgs[8] = (nint)(&numHeads);
+        kArgs[9] = (nint)(&numKvHeads);
+        _stream.Launch(func, grid, 1, 1, (uint)BlockSize, 1, 1, 0, kArgs);
+    }
+
+    /// <inheritdoc />
+    public unsafe void BatchedKvCacheWrite(ITensor kCache, ITensor vCache, ITensor k, ITensor v,
+        int nKvHeads, int keyLength, int valueLength, int maxSeqLen, int startPosition, int M)
+    {
+        var kcT = (CudaTensor)kCache;
+        var vcT = (CudaTensor)vCache;
+        var kT = (CudaTensor)k;
+        var vT = (CudaTensor)v;
+        ulong kcPtr = kcT.DevicePtr;
+        ulong vcPtr = vcT.DevicePtr;
+        ulong kPtr = kT.DevicePtr;
+        ulong vPtr = vT.DevicePtr;
+        int cacheIsFp16 = kCache.Type == GgmlType.F16 ? 1 : 0;
+
+        int totalElements = Math.Max(M * nKvHeads * keyLength, M * nKvHeads * valueLength);
+        uint grid = (uint)((totalElements + BlockSize - 1) / BlockSize);
+
+        var func = _compositeModule.GetFunction("batched_kv_cache_write");
+        nint* kArgs = stackalloc nint[11];
+        kArgs[0] = (nint)(&kcPtr);
+        kArgs[1] = (nint)(&vcPtr);
+        kArgs[2] = (nint)(&kPtr);
+        kArgs[3] = (nint)(&vPtr);
+        kArgs[4] = (nint)(&nKvHeads);
+        kArgs[5] = (nint)(&keyLength);
+        kArgs[6] = (nint)(&valueLength);
+        kArgs[7] = (nint)(&maxSeqLen);
+        kArgs[8] = (nint)(&startPosition);
+        kArgs[9] = (nint)(&M);
+        kArgs[10] = (nint)(&cacheIsFp16);
+        _stream.Launch(func, grid, 1, 1, (uint)BlockSize, 1, 1, 0, kArgs);
+    }
+
+    /// <inheritdoc />
+    public unsafe void BatchedGatedAttention(ITensor output, ITensor qAttn, ITensor qGate,
+        ITensor kCache, ITensor vCache,
+        int numHeads, int numKvHeads, int keyLength, int valueLength,
+        int maxSeqLen, int startPosition, int M, float scale)
+    {
+        var outT = (CudaTensor)output;
+        var qaT = (CudaTensor)qAttn;
+        var qgT = (CudaTensor)qGate;
+        var kcT = (CudaTensor)kCache;
+        var vcT = (CudaTensor)vCache;
+        ulong outPtr = outT.DevicePtr;
+        ulong qaPtr = qaT.DevicePtr;
+        ulong qgPtr = qgT.DevicePtr;
+        ulong kcPtr = kcT.DevicePtr;
+        ulong vcPtr = vcT.DevicePtr;
+        int cacheIsFp16 = kCache.Type == GgmlType.F16 ? 1 : 0;
+
+        const int tileSize = 256;
+        uint sharedMem = (uint)((tileSize + BlockSize) * sizeof(float));
+        var func = _compositeModule.GetFunction("batched_gated_attention");
+
+        // Grid: M * numHeads blocks (one per query_token × head)
+        uint gridX = (uint)(M * numHeads);
+
+        nint* kArgs = stackalloc nint[14];
+        kArgs[0] = (nint)(&outPtr);
+        kArgs[1] = (nint)(&qaPtr);
+        kArgs[2] = (nint)(&qgPtr);
+        kArgs[3] = (nint)(&kcPtr);
+        kArgs[4] = (nint)(&vcPtr);
+        kArgs[5] = (nint)(&numHeads);
+        kArgs[6] = (nint)(&numKvHeads);
+        kArgs[7] = (nint)(&keyLength);
+        kArgs[8] = (nint)(&valueLength);
+        kArgs[9] = (nint)(&maxSeqLen);
+        kArgs[10] = (nint)(&startPosition);
+        kArgs[11] = (nint)(&M);
+        kArgs[12] = (nint)(&scale);
+        kArgs[13] = (nint)(&cacheIsFp16);
+        _stream.Launch(func, gridX, 1, 1, (uint)BlockSize, 1, 1, sharedMem, kArgs);
+    }
+
+    /// <inheritdoc />
     public unsafe void CausalConv1d(ITensor qkv, ITensor convBuffer, ITensor convWeight, int channels, int kernelSize)
     {
         var qkvT = (CudaTensor)qkv;
@@ -1125,6 +1231,18 @@ public sealed class CudaBackend : IComputeBackend
         var srcT = (CudaTensor)src;
         ulong srcPtr = srcT.DevicePtr + (ulong)(srcOffset * sizeof(float));
         CudaApi.Check(CudaApi.MemcpyDtoDAsync(dstT.DevicePtr, srcPtr,
+            (ulong)(count * sizeof(float)), _stream.Handle), "cuMemcpyDtoDAsync");
+    }
+
+    /// <inheritdoc />
+    public void CopyTensorSlice(ITensor dst, int dstOffset, ITensor src, int srcOffset, int count)
+    {
+        EnsureContext();
+        var dstT = (CudaTensor)dst;
+        var srcT = (CudaTensor)src;
+        ulong dstPtr = dstT.DevicePtr + (ulong)(dstOffset * sizeof(float));
+        ulong srcPtr = srcT.DevicePtr + (ulong)(srcOffset * sizeof(float));
+        CudaApi.Check(CudaApi.MemcpyDtoDAsync(dstPtr, srcPtr,
             (ulong)(count * sizeof(float)), _stream.Handle), "cuMemcpyDtoDAsync");
     }
 

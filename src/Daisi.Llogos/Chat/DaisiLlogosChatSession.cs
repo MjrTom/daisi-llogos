@@ -82,16 +82,26 @@ public sealed class DaisiLlogosChatSession : IDisposable
         }
 
         // Prefill new tokens (delta from cached position)
-        // Use ForwardHidden for intermediate tokens — skips the expensive
-        // RMSNorm + LM head projection + logit download that's only needed
-        // for the final token where we sample.
         {
             int prefillEnd = allTokenIds.Length - 1;
-            for (int i = commonPrefix; i < prefillEnd; i++)
+            int deltaCount = prefillEnd - commonPrefix;
+
+            if (deltaCount > 1 && _forward.SupportsBatchedPrefill)
             {
+                // Batched prefill: process all delta tokens except last in one pass
                 ct.ThrowIfCancellationRequested();
-                _forward.ForwardHidden(allTokenIds[i], i);
+                _forward.ForwardBatchedPrefill(allTokenIds[commonPrefix..prefillEnd], commonPrefix);
             }
+            else
+            {
+                // Sequential prefill
+                for (int i = commonPrefix; i < prefillEnd; i++)
+                {
+                    ct.ThrowIfCancellationRequested();
+                    _forward.ForwardHidden(allTokenIds[i], i);
+                }
+            }
+
             // Full forward on the last token to get logits for sampling
             if (prefillEnd >= commonPrefix)
             {
