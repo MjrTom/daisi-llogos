@@ -47,6 +47,43 @@ __global__ void rms_norm(float* output, const float* input, const float* weight,
         output[i] = input[i] * inv_rms * weight[i];
 }
 
+// ── Batched RMSNorm ─────────────────────────────────────────────────────────
+// Same as rms_norm but processes M independent rows. blockIdx.x selects the row.
+// input/output are [M × n] row-major. weight is [n] (shared across rows).
+
+__global__ void batched_rms_norm(float* output, const float* input, const float* weight,
+                                  int n, int M, float eps)
+{
+    extern __shared__ float sdata[];
+
+    int row = blockIdx.x;
+    if (row >= M) return;
+
+    int tid = threadIdx.x;
+    int stride = blockDim.x;
+    int offset = row * n;
+
+    // Pass 1: sum of squares for this row
+    float sum = 0.0f;
+    for (int i = tid; i < n; i += stride)
+        sum += input[offset + i] * input[offset + i];
+
+    sdata[tid] = sum;
+    __syncthreads();
+
+    for (int s = blockDim.x / 2; s > 0; s >>= 1)
+    {
+        if (tid < s) sdata[tid] += sdata[tid + s];
+        __syncthreads();
+    }
+
+    float inv_rms = 1.0f / sqrtf(sdata[0] / (float)n + eps);
+
+    // Pass 2: normalize this row
+    for (int i = tid; i < n; i += stride)
+        output[offset + i] = input[offset + i] * inv_rms * weight[i];
+}
+
 // ── Softmax ──────────────────────────────────────────────────────────────────
 // Numerically stable: subtract max, exp, normalize.
 // Single block launch for typical vocab sizes.

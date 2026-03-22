@@ -440,19 +440,35 @@ public sealed class CudaBackend : IComputeBackend
         ulong outPtr = outT.DevicePtr;
         ulong inPtr = inT.DevicePtr;
         ulong wPtr = wT.DevicePtr;
-        int n = (int)input.ElementCount;
-
-        var func = _elementwiseModule.GetFunction("rms_norm");
-        nint* kArgs = stackalloc nint[5];
-        kArgs[0] = (nint)(&outPtr);
-        kArgs[1] = (nint)(&inPtr);
-        kArgs[2] = (nint)(&wPtr);
-        kArgs[3] = (nint)(&n);
-        kArgs[4] = (nint)(&eps);
+        int n = (int)weight.ElementCount; // hidden dim
+        int totalElements = (int)input.ElementCount;
+        int M = totalElements / n; // number of rows (1 for decode, >1 for prefill)
 
         uint sharedMem = (uint)(BlockSize * sizeof(float));
-        _stream.Launch(func, 1, 1, 1, (uint)BlockSize, 1, 1, sharedMem, kArgs);
 
+        if (M > 1)
+        {
+            var func = _elementwiseModule.GetFunction("batched_rms_norm");
+            nint* kArgs = stackalloc nint[6];
+            kArgs[0] = (nint)(&outPtr);
+            kArgs[1] = (nint)(&inPtr);
+            kArgs[2] = (nint)(&wPtr);
+            kArgs[3] = (nint)(&n);
+            kArgs[4] = (nint)(&M);
+            kArgs[5] = (nint)(&eps);
+            _stream.Launch(func, (uint)M, 1, 1, (uint)BlockSize, 1, 1, sharedMem, kArgs);
+        }
+        else
+        {
+            var func = _elementwiseModule.GetFunction("rms_norm");
+            nint* kArgs = stackalloc nint[5];
+            kArgs[0] = (nint)(&outPtr);
+            kArgs[1] = (nint)(&inPtr);
+            kArgs[2] = (nint)(&wPtr);
+            kArgs[3] = (nint)(&n);
+            kArgs[4] = (nint)(&eps);
+            _stream.Launch(func, 1, 1, 1, (uint)BlockSize, 1, 1, sharedMem, kArgs);
+        }
     }
 
     /// <inheritdoc />
