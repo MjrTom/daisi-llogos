@@ -1251,8 +1251,20 @@ public sealed class CudaBackend : IComputeBackend
         ulong resPtr = resT.DevicePtr;
         ulong inPtr = inT.DevicePtr;
         ulong wPtr = wT.DevicePtr;
-        int n = (int)input.ElementCount;
+        int n = (int)weight.ElementCount; // hidden dim
+        int totalElements = (int)input.ElementCount;
+        int M = totalElements / n;
         uint sharedMem = (uint)(BlockSize * sizeof(float));
+
+        if (M > 1)
+        {
+            var func = _elementwiseModule.GetFunction("batched_rms_norm_residual");
+            nint* kArgs = stackalloc nint[7];
+            kArgs[0] = (nint)(&outPtr); kArgs[1] = (nint)(&resPtr); kArgs[2] = (nint)(&inPtr);
+            kArgs[3] = (nint)(&wPtr); kArgs[4] = (nint)(&n); kArgs[5] = (nint)(&M); kArgs[6] = (nint)(&eps);
+            _stream.Launch(func, (uint)M, 1, 1, (uint)BlockSize, 1, 1, sharedMem, kArgs);
+            return;
+        }
 
         if (_hasQ4_0Weights && _q8_1Scratch != null)
         {
@@ -1318,8 +1330,21 @@ public sealed class CudaBackend : IComputeBackend
         var wT = (CudaTensor)weight;
         ulong outPtr = outT.DevicePtr, hidPtr = hidT.DevicePtr, resPtr = resT.DevicePtr;
         ulong bPtr = bT.DevicePtr, wPtr = wT.DevicePtr;
-        int n = (int)hidden.ElementCount;
+        int n = (int)weight.ElementCount;
+        int totalElements = (int)hidden.ElementCount;
+        int M = totalElements / n;
         uint sharedMem = (uint)(BlockSize * sizeof(float));
+
+        if (M > 1)
+        {
+            var func = _elementwiseModule.GetFunction("batched_add_rms_norm_residual");
+            nint* kArgs = stackalloc nint[8];
+            kArgs[0] = (nint)(&outPtr); kArgs[1] = (nint)(&hidPtr); kArgs[2] = (nint)(&resPtr);
+            kArgs[3] = (nint)(&bPtr); kArgs[4] = (nint)(&wPtr); kArgs[5] = (nint)(&n);
+            kArgs[6] = (nint)(&M); kArgs[7] = (nint)(&eps);
+            _stream.Launch(func, (uint)M, 1, 1, (uint)BlockSize, 1, 1, sharedMem, kArgs);
+            return;
+        }
 
         if (_hasQ4_0Weights && _q8_1Scratch != null)
         {
@@ -1368,8 +1393,21 @@ public sealed class CudaBackend : IComputeBackend
         ulong aPtr = aT.DevicePtr;
         ulong bPtr = bT.DevicePtr;
         ulong wPtr = wT.DevicePtr;
-        int n = (int)a.ElementCount;
+        int n = (int)weight.ElementCount;
+        int totalElements = (int)a.ElementCount;
+        int M = totalElements / n;
         uint sharedMem = (uint)(BlockSize * sizeof(float));
+
+        if (M > 1)
+        {
+            var func = _elementwiseModule.GetFunction("batched_add_rms_norm");
+            nint* kArgs = stackalloc nint[8];
+            kArgs[0] = (nint)(&outPtr); kArgs[1] = (nint)(&hidPtr); kArgs[2] = (nint)(&aPtr);
+            kArgs[3] = (nint)(&bPtr); kArgs[4] = (nint)(&wPtr); kArgs[5] = (nint)(&n);
+            kArgs[6] = (nint)(&M); kArgs[7] = (nint)(&eps);
+            _stream.Launch(func, (uint)M, 1, 1, (uint)BlockSize, 1, 1, sharedMem, kArgs);
+            return;
+        }
 
         if (_hasQ4_0Weights && _q8_1Scratch != null)
         {
