@@ -188,13 +188,16 @@ Batched prefill processes all M prompt tokens simultaneously through each layer:
 
 RTX 5080, CUDA 13, greedy sampling. Prefill measured with 128-token prompt; decode with short prompt to isolate decode performance (longer prompts inflate KV cache and slow attention — see note below).
 
-| Model | Llogos pp | llama.cpp pp | Ratio | Llogos tg | llama.cpp tg | Ratio |
-|-------|----------:|-------------:|------:|----------:|-------------:|------:|
-| TinyLlama 1.1B Q8_0 | **2,050** | 15,730 | 0.13x | 444 | 448 | 0.99x |
-| Qwen3-8B Q8_0 | **456** | 5,184 | 0.09x | 89 | 91 | 0.98x |
-| Qwen3-8B Q4_K_M | **462** | 5,278 | 0.09x | 122 | 138 | 0.88x |
+| Model | Architecture | Llogos pp | llama.cpp pp | Ratio | Llogos tg | llama.cpp tg | Ratio |
+|-------|-------------|----------:|-------------:|------:|----------:|-------------:|------:|
+| TinyLlama 1.1B Q8_0 | LLaMA | **2,050** | 15,730 | 0.13x | 444 | 448 | 0.99x |
+| Qwen3-8B Q8_0 | Std attn | **456** | 5,184 | 0.09x | 89 | 91 | 0.98x |
+| Qwen3-8B Q4_K_M | Std attn | **462** | 5,278 | 0.09x | 122 | 138 | 0.88x |
+| Qwen3.5-4B Q8_0 | DeltaNet | **224** | 5,704 | 0.04x | **142** | 134 | **1.05x** |
+| Qwen3.5-9B Q8_0 | DeltaNet | **165** | 4,714 | 0.03x | **86** | 84 | **1.02x** |
+| Qwen3.5-9B Q4_0 | DeltaNet | **155** | 4,954 | 0.03x | 99 | 126 | 0.79x |
 
-Batched prefill delivers a 5-9x speedup over our own sequential prefill (which runs at decode speed), but llama.cpp's fused quantized GEMM is 8-12x faster still. DeltaNet hybrid models (Qwen3.5) currently fall back to sequential prefill.
+Batched prefill delivers a 5-9x speedup on pure attention models and 1.5-1.8x on DeltaNet hybrids (where only RmsNorm, FFN, and attention layers are batched). llama.cpp's fused quantized GEMM remains 8-30x faster on prefill.
 
 **Prompt length affects decode speed.** Decode tok/s depends on the KV cache size: a 169-token prompt leaves 169 KV entries that the attention kernel must scan every decode step. On TinyLlama, this costs ~15% vs a 1-token prompt. All decode numbers in this paper use a short prompt to measure pure decode throughput.
 
@@ -220,7 +223,9 @@ The batched forward pass (`ForwardBatchedPrefill`) allocates M-wide scratch tens
 
 **Non-fused projections only.** The single-token path fuses Q+K+V into a single matmul and gate+up into another. For M>1, the fused matmul output is `[M × (qDim+kDim+vDim)]` where each row contains interleaved `[Q,K,V]` for one token. Deinterleaving into separate `[M×qDim]`, `[M×kDim]`, `[M×vDim]` tensors requires M×3 scatter copies. Using three separate projections produces the correct layout directly and benchmarks faster for M>8.
 
-**Pure attention models only (current).** DeltaNet hybrid models (Qwen3.5) have sequential state dependencies that prevent full batching. For these models, the prefill falls back to the sequential token-by-token path. A future optimization could batch the attention layers and MatMuls while processing only the DeltaNet state updates sequentially.
+**DeltaNet hybrid support.** DeltaNet layers have sequential state dependencies (conv buffer, state matrix). The batched prefill handles hybrids by batching RmsNorm and FFN for all layers, batching attention for attention layers, and processing only the DeltaNet state update sequentially per token. This gives 1.5-1.8x prefill speedup on the larger DeltaNet models (4B, 9B) where batched MatMuls dominate, though the 0.8B model sees no benefit due to small matrix sizes.
+
+**Unaligned weight dequantization.** The `dequant_to_f32` kernel originally hardcoded aligned block strides (36 bytes for Q8_0, 20 bytes for Q4_0). Models with `hiddenDim < 2048` (like the 0.8B) skip alignment repacking at load time, leaving weights in their original unaligned format. The kernel now checks an `isAligned` flag and uses the correct stride (34 bytes unaligned vs 36 bytes aligned for Q8_0).
 
 ### Why Prefill Scales Sublinearly
 

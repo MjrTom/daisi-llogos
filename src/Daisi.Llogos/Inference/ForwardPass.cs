@@ -513,13 +513,16 @@ public sealed class ForwardPass : IForwardPass
     // ── Batched Prefill ────────────────────────────────────────────────────────
 
     /// <summary>
-    /// Whether this model supports batched prefill (no DeltaNet layers).
+    /// Whether this model supports batched prefill.
+    /// Supports pure attention and DeltaNet hybrid models (DeltaNet layers run sequentially within the batch).
     /// </summary>
-    public bool SupportsBatchedPrefill => !_config.HasDeltaNet;
+    public bool SupportsBatchedPrefill => true;
 
     /// <summary>
     /// Process M tokens through all transformer layers in parallel.
-    /// Only for pure standard-attention models (no DeltaNet).
+    /// Standard attention layers run fully batched. DeltaNet layers run
+    /// sequentially per token (state updates are order-dependent), but
+    /// RmsNorm and FFN surrounding them are still batched.
     /// After this call, KV cache contains all M tokens and the last token's
     /// hidden state is in the single-token _hidden buffer.
     /// </summary>
@@ -542,6 +545,12 @@ public sealed class ForwardPass : IForwardPass
             _backend.CopyTensorSlice(_bHidden!, i * hDim, _hidden, 0, hDim);
         }
 
+        for (int i = 0; i < M; i++)
+        {
+            _backend.EmbeddingLookup(_hidden, _weights.TokenEmbedding, tokenIds[i]);
+            _backend.CopyTensorSlice(_bHidden!, i * hDim, _hidden, 0, hDim);
+        }
+
         // 2. Transformer layers
         for (int layer = 0; layer < _config.NumLayers; layer++)
         {
@@ -553,12 +562,33 @@ public sealed class ForwardPass : IForwardPass
             else
                 _backend.AddRmsNormResidual(_bNormOut!, _bHidden!, _bResidual!, _bResidual!, lw.AttnNorm, _config.NormEps);
 
-            // Standard attention (batched)
-            var saw = (StandardAttentionWeights)lw;
-            BatchedForwardStandardAttention(saw, startPosition, layer, M);
+            if (lw is StandardAttentionWeights saw)
+            {
+                // Standard attention (fully batched)
+                BatchedForwardStandardAttention(saw, startPosition, layer, M);
+            }
+            else if (lw is DeltaNetWeights dnw)
+            {
+                // DeltaNet: process each token sequentially (state updates are order-dependent)
+                // Extract single-token normOut → run DeltaNet → put hidden back
+                for (int t = 0; t < M; t++)
+                {
+                    _backend.CopyTensorSlice(_normOut, 0, _bNormOut!, t * hDim, hDim);
+                    ForwardDeltaNet(dnw, layer);
+                    _backend.CopyTensorSlice(_bHidden!, t * hDim, _hidden, 0, hDim);
+                }
+            }
 
             _backend.AddRmsNorm(_bNormOut!, _bHidden!, _bHidden!, _bResidual!, lw.PostAttnNorm, _config.NormEps);
             _backend.CopyTensor(_bResidual!, _bHidden!);
+
+            // DEBUG: dump after PostAttnNorm + CopyResidual
+            if (layer == 0)
+            {
+                var bdbg = new float[M * hDim];
+                _bHidden!.DequantizeTo(bdbg);
+                Console.Error.WriteLine($"[BAT] L0 post bHid[0]: {bdbg[0]:F6} {bdbg[1]:F6} {bdbg[2]:F6} {bdbg[3]:F6}");
+            }
 
             // FFN (batched — MatMul handles M>1 via cuBLAS)
             // Always use non-fused path: SplitSwiGLU assumes flat [gate|up] layout
