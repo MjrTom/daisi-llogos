@@ -257,7 +257,7 @@ __global__ void matmul_f32(float* output, const float* a, const float* b,
 // ── Fused Q8_0 Dequant + MatMul (aligned 36-byte blocks) ────────────────────
 // Multi-row constant (shared by aligned and unaligned Q8_0 kernels)
 #ifndef Q8_ROWS_PER_BLOCK
-#define Q8_ROWS_PER_BLOCK 4
+#define Q8_ROWS_PER_BLOCK 2
 #endif
 
 // Multi-row aligned Q8_0: 4 output neurons per block with activation reuse
@@ -322,7 +322,7 @@ __global__ void dequant_matmul_q8_0_aligned(float* __restrict__ output,
 
 // ── Fused Q8_0 Dequant + MatMul (original 34-byte blocks) ──────────────────
 // Multi-row Q8_0: 4 output neurons per block with activation reuse
-#define Q8_ROWS_PER_BLOCK 4
+#define Q8_ROWS_PER_BLOCK 2
 
 __global__ void dequant_matmul_q8_0(float* __restrict__ output,
                                      const float* __restrict__ a,

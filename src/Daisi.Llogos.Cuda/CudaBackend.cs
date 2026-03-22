@@ -238,7 +238,7 @@ public sealed class CudaBackend : IComputeBackend
         }
         else if (b.Type == GgmlType.Q8_0)
         {
-            var (grid, threads, smem) = AdaptiveLaunch(N, 4, K / 32); // Q8_ROWS_PER_BLOCK=4
+            var (grid, threads, smem) = AdaptiveLaunch(N, 2, K / 32); // Q8_ROWS_PER_BLOCK=2
             bool isAligned = bT is CudaTensor ct2 && ct2.IsAlignedQ8_0;
             var func = _matmulModule.GetFunction(isAligned
                 ? "dequant_matmul_q8_0_aligned" : "dequant_matmul_q8_0");
