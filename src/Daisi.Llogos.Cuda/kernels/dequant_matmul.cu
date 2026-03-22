@@ -148,6 +148,136 @@ __global__ void dequant_matmul_q8_0_q8_1_aligned(float* __restrict__ output,
     if (tid == 0) output[n] = sum;
 }
 
+#ifndef Q8_ROWS_PER_BLOCK
+#define Q8_ROWS_PER_BLOCK 2
+#endif
+
+// ── Batched Q8_0 MatMul (M>1, fused dequant, aligned) ────────────────────────
+// Same as dequant_matmul_q8_0_aligned but with grid.y for batch dimension.
+// Grid: ceil(N/Q8_ROWS_PER_BLOCK) × M blocks.
+// Weights stay in L2 cache across M rows → eliminates intermediate dequant buffer.
+
+__global__ void batch_matmul_q8_0_aligned(float* __restrict__ output,
+                                            const float* __restrict__ a,
+                                            const unsigned char* __restrict__ b,
+                                            int M, int K, int N)
+{
+    extern __shared__ float shared[];
+    int n_base = blockIdx.x * Q8_ROWS_PER_BLOCK;
+    int m = blockIdx.y;  // which input row
+    int tid = threadIdx.x;
+    int blockSize = blockDim.x;
+    if (n_base >= N || m >= M) return;
+
+    const float* a_row = a + (long)m * K;
+    float* out_row = output + (long)m * N;
+
+    int blocks_per_row = K / 32;
+    long bytes_per_row = (long)blocks_per_row * 36;
+
+    float sums[Q8_ROWS_PER_BLOCK] = {0};
+
+    for (int blk = tid; blk < blocks_per_row; blk += blockSize)
+    {
+        const float4* ap = reinterpret_cast<const float4*>(a_row + blk * 32);
+        float4 a_cache[8];
+        #pragma unroll
+        for (int i = 0; i < 8; i++) a_cache[i] = __ldg(&ap[i]);
+
+        #pragma unroll
+        for (int r = 0; r < Q8_ROWS_PER_BLOCK; r++)
+        {
+            int n = n_base + r;
+            if (n >= N) break;
+            const unsigned char* block_ptr = b + (long)n * bytes_per_row + blk * 36;
+            float scale = fp16_to_fp32(__ldg(reinterpret_cast<const unsigned short*>(block_ptr)));
+            const unsigned int* q32 = reinterpret_cast<const unsigned int*>(block_ptr + 4);
+            float bs = 0.0f;
+            #pragma unroll
+            for (int i = 0; i < 8; i++) {
+                float4 ai = a_cache[i];
+                unsigned int packed = __ldg(&q32[i]);
+                bs += ai.x*(float)(int)((signed char)(packed))
+                    + ai.y*(float)(int)((signed char)(packed >> 8))
+                    + ai.z*(float)(int)((signed char)(packed >> 16))
+                    + ai.w*(float)(int)((signed char)(packed >> 24));
+            }
+            sums[r] += scale * bs;
+        }
+    }
+
+    int numWarps = blockSize >> 5;
+    #pragma unroll
+    for (int r = 0; r < Q8_ROWS_PER_BLOCK; r++) {
+        float sum = warp_reduce_sum(sums[r]);
+        int lane = tid & 31; int warp = tid >> 5;
+        if (lane == 0) shared[warp] = sum;
+        __syncthreads();
+        if (tid < numWarps) sum = shared[tid]; else sum = 0.0f;
+        sum = warp_reduce_sum(sum);
+        if (tid == 0 && n_base + r < N) out_row[n_base + r] = sum;
+        __syncthreads();
+    }
+}
+
+// Batched Q8_0 MatMul (M>1, fused dequant, unaligned 34-byte blocks)
+__global__ void batch_matmul_q8_0(float* __restrict__ output,
+                                    const float* __restrict__ a,
+                                    const unsigned char* __restrict__ b,
+                                    int M, int K, int N)
+{
+    extern __shared__ float shared[];
+    int n_base = blockIdx.x * Q8_ROWS_PER_BLOCK;
+    int m = blockIdx.y;
+    int tid = threadIdx.x;
+    int blockSize = blockDim.x;
+    if (n_base >= N || m >= M) return;
+
+    const float* a_row = a + (long)m * K;
+    float* out_row = output + (long)m * N;
+
+    int blocks_per_row = K / 32;
+    long bytes_per_row = (long)blocks_per_row * 34;
+
+    float sums[Q8_ROWS_PER_BLOCK] = {0};
+
+    for (int blk = tid; blk < blocks_per_row; blk += blockSize)
+    {
+        // Load activation tile (32 floats)
+        float a_local[32];
+        const float* a_base = a_row + blk * 32;
+        #pragma unroll
+        for (int i = 0; i < 32; i++) a_local[i] = a_base[i];
+
+        #pragma unroll
+        for (int r = 0; r < Q8_ROWS_PER_BLOCK; r++)
+        {
+            int n = n_base + r;
+            if (n >= N) break;
+            const unsigned char* block_ptr = b + (long)n * bytes_per_row + blk * 34;
+            float scale = fp16_to_fp32(__ldg(reinterpret_cast<const unsigned short*>(block_ptr)));
+            float bs = 0.0f;
+            #pragma unroll
+            for (int i = 0; i < 32; i++)
+                bs += a_local[i] * (float)((signed char)block_ptr[2 + i]);
+            sums[r] += scale * bs;
+        }
+    }
+
+    int numWarps = blockSize >> 5;
+    #pragma unroll
+    for (int r = 0; r < Q8_ROWS_PER_BLOCK; r++) {
+        float sum = warp_reduce_sum(sums[r]);
+        int lane = tid & 31; int warp = tid >> 5;
+        if (lane == 0) shared[warp] = sum;
+        __syncthreads();
+        if (tid < numWarps) sum = shared[tid]; else sum = 0.0f;
+        sum = warp_reduce_sum(sum);
+        if (tid == 0 && n_base + r < N) out_row[n_base + r] = sum;
+        __syncthreads();
+    }
+}
+
 // Unaligned Q8_0 variant (fallback for non-repacked data)
 __global__ void dequant_matmul_q8_0_q8_1(float* __restrict__ output,
                                            const void* __restrict__ vq8_1,
