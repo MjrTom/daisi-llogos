@@ -272,12 +272,20 @@ public sealed class CudaBackend : IComputeBackend
             return tensor;
         }
 
-        // Repack Q4_0 to aligned layout: 18-byte blocks → 20-byte blocks
-        // [scale(2b) | pad(2b) | nibbles(16b)] = 20 bytes, 4-byte aligned
+        // Q4_0: keep original 18-byte blocks (saves 11% bandwidth vs 20-byte aligned)
+        // The dp4a kernel uses 2-byte aligned reads for nibble data.
         if (type == GgmlType.Q4_0 && dimensions.Length >= 2)
         {
             _hasQ4_0Weights = true;
-            // Pre-allocate Q8_1 scratch for dp4a (must happen outside stream capture)
+            EnsureQ8_1Scratch((int)dimensions[0]);
+            // Load directly without repacking — unaligned dp4a kernel handles 18-byte blocks
+            return new CudaTensor(name, type, dimensions, data);
+        }
+
+        // DISABLED: Q4_0 alignment repacking (kept for reference)
+        if (false && type == GgmlType.Q4_0 && dimensions.Length >= 2)
+        {
+            _hasQ4_0Weights = true;
             EnsureQ8_1Scratch((int)dimensions[0]);
             int blockCount = data.Length / 18;
             var aligned = new byte[blockCount * 20];
@@ -360,10 +368,12 @@ public sealed class CudaBackend : IComputeBackend
         {
             // Q8_1 pre-computed by fused RmsNorm — use dp4a (zero quantization overhead)
             ulong q8_1Ptr = _q8_1Scratch!.DevicePtr;
-            var func = _matmulModule.GetFunction("dequant_matmul_q4_0_q8_1");
+            bool isAlignedQ4 = bT is CudaTensor ctq && ctq.IsAlignedQ4_0;
+            var func = _matmulModule.GetFunction(isAlignedQ4
+                ? "dequant_matmul_q4_0_q8_1" : "dequant_matmul_q4_0_q8_1_unaligned");
             int nVal = N;
-            uint dp4aGrid = ((uint)N + 3) / 4; // Q4_0_DP4A_ROWS = 8
-            uint dp4aSmem = (256 / 32) * 4 * sizeof(float); // smem[8][8]
+            uint dp4aGrid = ((uint)N + 3) / 4;
+            uint dp4aSmem = (256 / 32) * 4 * sizeof(float);
             nint* kArgs = stackalloc nint[6];
             kArgs[0] = (nint)(&outPtr);
             kArgs[1] = (nint)(&q8_1Ptr);
@@ -394,10 +404,12 @@ public sealed class CudaBackend : IComputeBackend
                 _stream.Launch(quantFunc, quantGrid, 1, 1, (uint)BlockSize, 1, 1, 0, qArgs);
             }
 
-            var func = _matmulModule.GetFunction("dequant_matmul_q4_0_q8_1");
+            bool isAlignedQ4b = bT is CudaTensor ctqb && ctqb.IsAlignedQ4_0;
+            var func = _matmulModule.GetFunction(isAlignedQ4b
+                ? "dequant_matmul_q4_0_q8_1" : "dequant_matmul_q4_0_q8_1_unaligned");
             int nVal = N;
-            uint dp4aGrid = ((uint)N + 3) / 4; // Q4_0_DP4A_ROWS = 8
-            uint dp4aSmem = (256 / 32) * 4 * sizeof(float); // smem[8][8]
+            uint dp4aGrid2 = ((uint)N + 3) / 4;
+            uint dp4aSmem2 = (256 / 32) * 4 * sizeof(float);
             nint* kArgs = stackalloc nint[6];
             kArgs[0] = (nint)(&outPtr);
             kArgs[1] = (nint)(&q8_1Ptr);
@@ -405,7 +417,7 @@ public sealed class CudaBackend : IComputeBackend
             kArgs[3] = (nint)(&M);
             kArgs[4] = (nint)(&K);
             kArgs[5] = (nint)(&nVal);
-            _stream.Launch(func, dp4aGrid, 1, 1, 256, 1, 1, dp4aSmem, kArgs);
+            _stream.Launch(func, dp4aGrid2, 1, 1, 256, 1, 1, dp4aSmem2, kArgs);
         }
         else if (b.Type == GgmlType.Q4_1)
         {
