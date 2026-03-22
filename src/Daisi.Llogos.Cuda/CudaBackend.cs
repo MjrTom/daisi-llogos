@@ -41,6 +41,7 @@ public sealed class CudaBackend : IComputeBackend
         // Enable TF32 tensor cores for FP32 SGEMM (FP32 range, FP16 precision — ideal for inference)
         CublasApi.SetMathMode(_cublasHandle, CublasApi.CUBLAS_TF32_TENSOR_OP_MATH);
 
+
         // Load kernels with architecture-specific compilation for best codegen
         var archOpts = new[] { $"--gpu-architecture=compute_{_context.ComputeCapabilityMajor}{_context.ComputeCapabilityMinor}" };
         _elementwiseModule = CudaModule.FromEmbeddedResource("elementwise.cu", archOpts);
@@ -177,7 +178,7 @@ public sealed class CudaBackend : IComputeBackend
                 bF16Ptr, CublasApi.CUDA_R_16F, K,
                 aF16Ptr, CublasApi.CUDA_R_16F, K,
                 &beta, outPtr, CublasApi.CUDA_R_32F, N,
-                CublasApi.CUBLAS_COMPUTE_32F, CublasApi.CUBLAS_GEMM_DEFAULT),
+                CublasApi.CUBLAS_COMPUTE_32F, CublasApi.CUBLAS_GEMM_DEFAULT_TENSOR_OP),
                 "cublasGemmEx");
         }
         else
@@ -195,6 +196,7 @@ public sealed class CudaBackend : IComputeBackend
     private long _batchDequantBufSize;
     private CudaDeviceMemory? _batchActivationBuf;
     private long _batchActivationBufSize;
+    private CudaDeviceMemory? _cublasLtWorkspace;
 
     /// <summary>Launch a standard 6-arg matmul kernel: (output, a, b, M, K, N).</summary>
     private unsafe void LaunchMatMul(string kernelName, ulong outPtr, ulong aPtr, ulong bPtr,
@@ -1597,6 +1599,7 @@ public sealed class CudaBackend : IComputeBackend
             _q8_1Scratch?.Dispose();
             _batchDequantBuf?.Dispose();
             _batchActivationBuf?.Dispose();
+            _cublasLtWorkspace?.Dispose();
             if (_cublasHandle != 0) CublasApi.Destroy(_cublasHandle);
             _stream.Dispose();
             _matmulModule.Dispose();
