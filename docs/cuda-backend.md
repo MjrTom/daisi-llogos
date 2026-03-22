@@ -13,10 +13,14 @@ Key design choices:
 - **CUDA Driver API** (not Runtime API) — explicit context management, direct kernel loading
 - **NVRTC JIT compilation** with PTX disk cache — architecture-specific codegen, ~0.6s cached startup
 - **cuBLAS integration** — SGEMV for F32 matmul (ships with CUDA Toolkit, no extra dependency)
-- **`__dp4a` integer dot products** — quantize activation to Q8_1, use hardware int8 multiply-accumulate for Q8_0 (inspired by llama.cpp)
-- **Aligned Q8_0 repacking** — 36-byte blocks with 4-byte aligned quants for direct `int*` loads
-- **Fused kernels** — RmsNormResidual, SwiGLU, AddRmsNorm, GPU-side ArgMax, SplitUnequalQKV, RepeatTile
-- **Q8_1 activation cache** — skip re-quantization when consecutive matmuls share the same input
+- **`__dp4a` integer dot products** — Q4_0 uses hardware int8 multiply-accumulate with fused RmsNorm+Q8_1 quantization
+- **Architecture-adaptive dispatch** — Blackwell (SM 12.x) uses float path for 4-bit quants, pre-Blackwell uses dp4a
+- **Partial vocab logit computation** — lm_head computes VocabSize/32 tokens for greedy decode (+10% speedup)
+- **Per-quant row count tuning** — Q8_0=2, Q4_K=3, Q6_K=10, Q4_0=2, Q4_1=8, Q5_K=1 (optimal per format)
+- **Aligned block repacking** — Q8_0 34→36, Q4_0 18→20 bytes for 4-byte aligned uint32 reads
+- **Self-contained dispatch** — each quant type computes own grid/threads/smem via `AdaptiveLaunch()`, no shared variables
+- **Fused kernels** — RmsNormResidual+Q8_1, AddRmsNorm+Q8_1, SwiGLU, GPU-side ArgMax, SplitUnequalQKV, RepeatTile
+- **Q8_1 activation cache** — generation-based invalidation (only write ops bump the counter)
 
 ---
 
