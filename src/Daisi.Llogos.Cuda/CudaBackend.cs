@@ -105,6 +105,18 @@ public sealed class CudaBackend : IComputeBackend
     /// </summary>
     private void EnsureContext() => _context.MakeCurrent();
 
+    /// <summary>Launch a standard 6-arg matmul kernel: (output, a, b, M, K, N).</summary>
+    private unsafe void LaunchMatMul(string kernelName, ulong outPtr, ulong aPtr, ulong bPtr,
+        int M, int K, int N, uint grid, uint threads, uint smem)
+    {
+        var func = _matmulModule.GetFunction(kernelName);
+        int nVal = N;
+        nint* kArgs = stackalloc nint[6];
+        kArgs[0] = (nint)(&outPtr); kArgs[1] = (nint)(&aPtr); kArgs[2] = (nint)(&bPtr);
+        kArgs[3] = (nint)(&M); kArgs[4] = (nint)(&K); kArgs[5] = (nint)(&nVal);
+        _stream.Launch(func, grid, 1, 1, threads, 1, 1, smem, kArgs);
+    }
+
     /// <summary>
     /// Ensure the Q8_1 scratch buffer is large enough for the given K dimension.
     /// Must be called outside batch recording (no cuMemAlloc during batching).
@@ -201,31 +213,14 @@ public sealed class CudaBackend : IComputeBackend
         ulong aPtr = aT.DevicePtr;
         ulong bPtr = bT.DevicePtr;
 
-        // Multi-row grid: must match each kernel's ROWS_PER_BLOCK constant
-        uint gridX = b.Type switch {
-            GgmlType.Q8_0 => ((uint)N + 3) / 4,  // Q8_ROWS_PER_BLOCK = 4
-            GgmlType.Q4_0 => ((uint)N + 1) / 2,  // Q4_0_ROWS_PER_BLOCK = 2 (float kernel)
-            GgmlType.Q4_1 => ((uint)N + 7) / 8,  // Q4_1_ROWS_PER_BLOCK = 8
-            GgmlType.Q4_K => ((uint)N + 3) / 4,  // Q4K_ROWS_PER_BLOCK = 4
-            GgmlType.Q6_K => ((uint)N + 1) / 2,  // Q6K_ROWS_PER_BLOCK = 2
-            GgmlType.Q5_K => (uint)N,             // Q5K_ROWS_PER_BLOCK = 1
-            _ => (uint)N
-        };
-        // Adaptive block size: scale with the number of work items per row.
-        // Q8_0/Q4_0: 1 item per 32 elements. K-quants: 1 item per 256 elements. F32/F16: 1 item per element.
-        int workItemsPerRow = b.Type switch
+        // Helper: compute adaptive thread count from work items per row
+        static (uint grid, uint threads, uint smem) AdaptiveLaunch(int N, int rows, int workItems)
         {
-            GgmlType.Q4_K => K / 256 * 4,  // 4 chunks per super-block
-            GgmlType.Q5_K => K / 256 * 8,  // 8 chunk-halves per super-block
-            GgmlType.Q6_K => K / 256 * 8,  // 8 quadrants per super-block
-            GgmlType.Q8_0 => K / 32,
-            GgmlType.Q4_0 => K / 32,
-            GgmlType.Q4_1 => K / 32,
-            _ => K / 8 // F32/F16: 8 elements per thread is fine
-        };
-        int matmulBlockSize = Math.Clamp((workItemsPerRow + 31) & ~31, 32, 256);
-        int warpReductionBytes = (matmulBlockSize / 32) * sizeof(float);
-        uint sharedMem = (uint)warpReductionBytes;
+            uint grid = ((uint)N + (uint)rows - 1) / (uint)rows;
+            int threads = Math.Clamp((workItems + 31) & ~31, 32, 256);
+            uint smem = (uint)((threads / 32) * sizeof(float));
+            return (grid, (uint)threads, smem);
+        }
 
         if (b.Type == GgmlType.F32)
         {
@@ -241,68 +236,17 @@ public sealed class CudaBackend : IComputeBackend
                 &beta,
                 outPtr, 1), "cublasSgemv"); // y = output, incy = 1
         }
-        else if (false) // dp4a removed: grid mismatch (1 row/block kernel vs 4 row/block grid)
-        {
-            // dp4a path — disabled due to precision loss in activation quantization
-            // Cache: skip re-quantization if the same activation tensor is used again
-            // (e.g., Q/K/V projections all share normOut, gate/up share normOut).
-            int numBlocks = K / 32;
-            int q8_1Bytes = numBlocks * 36;
-            if (_q8_1Scratch == null || _q8_1ScratchK < K)
-            {
-                _q8_1Scratch?.Dispose();
-                _q8_1Scratch = new CudaDeviceMemory((ulong)q8_1Bytes);
-                _q8_1ScratchK = K;
-                _q8_1CachedInputPtr = 0; // invalidate cache on resize
-            }
-            ulong q8_1Ptr = _q8_1Scratch.DevicePtr;
-
-            // Only quantize if activation changed since last call
-            if (_q8_1CachedInputPtr != aPtr)
-            {
-                var quantFunc = _matmulModule.GetFunction("quantize_f32_q8_1");
-                uint quantGrid = (uint)((numBlocks + BlockSize - 1) / BlockSize);
-                int kVal = K;
-                nint* qArgs = stackalloc nint[3];
-                qArgs[0] = (nint)(&q8_1Ptr);
-                qArgs[1] = (nint)(&aPtr);
-                qArgs[2] = (nint)(&kVal);
-                _stream.Launch(quantFunc, quantGrid, 1, 1, (uint)BlockSize, 1, 1, 0, qArgs);
-                _q8_1CachedInputPtr = aPtr;
-            }
-
-            // Step 2: Q8_0 × Q8_1 matmul using __dp4a (aligned or unaligned path)
-            bool isAligned = bT is CudaTensor ct && ct.IsAlignedQ8_0;
-            var func = _matmulModule.GetFunction(isAligned
-                ? "dequant_matmul_q8_0_q8_1_aligned"
-                : "dequant_matmul_q8_0_q8_1");
-            int nVal = N;
-            int kVal2 = K;
-            nint* kArgs = stackalloc nint[6];
-            kArgs[0] = (nint)(&outPtr);
-            kArgs[1] = (nint)(&q8_1Ptr);
-            kArgs[2] = (nint)(&bPtr);
-            kArgs[3] = (nint)(&M);
-            kArgs[4] = (nint)(&kVal2);
-            kArgs[5] = (nint)(&nVal);
-            _stream.Launch(func, gridX, 1, 1, (uint)matmulBlockSize, 1, 1, sharedMem, kArgs);
-        }
         else if (b.Type == GgmlType.Q8_0)
         {
-            // Float path for small K (dp4a quantization overhead not worth it)
-            // Use aligned kernel variant if weights are repacked
-            bool isSmallAligned = bT is CudaTensor ct2 && ct2.IsAlignedQ8_0;
-            var func = _matmulModule.GetFunction(isSmallAligned
+            var (grid, threads, smem) = AdaptiveLaunch(N, 4, K / 32); // Q8_ROWS_PER_BLOCK=4
+            bool isAligned = bT is CudaTensor ct2 && ct2.IsAlignedQ8_0;
+            var func = _matmulModule.GetFunction(isAligned
                 ? "dequant_matmul_q8_0_aligned" : "dequant_matmul_q8_0");
             int nVal = N;
             nint* kArgs = stackalloc nint[6];
-            kArgs[0] = (nint)(&outPtr);
-            kArgs[1] = (nint)(&aPtr);
-            kArgs[2] = (nint)(&bPtr);
-            kArgs[3] = (nint)(&M);
-            kArgs[4] = (nint)(&K);
-            kArgs[5] = (nint)(&nVal);
-            _stream.Launch(func, gridX, 1, 1, (uint)matmulBlockSize, 1, 1, sharedMem, kArgs);
+            kArgs[0] = (nint)(&outPtr); kArgs[1] = (nint)(&aPtr); kArgs[2] = (nint)(&bPtr);
+            kArgs[3] = (nint)(&M); kArgs[4] = (nint)(&K); kArgs[5] = (nint)(&nVal);
+            _stream.Launch(func, grid, 1, 1, threads, 1, 1, smem, kArgs);
         }
         else if (b.Type == GgmlType.Q4_0 && _q8_1FusedReady
                  && _q8_1CachedInputPtr == aPtr && _q8_1CachedGeneration == _q8_1CacheGeneration)
@@ -324,17 +268,13 @@ public sealed class CudaBackend : IComputeBackend
         }
         else if (b.Type == GgmlType.Q4_0 && _context.ComputeCapabilityMajor >= 12)
         {
-            // Blackwell fallback: FP32 float path when Q8_1 not pre-computed
+            var (grid, threads, smem) = AdaptiveLaunch(N, 2, K / 32); // Q4_0_ROWS_PER_BLOCK=2
             var func = _matmulModule.GetFunction("dequant_matmul_q4_0");
             int nVal = N;
             nint* kArgs = stackalloc nint[6];
-            kArgs[0] = (nint)(&outPtr);
-            kArgs[1] = (nint)(&aPtr);
-            kArgs[2] = (nint)(&bPtr);
-            kArgs[3] = (nint)(&M);
-            kArgs[4] = (nint)(&K);
-            kArgs[5] = (nint)(&nVal);
-            _stream.Launch(func, gridX, 1, 1, (uint)matmulBlockSize, 1, 1, sharedMem, kArgs);
+            kArgs[0] = (nint)(&outPtr); kArgs[1] = (nint)(&aPtr); kArgs[2] = (nint)(&bPtr);
+            kArgs[3] = (nint)(&M); kArgs[4] = (nint)(&K); kArgs[5] = (nint)(&nVal);
+            _stream.Launch(func, grid, 1, 1, threads, 1, 1, smem, kArgs);
         }
         else if (b.Type == GgmlType.Q4_0)
         {
@@ -372,94 +312,38 @@ public sealed class CudaBackend : IComputeBackend
         }
         else if (b.Type == GgmlType.Q4_1)
         {
-            var func = _matmulModule.GetFunction("dequant_matmul_q4_1");
-            int nVal = N;
-            nint* kArgs = stackalloc nint[6];
-            kArgs[0] = (nint)(&outPtr);
-            kArgs[1] = (nint)(&aPtr);
-            kArgs[2] = (nint)(&bPtr);
-            kArgs[3] = (nint)(&M);
-            kArgs[4] = (nint)(&K);
-            kArgs[5] = (nint)(&nVal);
-            _stream.Launch(func, gridX, 1, 1, (uint)matmulBlockSize, 1, 1, sharedMem, kArgs);
+            var (grid, threads, smem) = AdaptiveLaunch(N, 8, K / 32); // Q4_1_ROWS_PER_BLOCK=8
+            LaunchMatMul("dequant_matmul_q4_1", outPtr, aPtr, bPtr, M, K, N, grid, threads, smem);
         }
         else if (b.Type == GgmlType.I2_S)
         {
-            var func = _matmulModule.GetFunction("dequant_matmul_i2s");
-            int nVal = N;
-            nint* kArgs = stackalloc nint[6];
-            kArgs[0] = (nint)(&outPtr);
-            kArgs[1] = (nint)(&aPtr);
-            kArgs[2] = (nint)(&bPtr);
-            kArgs[3] = (nint)(&M);
-            kArgs[4] = (nint)(&K);
-            kArgs[5] = (nint)(&nVal);
-            _stream.Launch(func, gridX, 1, 1, (uint)matmulBlockSize, 1, 1, sharedMem, kArgs);
+            var (grid, threads, smem) = AdaptiveLaunch(N, 1, K / 8);
+            LaunchMatMul("dequant_matmul_i2s", outPtr, aPtr, bPtr, M, K, N, grid, threads, smem);
         }
         else if (b.Type == GgmlType.TQ1_0)
         {
-            var func = _matmulModule.GetFunction("dequant_matmul_tq1_0");
-            int nVal = N;
-            nint* kArgs = stackalloc nint[6];
-            kArgs[0] = (nint)(&outPtr);
-            kArgs[1] = (nint)(&aPtr);
-            kArgs[2] = (nint)(&bPtr);
-            kArgs[3] = (nint)(&M);
-            kArgs[4] = (nint)(&K);
-            kArgs[5] = (nint)(&nVal);
-            _stream.Launch(func, gridX, 1, 1, (uint)matmulBlockSize, 1, 1, sharedMem, kArgs);
+            var (grid, threads, smem) = AdaptiveLaunch(N, 1, K / 8);
+            LaunchMatMul("dequant_matmul_tq1_0", outPtr, aPtr, bPtr, M, K, N, grid, threads, smem);
         }
         else if (b.Type == GgmlType.F16)
         {
-            var func = _matmulModule.GetFunction("dequant_matmul_f16");
-            int nVal = N;
-            nint* kArgs = stackalloc nint[6];
-            kArgs[0] = (nint)(&outPtr);
-            kArgs[1] = (nint)(&aPtr);
-            kArgs[2] = (nint)(&bPtr);
-            kArgs[3] = (nint)(&M);
-            kArgs[4] = (nint)(&K);
-            kArgs[5] = (nint)(&nVal);
-            _stream.Launch(func, gridX, 1, 1, (uint)matmulBlockSize, 1, 1, sharedMem, kArgs);
+            var (grid, threads, smem) = AdaptiveLaunch(N, 1, K / 8);
+            LaunchMatMul("dequant_matmul_f16", outPtr, aPtr, bPtr, M, K, N, grid, threads, smem);
         }
         else if (b.Type == GgmlType.Q4_K)
         {
-            var func = _matmulModule.GetFunction("dequant_matmul_q4_k");
-            int nVal = N;
-            nint* kArgs = stackalloc nint[6];
-            kArgs[0] = (nint)(&outPtr);
-            kArgs[1] = (nint)(&aPtr);
-            kArgs[2] = (nint)(&bPtr);
-            kArgs[3] = (nint)(&M);
-            kArgs[4] = (nint)(&K);
-            kArgs[5] = (nint)(&nVal);
-            _stream.Launch(func, gridX, 1, 1, (uint)matmulBlockSize, 1, 1, sharedMem, kArgs);
+            var (grid, threads, smem) = AdaptiveLaunch(N, 4, K / 256 * 4); // Q4K_ROWS_PER_BLOCK=4
+            LaunchMatMul("dequant_matmul_q4_k", outPtr, aPtr, bPtr, M, K, N, grid, threads, smem);
         }
         else if (b.Type == GgmlType.Q5_K)
         {
-            var func = _matmulModule.GetFunction("dequant_matmul_q5_k");
-            int nVal = N;
-            nint* kArgs = stackalloc nint[6];
-            kArgs[0] = (nint)(&outPtr);
-            kArgs[1] = (nint)(&aPtr);
-            kArgs[2] = (nint)(&bPtr);
-            kArgs[3] = (nint)(&M);
-            kArgs[4] = (nint)(&K);
-            kArgs[5] = (nint)(&nVal);
-            _stream.Launch(func, gridX, 1, 1, (uint)matmulBlockSize, 1, 1, sharedMem, kArgs);
+            var (grid, threads, smem) = AdaptiveLaunch(N, 1, K / 256 * 8); // Q5K_ROWS_PER_BLOCK=1
+            LaunchMatMul("dequant_matmul_q5_k", outPtr, aPtr, bPtr, M, K, N, grid, threads, smem);
         }
         else if (b.Type == GgmlType.Q6_K)
         {
-            var func = _matmulModule.GetFunction("dequant_matmul_q6_k");
-            int nVal = N;
-            nint* kArgs = stackalloc nint[6];
-            kArgs[0] = (nint)(&outPtr);
-            kArgs[1] = (nint)(&aPtr);
-            kArgs[2] = (nint)(&bPtr);
-            kArgs[3] = (nint)(&M);
-            kArgs[4] = (nint)(&K);
-            kArgs[5] = (nint)(&nVal);
-            _stream.Launch(func, gridX, 1, 1, (uint)matmulBlockSize, 1, 1, sharedMem, kArgs);
+            var (grid, threads, smem) = AdaptiveLaunch(N, 2, K / 256 * 8); // Q6K_ROWS_PER_BLOCK=2
+            LaunchMatMul("dequant_matmul_q6_k", outPtr, aPtr, bPtr, M, K, N, grid, threads, smem);
         }
         else
         {
