@@ -257,7 +257,7 @@ __global__ void matmul_f32(float* output, const float* a, const float* b,
 // ── Fused Q8_0 Dequant + MatMul (aligned 36-byte blocks) ────────────────────
 // Multi-row constant (shared by aligned and unaligned Q8_0 kernels)
 #ifndef Q8_ROWS_PER_BLOCK
-#define Q8_ROWS_PER_BLOCK 4
+#define Q8_ROWS_PER_BLOCK 2
 #endif
 
 // Multi-row aligned Q8_0: 4 output neurons per block with activation reuse
@@ -322,7 +322,7 @@ __global__ void dequant_matmul_q8_0_aligned(float* __restrict__ output,
 
 // ── Fused Q8_0 Dequant + MatMul (original 34-byte blocks) ──────────────────
 // Multi-row Q8_0: 4 output neurons per block with activation reuse
-#define Q8_ROWS_PER_BLOCK 4
+#define Q8_ROWS_PER_BLOCK 2
 
 __global__ void dequant_matmul_q8_0(float* __restrict__ output,
                                      const float* __restrict__ a,
@@ -672,7 +672,7 @@ void dequant_matmul_q4_0_q8_1(float* __restrict__ output,
 // ── Fused Q4_0 Dequant + MatMul (aligned 20-byte blocks) ──────────────────
 // Q4_0 repacked: [scale(2b) + pad(2b) + nibbles(16b)] = 20 bytes, 4-byte aligned.
 // 2 output rows per block for activation reuse.
-#define Q4_0_ROWS_PER_BLOCK 2
+#define Q4_0_ROWS_PER_BLOCK 4
 
 __global__ void dequant_matmul_q4_0(float* __restrict__ output,
                                      const float* __restrict__ a,
@@ -844,7 +844,7 @@ __device__ __forceinline__ void unpack_q4k_scales(const unsigned char* sb,
 }
 
 // Multi-row Q4_K: output neurons per block with activation reuse + uint reads
-#define Q4K_ROWS_PER_BLOCK 4
+#define Q4K_ROWS_PER_BLOCK 3
 
 __global__ void dequant_matmul_q4_k(float* output, const float* a,
                                      const unsigned char* b,
@@ -1010,7 +1010,7 @@ __global__ void dequant_matmul_q5_k(float* output, const float* a,
 // Layout: ql[128] + qh[64] + sc[16] + d[2].
 
 // Multi-row Q6_K: 2 output neurons per block with activation reuse
-#define Q6K_ROWS_PER_BLOCK 2
+#define Q6K_ROWS_PER_BLOCK 10
 
 __global__ void dequant_matmul_q6_k(float* output, const float* a,
                                      const unsigned char* b,
