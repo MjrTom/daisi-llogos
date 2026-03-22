@@ -575,14 +575,15 @@ __global__ void dequant_matmul_f16(float* output, const float* a,
         output[n] = sum;
 }
 
-// ── Q4_0 × Q8_1 dp4a MatMul (warp-cooperative, llama.cpp style) ──────────
-// 2 threads per Q4_0 block: each handles 8 nibble bytes (16 elements).
-// Thread 0 (kqs=0): nibble bytes 0-7 → elements {0-3,16-19} and {4-7,20-23}
-// Thread 1 (kqs=2): nibble bytes 8-15 → elements {8-11,24-27} and {12-15,28-31}
-// 4 dp4a calls per thread per block. Warp reduction sums across thread pairs.
-// nwarps=2 (64 threads), 1 row per CUDA block.
+// ── Q4_0 × Q8_1 dp4a MatMul ──────────────────────────────────────────────
+// 1 thread per Q4_0 block, 8 dp4a ops per block (full 32 elements).
+// Multi-row: 2 output rows per CUDA block for weight data reuse.
+// Configurable thread count via template.
 
-__global__ __launch_bounds__(64)
+#define Q4_0_DP4A_THREADS 256
+#define Q4_0_DP4A_ROWS 4
+
+__global__ __launch_bounds__(Q4_0_DP4A_THREADS)
 void dequant_matmul_q4_0_q8_1(float* __restrict__ output,
                                 const void* __restrict__ vq8_1,
                                 const unsigned char* __restrict__ b,
@@ -591,53 +592,66 @@ void dequant_matmul_q4_0_q8_1(float* __restrict__ output,
     const int tid = threadIdx.x;
     const int lane = tid & 31;
     const int warp = tid >> 5;
-    const int n = blockIdx.x; // 1 row per CUDA block
-    if (n >= N) return;
+    const int n_base = blockIdx.x * Q4_0_DP4A_ROWS;
+    if (n_base >= N) return;
 
     const int blocks_per_row = K / 32;
     const long bytes_per_row = (long)blocks_per_row * 20;
     const unsigned char* a_q8_1 = (const unsigned char*)vq8_1;
+    const int nwarps = Q4_0_DP4A_THREADS / 32;
 
-    // 2 threads per Q4_0 block: kbx = tid/2, kqs = (tid%2)*2
-    const int kqs = (tid & 1) * 2; // 0 or 2 — which half of the nibble array
-    const int qi_over_vdr = 2;     // qi/vdr = 4/2 = 2
-    const int blocks_per_iter = 2 * 2 * 32 / 4; // vdr * nwarps * warp_size / qi = 2*2*32/4 = 32
+    float sums[Q4_0_DP4A_ROWS] = {0};
 
-    float sum = 0.0f;
-
-    for (int kbx = tid / qi_over_vdr; kbx < blocks_per_row; kbx += blocks_per_iter)
+    for (int blk = tid; blk < blocks_per_row; blk += Q4_0_DP4A_THREADS)
     {
-        const unsigned char* ablk = a_q8_1 + kbx * 36;
+        // Load Q8_1 activation: [d(f16) + sum(f16) + quants(32b)] = 36 bytes
+        const unsigned char* ablk = a_q8_1 + blk * 36;
         float a_d = fp16_to_fp32(*reinterpret_cast<const unsigned short*>(ablk));
         float a_s = fp16_to_fp32(*reinterpret_cast<const unsigned short*>(ablk + 2));
         const int* a_qs = reinterpret_cast<const int*>(ablk + 4);
 
-        const unsigned int* bw = reinterpret_cast<const unsigned int*>(
-            b + (long)n * bytes_per_row + kbx * 20);
-        float w_d = fp16_to_fp32((unsigned short)(__ldg(&bw[0]) & 0xFFFF));
-
-        int sumi = 0;
         #pragma unroll
-        for (int i = 0; i < 2; i++) {
-            unsigned int packed = __ldg(&bw[1 + kqs + i]);
-            int vi0 = (int)(packed & 0x0F0F0F0F);
-            int vi1 = (int)((packed >> 4) & 0x0F0F0F0F);
-            sumi = __dp4a(vi0, a_qs[kqs + i], sumi);
-            sumi = __dp4a(vi1, a_qs[kqs + i + 4], sumi);
+        for (int r = 0; r < Q4_0_DP4A_ROWS; r++)
+        {
+            int n = n_base + r;
+            if (n >= N) break;
+
+            const unsigned int* bw = reinterpret_cast<const unsigned int*>(
+                b + (long)n * bytes_per_row + blk * 20);
+            float w_d = fp16_to_fp32((unsigned short)(__ldg(&bw[0]) & 0xFFFF));
+
+            int sumi = 0;
+            #pragma unroll
+            for (int i = 0; i < 4; i++) {
+                unsigned int packed = __ldg(&bw[1 + i]);
+                int vi0 = (int)(packed & 0x0F0F0F0F);
+                int vi1 = (int)((packed >> 4) & 0x0F0F0F0F);
+                sumi = __dp4a(vi0, a_qs[i], sumi);
+                sumi = __dp4a(vi1, a_qs[i + 4], sumi);
+            }
+            // Full block: coefficient = 8 (32 elements × 8 offset / 32 block size)
+            sums[r] += w_d * ((float)sumi * a_d - 8.0f * a_s);
         }
-        sum += w_d * ((float)sumi * a_d - 4.0f * a_s);
     }
 
     // Warp + cross-warp reduction
-    sum = warp_reduce_sum(sum);
-    __shared__ float warp_sums[2];
-    if (lane == 0) warp_sums[warp] = sum;
+    __shared__ float smem[Q4_0_DP4A_THREADS / 32][Q4_0_DP4A_ROWS];
+
+    #pragma unroll
+    for (int r = 0; r < Q4_0_DP4A_ROWS; r++) {
+        float val = warp_reduce_sum(sums[r]);
+        if (lane == 0) smem[warp][r] = val;
+    }
     __syncthreads();
 
     if (warp == 0) {
-        sum = (lane < 2) ? warp_sums[lane] : 0.0f;
-        sum = warp_reduce_sum(sum);
-        if (lane == 0) output[n] = sum;
+        #pragma unroll
+        for (int r = 0; r < Q4_0_DP4A_ROWS; r++) {
+            float val = (lane < nwarps) ? smem[lane][r] : 0.0f;
+            val = warp_reduce_sum(val);
+            if (lane == 0 && n_base + r < N)
+                output[n_base + r] = val;
+        }
     }
 }
 
