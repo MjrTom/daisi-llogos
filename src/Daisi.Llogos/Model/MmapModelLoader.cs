@@ -1,5 +1,6 @@
 using System.IO.MemoryMappedFiles;
 using Daisi.Llogos.Gguf;
+using Daisi.Llogos.Tokenizer;
 
 namespace Daisi.Llogos.Model;
 
@@ -10,7 +11,8 @@ namespace Daisi.Llogos.Model;
 /// </summary>
 public static class MmapModelLoader
 {
-    public static unsafe ModelWeights Load(GgufFile gguf, string filePath, IComputeBackend backend, ModelConfig config)
+    public static unsafe ModelWeights Load(GgufFile gguf, string filePath, IComputeBackend backend, ModelConfig config,
+        VocabRemapper? remapper = null)
     {
         using var mmf = MemoryMappedFile.CreateFromFile(filePath, FileMode.Open, null, 0, MemoryMappedFileAccess.Read);
         using var accessor = mmf.CreateViewAccessor(0, 0, MemoryMappedFileAccess.Read);
@@ -23,9 +25,13 @@ public static class MmapModelLoader
             foreach (var t in gguf.Tensors)
                 tensorMap[t.Name] = t;
 
-            var tokenEmbedding = LoadTensor(gguf, basePtr, backend, tensorMap, "token_embd.weight");
+            var tokenEmbedding = remapper != null
+                ? LoadTensorRemapped(gguf, basePtr, backend, tensorMap, "token_embd.weight", remapper)
+                : LoadTensor(gguf, basePtr, backend, tensorMap, "token_embd.weight");
             var outputNorm = LoadTensor(gguf, basePtr, backend, tensorMap, "output_norm.weight");
-            var output = TryLoadTensor(gguf, basePtr, backend, tensorMap, "output.weight");
+            var output = remapper != null && tensorMap.ContainsKey("output.weight")
+                ? LoadTensorRemapped(gguf, basePtr, backend, tensorMap, "output.weight", remapper)
+                : TryLoadTensor(gguf, basePtr, backend, tensorMap, "output.weight");
 
             var layers = new LayerWeights[config.NumLayers];
             for (int i = 0; i < config.NumLayers; i++)
@@ -145,6 +151,30 @@ public static class MmapModelLoader
         var span = new ReadOnlySpan<byte>(basePtr + offset, byteSize);
         var dims = ConvertDimensions(info);
         return backend.LoadTensor(name, info.Type, dims, span);
+    }
+
+    /// <summary>
+    /// Load a tensor with row permutation applied. Used for embedding and output tensors
+    /// when vocabulary remapping is active. Each "row" is one token's weight vector.
+    /// </summary>
+    private static unsafe ITensor LoadTensorRemapped(
+        GgufFile gguf, byte* basePtr, IComputeBackend backend,
+        Dictionary<string, GgufTensorInfo> tensorMap, string name, VocabRemapper remapper)
+    {
+        if (!tensorMap.TryGetValue(name, out var info))
+            throw new InvalidDataException($"Missing tensor: {name}");
+
+        long offset = gguf.GetTensorDataOffset(info);
+        int byteSize = (int)info.ByteSize;
+        var span = new ReadOnlySpan<byte>(basePtr + offset, byteSize);
+        var dims = ConvertDimensions(info);
+
+        // dims[1] = vocabSize (number of rows), dims[0] = hiddenDim (row width)
+        int vocabSize = dims.Length > 1 ? (int)dims[1] : (int)dims[0];
+        int bytesPerRow = byteSize / vocabSize;
+
+        var permuted = remapper.PermuteRows(span, vocabSize, bytesPerRow);
+        return backend.LoadTensor(name, info.Type, dims, permuted);
     }
 
     private static long[] ConvertDimensions(GgufTensorInfo info)

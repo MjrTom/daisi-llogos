@@ -61,9 +61,19 @@ if (isBitNet)
 else
 {
     // ── Standard path (Qwen / hybrid) ───────────────────────────────────────
+    // Build vocab remapper if partial vocab is active (vocab-limit > 1)
+    VocabRemapper? remapper = null;
+    int vocabDivisor = options.VocabLimit ?? 32;
+    if (vocabDivisor > 1)
+    {
+        var tokens = gguf.GetMetadata<string[]>("tokenizer.ggml.tokens")!;
+        remapper = new VocabRemapper(tokens);
+        tokenizer.Vocabulary.ApplyRemapper(remapper);
+    }
+
     ModelWeights weights;
     if (options.UseMmap)
-        weights = MmapModelLoader.Load(gguf, options.ModelPath, backend, config);
+        weights = MmapModelLoader.Load(gguf, options.ModelPath, backend, config, remapper);
     else
         weights = ModelLoader.Load(gguf, stream, backend, config);
 
