@@ -135,8 +135,9 @@ else
         var draftKvCache = new KvCache(backend, draftConfig, maxSeqLen: options.MaxContext);
         var draftDeltaState = new DeltaNetState(backend, draftConfig, draftWeights);
         draftForward = new ForwardPass(backend, draftConfig, draftWeights, draftKvCache, draftDeltaState);
-        // Draft uses full vocab (no remapper, so partial vocab selects wrong token pool)
-        draftForward.ArgMaxVocabLimit = draftConfig.VocabSize;
+        // Draft uses partial vocab (same raw token order as target since both un-remapped)
+        // /4 gives ~62K tokens — generous enough for common tokens without remapper
+        draftForward.ArgMaxVocabLimit = draftConfig.VocabSize / 4;
 
         specDecoder = new SpeculativeDecoder(forward, draftForward, tokenizer, options.SpecDepth, remapper);
         Console.Error.WriteLine($"done ({draftConfig.Architecture}, {draftConfig.NumLayers}L, {draftConfig.HiddenDim}d)");

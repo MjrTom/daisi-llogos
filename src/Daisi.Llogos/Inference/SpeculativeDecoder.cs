@@ -48,8 +48,9 @@ public sealed class SpeculativeDecoder
         var promptIds = _tokenizer.Encode(prompt);
         if (promptIds.Length == 0) yield break;
 
-        // Note: graph capture with two models re-instantiates frequently (topology changes)
-        // but produces correct results since each model's forward pass is self-contained.
+        // Disable graph capture — two models alternating causes constant re-instantiation
+        _target.DisableGraphCapture();
+        _draft.DisableGraphCapture();
 
         // Prefill target model first (remapped IDs), then draft (original IDs)
         var prefillSw = System.Diagnostics.Stopwatch.StartNew();
