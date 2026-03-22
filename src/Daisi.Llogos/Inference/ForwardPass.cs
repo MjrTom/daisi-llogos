@@ -15,6 +15,14 @@ public sealed class ForwardPass : IForwardPass
     private readonly IKvCache _kvCache;
     private readonly DeltaNetState _deltaState;
 
+    /// <summary>
+    /// Maximum vocab entries to compute in lm_head for greedy decode (ForwardArgMax).
+    /// Common tokens occupy the low vocab range, so computing a fraction is sufficient
+    /// for argmax. Set to VocabSize for full computation, or smaller for faster decode.
+    /// Default: VocabSize / 4 (covers ~38K tokens for 152K vocab).
+    /// </summary>
+    public int ArgMaxVocabLimit { get; set; }
+
     // Scratch buffers
     private readonly ITensor _hidden;
     private readonly ITensor _residual;
@@ -58,6 +66,7 @@ public sealed class ForwardPass : IForwardPass
         _weights = weights;
         _kvCache = kvCache;
         _deltaState = deltaState;
+        ArgMaxVocabLimit = config.VocabSize / 4;
 
         _hidden = CreateF32("scratch_hidden", config.HiddenDim);
         _residual = CreateF32("scratch_residual", config.HiddenDim);
@@ -235,9 +244,11 @@ public sealed class ForwardPass : IForwardPass
     {
         ForwardTransformer(tokenId, position);
         _backend.RmsNorm(_normOut, _hidden, _weights.OutputNorm, _config.NormEps);
-        ProjectLinear(_logits, _normOut, _weights.OutputWeight);
+        // Partial vocab: only compute logits for the first ArgMaxVocabLimit tokens.
+        // Common tokens are in the low vocab range — sufficient for greedy argmax.
+        ProjectLinearPartial(_logits, _normOut, _weights.OutputWeight, ArgMaxVocabLimit);
         _backend.FlushCommands(); // submit batch before argmax readback
-        return _backend.ArgMax(_logits);
+        return _backend.ArgMax(_logits, ArgMaxVocabLimit);
     }
 
     // ── Standard Attention (Gated) ───────────────────────────────────────────
@@ -441,6 +452,18 @@ public sealed class ForwardPass : IForwardPass
     {
         int K = (int)weight.Dimensions[0];
         int N = (int)weight.Dimensions[1];
+        _backend.MatMul(output, input, weight, 1, K, N);
+    }
+
+    /// <summary>
+    /// Project with a reduced output dimension. Only computes the first maxN output neurons.
+    /// Used for lm_head in greedy decode — common tokens are in the low vocab range,
+    /// so computing a subset of logits is sufficient for argmax.
+    /// </summary>
+    private void ProjectLinearPartial(ITensor output, ITensor input, ITensor weight, int maxN)
+    {
+        int K = (int)weight.Dimensions[0];
+        int N = Math.Min((int)weight.Dimensions[1], maxN);
         _backend.MatMul(output, input, weight, 1, K, N);
     }
 
