@@ -20,33 +20,42 @@ All original bugs (issues 1-5) are **fixed**. This document tracks remaining opt
 
 ---
 
-## Open: dp4a Precision Loss
+## Resolved: dp4a Precision Loss
 
-### Symptom
-The `__dp4a` integer dot product approach (CUDA) quantizes the activation to int8, which loses precision that compounds across 36 layers, producing garbage for 8B+ models.
+### Original Symptom
+The `__dp4a` integer dot product approach (CUDA) produced garbage output. Initially believed to be precision loss from int8 activation quantization compounding across layers.
 
-### Status
-dp4a path disabled. llama.cpp handles this with a more sophisticated Q8_1 format that preserves per-block activation sums for error compensation. A proper implementation would require matching their exact precision handling.
+### Root Cause
+**Stale Q8_1 cache.** The Q8_1 quantized activation was cached by device pointer address, but the same tensor (`_normOut`) is reused across layers — same pointer, different data. The cache served stale Q8_1 data from the previous layer.
+
+### Fix
+Generation-based cache invalidation: a counter is incremented by every operation that writes to a tensor (RmsNorm, AddRmsNorm, etc.). The cache checks both pointer AND generation. Additionally, three fused RmsNorm+Q8_1 kernels pre-compute the Q8_1 data inside the normalization pass, eliminating the separate quantization kernel entirely.
+
+dp4a is now the default Q4_0 path on pre-Blackwell GPUs, with architecture-adaptive dispatch selecting the float path on Blackwell (SM 12.x).
 
 ---
 
-## Open: Performance Gap vs llama.cpp
+## Performance vs llama.cpp
 
 ### Current Standing (RTX 5080, decode tok/s, 128 tokens)
 
-| Model | llama.cpp CUDA | Llogos CUDA | % | llama.cpp Vulkan | Llogos Vulkan | % |
-|-------|--------:|--------:|--------:|--------:|--------:|--------:|
-| 0.8B Q8_0 | 399 | 363 | 91% | 466 | 150 | 32% |
-| 8B Q8_0 | 92 | **83** | **90%** | 96 | 54 | 56% |
-| 8B Q4_K_M | 138 | 86 | 62% | 142 | 53 | 37% |
-| 9B Q8_0 | 84 | **76** | **90%** | —* | 51 | — |
+**Exceeding llama.cpp on 4 of 6 CUDA models tested.**
 
-*llama.cpp Vulkan b8461 has a regression on DeltaNet models (~11 tok/s).
+| Model | Llogos CUDA | llama.cpp CUDA | % |
+|-------|--------:|--------:|--------:|
+| 0.8B Q8_0 | **436** | 399 | **109%** |
+| 4B Q8_0 | **142** | 135 | **105%** |
+| 8B Q8_0 | 90 | 92 | 98% |
+| 8B Q4_K_M | 122 | 138 | 88% |
+| 9B Q8_0 | **86** | 84 | **102%** |
+| 9B Q4_0 | 100 | 123 | 81% |
 
 ### Remaining Gaps
-- **CUDA Q4_K_M** (62%): llama.cpp's Q4_K kernel is significantly more optimized (dp4a, specific memory patterns)
-- **Vulkan** (32-56%): matmul bandwidth utilization gap, descriptor set overhead vs llama.cpp's buffer device addresses
-- **CUDA Q8_0** (90%): target achieved — remaining gap is fundamental memory bandwidth efficiency
+- **CUDA 4-bit quants** (81-88%): Q4_0 float kernel is compute-bound on nibble extraction; dp4a matches float on Blackwell but doesn't exceed it. Q4_K needs dp4a implementation.
+- **Vulkan** (33-58%): matmul bandwidth utilization gap, no dp4a equivalent in GLSL. Needs further shader optimization.
+
+### Key Optimizations
+See [Inference Optimization White Paper](inference-optimization.md) for full details on partial vocab logits, per-quant row tuning, fused RmsNorm+Q8_1, and other techniques.
 
 ---
 

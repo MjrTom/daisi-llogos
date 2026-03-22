@@ -64,8 +64,10 @@ flowchart TD
 | `silu.comp` | SiLU activation |
 | `rope.comp` | Rotary position embeddings |
 | `element_ops.comp` | Element-wise add/multiply |
-| `dequant_matmul.comp` | Fused dequant+matmul (F32, Q8_0) |
-| `embedding.comp` | Embedding lookup (F32, Q8_0) |
+| `dequant_matmul.comp` | Fused dequant+matmul (F32, Q8_0, Q4_0, Q4_1, Q4_K, Q5_K, Q6_K, I2_S, TQ1_0, F16) |
+| `matmul_q8_0_aligned.comp` | Dedicated aligned Q8_0 matmul (optimized uint32 reads) |
+| `dequant_matmul_bda.comp` | Buffer device address matmul variant |
+| `embedding.comp` | Embedding lookup (F32, Q8_0, Q4_0, Q4_1, Q4_K, F16) |
 | `composite_ops.comp` | SiLU in-place, SiLU gate, split QKV, de-interleave Q, L2 norm, per-head RMSNorm, KV cache write, compute decay/beta, causal conv1d |
 | `gated_attention.comp` | Tiled gated attention with online softmax |
 | `deltanet_step.comp` | DeltaNet state update + output + per-head RMSNorm |
