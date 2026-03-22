@@ -19,6 +19,8 @@ public sealed class CudaBackend : IComputeBackend
     private ulong _q8_1CachedInputPtr; // device ptr of last quantized activation (for reuse)
     private int _q8_1CacheGeneration; // incremented by non-matmul ops to invalidate cache
     private int _q8_1CachedGeneration; // generation when cache was last written
+    private bool _q8_1FusedReady; // true when Q8_1 was pre-computed by fused RmsNorm
+    private bool _hasQ4_0Weights; // true when model contains Q4_0 weight tensors
     private bool _disposed;
 
     private const int BlockSize = 256;
@@ -164,6 +166,7 @@ public sealed class CudaBackend : IComputeBackend
         // [scale(2b) | pad(2b) | nibbles(16b)] = 20 bytes, 4-byte aligned
         if (type == GgmlType.Q4_0 && dimensions.Length >= 2)
         {
+            _hasQ4_0Weights = true;
             // Pre-allocate Q8_1 scratch for dp4a (must happen outside stream capture)
             EnsureQ8_1Scratch((int)dimensions[0]);
             int blockCount = data.Length / 18;
@@ -187,9 +190,8 @@ public sealed class CudaBackend : IComputeBackend
     /// <inheritdoc />
     public unsafe void MatMul(ITensor output, ITensor a, ITensor b, int M, int K, int N)
     {
-        // Any matmul with a different activation invalidates the Q8_1 cache
-        if (b.Type != GgmlType.Q4_0)
-            _q8_1CacheGeneration++;
+        // Note: MatMul is read-only on the activation tensor, so it does NOT
+        // invalidate the Q8_1 cache. Only ops that WRITE to tensors bump the generation.
 
         var outT = (CudaTensor)output;
         var aT = (CudaTensor)a;
@@ -301,9 +303,26 @@ public sealed class CudaBackend : IComputeBackend
             kArgs[5] = (nint)(&nVal);
             _stream.Launch(func, gridX, 1, 1, (uint)matmulBlockSize, 1, 1, sharedMem, kArgs);
         }
+        else if (b.Type == GgmlType.Q4_0 && _q8_1FusedReady
+                 && _q8_1CachedInputPtr == aPtr && _q8_1CachedGeneration == _q8_1CacheGeneration)
+        {
+            // Q8_1 pre-computed by fused RmsNorm for THIS activation — use dp4a
+            ulong q8_1Ptr = _q8_1Scratch!.DevicePtr;
+            var func = _matmulModule.GetFunction("dequant_matmul_q4_0_q8_1");
+            int nVal = N;
+            uint dp4aSmem = 2 * sizeof(float);
+            nint* kArgs = stackalloc nint[6];
+            kArgs[0] = (nint)(&outPtr);
+            kArgs[1] = (nint)(&q8_1Ptr);
+            kArgs[2] = (nint)(&bPtr);
+            kArgs[3] = (nint)(&M);
+            kArgs[4] = (nint)(&K);
+            kArgs[5] = (nint)(&nVal);
+            _stream.Launch(func, (uint)N, 1, 1, 64, 1, 1, dp4aSmem, kArgs);
+        }
         else if (b.Type == GgmlType.Q4_0 && _context.ComputeCapabilityMajor >= 12)
         {
-            // Blackwell: FP32 float path (faster due to massive FP32 throughput)
+            // Blackwell fallback: FP32 float path when Q8_1 not pre-computed
             var func = _matmulModule.GetFunction("dequant_matmul_q4_0");
             int nVal = N;
             nint* kArgs = stackalloc nint[6];
@@ -317,10 +336,11 @@ public sealed class CudaBackend : IComputeBackend
         }
         else if (b.Type == GgmlType.Q4_0)
         {
-            // Pre-Blackwell: dp4a path (4x int8 throughput beats float nibble extraction)
+            // dp4a path: use fused Q8_1 from RmsNorm, or quantize on demand
             ulong q8_1Ptr = EnsureQ8_1Scratch(K);
 
-            if (_q8_1CachedInputPtr != aPtr || _q8_1CachedGeneration != _q8_1CacheGeneration)
+            if (!_q8_1FusedReady &&
+                (_q8_1CachedInputPtr != aPtr || _q8_1CachedGeneration != _q8_1CacheGeneration))
             {
                 _q8_1CachedInputPtr = aPtr;
                 _q8_1CachedGeneration = _q8_1CacheGeneration;
@@ -1242,6 +1262,7 @@ public sealed class CudaBackend : IComputeBackend
     public unsafe void RmsNormResidual(ITensor output, ITensor residual, ITensor input, ITensor weight, float eps)
     {
         _q8_1CacheGeneration++;
+        _q8_1FusedReady = false;
         var outT = (CudaTensor)output;
         var resT = (CudaTensor)residual;
         var inT = (CudaTensor)input;
@@ -1251,17 +1272,37 @@ public sealed class CudaBackend : IComputeBackend
         ulong inPtr = inT.DevicePtr;
         ulong wPtr = wT.DevicePtr;
         int n = (int)input.ElementCount;
-
-        var func = _elementwiseModule.GetFunction("rms_norm_residual");
         uint sharedMem = (uint)(BlockSize * sizeof(float));
-        nint* kArgs = stackalloc nint[6];
-        kArgs[0] = (nint)(&outPtr);
-        kArgs[1] = (nint)(&resPtr);
-        kArgs[2] = (nint)(&inPtr);
-        kArgs[3] = (nint)(&wPtr);
-        kArgs[4] = (nint)(&n);
-        kArgs[5] = (nint)(&eps);
-        _stream.Launch(func, 1, 1, 1, (uint)BlockSize, 1, 1, sharedMem, kArgs);
+
+        if (_hasQ4_0Weights && _q8_1Scratch != null)
+        {
+            ulong q8Ptr = _q8_1Scratch.DevicePtr;
+            var func = _elementwiseModule.GetFunction("rms_norm_residual_q8_1");
+            nint* kArgs = stackalloc nint[7];
+            kArgs[0] = (nint)(&outPtr);
+            kArgs[1] = (nint)(&resPtr);
+            kArgs[2] = (nint)(&inPtr);
+            kArgs[3] = (nint)(&wPtr);
+            kArgs[4] = (nint)(&q8Ptr);
+            kArgs[5] = (nint)(&n);
+            kArgs[6] = (nint)(&eps);
+            _stream.Launch(func, 1, 1, 1, (uint)BlockSize, 1, 1, sharedMem, kArgs);
+            _q8_1FusedReady = true;
+            _q8_1CachedInputPtr = outPtr;
+            _q8_1CachedGeneration = _q8_1CacheGeneration;
+        }
+        else
+        {
+            var func = _elementwiseModule.GetFunction("rms_norm_residual");
+            nint* kArgs = stackalloc nint[6];
+            kArgs[0] = (nint)(&outPtr);
+            kArgs[1] = (nint)(&resPtr);
+            kArgs[2] = (nint)(&inPtr);
+            kArgs[3] = (nint)(&wPtr);
+            kArgs[4] = (nint)(&n);
+            kArgs[5] = (nint)(&eps);
+            _stream.Launch(func, 1, 1, 1, (uint)BlockSize, 1, 1, sharedMem, kArgs);
+        }
     }
 
     /// <inheritdoc />
@@ -1289,6 +1330,7 @@ public sealed class CudaBackend : IComputeBackend
     public unsafe void AddRmsNormResidual(ITensor output, ITensor hidden, ITensor residual, ITensor b, ITensor weight, float eps)
     {
         _q8_1CacheGeneration++;
+        _q8_1FusedReady = false;
         var outT = (CudaTensor)output;
         var hidT = (CudaTensor)hidden;
         var resT = (CudaTensor)residual;
@@ -1297,23 +1339,45 @@ public sealed class CudaBackend : IComputeBackend
         ulong outPtr = outT.DevicePtr, hidPtr = hidT.DevicePtr, resPtr = resT.DevicePtr;
         ulong bPtr = bT.DevicePtr, wPtr = wT.DevicePtr;
         int n = (int)hidden.ElementCount;
-
-        var func = _elementwiseModule.GetFunction("add_rms_norm_residual");
         uint sharedMem = (uint)(BlockSize * sizeof(float));
-        nint* kArgs = stackalloc nint[7];
-        kArgs[0] = (nint)(&outPtr);
-        kArgs[1] = (nint)(&hidPtr);
-        kArgs[2] = (nint)(&resPtr);
-        kArgs[3] = (nint)(&bPtr);
-        kArgs[4] = (nint)(&wPtr);
-        kArgs[5] = (nint)(&n);
-        kArgs[6] = (nint)(&eps);
-        _stream.Launch(func, 1, 1, 1, (uint)BlockSize, 1, 1, sharedMem, kArgs);
+
+        if (_hasQ4_0Weights && _q8_1Scratch != null)
+        {
+            ulong q8Ptr = _q8_1Scratch.DevicePtr;
+            var func = _elementwiseModule.GetFunction("add_rms_norm_residual_q8_1");
+            nint* kArgs = stackalloc nint[8];
+            kArgs[0] = (nint)(&outPtr);
+            kArgs[1] = (nint)(&hidPtr);
+            kArgs[2] = (nint)(&resPtr);
+            kArgs[3] = (nint)(&bPtr);
+            kArgs[4] = (nint)(&wPtr);
+            kArgs[5] = (nint)(&q8Ptr);
+            kArgs[6] = (nint)(&n);
+            kArgs[7] = (nint)(&eps);
+            _stream.Launch(func, 1, 1, 1, (uint)BlockSize, 1, 1, sharedMem, kArgs);
+            _q8_1FusedReady = true;
+            _q8_1CachedInputPtr = outPtr;
+            _q8_1CachedGeneration = _q8_1CacheGeneration;
+        }
+        else
+        {
+            var func = _elementwiseModule.GetFunction("add_rms_norm_residual");
+            nint* kArgs = stackalloc nint[7];
+            kArgs[0] = (nint)(&outPtr);
+            kArgs[1] = (nint)(&hidPtr);
+            kArgs[2] = (nint)(&resPtr);
+            kArgs[3] = (nint)(&bPtr);
+            kArgs[4] = (nint)(&wPtr);
+            kArgs[5] = (nint)(&n);
+            kArgs[6] = (nint)(&eps);
+            _stream.Launch(func, 1, 1, 1, (uint)BlockSize, 1, 1, sharedMem, kArgs);
+        }
     }
 
     public unsafe void AddRmsNorm(ITensor output, ITensor hidden, ITensor a, ITensor b, ITensor weight, float eps)
     {
         _q8_1CacheGeneration++;
+        _q8_1FusedReady = false;
         var outT = (CudaTensor)output;
         var hidT = (CudaTensor)hidden;
         var aT = (CudaTensor)a;
@@ -1325,18 +1389,39 @@ public sealed class CudaBackend : IComputeBackend
         ulong bPtr = bT.DevicePtr;
         ulong wPtr = wT.DevicePtr;
         int n = (int)a.ElementCount;
-
-        var func = _elementwiseModule.GetFunction("add_rms_norm");
         uint sharedMem = (uint)(BlockSize * sizeof(float));
-        nint* kArgs = stackalloc nint[7];
-        kArgs[0] = (nint)(&outPtr);
-        kArgs[1] = (nint)(&hidPtr);
-        kArgs[2] = (nint)(&aPtr);
-        kArgs[3] = (nint)(&bPtr);
-        kArgs[4] = (nint)(&wPtr);
-        kArgs[5] = (nint)(&n);
-        kArgs[6] = (nint)(&eps);
-        _stream.Launch(func, 1, 1, 1, (uint)BlockSize, 1, 1, sharedMem, kArgs);
+
+        if (_hasQ4_0Weights && _q8_1Scratch != null)
+        {
+            ulong q8Ptr = _q8_1Scratch.DevicePtr;
+            var func = _elementwiseModule.GetFunction("add_rms_norm_q8_1");
+            nint* kArgs = stackalloc nint[8];
+            kArgs[0] = (nint)(&outPtr);
+            kArgs[1] = (nint)(&hidPtr);
+            kArgs[2] = (nint)(&aPtr);
+            kArgs[3] = (nint)(&bPtr);
+            kArgs[4] = (nint)(&wPtr);
+            kArgs[5] = (nint)(&q8Ptr);
+            kArgs[6] = (nint)(&n);
+            kArgs[7] = (nint)(&eps);
+            _stream.Launch(func, 1, 1, 1, (uint)BlockSize, 1, 1, sharedMem, kArgs);
+            _q8_1FusedReady = true;
+            _q8_1CachedInputPtr = outPtr;
+            _q8_1CachedGeneration = _q8_1CacheGeneration;
+        }
+        else
+        {
+            var func = _elementwiseModule.GetFunction("add_rms_norm");
+            nint* kArgs = stackalloc nint[7];
+            kArgs[0] = (nint)(&outPtr);
+            kArgs[1] = (nint)(&hidPtr);
+            kArgs[2] = (nint)(&aPtr);
+            kArgs[3] = (nint)(&bPtr);
+            kArgs[4] = (nint)(&wPtr);
+            kArgs[5] = (nint)(&n);
+            kArgs[6] = (nint)(&eps);
+            _stream.Launch(func, 1, 1, 1, (uint)BlockSize, 1, 1, sharedMem, kArgs);
+        }
     }
 
     /// <inheritdoc />
