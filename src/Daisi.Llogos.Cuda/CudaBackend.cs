@@ -29,8 +29,6 @@ public sealed class CudaBackend : IComputeBackend
     private bool _capturing;          // true while stream is in capture mode
     private nint _graphExec;          // reusable graph executable (0 = none)
     private bool _graphEnabled = true;
-    /// <summary>Disable graph capture (needed when multiple models share one backend).</summary>
-    public bool GraphEnabled { get => _graphEnabled; set => _graphEnabled = value; }
 
     public CudaBackend(int deviceOrdinal = 0)
     {
@@ -40,9 +38,6 @@ public sealed class CudaBackend : IComputeBackend
         // Initialize cuBLAS
         CublasApi.Check(CublasApi.Create(out _cublasHandle), "cublasCreate");
         CublasApi.Check(CublasApi.SetStream(_cublasHandle, _stream.Handle), "cublasSetStream");
-        // Enable TF32 tensor cores for FP32 SGEMM (FP32 range, FP16 precision — ideal for inference)
-        CublasApi.SetMathMode(_cublasHandle, CublasApi.CUBLAS_TF32_TENSOR_OP_MATH);
-
 
         // Load kernels with architecture-specific compilation for best codegen
         var archOpts = new[] { $"--gpu-architecture=compute_{_context.ComputeCapabilityMajor}{_context.ComputeCapabilityMinor}" };
@@ -56,9 +51,6 @@ public sealed class CudaBackend : IComputeBackend
 
     /// <inheritdoc />
     public string Name => $"CUDA ({_context.DeviceName})";
-
-    /// <inheritdoc />
-    public void DisableGraphCapture() => _graphEnabled = false;
 
     /// <summary>Begin recording operations into a CUDA graph (if enabled).</summary>
     public void BeginCommands()
@@ -123,85 +115,62 @@ public sealed class CudaBackend : IComputeBackend
         ulong aPtr = aT.DevicePtr;
         ulong bPtr = bT.DevicePtr;
 
-        bool needsDequant = bT.Type != Gguf.GgmlType.F32 && bT.Type != Gguf.GgmlType.F16;
+        ulong bF32Ptr;
+        bool needsDequant = bT.Type != Gguf.GgmlType.F32;
 
-        ulong bF16Ptr;
         if (needsDequant)
         {
-            long f16Bytes = (long)K * N * 2;
-
-            // Dequantize weight to FP16 temp buffer
-            if (_batchDequantBuf == null || _batchDequantBufSize < f16Bytes)
+            // Dequantize weight to temporary FP32 buffer
+            long f32Bytes = (long)K * N * sizeof(float);
+            if (_batchDequantBuf == null || _batchDequantBufSize < f32Bytes)
             {
                 _batchDequantBuf?.Dispose();
-                _batchDequantBuf = new CudaDeviceMemory((ulong)f16Bytes);
-                _batchDequantBufSize = f16Bytes;
+                _batchDequantBuf = new CudaDeviceMemory((ulong)f32Bytes);
+                _batchDequantBufSize = f32Bytes;
             }
-            bF16Ptr = _batchDequantBuf.DevicePtr;
-            {
+            bF32Ptr = _batchDequantBuf.DevicePtr;
 
-                var func = _elementwiseModule.GetFunction("dequant_to_f16");
-                int totalElements = K * N;
-                int blockSize = Gguf.GgmlTypeInfo.BlockSize(bT.Type);
-                int typeTag = (int)bT.Type;
-                int isAligned = (bT.IsAlignedQ8_0 || bT.IsAlignedQ4_0) ? 1 : 0;
-                uint grid = (uint)((totalElements + BlockSize - 1) / BlockSize);
-                nint* dArgs = stackalloc nint[6];
-                dArgs[0] = (nint)(&bF16Ptr);
-                dArgs[1] = (nint)(&bPtr);
-                dArgs[2] = (nint)(&totalElements);
-                dArgs[3] = (nint)(&typeTag);
-                dArgs[4] = (nint)(&blockSize);
-                dArgs[5] = (nint)(&isAligned);
-                _stream.Launch(func, grid, 1, 1, (uint)BlockSize, 1, 1, 0, dArgs);
-            }
-
-            // Convert activation from FP32 to FP16 for tensor core path
-            int aElems = M * K;
-            long aF16Bytes = (long)aElems * 2;
-            if (_batchActivationBuf == null || _batchActivationBufSize < aF16Bytes)
-            {
-                _batchActivationBuf?.Dispose();
-                _batchActivationBuf = new CudaDeviceMemory((ulong)aF16Bytes);
-                _batchActivationBufSize = aF16Bytes;
-            }
-            ulong aF16Ptr = _batchActivationBuf.DevicePtr;
-            {
-                var cvtFunc = _elementwiseModule.GetFunction("fp32_to_fp16");
-                uint cvtGrid = (uint)((aElems + BlockSize - 1) / BlockSize);
-                nint* cArgs = stackalloc nint[3];
-                cArgs[0] = (nint)(&aF16Ptr);
-                cArgs[1] = (nint)(&aPtr);
-                cArgs[2] = (nint)(&aElems);
-                _stream.Launch(cvtFunc, cvtGrid, 1, 1, (uint)BlockSize, 1, 1, 0, cArgs);
-            }
-
-            float alpha = 1.0f, beta = 0.0f;
-            CublasApi.Check(CublasApi.GemmEx(_cublasHandle,
-                CublasApi.CUBLAS_OP_T, CublasApi.CUBLAS_OP_N,
-                N, M, K, &alpha,
-                bF16Ptr, CublasApi.CUDA_R_16F, K,
-                aF16Ptr, CublasApi.CUDA_R_16F, K,
-                &beta, outPtr, CublasApi.CUDA_R_32F, N,
-                CublasApi.CUBLAS_COMPUTE_32F, CublasApi.CUBLAS_GEMM_DEFAULT_TENSOR_OP),
-                "cublasGemmEx");
+            // GPU dequant kernel: expand quantized weight to FP32
+            var func = _elementwiseModule.GetFunction("dequant_to_f32");
+            int totalElements = K * N;
+            int blockSize = Gguf.GgmlTypeInfo.BlockSize(bT.Type);
+            int typeTag = (int)bT.Type;
+            int isAligned = (bT.IsAlignedQ8_0 || bT.IsAlignedQ4_0) ? 1 : 0;
+            uint grid = (uint)((totalElements + BlockSize - 1) / BlockSize);
+            nint* dArgs = stackalloc nint[6];
+            dArgs[0] = (nint)(&bF32Ptr);
+            dArgs[1] = (nint)(&bPtr);
+            dArgs[2] = (nint)(&totalElements);
+            dArgs[3] = (nint)(&typeTag);
+            dArgs[4] = (nint)(&blockSize);
+            dArgs[5] = (nint)(&isAligned);
+            _stream.Launch(func, grid, 1, 1, (uint)BlockSize, 1, 1, 0, dArgs);
         }
         else
         {
-            // FP32 or FP16 weights — use SGEMM with TF32 tensor cores
-            float alpha = 1.0f, beta = 0.0f;
-            CublasApi.Check(CublasApi.Sgemm(_cublasHandle,
-                CublasApi.CUBLAS_OP_T, CublasApi.CUBLAS_OP_N,
-                N, M, K, &alpha, bPtr, K, aPtr, K, &beta, outPtr, N),
-                "cublasSgemm");
+            bF32Ptr = bPtr;
         }
+
+        // cuBLAS SGEMM: C = alpha * A * B^T + beta * C
+        // A is [M × K] row-major = [K × M] column-major
+        // B is [N × K] row-major = [K × N] column-major, need transpose
+        // C is [M × N] row-major = [N × M] column-major
+        // In column-major: C(N×M) = B^T(N×K) × A(K×M)
+        float alpha = 1.0f, beta = 0.0f;
+        CublasApi.Check(CublasApi.Sgemm(_cublasHandle,
+            CublasApi.CUBLAS_OP_T,  // B^T
+            CublasApi.CUBLAS_OP_N,  // A as-is
+            N, M, K,               // column-major dims
+            &alpha,
+            bF32Ptr, K,            // B: [N×K] row-major → ldb = K
+            aPtr, K,               // A: [M×K] row-major → lda = K
+            &beta,
+            outPtr, N),            // C: [M×N] row-major → ldc = N
+            "cublasSgemm");
     }
 
     private CudaDeviceMemory? _batchDequantBuf;
     private long _batchDequantBufSize;
-    private CudaDeviceMemory? _batchActivationBuf;
-    private long _batchActivationBufSize;
-    private CudaDeviceMemory? _cublasLtWorkspace;
 
     /// <summary>Launch a standard 6-arg matmul kernel: (output, a, b, M, K, N).</summary>
     private unsafe void LaunchMatMul(string kernelName, ulong outPtr, ulong aPtr, ulong bPtr,
@@ -272,20 +241,12 @@ public sealed class CudaBackend : IComputeBackend
             return tensor;
         }
 
-        // Q4_0: keep original 18-byte blocks (saves 11% bandwidth vs 20-byte aligned)
-        // The dp4a kernel uses 2-byte aligned reads for nibble data.
+        // Repack Q4_0 to aligned layout: 18-byte blocks → 20-byte blocks
+        // [scale(2b) | pad(2b) | nibbles(16b)] = 20 bytes, 4-byte aligned
         if (type == GgmlType.Q4_0 && dimensions.Length >= 2)
         {
             _hasQ4_0Weights = true;
-            EnsureQ8_1Scratch((int)dimensions[0]);
-            // Load directly without repacking — unaligned dp4a kernel handles 18-byte blocks
-            return new CudaTensor(name, type, dimensions, data);
-        }
-
-        // DISABLED: Q4_0 alignment repacking (kept for reference)
-        if (false && type == GgmlType.Q4_0 && dimensions.Length >= 2)
-        {
-            _hasQ4_0Weights = true;
+            // Pre-allocate Q8_1 scratch for dp4a (must happen outside stream capture)
             EnsureQ8_1Scratch((int)dimensions[0]);
             int blockCount = data.Length / 18;
             var aligned = new byte[blockCount * 20];
@@ -368,12 +329,10 @@ public sealed class CudaBackend : IComputeBackend
         {
             // Q8_1 pre-computed by fused RmsNorm — use dp4a (zero quantization overhead)
             ulong q8_1Ptr = _q8_1Scratch!.DevicePtr;
-            bool isAlignedQ4 = bT is CudaTensor ctq && ctq.IsAlignedQ4_0;
-            var func = _matmulModule.GetFunction(isAlignedQ4
-                ? "dequant_matmul_q4_0_q8_1" : "dequant_matmul_q4_0_q8_1_unaligned");
+            var func = _matmulModule.GetFunction("dequant_matmul_q4_0_q8_1");
             int nVal = N;
-            uint dp4aGrid = ((uint)N + 3) / 4;
-            uint dp4aSmem = (256 / 32) * 4 * sizeof(float);
+            uint dp4aGrid = ((uint)N + 7) / 8; // Q4_0_DP4A_ROWS = 8
+            uint dp4aSmem = (256 / 32) * 8 * sizeof(float); // smem[8][8]
             nint* kArgs = stackalloc nint[6];
             kArgs[0] = (nint)(&outPtr);
             kArgs[1] = (nint)(&q8_1Ptr);
@@ -382,6 +341,16 @@ public sealed class CudaBackend : IComputeBackend
             kArgs[4] = (nint)(&K);
             kArgs[5] = (nint)(&nVal);
             _stream.Launch(func, dp4aGrid, 1, 1, 256, 1, 1, dp4aSmem, kArgs);
+        }
+        else if (b.Type == GgmlType.Q4_0 && _context.ComputeCapabilityMajor >= 12)
+        {
+            var (grid, threads, smem) = AdaptiveLaunch(N, 4, K / 32); // Q4_0_ROWS_PER_BLOCK=4
+            var func = _matmulModule.GetFunction("dequant_matmul_q4_0");
+            int nVal = N;
+            nint* kArgs = stackalloc nint[6];
+            kArgs[0] = (nint)(&outPtr); kArgs[1] = (nint)(&aPtr); kArgs[2] = (nint)(&bPtr);
+            kArgs[3] = (nint)(&M); kArgs[4] = (nint)(&K); kArgs[5] = (nint)(&nVal);
+            _stream.Launch(func, grid, 1, 1, threads, 1, 1, smem, kArgs);
         }
         else if (b.Type == GgmlType.Q4_0)
         {
@@ -404,12 +373,10 @@ public sealed class CudaBackend : IComputeBackend
                 _stream.Launch(quantFunc, quantGrid, 1, 1, (uint)BlockSize, 1, 1, 0, qArgs);
             }
 
-            bool isAlignedQ4b = bT is CudaTensor ctqb && ctqb.IsAlignedQ4_0;
-            var func = _matmulModule.GetFunction(isAlignedQ4b
-                ? "dequant_matmul_q4_0_q8_1" : "dequant_matmul_q4_0_q8_1_unaligned");
+            var func = _matmulModule.GetFunction("dequant_matmul_q4_0_q8_1");
             int nVal = N;
-            uint dp4aGrid2 = ((uint)N + 3) / 4;
-            uint dp4aSmem2 = (256 / 32) * 4 * sizeof(float);
+            uint dp4aGrid = ((uint)N + 7) / 8; // Q4_0_DP4A_ROWS = 8
+            uint dp4aSmem = (256 / 32) * 8 * sizeof(float); // smem[8][8]
             nint* kArgs = stackalloc nint[6];
             kArgs[0] = (nint)(&outPtr);
             kArgs[1] = (nint)(&q8_1Ptr);
@@ -417,7 +384,7 @@ public sealed class CudaBackend : IComputeBackend
             kArgs[3] = (nint)(&M);
             kArgs[4] = (nint)(&K);
             kArgs[5] = (nint)(&nVal);
-            _stream.Launch(func, dp4aGrid2, 1, 1, 256, 1, 1, dp4aSmem2, kArgs);
+            _stream.Launch(func, dp4aGrid, 1, 1, 256, 1, 1, dp4aSmem, kArgs);
         }
         else if (b.Type == GgmlType.Q4_1)
         {
@@ -441,7 +408,7 @@ public sealed class CudaBackend : IComputeBackend
         }
         else if (b.Type == GgmlType.Q4_K)
         {
-            var (grid, threads, smem) = AdaptiveLaunch(N, 4, K / 256 * 4); // Q4K_ROWS_PER_BLOCK=4
+            var (grid, threads, smem) = AdaptiveLaunch(N, 3, K / 256 * 4); // Q4K_ROWS_PER_BLOCK=3
             LaunchMatMul("dequant_matmul_q4_k", outPtr, aPtr, bPtr, M, K, N, grid, threads, smem);
         }
         else if (b.Type == GgmlType.Q5_K)
@@ -1604,9 +1571,6 @@ public sealed class CudaBackend : IComputeBackend
             if (_graphExec != 0) CudaApi.GraphExecDestroy(_graphExec);
             _argmaxResult?.Dispose();
             _q8_1Scratch?.Dispose();
-            _batchDequantBuf?.Dispose();
-            _batchActivationBuf?.Dispose();
-            _cublasLtWorkspace?.Dispose();
             if (_cublasHandle != 0) CublasApi.Destroy(_cublasHandle);
             _stream.Dispose();
             _matmulModule.Dispose();
