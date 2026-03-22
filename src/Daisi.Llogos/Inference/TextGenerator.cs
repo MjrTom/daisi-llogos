@@ -38,13 +38,22 @@ public sealed class TextGenerator
         var history = new List<int>(promptIds);
 
         // Prefill: process all prompt tokens
-        // Use ForwardHidden for intermediate tokens (no logit download needed)
         var prefillSw = Stopwatch.StartNew();
         ReadOnlySpan<float> logits = default;
-        for (int i = 0; i < promptIds.Length - 1; i++)
-            _forward.ForwardHidden(promptIds[i], i);
-        // Only the last prefill token needs full logit output
-        logits = _forward.Forward(promptIds[^1], promptIds.Length - 1);
+        if (_forward.SupportsBatchedPrefill && promptIds.Length > 2)
+        {
+            // Batched prefill: process all tokens except the last in one parallel pass
+            _forward.ForwardBatchedPrefill(promptIds[..^1], 0);
+            // Last token needs full logit output
+            logits = _forward.Forward(promptIds[^1], promptIds.Length - 1);
+        }
+        else
+        {
+            // Sequential prefill: one token at a time
+            for (int i = 0; i < promptIds.Length - 1; i++)
+                _forward.ForwardHidden(promptIds[i], i);
+            logits = _forward.Forward(promptIds[^1], promptIds.Length - 1);
+        }
         prefillSw.Stop();
 
         int position = promptIds.Length;
@@ -87,12 +96,20 @@ public sealed class TextGenerator
         if (promptIds.Length == 0)
             return default;
 
-        // Prefill — skip logit download for intermediate tokens
+        // Prefill
         var prefillSw = Stopwatch.StartNew();
         ReadOnlySpan<float> logits = default;
-        for (int i = 0; i < promptIds.Length - 1; i++)
-            _forward.ForwardHidden(promptIds[i], i);
-        logits = _forward.Forward(promptIds[^1], promptIds.Length - 1);
+        if (_forward.SupportsBatchedPrefill && promptIds.Length > 2)
+        {
+            _forward.ForwardBatchedPrefill(promptIds[..^1], 0);
+            logits = _forward.Forward(promptIds[^1], promptIds.Length - 1);
+        }
+        else
+        {
+            for (int i = 0; i < promptIds.Length - 1; i++)
+                _forward.ForwardHidden(promptIds[i], i);
+            logits = _forward.Forward(promptIds[^1], promptIds.Length - 1);
+        }
         prefillSw.Stop();
 
         // Decode — use GPU-side argmax for maximum throughput (greedy benchmark)

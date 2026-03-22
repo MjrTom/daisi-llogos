@@ -289,6 +289,65 @@ __global__ void rope(float* q, float* k,
     }
 }
 
+// ── Batched RoPE ─────────────────────────────────────────────────────────────
+// Apply rotary position embedding to M tokens with positions [startPos..startPos+M-1].
+// q: [M * nHeads * headDim], k: [M * nKvHeads * headDim]
+// Each token's heads are contiguous: [token0_head0..token0_headN, token1_head0..]
+
+__global__ void batched_rope(float* q, float* k,
+                             int q_total, int k_total,
+                             int head_dim, int rope_dim,
+                             int start_position, float theta,
+                             int q_heads_per_token, int k_heads_per_token)
+{
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    int half_rope = rope_dim / 2;
+
+    // Process Q
+    if (idx < q_total / 2)
+    {
+        int head = idx / (head_dim / 2);
+        int pair = idx % (head_dim / 2);
+        if (pair < half_rope)
+        {
+            int token = head / q_heads_per_token;
+            int position = start_position + token;
+            float freq = 1.0f / powf(theta, (float)(2 * pair) / (float)rope_dim);
+            float angle = (float)position * freq;
+            float cos_a = cosf(angle);
+            float sin_a = sinf(angle);
+
+            int base_idx = head * head_dim + pair * 2;
+            float v0 = q[base_idx];
+            float v1 = q[base_idx + 1];
+            q[base_idx]     = v0 * cos_a - v1 * sin_a;
+            q[base_idx + 1] = v0 * sin_a + v1 * cos_a;
+        }
+    }
+
+    // Process K
+    if (idx < k_total / 2)
+    {
+        int head = idx / (head_dim / 2);
+        int pair = idx % (head_dim / 2);
+        if (pair < half_rope)
+        {
+            int token = head / k_heads_per_token;
+            int position = start_position + token;
+            float freq = 1.0f / powf(theta, (float)(2 * pair) / (float)rope_dim);
+            float angle = (float)position * freq;
+            float cos_a = cosf(angle);
+            float sin_a = sinf(angle);
+
+            int base_idx = head * head_dim + pair * 2;
+            float v0 = k[base_idx];
+            float v1 = k[base_idx + 1];
+            k[base_idx]     = v0 * cos_a - v1 * sin_a;
+            k[base_idx + 1] = v0 * sin_a + v1 * cos_a;
+        }
+    }
+}
+
 // ── Element-wise multiply ────────────────────────────────────────────────────
 
 __global__ void element_mul(float* output, const float* a, const float* b, int n)

@@ -163,15 +163,55 @@ Even for this trivial number sequence, the correct prediction (`#`) first appear
 
 To achieve meaningful early exit (50%+ layer skip), the model would need to be fine-tuned with auxiliary classification heads at intermediate layers and an early exit loss objective. This is a training-time change, not an inference-time optimization applicable to off-the-shelf GGUF models.
 
-## 9. Batch MatMul Foundation
+## 9. Batched Prefill
 
-We added M>1 matrix-matrix multiply support using cuBLAS SGEMM with GPU-side weight dequantization. When M>1, quantized weights are expanded to FP32 via a generic `dequant_to_f32` kernel, then multiplied using cuBLAS. The M=1 path remains completely untouched.
+Standard LLM inference processes prompt tokens one at a time: embed token, run 32 layers, write KV cache, repeat. Each token requires a full forward pass with M=1 matrix-vector multiplies. For a 100-token prompt on the 9B model, that's 100 sequential passes through 32 layers — ~1.1 seconds.
 
-This infrastructure enables:
-- **Batched prefill** — process all prompt tokens in parallel instead of one at a time
-- **Speculative decoding** — verify N draft tokens from a small model in a single target model forward pass
+Batched prefill processes all M prompt tokens simultaneously through each layer: M×K input matrix × K×N weight matrix via cuBLAS SGEMM, batched normalization, batched RoPE, and a batched causal attention kernel. The KV cache is written in bulk and attention uses a causal mask so each query token only attends to preceding positions.
 
-Both require batching all non-matmul operations (RmsNorm, attention, SiLU, DeltaNet) for M>1, which is the next implementation step.
+### Results
+
+RTX 5080, CUDA 13, greedy sampling.
+
+| Model | Prompt tokens | Prefill tok/s | Decode tok/s | Prefill speedup |
+|-------|:------------:|:-------------:|:------------:|:---------------:|
+| TinyLlama 1.1B Q8_0 | 173 | **1,976** | 369 | **5.4x** |
+| TinyLlama 1.1B Q8_0 | 126 | **1,708** | 362 | **4.7x** |
+| Qwen3-8B Q8_0 | 55 | **329** | 88 | **3.7x** |
+
+### Implementation
+
+Five new CUDA kernels enable the batched forward pass:
+
+1. **`batched_rope`** — Applies rotary position embedding to M tokens with positions `[startPos..startPos+M-1]`. Each token's Q/K heads are rotated by their own position angle. The token index is derived from the global head index: `token = head / headsPerToken`.
+
+2. **`batched_kv_cache_write`** — Writes M K/V pairs at consecutive positions in a single kernel launch. Input is `[M × nKvHeads × keyLen]`, scattered into the `[nKvHeads × maxSeqLen × keyLen]` cache layout.
+
+3. **`batched_gated_attention`** — The core kernel. Grid of `M × numHeads` blocks, one per (query_token, head) pair. Each block computes tiled online-softmax attention with a causal cutoff: query token m sees keys `[0..startPos+m]`. Uses the same tile size and online softmax algorithm as the single-token kernel, just with per-query sequence length bounds.
+
+4. **`batched_rms_norm`** (and variants) — Normalizes M independent rows. One block per row. Weight vector is shared across rows.
+
+5. **`dequant_to_f32`** — Expands quantized weight matrices to FP32 for cuBLAS SGEMM. Handles Q8_0, Q4_0, Q4_K, Q6_K, and F16.
+
+The batched forward pass (`ForwardBatchedPrefill`) allocates M-wide scratch tensors lazily and reuses them across calls with the same batch size. It always uses separate Q/K/V and gate/up projections (fused layouts produce per-token interleaved output that would require M scatter copies to deinterleave).
+
+### Design Decisions
+
+**No CUDA graph capture.** The batched path uses cuBLAS SGEMM, which lazily allocates a dequantization buffer via `cuMemAlloc`. This allocation crashes during CUDA graph capture (stream recording forbids `cuMemAlloc`). Since prefill is a one-shot operation (not replayed like decode), graph capture provides no benefit anyway.
+
+**Non-fused projections only.** The single-token path fuses Q+K+V into a single matmul and gate+up into another. For M>1, the fused matmul output is `[M × (qDim+kDim+vDim)]` where each row contains interleaved `[Q,K,V]` for one token. Deinterleaving into separate `[M×qDim]`, `[M×kDim]`, `[M×vDim]` tensors requires M×3 scatter copies. Using three separate projections produces the correct layout directly and benchmarks faster for M>8.
+
+**Pure attention models only (current).** DeltaNet hybrid models (Qwen3.5) have sequential state dependencies that prevent full batching. For these models, the prefill falls back to the sequential token-by-token path. A future optimization could batch the attention layers and MatMuls while processing only the DeltaNet state updates sequentially.
+
+### Why Prefill Scales Sublinearly
+
+The 5.4x speedup on TinyLlama (173 tokens) is less than the theoretical 173x from perfect parallelization. Three factors limit scaling:
+
+1. **Attention is O(M²).** The causal attention kernel launches `M × numHeads` blocks, and each block scans up to `startPos + M` keys. Total work grows quadratically with M, while sequential prefill's attention work grows linearly (each token sees one more key than the last).
+
+2. **Memory bandwidth.** cuBLAS SGEMM with M>1 achieves higher arithmetic intensity than M=1 vector-matrix multiply, but the weight matrices still must be read from VRAM once per layer. The dequant+SGEMM path reads weights as quantized data then expands to FP32, consuming more bandwidth than the fused M=1 kernels that dequantize in-register.
+
+3. **Embedding scatter.** The M embeddings are looked up individually and copied into the batch tensor via M `cuMemcpyDtoDAsync` calls. This is negligible for large M but measurable for small prompts.
 
 ## Reproducibility
 

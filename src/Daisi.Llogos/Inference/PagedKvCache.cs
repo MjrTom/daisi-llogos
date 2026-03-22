@@ -135,6 +135,27 @@ public sealed class PagedKvCache : IKvCache
         Length = _strategy.EffectiveSeqLen(position);
     }
 
+    public void BatchedWrite(IComputeBackend backend, int layer, int startPosition, int M, ITensor k, ITensor v)
+    {
+        // Ensure pages and scratch exist for the full range
+        int lastSlot = _strategy.MapPosition(startPosition + M - 1);
+        int neededPages = lastSlot / PageSize + 1;
+        EnsurePages(neededPages);
+
+        int idx = GetCacheIndex(layer);
+        EnsureScratch(idx);
+
+        int startSlot = _strategy.MapPosition(startPosition);
+
+        // Write all M positions to scratch in one batched kernel call.
+        // Scratch is the canonical store — GrowScratch copies old scratch to new,
+        // so page-level writes are not needed here.
+        backend.BatchedKvCacheWrite(_kScratch[idx], _vScratch[idx], k, v,
+            _nKvHeads, _keyLength, _valueLength, _scratchCapacity, startSlot, M);
+
+        Length = _strategy.EffectiveSeqLen(startPosition + M - 1);
+    }
+
     public ITensor GetKCacheTensor(int layer)
     {
         int idx = GetCacheIndex(layer);
