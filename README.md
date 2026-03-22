@@ -78,7 +78,7 @@ Measured on AMD Ryzen 9 9900X + NVIDIA RTX 5080, 128 decode tokens, FP16 KV cach
 | Qwen3.5-9B Q8_0 | **86** | 84 | **102%** | 53 |
 | Qwen3.5-9B Q4_0 | 100 | 123 | 81% | 45 |
 
-**Exceeding llama.cpp** on 4 of 6 models tested. See [Inference Optimization White Paper](docs/inference-optimization.md) for technical details.
+**Exceeding llama.cpp** on 3 of 6 models, matching within 2% on a fourth. See [Inference Optimization White Paper](docs/inference-optimization.md) for technical details.
 
 ### Key Optimizations
 

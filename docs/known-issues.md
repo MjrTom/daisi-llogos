@@ -39,7 +39,7 @@ dp4a is now the default Q4_0 path on pre-Blackwell GPUs, with architecture-adapt
 
 ### Current Standing (RTX 5080, decode tok/s, 128 tokens)
 
-**Exceeding llama.cpp on 4 of 6 CUDA models tested.**
+**Exceeding llama.cpp on 3 of 6 CUDA models, matching within 2% on a fourth.**
 
 | Model | Llogos CUDA | llama.cpp CUDA | % |
 |-------|--------:|--------:|--------:|
