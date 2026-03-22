@@ -249,17 +249,19 @@ __global__ void gated_attention(float* output,
     int stride = blockDim.x;
     int kvHead = head * numKvHeads / numHeads;
 
-    const float* q = qAttn + head * keyLength;
-    const float* qg = qGate + head * keyLength;
-
-    // Byte offsets into cache depend on element size
-    int elemSize = cacheIsFp16 ? 1 : 1; // handled by load_cache_val
     int kBaseOffset = kvHead * maxSeqLen * keyLength;
     int vBaseOffset = kvHead * maxSeqLen * valueLength;
 
-    // Shared memory layout: [ATTN_TILE_SIZE scores] + [blockDim.x temp for reduction]
-    float* scores = shared;
-    float* temp = shared + ATTN_TILE_SIZE;
+    // Shared memory layout: [keyLength Q values] + [ATTN_TILE_SIZE scores] + [blockDim.x temp]
+    float* sQ = shared;
+    float* scores = shared + keyLength;
+    float* temp = scores + ATTN_TILE_SIZE;
+
+    // Load Q vector into shared memory once (reused for all tiles)
+    const float* q = qAttn + head * keyLength;
+    for (int d = tid; d < keyLength; d += stride)
+        sQ[d] = q[d];
+    __syncthreads();
 
     // Initialize output to zero
     float* outHead = output + head * valueLength;
@@ -267,7 +269,7 @@ __global__ void gated_attention(float* output,
         outHead[d] = 0.0f;
     __syncthreads();
 
-    // Online softmax state (same across all threads after reductions)
+    // Online softmax state
     float running_max = -1e30f;
     float running_sum = 0.0f;
 
@@ -278,13 +280,13 @@ __global__ void gated_attention(float* output,
         if (tile_end > seqLen) tile_end = seqLen;
         int tile_len = tile_end - tile_start;
 
-        // Compute attention scores for this tile: q @ K_tile^T * scale
+        // Compute attention scores: sQ @ K_tile^T * scale
         for (int t = tid; t < tile_len; t += stride)
         {
             float dot = 0.0f;
             int kOffset = kBaseOffset + (tile_start + t) * keyLength;
             for (int d = 0; d < keyLength; d++)
-                dot += q[d] * load_cache_val(kCache, kOffset + d, cacheIsFp16);
+                dot += sQ[d] * load_cache_val(kCache, kOffset + d, cacheIsFp16);
             scores[t] = dot * scale;
         }
         __syncthreads();
@@ -341,6 +343,7 @@ __global__ void gated_attention(float* output,
     }
 
     // Normalize by total sum and apply sigmoid gating
+    const float* qg = qGate + head * keyLength;
     float inv_sum = (running_sum > 0.0f) ? 1.0f / running_sum : 0.0f;
     for (int d = tid; d < valueLength; d += stride)
     {

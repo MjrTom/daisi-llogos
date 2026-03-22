@@ -863,9 +863,9 @@ public sealed class CudaBackend : IComputeBackend
         ulong vcPtr = vcT.DevicePtr;
         int cacheIsFp16 = kCache.Type == GgmlType.F16 ? 1 : 0;
 
-        // Tiled attention: shared memory for tile scores + reduction temp (constant size)
+        // Shared memory: [keyLength Q] + [tileSize scores] + [BlockSize reduction temp]
         const int tileSize = 256;
-        uint sharedMem = (uint)((tileSize + BlockSize) * sizeof(float));
+        uint sharedMem = (uint)((keyLength + tileSize + BlockSize) * sizeof(float));
         var func = _compositeModule.GetFunction("gated_attention");
         nint* kArgs = stackalloc nint[13];
         kArgs[0] = (nint)(&outPtr);
