@@ -69,7 +69,14 @@ internal static partial class CublasApi
     internal const int CUDA_R_16F = 2;
     internal const int CUDA_R_32F = 0;
     internal const int CUBLAS_GEMM_DEFAULT = -1;
+    internal const int CUBLAS_GEMM_DEFAULT_TENSOR_OP = 99;
     internal const int CUBLAS_COMPUTE_32F = 68;
+
+    [LibraryImport(Lib, EntryPoint = "cublasSetMathMode")]
+    internal static partial int SetMathMode(nint handle, int mode);
+
+    internal const int CUBLAS_DEFAULT_MATH = 0;
+    internal const int CUBLAS_TF32_TENSOR_OP_MATH = 3;
 
     internal static void Check(int status, string op)
     {

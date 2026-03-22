@@ -16,6 +16,13 @@ internal sealed class CudaDeviceMemory : IDisposable
         CudaApi.Check(CudaApi.MemAlloc(out _devicePtr, byteSize), "cuMemAlloc");
     }
 
+    /// <summary>Wrap an existing device pointer (takes ownership, will free on dispose).</summary>
+    internal CudaDeviceMemory(ulong devicePtr, ulong byteSize)
+    {
+        _devicePtr = devicePtr;
+        ByteSize = byteSize;
+    }
+
     /// <summary>
     /// Device pointer for use in kernel parameters.
     /// </summary>

@@ -170,6 +170,8 @@ public sealed class PagedKvCache : IKvCache
         return _vScratch[idx];
     }
 
+    public void SetLength(int length) => Length = length;
+
     public void Reset()
     {
         Length = 0;

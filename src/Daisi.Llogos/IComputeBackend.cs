@@ -231,6 +231,9 @@ public interface IComputeBackend : IDisposable
     /// submitting until FlushCommands() is called. No-op for backends
     /// that don't support batching (CPU, CUDA with async streams).
     /// </summary>
+    /// <summary>Disable graph capture / command batching. Used when multiple models share one backend.</summary>
+    void DisableGraphCapture() { }
+
     void BeginCommands() { }
 
     /// <summary>

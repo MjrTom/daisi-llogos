@@ -29,6 +29,8 @@ public sealed class CudaBackend : IComputeBackend
     private bool _capturing;          // true while stream is in capture mode
     private nint _graphExec;          // reusable graph executable (0 = none)
     private bool _graphEnabled = true;
+    /// <summary>Disable graph capture (needed when multiple models share one backend).</summary>
+    public bool GraphEnabled { get => _graphEnabled; set => _graphEnabled = value; }
 
     public CudaBackend(int deviceOrdinal = 0)
     {
@@ -38,6 +40,9 @@ public sealed class CudaBackend : IComputeBackend
         // Initialize cuBLAS
         CublasApi.Check(CublasApi.Create(out _cublasHandle), "cublasCreate");
         CublasApi.Check(CublasApi.SetStream(_cublasHandle, _stream.Handle), "cublasSetStream");
+        // Enable TF32 tensor cores for FP32 SGEMM (FP32 range, FP16 precision — ideal for inference)
+        CublasApi.SetMathMode(_cublasHandle, CublasApi.CUBLAS_TF32_TENSOR_OP_MATH);
+
 
         // Load kernels with architecture-specific compilation for best codegen
         var archOpts = new[] { $"--gpu-architecture=compute_{_context.ComputeCapabilityMajor}{_context.ComputeCapabilityMinor}" };
@@ -51,6 +56,9 @@ public sealed class CudaBackend : IComputeBackend
 
     /// <inheritdoc />
     public string Name => $"CUDA ({_context.DeviceName})";
+
+    /// <inheritdoc />
+    public void DisableGraphCapture() => _graphEnabled = false;
 
     /// <summary>Begin recording operations into a CUDA graph (if enabled).</summary>
     public void BeginCommands()
@@ -115,62 +123,85 @@ public sealed class CudaBackend : IComputeBackend
         ulong aPtr = aT.DevicePtr;
         ulong bPtr = bT.DevicePtr;
 
-        ulong bF32Ptr;
-        bool needsDequant = bT.Type != Gguf.GgmlType.F32;
+        bool needsDequant = bT.Type != Gguf.GgmlType.F32 && bT.Type != Gguf.GgmlType.F16;
 
+        ulong bF16Ptr;
         if (needsDequant)
         {
-            // Dequantize weight to temporary FP32 buffer
-            long f32Bytes = (long)K * N * sizeof(float);
-            if (_batchDequantBuf == null || _batchDequantBufSize < f32Bytes)
+            long f16Bytes = (long)K * N * 2;
+
+            // Dequantize weight to FP16 temp buffer
+            if (_batchDequantBuf == null || _batchDequantBufSize < f16Bytes)
             {
                 _batchDequantBuf?.Dispose();
-                _batchDequantBuf = new CudaDeviceMemory((ulong)f32Bytes);
-                _batchDequantBufSize = f32Bytes;
+                _batchDequantBuf = new CudaDeviceMemory((ulong)f16Bytes);
+                _batchDequantBufSize = f16Bytes;
             }
-            bF32Ptr = _batchDequantBuf.DevicePtr;
+            bF16Ptr = _batchDequantBuf.DevicePtr;
+            {
 
-            // GPU dequant kernel: expand quantized weight to FP32
-            var func = _elementwiseModule.GetFunction("dequant_to_f32");
-            int totalElements = K * N;
-            int blockSize = Gguf.GgmlTypeInfo.BlockSize(bT.Type);
-            int typeTag = (int)bT.Type;
-            int isAligned = (bT.IsAlignedQ8_0 || bT.IsAlignedQ4_0) ? 1 : 0;
-            uint grid = (uint)((totalElements + BlockSize - 1) / BlockSize);
-            nint* dArgs = stackalloc nint[6];
-            dArgs[0] = (nint)(&bF32Ptr);
-            dArgs[1] = (nint)(&bPtr);
-            dArgs[2] = (nint)(&totalElements);
-            dArgs[3] = (nint)(&typeTag);
-            dArgs[4] = (nint)(&blockSize);
-            dArgs[5] = (nint)(&isAligned);
-            _stream.Launch(func, grid, 1, 1, (uint)BlockSize, 1, 1, 0, dArgs);
+                var func = _elementwiseModule.GetFunction("dequant_to_f16");
+                int totalElements = K * N;
+                int blockSize = Gguf.GgmlTypeInfo.BlockSize(bT.Type);
+                int typeTag = (int)bT.Type;
+                int isAligned = (bT.IsAlignedQ8_0 || bT.IsAlignedQ4_0) ? 1 : 0;
+                uint grid = (uint)((totalElements + BlockSize - 1) / BlockSize);
+                nint* dArgs = stackalloc nint[6];
+                dArgs[0] = (nint)(&bF16Ptr);
+                dArgs[1] = (nint)(&bPtr);
+                dArgs[2] = (nint)(&totalElements);
+                dArgs[3] = (nint)(&typeTag);
+                dArgs[4] = (nint)(&blockSize);
+                dArgs[5] = (nint)(&isAligned);
+                _stream.Launch(func, grid, 1, 1, (uint)BlockSize, 1, 1, 0, dArgs);
+            }
+
+            // Convert activation from FP32 to FP16 for tensor core path
+            int aElems = M * K;
+            long aF16Bytes = (long)aElems * 2;
+            if (_batchActivationBuf == null || _batchActivationBufSize < aF16Bytes)
+            {
+                _batchActivationBuf?.Dispose();
+                _batchActivationBuf = new CudaDeviceMemory((ulong)aF16Bytes);
+                _batchActivationBufSize = aF16Bytes;
+            }
+            ulong aF16Ptr = _batchActivationBuf.DevicePtr;
+            {
+                var cvtFunc = _elementwiseModule.GetFunction("fp32_to_fp16");
+                uint cvtGrid = (uint)((aElems + BlockSize - 1) / BlockSize);
+                nint* cArgs = stackalloc nint[3];
+                cArgs[0] = (nint)(&aF16Ptr);
+                cArgs[1] = (nint)(&aPtr);
+                cArgs[2] = (nint)(&aElems);
+                _stream.Launch(cvtFunc, cvtGrid, 1, 1, (uint)BlockSize, 1, 1, 0, cArgs);
+            }
+
+            float alpha = 1.0f, beta = 0.0f;
+            CublasApi.Check(CublasApi.GemmEx(_cublasHandle,
+                CublasApi.CUBLAS_OP_T, CublasApi.CUBLAS_OP_N,
+                N, M, K, &alpha,
+                bF16Ptr, CublasApi.CUDA_R_16F, K,
+                aF16Ptr, CublasApi.CUDA_R_16F, K,
+                &beta, outPtr, CublasApi.CUDA_R_32F, N,
+                CublasApi.CUBLAS_COMPUTE_32F, CublasApi.CUBLAS_GEMM_DEFAULT_TENSOR_OP),
+                "cublasGemmEx");
         }
         else
         {
-            bF32Ptr = bPtr;
+            // FP32 or FP16 weights — use SGEMM with TF32 tensor cores
+            float alpha = 1.0f, beta = 0.0f;
+            CublasApi.Check(CublasApi.Sgemm(_cublasHandle,
+                CublasApi.CUBLAS_OP_T, CublasApi.CUBLAS_OP_N,
+                N, M, K, &alpha, bPtr, K, aPtr, K, &beta, outPtr, N),
+                "cublasSgemm");
         }
-
-        // cuBLAS SGEMM: C = alpha * A * B^T + beta * C
-        // A is [M × K] row-major = [K × M] column-major
-        // B is [N × K] row-major = [K × N] column-major, need transpose
-        // C is [M × N] row-major = [N × M] column-major
-        // In column-major: C(N×M) = B^T(N×K) × A(K×M)
-        float alpha = 1.0f, beta = 0.0f;
-        CublasApi.Check(CublasApi.Sgemm(_cublasHandle,
-            CublasApi.CUBLAS_OP_T,  // B^T
-            CublasApi.CUBLAS_OP_N,  // A as-is
-            N, M, K,               // column-major dims
-            &alpha,
-            bF32Ptr, K,            // B: [N×K] row-major → ldb = K
-            aPtr, K,               // A: [M×K] row-major → lda = K
-            &beta,
-            outPtr, N),            // C: [M×N] row-major → ldc = N
-            "cublasSgemm");
     }
 
     private CudaDeviceMemory? _batchDequantBuf;
     private long _batchDequantBufSize;
+    private CudaDeviceMemory? _batchActivationBuf;
+    private long _batchActivationBufSize;
+    private CudaDeviceMemory? _cublasLtWorkspace;
 
     /// <summary>Launch a standard 6-arg matmul kernel: (output, a, b, M, K, N).</summary>
     private unsafe void LaunchMatMul(string kernelName, ulong outPtr, ulong aPtr, ulong bPtr,
@@ -1571,6 +1602,9 @@ public sealed class CudaBackend : IComputeBackend
             if (_graphExec != 0) CudaApi.GraphExecDestroy(_graphExec);
             _argmaxResult?.Dispose();
             _q8_1Scratch?.Dispose();
+            _batchDequantBuf?.Dispose();
+            _batchActivationBuf?.Dispose();
+            _cublasLtWorkspace?.Dispose();
             if (_cublasHandle != 0) CublasApi.Destroy(_cublasHandle);
             _stream.Dispose();
             _matmulModule.Dispose();

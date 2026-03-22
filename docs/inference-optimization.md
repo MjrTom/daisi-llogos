@@ -213,7 +213,7 @@ Five new CUDA kernels enable the batched forward pass:
 
 4. **`batched_rms_norm`** (and variants) — Normalizes M independent rows. One block per row. Weight vector is shared across rows.
 
-5. **`dequant_to_f32`** — Expands quantized weight matrices to FP32 for cuBLAS SGEMM. Handles Q8_0, Q4_0, Q4_K, Q6_K, and F16.
+5. **`dequant_to_f16`** — Expands quantized weight matrices to FP16 for `cublasGemmEx` with tensor cores. Handles Q8_0, Q4_0, Q4_K, Q6_K, and F16. Paired with `fp32_to_fp16` activation conversion.
 
 The batched forward pass (`ForwardBatchedPrefill`) allocates M-wide scratch tensors lazily and reuses them across calls with the same batch size. It always uses separate Q/K/V and gate/up projections (fused layouts produce per-token interleaved output that would require M scatter copies to deinterleave).
 
@@ -236,6 +236,26 @@ The 5.4x speedup on TinyLlama (173 tokens) is less than the theoretical 173x fro
 2. **Memory bandwidth.** cuBLAS SGEMM with M>1 achieves higher arithmetic intensity than M=1 vector-matrix multiply, but the weight matrices still must be read from VRAM once per layer. The dequant+SGEMM path reads weights as quantized data then expands to FP32, consuming more bandwidth than the fused M=1 kernels that dequantize in-register.
 
 3. **Embedding scatter.** The M embeddings are looked up individually and copied into the batch tensor via M `cuMemcpyDtoDAsync` calls. This is negligible for large M but measurable for small prompts.
+
+### Closing the Prefill Gap: What We Tried
+
+Our batched prefill is 6-8x slower than llama.cpp on prompt processing. The root cause is the intermediate dequantization buffer: we read Q8_0 weights, write FP16 to a temp buffer, then read the FP16 data back for the GEMM — ~5× the minimum memory traffic. llama.cpp reads Q8_0 once and dequantizes in-register during the GEMM. We attempted several approaches to close this gap:
+
+**FP16 tensor cores (+35%).** Replaced `dequant_to_f32` + `cublasSgemm` with `dequant_to_f16` + `cublasGemmEx` (FP16 inputs, FP32 compute). This uses tensor cores and halves the dequant buffer size. Qwen3-8B prefill improved from 456 to 616 tok/s (+35%). The dequant buffer write is still the bottleneck.
+
+**TF32 math mode (+9%).** Enabled `CUBLAS_TF32_TENSOR_OP_MATH` for any FP32 SGEMM fallback paths. Small additional gain on TinyLlama (2312 → 2516 tok/s).
+
+**Fused row-based kernel (failed, 2.5-3.6× slower).** Extended the M=1 matmul kernel with a `grid.y` batch dimension — one block per (output_neuron, input_row). Expected L2 cache reuse across rows. Result: 171 vs 616 tok/s on Qwen3-8B. The grid was too large (N/2 × M blocks), each block did an independent K reduction with no tile-level weight reuse. cuBLAS's tensor core tiling is fundamentally better.
+
+**Persistent FP16 weight cache (failed, OOM on 8B+).** Lazily allocated a persistent FP16 copy of each weight tensor to eliminate per-prefill dequant. TinyLlama (3 GB total) worked, but Qwen3-8B needed 23 GB (Q8_0 + FP16) for 16 GB VRAM — caused GPU memory thrashing at 20 tok/s. Also useless for single-prefill benchmarks since each weight is used exactly once per forward pass. Additionally, `cuMemGetInfo` for budget checks synchronizes the GPU pipeline.
+
+**Tiled fused dequant-GEMM (failed, 40% slower).** Proper tiled kernel (BM=64, BN=64, BK=32) that reads Q8_0 blocks directly into shared memory and computes the GEMM without any intermediate buffer. Eliminates the bandwidth overhead entirely. Result: 373 vs 616 tok/s on Qwen3-8B. The kernel uses scalar FP32 multiply-adds which can't compete with cuBLAS's `wmma::mma_sync` tensor core intrinsics — ~10-50× less compute throughput.
+
+**Stream pipelining (analyzed, not implemented).** Overlap dequant of weight N+1 with GEMM of weight N using dual streams. Analysis showed both operations are bandwidth-bound at typical M (40-200), competing for the same memory bus. Overlap provides no benefit when the bottleneck is shared bandwidth, not compute.
+
+### What Would Close the Gap
+
+The remaining path is a **fused dequant-GEMM kernel using `wmma` tensor core intrinsics**: read Q8_0 blocks, dequant to FP16 in shared memory, and compute the matrix multiply with `wmma::mma_sync` or `mma.m16n8k16` PTX instructions. This combines the bandwidth savings of the tiled kernel (read Q8_0 once, no intermediate buffer) with the compute throughput of tensor cores (matching cuBLAS). This is approximately what llama.cpp's CUDA backend does.
 
 ## Reproducibility
 

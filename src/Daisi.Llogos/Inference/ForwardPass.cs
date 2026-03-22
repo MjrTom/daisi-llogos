@@ -518,6 +518,9 @@ public sealed class ForwardPass : IForwardPass
     /// </summary>
     public bool SupportsBatchedPrefill => true;
 
+    /// <summary>Disable command batching/graph capture (needed when two models share one backend).</summary>
+    public void DisableGraphCapture() => _backend.DisableGraphCapture();
+
     /// <summary>
     /// Process M tokens through all transformer layers in parallel.
     /// Standard attention layers run fully batched. DeltaNet layers run
@@ -582,14 +585,6 @@ public sealed class ForwardPass : IForwardPass
             _backend.AddRmsNorm(_bNormOut!, _bHidden!, _bHidden!, _bResidual!, lw.PostAttnNorm, _config.NormEps);
             _backend.CopyTensor(_bResidual!, _bHidden!);
 
-            // DEBUG: dump after PostAttnNorm + CopyResidual
-            if (layer == 0)
-            {
-                var bdbg = new float[M * hDim];
-                _bHidden!.DequantizeTo(bdbg);
-                Console.Error.WriteLine($"[BAT] L0 post bHid[0]: {bdbg[0]:F6} {bdbg[1]:F6} {bdbg[2]:F6} {bdbg[3]:F6}");
-            }
-
             // FFN (batched — MatMul handles M>1 via cuBLAS)
             // Always use non-fused path: SplitSwiGLU assumes flat [gate|up] layout
             // which doesn't work for M>1 (per-token interleaving).
@@ -620,6 +615,58 @@ public sealed class ForwardPass : IForwardPass
         _backend.FlushCommands();
         return _backend.ArgMax(_logits, ArgMaxVocabLimit);
     }
+
+    /// <summary>
+    /// Batched forward pass that returns the argmax prediction at EVERY position.
+    /// Used by speculative decoding: the target model verifies N draft tokens
+    /// and returns what it would have predicted at each position.
+    /// </summary>
+    public int[] ForwardBatchedVerify(int[] tokenIds, int startPosition)
+    {
+        int M = tokenIds.Length;
+        ForwardBatchedPrefill(tokenIds, startPosition);
+
+        // Batched: norm all M hidden states, project through lm_head, per-row argmax
+        int hDim = _config.HiddenDim;
+        int vocabLimit = ArgMaxVocabLimit;
+        var results = new int[M];
+
+        // _bHidden has [M × hiddenDim], _bNormOut has [M × hiddenDim]
+        // Batched RmsNorm: normalize each row independently
+        _backend.RmsNorm(_bNormOut!, _bHidden!, _weights.OutputNorm, _config.NormEps);
+
+        // Batched lm_head: [M × hiddenDim] × [hiddenDim × vocabLimit] → [M × vocabLimit]
+        // Need M-wide logits buffer
+        int K = (int)_weights.OutputWeight.Dimensions[0];
+        int N = Math.Min((int)_weights.OutputWeight.Dimensions[1], vocabLimit);
+        if (_bLogits == null || _bLogitsSize < M * N)
+        {
+            _bLogits?.Dispose();
+            _bLogits = _backend.CreateTensor("batch_logits", Gguf.GgmlType.F32, [(long)(M * N)]);
+            _bLogitsSize = M * N;
+        }
+        _backend.MatMul(_bLogits, _bNormOut!, _weights.OutputWeight, M, K, N);
+
+        // Per-row argmax
+        var logitsBuf = new float[_bLogitsSize];
+        _bLogits.DequantizeTo(logitsBuf);
+        for (int t = 0; t < M; t++)
+        {
+            int bestIdx = 0;
+            float bestVal = logitsBuf[t * N];
+            for (int j = 1; j < N; j++)
+            {
+                float v = logitsBuf[t * N + j];
+                if (v > bestVal) { bestVal = v; bestIdx = j; }
+            }
+            results[t] = bestIdx;
+        }
+
+        return results;
+    }
+
+    private ITensor? _bLogits;
+    private int _bLogitsSize;
 
     private void BatchedForwardStandardAttention(StandardAttentionWeights w, int startPosition, int layer, int M)
     {
@@ -754,6 +801,7 @@ public sealed class ForwardPass : IForwardPass
     public void Dispose()
     {
         DisposeBatchBuffers();
+        _bLogits?.Dispose();
         _hidden.Dispose();
         _residual.Dispose();
         _normOut.Dispose();
