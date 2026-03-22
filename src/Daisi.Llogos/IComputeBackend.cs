@@ -307,14 +307,21 @@ public interface IComputeBackend : IDisposable
     /// Find the index of the maximum value in a tensor. Returns -1 if tensor is empty.
     /// GPU backends can compute this on-device to avoid downloading the full tensor.
     /// </summary>
-    int ArgMax(ITensor tensor)
+    int ArgMax(ITensor tensor) => ArgMax(tensor, (int)tensor.ElementCount);
+
+    /// <summary>
+    /// Find the index of the maximum value in the first <paramref name="count"/> elements.
+    /// Used for partial vocab logit computation where only a subset of logits are valid.
+    /// </summary>
+    int ArgMax(ITensor tensor, int count)
     {
         // Default: download and scan on CPU
         var buf = new float[tensor.ElementCount];
         tensor.DequantizeTo(buf);
+        int n = Math.Min(count, buf.Length);
         int best = 0;
         float bestVal = buf[0];
-        for (int i = 1; i < buf.Length; i++)
+        for (int i = 1; i < n; i++)
             if (buf[i] > bestVal) { bestVal = buf[i]; best = i; }
         return best;
     }

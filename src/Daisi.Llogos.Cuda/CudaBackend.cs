@@ -1000,12 +1000,14 @@ public sealed class CudaBackend : IComputeBackend
     private readonly float[] _argmaxHostBuf = new float[1];
 
     /// <inheritdoc />
-    public unsafe int ArgMax(ITensor tensor)
+    public unsafe int ArgMax(ITensor tensor) => ArgMax(tensor, (int)tensor.ElementCount);
+
+    public unsafe int ArgMax(ITensor tensor, int count)
     {
         EnsureContext();
         var t = (CudaTensor)tensor;
         ulong tPtr = t.DevicePtr;
-        int n = (int)tensor.ElementCount;
+        int n = Math.Min(count, (int)tensor.ElementCount);
 
         _argmaxResult ??= new CudaTensor("argmax_result", Gguf.GgmlType.F32, [1]);
 
