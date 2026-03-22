@@ -47,6 +47,129 @@ __global__ void rms_norm(float* output, const float* input, const float* weight,
         output[i] = input[i] * inv_rms * weight[i];
 }
 
+// ── Batched RMSNorm ─────────────────────────────────────────────────────────
+// Same as rms_norm but processes M independent rows. blockIdx.x selects the row.
+// input/output are [M × n] row-major. weight is [n] (shared across rows).
+
+__global__ void batched_rms_norm(float* output, const float* input, const float* weight,
+                                  int n, int M, float eps)
+{
+    extern __shared__ float sdata[];
+
+    int row = blockIdx.x;
+    if (row >= M) return;
+
+    int tid = threadIdx.x;
+    int stride = blockDim.x;
+    int offset = row * n;
+
+    // Pass 1: sum of squares for this row
+    float sum = 0.0f;
+    for (int i = tid; i < n; i += stride)
+        sum += input[offset + i] * input[offset + i];
+
+    sdata[tid] = sum;
+    __syncthreads();
+
+    for (int s = blockDim.x / 2; s > 0; s >>= 1)
+    {
+        if (tid < s) sdata[tid] += sdata[tid + s];
+        __syncthreads();
+    }
+
+    float inv_rms = 1.0f / sqrtf(sdata[0] / (float)n + eps);
+
+    // Pass 2: normalize this row
+    for (int i = tid; i < n; i += stride)
+        output[offset + i] = input[offset + i] * inv_rms * weight[i];
+}
+
+// ── Batched RmsNormResidual ──────────────────────────────────────────────────
+// residual[row] = input[row]; output[row] = RmsNorm(input[row], weight)
+
+__global__ void batched_rms_norm_residual(float* output, float* residual, const float* input,
+                                           const float* weight, int n, int M, float eps)
+{
+    extern __shared__ float sdata[];
+    int row = blockIdx.x;
+    if (row >= M) return;
+    int tid = threadIdx.x;
+    int stride = blockDim.x;
+    int off = row * n;
+
+    float sum = 0.0f;
+    for (int i = tid; i < n; i += stride)
+    {
+        float v = input[off + i];
+        residual[off + i] = v;
+        sum += v * v;
+    }
+    sdata[tid] = sum;
+    __syncthreads();
+    for (int s = blockDim.x / 2; s > 0; s >>= 1) { if (tid < s) sdata[tid] += sdata[tid + s]; __syncthreads(); }
+    float inv_rms = 1.0f / sqrtf(sdata[0] / (float)n + eps);
+    for (int i = tid; i < n; i += stride)
+        output[off + i] = input[off + i] * inv_rms * weight[i];
+}
+
+// ── Batched AddRmsNormResidual ──────────────────────────────────────────────
+// hidden[row] += b[row]; residual[row] = hidden[row]; output[row] = RmsNorm(hidden[row], weight)
+
+__global__ void batched_add_rms_norm_residual(float* output, float* hidden, float* residual,
+                                               const float* b, const float* weight,
+                                               int n, int M, float eps)
+{
+    extern __shared__ float sdata[];
+    int row = blockIdx.x;
+    if (row >= M) return;
+    int tid = threadIdx.x;
+    int stride = blockDim.x;
+    int off = row * n;
+
+    float sum = 0.0f;
+    for (int i = tid; i < n; i += stride)
+    {
+        float v = hidden[off + i] + b[off + i];
+        hidden[off + i] = v;
+        residual[off + i] = v;
+        sum += v * v;
+    }
+    sdata[tid] = sum;
+    __syncthreads();
+    for (int s = blockDim.x / 2; s > 0; s >>= 1) { if (tid < s) sdata[tid] += sdata[tid + s]; __syncthreads(); }
+    float inv_rms = 1.0f / sqrtf(sdata[0] / (float)n + eps);
+    for (int i = tid; i < n; i += stride)
+        output[off + i] = hidden[off + i] * inv_rms * weight[i];
+}
+
+// ── Batched AddRmsNorm ──────────────────────────────────────────────────────
+// hidden[row] = a[row] + b[row]; output[row] = RmsNorm(hidden[row], weight)
+
+__global__ void batched_add_rms_norm(float* output, float* hidden, const float* a, const float* b,
+                                      const float* weight, int n, int M, float eps)
+{
+    extern __shared__ float sdata[];
+    int row = blockIdx.x;
+    if (row >= M) return;
+    int tid = threadIdx.x;
+    int stride = blockDim.x;
+    int off = row * n;
+
+    float sum = 0.0f;
+    for (int i = tid; i < n; i += stride)
+    {
+        float v = a[off + i] + b[off + i];
+        hidden[off + i] = v;
+        sum += v * v;
+    }
+    sdata[tid] = sum;
+    __syncthreads();
+    for (int s = blockDim.x / 2; s > 0; s >>= 1) { if (tid < s) sdata[tid] += sdata[tid + s]; __syncthreads(); }
+    float inv_rms = 1.0f / sqrtf(sdata[0] / (float)n + eps);
+    for (int i = tid; i < n; i += stride)
+        output[off + i] = hidden[off + i] * inv_rms * weight[i];
+}
+
 // ── Softmax ──────────────────────────────────────────────────────────────────
 // Numerically stable: subtract max, exp, normalize.
 // Single block launch for typical vocab sizes.
