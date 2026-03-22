@@ -362,8 +362,8 @@ public sealed class CudaBackend : IComputeBackend
             ulong q8_1Ptr = _q8_1Scratch!.DevicePtr;
             var func = _matmulModule.GetFunction("dequant_matmul_q4_0_q8_1");
             int nVal = N;
-            uint dp4aGrid = ((uint)N + 3) / 4; // Q4_0_DP4A_ROWS = 8
-            uint dp4aSmem = (256 / 32) * 4 * sizeof(float); // smem[8][8]
+            uint dp4aGrid = ((uint)N + 3) / 4;
+            uint dp4aSmem = (256 / 32) * 4 * sizeof(float);
             nint* kArgs = stackalloc nint[6];
             kArgs[0] = (nint)(&outPtr);
             kArgs[1] = (nint)(&q8_1Ptr);
@@ -396,8 +396,8 @@ public sealed class CudaBackend : IComputeBackend
 
             var func = _matmulModule.GetFunction("dequant_matmul_q4_0_q8_1");
             int nVal = N;
-            uint dp4aGrid = ((uint)N + 3) / 4; // Q4_0_DP4A_ROWS = 8
-            uint dp4aSmem = (256 / 32) * 4 * sizeof(float); // smem[8][8]
+            uint dp4aGrid2 = ((uint)N + 3) / 4;
+            uint dp4aSmem2 = (256 / 32) * 4 * sizeof(float);
             nint* kArgs = stackalloc nint[6];
             kArgs[0] = (nint)(&outPtr);
             kArgs[1] = (nint)(&q8_1Ptr);
@@ -405,7 +405,7 @@ public sealed class CudaBackend : IComputeBackend
             kArgs[3] = (nint)(&M);
             kArgs[4] = (nint)(&K);
             kArgs[5] = (nint)(&nVal);
-            _stream.Launch(func, dp4aGrid, 1, 1, 256, 1, 1, dp4aSmem, kArgs);
+            _stream.Launch(func, dp4aGrid2, 1, 1, 256, 1, 1, dp4aSmem2, kArgs);
         }
         else if (b.Type == GgmlType.Q4_1)
         {
