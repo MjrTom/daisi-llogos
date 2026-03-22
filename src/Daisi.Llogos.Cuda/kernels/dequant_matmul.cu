@@ -220,6 +220,121 @@ __global__ void batch_matmul_q8_0_aligned(float* __restrict__ output,
     }
 }
 
+// ── Tiled Fused Dequant-GEMM for Q8_0 (aligned) ─────────────────────────────
+// Reads Q8_0 weight directly, dequants into shared memory, computes GEMM.
+// No intermediate FP16 buffer — eliminates 5x bandwidth overhead.
+// Grid: ceil(N/TN) × ceil(M/TM). Block: (TN/TN_THREAD) × (TM/TM_THREAD) threads.
+// Each thread computes a TM_THREAD × TN_THREAD sub-tile of the output.
+//
+// Tile sizes chosen for RTX 5080 (96 KB shared, 255 regs, 1024 threads/block):
+#define TILE_M 64    // rows of output per block
+#define TILE_N 64    // cols of output per block
+#define TILE_K 32    // inner dim step = Q8_0 block size
+#define THREAD_M 4   // rows per thread
+#define THREAD_N 4   // cols per thread
+// Block dims: (TILE_N/THREAD_N) × (TILE_M/THREAD_M) = 16 × 16 = 256 threads
+
+__global__ void tiled_matmul_q8_0_aligned(float* __restrict__ output,
+                                            const float* __restrict__ a,
+                                            const unsigned char* __restrict__ b,
+                                            int M, int K, int N)
+{
+    // Output tile position
+    int bx = blockIdx.x; // N dimension
+    int by = blockIdx.y; // M dimension
+    int tx = threadIdx.x; // 0..15 (N direction)
+    int ty = threadIdx.y; // 0..15 (M direction)
+
+    int n_base = bx * TILE_N;
+    int m_base = by * TILE_M;
+
+    // Shared memory for tiles
+    __shared__ float sA[TILE_M][TILE_K];       // activation tile
+    __shared__ float sB[TILE_K][TILE_N];       // dequanted weight tile
+
+    // Per-thread accumulator
+    float acc[THREAD_M][THREAD_N] = {{0}};
+
+    int blocks_per_row = K / 32;
+    long bytes_per_row = (long)blocks_per_row * 36; // aligned Q8_0
+
+    int numThreads = blockDim.x * blockDim.y; // 256
+    int flatTid = ty * blockDim.x + tx;
+
+    // Loop over K in steps of TILE_K (= 32 = Q8_0 block size)
+    for (int kk = 0; kk < K; kk += TILE_K)
+    {
+        int kBlock = kk / 32; // Q8_0 block index along K
+
+        // Cooperatively load A tile [TILE_M × TILE_K] from global memory
+        // Total: 64 × 32 = 2048 floats, 256 threads → 8 floats per thread
+        for (int i = flatTid; i < TILE_M * TILE_K; i += numThreads)
+        {
+            int row = i / TILE_K;
+            int col = i % TILE_K;
+            int gRow = m_base + row;
+            int gCol = kk + col;
+            sA[row][col] = (gRow < M && gCol < K) ? a[(long)gRow * K + gCol] : 0.0f;
+        }
+
+        // Cooperatively load + dequant B tile [TILE_K × TILE_N] from Q8_0
+        // For each output neuron n in [n_base..n_base+TILE_N-1]:
+        //   Read Q8_0 block at row n, block kBlock: 36 bytes → 32 floats
+        // Total: TILE_N × TILE_K = 64 × 32 = 2048 floats, 256 threads → 8 per thread
+        for (int i = flatTid; i < TILE_N * TILE_K; i += numThreads)
+        {
+            int col = i / TILE_K;  // which output neuron (0..TILE_N-1)
+            int elem = i % TILE_K; // which element within Q8_0 block (0..31)
+            int gN = n_base + col;
+            if (gN < N)
+            {
+                const unsigned char* bp = b + (long)gN * bytes_per_row + kBlock * 36;
+                float scale = fp16_to_fp32(__ldg(reinterpret_cast<const unsigned short*>(bp)));
+                sB[elem][col] = scale * (float)((signed char)bp[4 + elem]);
+            }
+            else
+            {
+                sB[elem][col] = 0.0f;
+            }
+        }
+
+        __syncthreads();
+
+        // Compute partial products: each thread handles THREAD_M × THREAD_N output elements
+        #pragma unroll
+        for (int k = 0; k < TILE_K; k++)
+        {
+            #pragma unroll
+            for (int m = 0; m < THREAD_M; m++)
+            {
+                float a_val = sA[ty * THREAD_M + m][k];
+                #pragma unroll
+                for (int n = 0; n < THREAD_N; n++)
+                {
+                    acc[m][n] += a_val * sB[k][tx * THREAD_N + n];
+                }
+            }
+        }
+
+        __syncthreads();
+    }
+
+    // Write output
+    #pragma unroll
+    for (int m = 0; m < THREAD_M; m++)
+    {
+        int gRow = m_base + ty * THREAD_M + m;
+        if (gRow >= M) continue;
+        #pragma unroll
+        for (int n = 0; n < THREAD_N; n++)
+        {
+            int gCol = n_base + tx * THREAD_N + n;
+            if (gCol < N)
+                output[(long)gRow * N + gCol] = acc[m][n];
+        }
+    }
+}
+
 // Batched Q8_0 MatMul (M>1, fused dequant, unaligned 34-byte blocks)
 __global__ void batch_matmul_q8_0(float* __restrict__ output,
                                     const float* __restrict__ a,
