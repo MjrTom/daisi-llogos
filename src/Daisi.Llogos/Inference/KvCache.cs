@@ -128,6 +128,7 @@ public sealed class KvCache : IKvCache
     public int KHeadStride => _maxSeqLen * _keyLength;
     public int VHeadStride => _maxSeqLen * _valueLength;
 
+    public void SetLength(int length) => Length = length;
     public void Reset() => Length = 0;
 
     public void Dispose()

@@ -62,8 +62,11 @@ else
 {
     // ── Standard path (Qwen / hybrid) ───────────────────────────────────────
     // Build vocab remapper if partial vocab is active (vocab-limit > 1)
+    // Build vocab remapper if partial vocab is active (vocab-limit > 1)
+    // Same-family models (Qwen3.5) have identical vocabularies, so same remapper works for both
     VocabRemapper? remapper = null;
-    int vocabDivisor = options.VocabLimit ?? 32;
+    // Disable remapper + partial vocab for speculative decoding (both models must share same ID space)
+    int vocabDivisor = options.DraftModelPath != null ? 1 : (options.VocabLimit ?? 32);
     if (vocabDivisor > 1)
     {
         var tokens = gguf.GetMetadata<string[]>("tokenizer.ggml.tokens")!;
@@ -89,8 +92,7 @@ else
         kvCache = new KvCache(backend, config, maxSeqLen: maxContext, strategy: strategy);
     var deltaState = new DeltaNetState(backend, config, weights);
     var forward = new ForwardPass(backend, config, weights, kvCache, deltaState);
-    if (options.VocabLimit.HasValue)
-        forward.ArgMaxVocabLimit = config.VocabSize / options.VocabLimit.Value;
+    forward.ArgMaxVocabLimit = config.VocabSize / vocabDivisor;
 
     // Early exit profiling: measure at which layer the token prediction stabilizes
     if (options.ProfileEarlyExit)
@@ -111,6 +113,38 @@ else
     Console.Error.WriteLine($"Model loaded in {loadSw.Elapsed.TotalSeconds:F1}s " +
         $"({config.Architecture}, {config.NumLayers} layers, {config.HiddenDim}d" +
         $"{(options.UseMmap ? ", mmap" : "")}{attnInfo}{pagedInfo})");
+
+    // ── Speculative decoding (optional draft model) ─────────────────────────
+    ForwardPass? draftForward = null;
+    SpeculativeDecoder? specDecoder = null;
+    if (options.DraftModelPath != null)
+    {
+        Console.Error.Write($"Loading draft model: {options.DraftModelPath}... ");
+        using var draftStream = File.OpenRead(options.DraftModelPath);
+        var draftGguf = GgufFile.Read(draftStream);
+        var draftConfig = ModelConfig.FromGguf(draftGguf);
+
+        // Draft uses NO remapper — its token IDs are in the original space.
+        // The SpeculativeDecoder translates between remapped (target) and original (draft) IDs.
+        ModelWeights draftWeights;
+        if (options.UseMmap)
+            draftWeights = MmapModelLoader.Load(draftGguf, options.DraftModelPath, backend, draftConfig, null);
+        else
+            draftWeights = ModelLoader.Load(draftGguf, draftStream, backend, draftConfig);
+
+        var draftKvCache = new KvCache(backend, draftConfig, maxSeqLen: options.MaxContext);
+        var draftDeltaState = new DeltaNetState(backend, draftConfig, draftWeights);
+        draftForward = new ForwardPass(backend, draftConfig, draftWeights, draftKvCache, draftDeltaState);
+        // Draft uses partial vocab (same raw token order as target since both un-remapped)
+        // /4 gives ~62K tokens — generous enough for common tokens without remapper
+        draftForward.ArgMaxVocabLimit = draftConfig.VocabSize / 4;
+
+        specDecoder = new SpeculativeDecoder(forward, draftForward, tokenizer, options.SpecDepth, remapper)
+        {
+            BatchedVerify = options.BatchedVerify
+        };
+        Console.Error.WriteLine($"done ({draftConfig.Architecture}, {draftConfig.NumLayers}L, {draftConfig.HiddenDim}d)");
+    }
 
     var generator = new TextGenerator(forward, tokenizer, options.Seed);
 
@@ -141,13 +175,20 @@ else
             Seed = options.Seed,
         };
 
-        foreach (var token in generator.Generate(options.Prompt!, parameters))
+        var generateFn = specDecoder != null
+            ? specDecoder.Generate(options.Prompt!, parameters)
+            : generator.Generate(options.Prompt!, parameters);
+
+        foreach (var token in generateFn)
         {
             if (token.IsDone)
             {
                 Console.Error.WriteLine();
+                var specInfo = specDecoder != null
+                    ? $" | accept: {specDecoder.AcceptanceRate:P0} ({specDecoder.TotalAcceptedTokens}/{specDecoder.TotalDraftTokens})"
+                    : "";
                 Console.Error.WriteLine($"\n[prefill: {token.PrefillTokens} tokens, {token.PrefillTokensPerSecond:F1} tok/s | " +
-                    $"decode: {token.TotalTokens} tokens, {token.TokensPerSecond:F1} tok/s]");
+                    $"decode: {token.TotalTokens} tokens, {token.TokensPerSecond:F1} tok/s{specInfo}]");
             }
             else
             {
@@ -177,6 +218,7 @@ else
         Console.Error.WriteLine();
     }
 
+    draftForward?.Dispose();
     forward.Dispose();
     deltaState.Dispose();
     kvCache.Dispose();
@@ -310,6 +352,15 @@ static CliArgs ParseArgs(string[] args)
                 result.Paged = true;
                 result.OffloadPages = int.Parse(NextArg(args, ref i));
                 break;
+            case "--draft":
+                result.DraftModelPath = NextArg(args, ref i);
+                break;
+            case "--spec-depth":
+                result.SpecDepth = int.Parse(NextArg(args, ref i));
+                break;
+            case "--batched-verify":
+                result.BatchedVerify = true;
+                break;
             case "--help" or "-h":
                 result.ShowHelp = true;
                 break;
@@ -345,6 +396,9 @@ static void PrintUsage()
           --attention <mode>       Attention strategy: full, window:<N>, sinks:<S>,<W> (default: full)
           --paged                  Use paged KV cache (dynamic allocation, grows with context)
           --offload-pages <n>      Enable RAM offloading: keep first N pages in VRAM, rest in RAM
+          --draft <path>           Draft model for speculative decoding (smaller, same family)
+          --spec-depth <n>         Speculation depth (default: 5)
+          --batched-verify         Use batched verify (faster, higher acceptance, different FP from native)
           --help, -h               Show this help
         """);
 }
@@ -369,4 +423,7 @@ class CliArgs
     public int OffloadPages;
     public int? VocabLimit;
     public bool ProfileEarlyExit;
+    public string? DraftModelPath;
+    public int SpecDepth = 5;
+    public bool BatchedVerify;
 }

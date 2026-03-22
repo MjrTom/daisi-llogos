@@ -38,5 +38,8 @@ public interface IKvCache : IDisposable
     /// <summary>Get the V cache tensor for an attention layer (contiguous, suitable for GatedAttention).</summary>
     ITensor GetVCacheTensor(int layer);
 
+    /// <summary>Truncate visible length (for speculative decode rejection).</summary>
+    void SetLength(int length) { }
+
     void Reset();
 }
