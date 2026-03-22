@@ -1152,12 +1152,15 @@ __global__ void dequant_matmul_q4_k(float* output, const float* a,
             unpack_q4k_scales(sbp, chunk * 2, d, dmin, ss0, sm0);
             unpack_q4k_scales(sbp, chunk * 2 + 1, d, dmin, ss1, sm1);
 
-            const unsigned int* qs32 = reinterpret_cast<const unsigned int*>(sbp + 16 + chunk * 32);
+            // Vectorized 128-bit loads for 32 bytes of nibble data (2 × uint4)
+            const uint4 qv0 = __ldg(reinterpret_cast<const uint4*>(sbp + 16 + chunk * 32));
+            const uint4 qv1 = __ldg(reinterpret_cast<const uint4*>(sbp + 16 + chunk * 32 + 16));
+            unsigned int qw[8] = {qv0.x, qv0.y, qv0.z, qv0.w, qv1.x, qv1.y, qv1.z, qv1.w};
             float dotLo = 0.0f, dotHi = 0.0f;
 
             #pragma unroll
             for (int l = 0; l < 8; l++) {
-                unsigned int packed = __ldg(&qs32[l]);
+                unsigned int packed = qw[l];
                 dotLo += aLoCache[l].x*(float)(packed      &0xF) + aLoCache[l].y*(float)((packed>>8) &0xF)
                        + aLoCache[l].z*(float)((packed>>16)&0xF) + aLoCache[l].w*(float)((packed>>24)&0xF);
                 dotHi += aHiCache[l].x*(float)((packed>>4) &0xF) + aHiCache[l].y*(float)((packed>>12)&0xF)
