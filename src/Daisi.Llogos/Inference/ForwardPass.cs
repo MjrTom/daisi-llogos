@@ -582,14 +582,6 @@ public sealed class ForwardPass : IForwardPass
             _backend.AddRmsNorm(_bNormOut!, _bHidden!, _bHidden!, _bResidual!, lw.PostAttnNorm, _config.NormEps);
             _backend.CopyTensor(_bResidual!, _bHidden!);
 
-            // DEBUG: dump after PostAttnNorm + CopyResidual
-            if (layer == 0)
-            {
-                var bdbg = new float[M * hDim];
-                _bHidden!.DequantizeTo(bdbg);
-                Console.Error.WriteLine($"[BAT] L0 post bHid[0]: {bdbg[0]:F6} {bdbg[1]:F6} {bdbg[2]:F6} {bdbg[3]:F6}");
-            }
-
             // FFN (batched — MatMul handles M>1 via cuBLAS)
             // Always use non-fused path: SplitSwiGLU assumes flat [gate|up] layout
             // which doesn't work for M>1 (per-token interleaving).
@@ -619,6 +611,37 @@ public sealed class ForwardPass : IForwardPass
         ProjectLinearPartial(_logits, _normOut, _weights.OutputWeight, ArgMaxVocabLimit);
         _backend.FlushCommands();
         return _backend.ArgMax(_logits, ArgMaxVocabLimit);
+    }
+
+    /// <summary>
+    /// Batched forward pass that returns the argmax prediction at EVERY position.
+    /// Used by speculative decoding: the target model verifies N draft tokens
+    /// and returns what it would have predicted at each position.
+    /// </summary>
+    public int[] ForwardBatchedVerify(int[] tokenIds, int startPosition)
+    {
+        int M = tokenIds.Length;
+        ForwardBatchedPrefill(tokenIds, startPosition);
+
+        // Compute argmax at each of the M positions
+        // _bHidden has [M × hiddenDim] after the forward pass
+        int hDim = _config.HiddenDim;
+        int vocabLimit = ArgMaxVocabLimit;
+        var results = new int[M];
+
+        for (int t = 0; t < M; t++)
+        {
+            // Extract token t's hidden state
+            _backend.CopyTensorSlice(_hidden, 0, _bHidden!, t * hDim, hDim);
+
+            _backend.BeginCommands();
+            _backend.RmsNorm(_normOut, _hidden, _weights.OutputNorm, _config.NormEps);
+            ProjectLinearPartial(_logits, _normOut, _weights.OutputWeight, vocabLimit);
+            _backend.FlushCommands();
+            results[t] = _backend.ArgMax(_logits, vocabLimit);
+        }
+
+        return results;
     }
 
     private void BatchedForwardStandardAttention(StandardAttentionWeights w, int startPosition, int layer, int M)

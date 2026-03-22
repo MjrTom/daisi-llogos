@@ -112,6 +112,33 @@ else
         $"({config.Architecture}, {config.NumLayers} layers, {config.HiddenDim}d" +
         $"{(options.UseMmap ? ", mmap" : "")}{attnInfo}{pagedInfo})");
 
+    // ── Speculative decoding (optional draft model) ─────────────────────────
+    ForwardPass? draftForward = null;
+    SpeculativeDecoder? specDecoder = null;
+    if (options.DraftModelPath != null)
+    {
+        Console.Error.Write($"Loading draft model: {options.DraftModelPath}... ");
+        using var draftStream = File.OpenRead(options.DraftModelPath);
+        var draftGguf = GgufFile.Read(draftStream);
+        var draftConfig = ModelConfig.FromGguf(draftGguf);
+
+        // Draft uses same backend and same vocab remapper as target (IDs must match for comparison)
+        ModelWeights draftWeights;
+        if (options.UseMmap)
+            draftWeights = MmapModelLoader.Load(draftGguf, options.DraftModelPath, backend, draftConfig, remapper);
+        else
+            draftWeights = ModelLoader.Load(draftGguf, draftStream, backend, draftConfig);
+
+        var draftKvCache = new KvCache(backend, draftConfig, maxSeqLen: options.MaxContext);
+        var draftDeltaState = new DeltaNetState(backend, draftConfig, draftWeights);
+        draftForward = new ForwardPass(backend, draftConfig, draftWeights, draftKvCache, draftDeltaState);
+        if (options.VocabLimit.HasValue)
+            draftForward.ArgMaxVocabLimit = draftConfig.VocabSize / options.VocabLimit.Value;
+
+        specDecoder = new SpeculativeDecoder(forward, draftForward, tokenizer, options.SpecDepth);
+        Console.Error.WriteLine($"done ({draftConfig.Architecture}, {draftConfig.NumLayers}L, {draftConfig.HiddenDim}d)");
+    }
+
     var generator = new TextGenerator(forward, tokenizer, options.Seed);
 
     if (options.Bench)
@@ -141,13 +168,20 @@ else
             Seed = options.Seed,
         };
 
-        foreach (var token in generator.Generate(options.Prompt!, parameters))
+        var generateFn = specDecoder != null
+            ? specDecoder.Generate(options.Prompt!, parameters)
+            : generator.Generate(options.Prompt!, parameters);
+
+        foreach (var token in generateFn)
         {
             if (token.IsDone)
             {
                 Console.Error.WriteLine();
+                var specInfo = specDecoder != null
+                    ? $" | accept: {specDecoder.AcceptanceRate:P0} ({specDecoder.TotalAcceptedTokens}/{specDecoder.TotalDraftTokens})"
+                    : "";
                 Console.Error.WriteLine($"\n[prefill: {token.PrefillTokens} tokens, {token.PrefillTokensPerSecond:F1} tok/s | " +
-                    $"decode: {token.TotalTokens} tokens, {token.TokensPerSecond:F1} tok/s]");
+                    $"decode: {token.TotalTokens} tokens, {token.TokensPerSecond:F1} tok/s{specInfo}]");
             }
             else
             {
@@ -177,6 +211,7 @@ else
         Console.Error.WriteLine();
     }
 
+    draftForward?.Dispose();
     forward.Dispose();
     deltaState.Dispose();
     kvCache.Dispose();
@@ -310,6 +345,12 @@ static CliArgs ParseArgs(string[] args)
                 result.Paged = true;
                 result.OffloadPages = int.Parse(NextArg(args, ref i));
                 break;
+            case "--draft":
+                result.DraftModelPath = NextArg(args, ref i);
+                break;
+            case "--spec-depth":
+                result.SpecDepth = int.Parse(NextArg(args, ref i));
+                break;
             case "--help" or "-h":
                 result.ShowHelp = true;
                 break;
@@ -345,6 +386,8 @@ static void PrintUsage()
           --attention <mode>       Attention strategy: full, window:<N>, sinks:<S>,<W> (default: full)
           --paged                  Use paged KV cache (dynamic allocation, grows with context)
           --offload-pages <n>      Enable RAM offloading: keep first N pages in VRAM, rest in RAM
+          --draft <path>           Draft model for speculative decoding (smaller, same family)
+          --spec-depth <n>         Speculation depth (default: 5)
           --help, -h               Show this help
         """);
 }
@@ -369,4 +412,6 @@ class CliArgs
     public int OffloadPages;
     public int? VocabLimit;
     public bool ProfileEarlyExit;
+    public string? DraftModelPath;
+    public int SpecDepth = 5;
 }
