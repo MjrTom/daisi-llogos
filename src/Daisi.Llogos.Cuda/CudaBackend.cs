@@ -208,6 +208,7 @@ public sealed class CudaBackend : IComputeBackend
             GgmlType.Q4_1 => ((uint)N + 7) / 8,  // 8 rows per block
             GgmlType.Q4_K => ((uint)N + 7) / 8,  // 4 rows per block
             GgmlType.Q6_K => ((uint)N + 7) / 8, // 2 rows per block
+            GgmlType.Q5_K => (uint)N, // 1 row per block (complex inner loop)
             _ => (uint)N
         };
         // Adaptive block size: scale with the number of work items per row.
