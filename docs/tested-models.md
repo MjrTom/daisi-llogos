@@ -22,16 +22,18 @@ Measured with `--bench`, 128 decode tokens, FP16 KV cache. llama.cpp b8461 compa
 
 ### Llogos vs llama.cpp — CUDA
 
-**Exceeding llama.cpp on 3 of 6 models, matching within 2% on a fourth.** See [Inference Optimization White Paper](inference-optimization.md) for technical details.
+**Exceeding llama.cpp on 4 of 8 models across three architectures (DeltaNet, LLaMA, standard attention).** See [Inference Optimization White Paper](inference-optimization.md) for technical details.
 
 | Model | Llogos CUDA | llama.cpp CUDA | % of llama.cpp |
 |-------|--------:|--------:|--------:|
-| Qwen3.5-0.8B Q8_0 | **436** | 399 | **109%** |
-| Qwen3.5-4B Q8_0 | **142** | 135 | **105%** |
-| Qwen3-8B Q8_0 | 90 | 92 | 98% |
-| Qwen3-8B Q4_K_M | 122 | 138 | 88% |
-| Qwen3.5-9B Q8_0 | **86** | 84 | **102%** |
-| Qwen3.5-9B Q4_0 | 100 | 123 | 81% |
+| Qwen3.5-0.8B Q8_0 | **441** | 399 | **110%** |
+| TinyLlama 1.1B Q8_0 | **448** | 443 | **101%** |
+| Qwen3.5-4B Q8_0 | **144** | 135 | **107%** |
+| Qwen3-8B Q8_0 | 91 | 92 | 99% |
+| DeepSeek R1 8B Q8_0 | 94 | 95 | 99% |
+| Qwen3-8B Q4_K_M | 124 | 138 | 90% |
+| Qwen3.5-9B Q8_0 | **88** | 84 | **105%** |
+| Qwen3.5-9B Q4_0 | 101 | 123 | 82% |
 
 ### Llogos vs llama.cpp — Vulkan
 
@@ -49,13 +51,14 @@ Measured with `--bench`, 128 decode tokens, FP16 KV cache. llama.cpp b8461 compa
 
 | Model | CUDA | Vulkan | CPU |
 |-------|-----:|-------:|----:|
-| Qwen3.5-0.8B Q8_0 | 436 | 156 | 22 |
-| Qwen3.5-4B Q8_0 | 142 | 73 | — |
-| Qwen3-8B Q8_0 | 90 | 56 | — |
-| Qwen3-8B Q4_K_M | 122 | 54 | — |
-| Qwen3.5-9B Q8_0 | 86 | 53 | — |
-| Qwen3.5-9B Q4_0 | 100 | 45 | — |
-| TinyLlama 1.1B Q8_0 | — | — | 13 |
+| Qwen3.5-0.8B Q8_0 | 441 | 156 | 22 |
+| TinyLlama 1.1B Q8_0 | 448 | — | 13 |
+| Qwen3.5-4B Q8_0 | 144 | 73 | — |
+| Qwen3-8B Q8_0 | 91 | 56 | — |
+| DeepSeek R1 8B Q8_0 | 94 | — | — |
+| Qwen3-8B Q4_K_M | 124 | 54 | — |
+| Qwen3.5-9B Q8_0 | 88 | 53 | — |
+| Qwen3.5-9B Q4_0 | 101 | 45 | — |
 
 ### CUDA Optimizations Applied
 

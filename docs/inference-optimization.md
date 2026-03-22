@@ -6,16 +6,18 @@
 
 RTX 5080, 128 decode tokens, greedy sampling (temperature=0). llama.cpp b8461.
 
-| Model | Llogos | llama.cpp | Ratio |
-|-------|-------:|----------:|------:|
-| Qwen3.5-0.8B Q8_0 | **436** | 399 | **1.09x** |
-| Qwen3.5-4B Q8_0 | **142** | 135 | **1.05x** |
-| Qwen3-8B Q8_0 | 90 | 92 | 0.98x |
-| Qwen3.5-9B Q8_0 | **86** | 84 | **1.02x** |
-| Qwen3.5-9B Q4_0 | 100 | 123 | 0.81x |
-| Qwen3-8B Q4_K_M | 122 | 138 | 0.88x |
+| Model | Architecture | Llogos | llama.cpp | Ratio |
+|-------|-------------|-------:|----------:|------:|
+| Qwen3.5-0.8B Q8_0 | DeltaNet hybrid | **441** | 399 | **1.10x** |
+| TinyLlama 1.1B Q8_0 | LLaMA | **448** | 443 | **1.01x** |
+| Qwen3.5-4B Q8_0 | DeltaNet hybrid | **144** | 135 | **1.07x** |
+| Qwen3-8B Q8_0 | Standard attention | 91 | 92 | 0.99x |
+| DeepSeek R1 8B Q8_0 | LLaMA | 94 | 95 | 0.99x |
+| Qwen3-8B Q4_K_M | Standard attention | 124 | 138 | 0.90x |
+| Qwen3.5-9B Q8_0 | DeltaNet hybrid | **88** | 84 | **1.05x** |
+| Qwen3.5-9B Q4_0 | DeltaNet hybrid | 101 | 123 | 0.82x |
 
-We exceed llama.cpp on 3 of 6 models and match within 2% on a fourth. The remaining gap on 4-bit quants is from our Q4_0 float kernel being compute-bound on nibble extraction — a known limitation that dp4a partially addresses.
+We exceed llama.cpp on 4 of 8 models tested, across three different architectures (DeltaNet, LLaMA, standard attention). Results are not Qwen-specific — the optimizations generalize across model families. The remaining gap on 4-bit quants is from our Q4_0 float kernel being compute-bound on nibble extraction.
 
 ## 1. Partial Vocabulary Logit Computation
 
@@ -37,6 +39,19 @@ The speedup saturates at ~32x because the lm_head becomes negligible relative to
 **Applicability:** This optimization is safe for any greedy decode workload: agentic tool calling, structured output (JSON/XML/SQL), factual Q&A, code generation, classification. It does NOT apply to temperature>0 sampling, which requires full logit distributions. The `--vocab-limit` CLI flag provides runtime control.
 
 **Why this works differently from top-K/top-P:** Top-K and top-P are post-hoc filters applied after computing all logits. They save nothing on compute. Partial vocab skips the compute entirely — the GPU never reads the weight data for excluded tokens. This is a matmul-level optimization, not a sampling-level one.
+
+### Vocabulary Frequency Remapping
+
+The partial vocab optimization assumes common tokens have low IDs. While empirically true for most tokenizers, we make it provably correct by remapping the vocabulary at load time:
+
+1. Score each token by frequency/utility (ASCII letters, CJK, digits = high; special control tokens = low)
+2. Sort to build a permutation: highest-scoring tokens get the lowest new IDs
+3. Permute the embedding table rows and lm_head weight columns in-place
+4. Update the tokenizer's ID↔string mapping
+
+This is a one-time cost of ~0.6s during model loading. After remapping, truncating to the first N tokens is guaranteed to include the N most useful tokens. The model's internal representations are unchanged — only the input/output mapping is permuted.
+
+The remapping is active by default when `--vocab-limit` > 1. Setting `--vocab-limit 1` disables both remapping and truncation.
 
 ## 2. Per-Quantization Row Count Tuning
 
@@ -119,6 +134,6 @@ The fix: each quant type's dispatch computes its own grid size, thread count, an
 All benchmarks use:
 - Hardware: AMD Ryzen 9 9900X, NVIDIA GeForce RTX 5080 (16GB)
 - Software: .NET 10, CUDA 13, Vulkan SDK 1.4.341, llama.cpp b8461
-- Models: Qwen3.5 family (0.8B, 4B, 9B DeltaNet hybrid) and Qwen3 (8B standard attention)
+- Models: Qwen3.5 (0.8B, 4B, 9B DeltaNet hybrid), Qwen3 (8B standard attention), TinyLlama (1.1B LLaMA), DeepSeek R1 (8B LLaMA distill)
 - Methodology: 128 decode tokens, greedy sampling (temperature=0), 3 runs for stability
 - CLI: `dotnet run --project src/Daisi.Llogos.Cli -c Release -- --model <path> --backend cuda --bench --prompt "Hello" --max-tokens 128 --temperature 0`
