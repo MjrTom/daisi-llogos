@@ -920,7 +920,7 @@ void dequant_matmul_q4_0_q8_1(float* __restrict__ output,
 
 // ── Q4_0 dp4a (unaligned 18-byte blocks — original GGUF format) ─────────────
 // Saves 11% bandwidth vs aligned 20-byte format by avoiding padding.
-// Uses 2-byte aligned reads for nibble data (like llama.cpp).
+// Uses 2-byte aligned reads for nibble data (like llama.cpp's get_int_b2).
 
 __global__ __launch_bounds__(Q4_0_DP4A_THREADS)
 void dequant_matmul_q4_0_q8_1_unaligned(float* __restrict__ output,
@@ -935,7 +935,7 @@ void dequant_matmul_q4_0_q8_1_unaligned(float* __restrict__ output,
     if (n_base >= N) return;
 
     const int blocks_per_row = K / 32;
-    const long bytes_per_row = (long)blocks_per_row * 18; // 18 bytes per unaligned Q4_0 block
+    const long bytes_per_row = (long)blocks_per_row * 18;
     const unsigned char* a_q8_1 = (const unsigned char*)vq8_1;
     const int nwarps = Q4_0_DP4A_THREADS / 32;
 
@@ -943,7 +943,6 @@ void dequant_matmul_q4_0_q8_1_unaligned(float* __restrict__ output,
 
     for (int blk = tid; blk < blocks_per_row; blk += Q4_0_DP4A_THREADS)
     {
-        // Load Q8_1 activation block
         const unsigned char* ablk = a_q8_1 + blk * 36;
         float a_d = fp16_to_fp32(*reinterpret_cast<const unsigned short*>(ablk));
         float a_s = fp16_to_fp32(*reinterpret_cast<const unsigned short*>(ablk + 2));
@@ -958,12 +957,10 @@ void dequant_matmul_q4_0_q8_1_unaligned(float* __restrict__ output,
             int n = n_base + r;
             if (n >= N) break;
 
-            // Unaligned Q4_0 block: [scale(2b) | nibbles(16b)] = 18 bytes
-            // Nibbles start at offset 2 (NOT 4-byte aligned)
             const unsigned char* bp = b + (long)n * bytes_per_row + blk * 18;
             float w_scale = fp16_to_fp32(*reinterpret_cast<const unsigned short*>(bp));
 
-            // 2-byte aligned reads for nibble data (like llama.cpp's get_int_b2)
+            // 2-byte aligned reads for nibble data
             const unsigned short* qs16 = reinterpret_cast<const unsigned short*>(bp + 2);
             unsigned int w_nibs[4];
             #pragma unroll
