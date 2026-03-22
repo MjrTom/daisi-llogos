@@ -17,6 +17,8 @@ public sealed class CudaBackend : IComputeBackend
     private CudaDeviceMemory? _q8_1Scratch; // scratch for quantized activation
     private int _q8_1ScratchK; // K dimension of current scratch
     private ulong _q8_1CachedInputPtr; // device ptr of last quantized activation (for reuse)
+    private int _q8_1CacheGeneration; // incremented by non-matmul ops to invalidate cache
+    private int _q8_1CachedGeneration; // generation when cache was last written
     private bool _disposed;
 
     private const int BlockSize = 256;
@@ -24,7 +26,7 @@ public sealed class CudaBackend : IComputeBackend
     // ── CUDA Graph capture state ─────────────────────────────────────────────
     private bool _capturing;          // true while stream is in capture mode
     private nint _graphExec;          // reusable graph executable (0 = none)
-    private bool _graphEnabled = true; // set false to disable graphs (debugging)
+    private bool _graphEnabled = true;
 
     public CudaBackend(int deviceOrdinal = 0)
     {
@@ -52,6 +54,7 @@ public sealed class CudaBackend : IComputeBackend
     public void BeginCommands()
     {
         EnsureContext();
+        _q8_1CacheGeneration++; // invalidate Q8_1 cache for new token
         if (!_graphEnabled) return;
         // Start stream capture — all subsequent launches are recorded, not executed
         var result = CudaApi.StreamBeginCapture(_stream.Handle, 0); // 0 = CU_STREAM_CAPTURE_MODE_GLOBAL
@@ -100,6 +103,25 @@ public sealed class CudaBackend : IComputeBackend
     /// </summary>
     private void EnsureContext() => _context.MakeCurrent();
 
+    /// <summary>
+    /// Ensure the Q8_1 scratch buffer is large enough for the given K dimension.
+    /// Must be called outside batch recording (no cuMemAlloc during batching).
+    /// </summary>
+    private ulong EnsureQ8_1Scratch(int K)
+    {
+        int numBlocks = K / 32;
+        int q8_1Bytes = numBlocks * 36; // [d(f16,2b) + sum(f16,2b) + quants(32b)] = 36 bytes
+        if (_q8_1Scratch == null || _q8_1ScratchK < K)
+        {
+            var old = _q8_1Scratch;
+            _q8_1Scratch = new CudaDeviceMemory((ulong)q8_1Bytes);
+            _q8_1ScratchK = K;
+            _q8_1CachedInputPtr = 0;
+            old?.Dispose();
+        }
+        return _q8_1Scratch.DevicePtr;
+    }
+
     /// <inheritdoc />
     public ITensor CreateTensor(string name, GgmlType type, ReadOnlySpan<long> dimensions)
     {
@@ -116,6 +138,8 @@ public sealed class CudaBackend : IComputeBackend
         // New: [scale(2b) | pad(2b) | quants(32b)] = 36 bytes, quants 4-byte aligned
         if (type == GgmlType.Q8_0 && dimensions.Length >= 2 && dimensions[0] >= 2048)
         {
+            // Pre-allocate Q8_1 scratch for dp4a matmul (must happen outside stream capture)
+            EnsureQ8_1Scratch((int)dimensions[0]);
             // Only repack weight matrices with K >= 2048 (not small embeddings or 1D tensors)
             int blockCount = data.Length / 34;
             var aligned = new byte[blockCount * 36];
@@ -136,12 +160,37 @@ public sealed class CudaBackend : IComputeBackend
             return tensor;
         }
 
+        // Repack Q4_0 to aligned layout: 18-byte blocks → 20-byte blocks
+        // [scale(2b) | pad(2b) | nibbles(16b)] = 20 bytes, 4-byte aligned
+        if (type == GgmlType.Q4_0 && dimensions.Length >= 2)
+        {
+            // Pre-allocate Q8_1 scratch for dp4a (must happen outside stream capture)
+            EnsureQ8_1Scratch((int)dimensions[0]);
+            int blockCount = data.Length / 18;
+            var aligned = new byte[blockCount * 20];
+            for (int i = 0; i < blockCount; i++)
+            {
+                int srcOff = i * 18;
+                int dstOff = i * 20;
+                aligned[dstOff] = data[srcOff];
+                aligned[dstOff + 1] = data[srcOff + 1];
+                data.Slice(srcOff + 2, 16).CopyTo(aligned.AsSpan(dstOff + 4, 16));
+            }
+            var tensor = new CudaTensor(name, type, dimensions, pinned: false, alignedQ4_0: true);
+            tensor.Memory.CopyFromHost(aligned);
+            return tensor;
+        }
+
         return new CudaTensor(name, type, dimensions, data);
     }
 
     /// <inheritdoc />
     public unsafe void MatMul(ITensor output, ITensor a, ITensor b, int M, int K, int N)
     {
+        // Any matmul with a different activation invalidates the Q8_1 cache
+        if (b.Type != GgmlType.Q4_0)
+            _q8_1CacheGeneration++;
+
         var outT = (CudaTensor)output;
         var aT = (CudaTensor)a;
         var bT = (CudaTensor)b;
@@ -150,22 +199,25 @@ public sealed class CudaBackend : IComputeBackend
         ulong aPtr = aT.DevicePtr;
         ulong bPtr = bT.DevicePtr;
 
-        // Q8_0: 4 rows per block (multi-row activation reuse). Others: 1 row per block.
-        // Multi-row: Q8_0 = 4, Q4_K = 2, Q6_K = 2, others = 1 row per block
+        // Multi-row: Q8_0 = 4, Q4_0 = 4, Q4_K = 4, Q6_K = 2, others = 1 row per block
         uint gridX = b.Type switch {
             GgmlType.Q8_0 => ((uint)N + 3) / 4,
+            GgmlType.Q4_0 => ((uint)N + 1) / 2,  // 2 rows per CUDA block
+            GgmlType.Q4_1 => ((uint)N + 7) / 8,  // 8 rows per block
             GgmlType.Q4_K => ((uint)N + 3) / 4,  // 4 rows per block
             GgmlType.Q6_K => ((uint)N + 1) / 2, // 2 rows per block
             _ => (uint)N
         };
         // Adaptive block size: scale with the number of work items per row.
-        // Q8_0: 1 item per 32 elements. K-quants: 1 item per 256 elements. F32/F16: 1 item per element.
+        // Q8_0/Q4_0: 1 item per 32 elements. K-quants: 1 item per 256 elements. F32/F16: 1 item per element.
         int workItemsPerRow = b.Type switch
         {
             GgmlType.Q4_K => K / 256 * 4,  // 4 chunks per super-block
             GgmlType.Q5_K => K / 256 * 8,  // 8 chunk-halves per super-block
             GgmlType.Q6_K => K / 256 * 8,  // 8 quadrants per super-block
             GgmlType.Q8_0 => K / 32,
+            GgmlType.Q4_0 => K / 32,
+            GgmlType.Q4_1 => K / 32,
             _ => K / 8 // F32/F16: 8 elements per thread is fine
         };
         int matmulBlockSize = Math.Clamp((workItemsPerRow + 31) & ~31, 32, 256);
@@ -186,7 +238,7 @@ public sealed class CudaBackend : IComputeBackend
                 &beta,
                 outPtr, 1), "cublasSgemv"); // y = output, incy = 1
         }
-        else if (false) // dp4a removed: Q8_1 quantization error compounds across layers
+        else if (false) // dp4a removed: grid mismatch (1 row/block kernel vs 4 row/block grid)
         {
             // dp4a path — disabled due to precision loss in activation quantization
             // Cache: skip re-quantization if the same activation tensor is used again
@@ -239,6 +291,65 @@ public sealed class CudaBackend : IComputeBackend
             bool isSmallAligned = bT is CudaTensor ct2 && ct2.IsAlignedQ8_0;
             var func = _matmulModule.GetFunction(isSmallAligned
                 ? "dequant_matmul_q8_0_aligned" : "dequant_matmul_q8_0");
+            int nVal = N;
+            nint* kArgs = stackalloc nint[6];
+            kArgs[0] = (nint)(&outPtr);
+            kArgs[1] = (nint)(&aPtr);
+            kArgs[2] = (nint)(&bPtr);
+            kArgs[3] = (nint)(&M);
+            kArgs[4] = (nint)(&K);
+            kArgs[5] = (nint)(&nVal);
+            _stream.Launch(func, gridX, 1, 1, (uint)matmulBlockSize, 1, 1, sharedMem, kArgs);
+        }
+        else if (b.Type == GgmlType.Q4_0 && _context.ComputeCapabilityMajor >= 12)
+        {
+            // Blackwell: FP32 float path (faster due to massive FP32 throughput)
+            var func = _matmulModule.GetFunction("dequant_matmul_q4_0");
+            int nVal = N;
+            nint* kArgs = stackalloc nint[6];
+            kArgs[0] = (nint)(&outPtr);
+            kArgs[1] = (nint)(&aPtr);
+            kArgs[2] = (nint)(&bPtr);
+            kArgs[3] = (nint)(&M);
+            kArgs[4] = (nint)(&K);
+            kArgs[5] = (nint)(&nVal);
+            _stream.Launch(func, gridX, 1, 1, (uint)matmulBlockSize, 1, 1, sharedMem, kArgs);
+        }
+        else if (b.Type == GgmlType.Q4_0)
+        {
+            // Pre-Blackwell: dp4a path (4x int8 throughput beats float nibble extraction)
+            ulong q8_1Ptr = EnsureQ8_1Scratch(K);
+
+            if (_q8_1CachedInputPtr != aPtr || _q8_1CachedGeneration != _q8_1CacheGeneration)
+            {
+                _q8_1CachedInputPtr = aPtr;
+                _q8_1CachedGeneration = _q8_1CacheGeneration;
+                var quantFunc = _matmulModule.GetFunction("quantize_f32_q8_1");
+                int numBlocks = K / 32;
+                uint quantGrid = (uint)((numBlocks + BlockSize - 1) / BlockSize);
+                int kVal = K;
+                nint* qArgs = stackalloc nint[3];
+                qArgs[0] = (nint)(&q8_1Ptr);
+                qArgs[1] = (nint)(&aPtr);
+                qArgs[2] = (nint)(&kVal);
+                _stream.Launch(quantFunc, quantGrid, 1, 1, (uint)BlockSize, 1, 1, 0, qArgs);
+            }
+
+            var func = _matmulModule.GetFunction("dequant_matmul_q4_0_q8_1");
+            int nVal = N;
+            uint dp4aSmem = 2 * sizeof(float); // warp_sums[2]
+            nint* kArgs = stackalloc nint[6];
+            kArgs[0] = (nint)(&outPtr);
+            kArgs[1] = (nint)(&q8_1Ptr);
+            kArgs[2] = (nint)(&bPtr);
+            kArgs[3] = (nint)(&M);
+            kArgs[4] = (nint)(&K);
+            kArgs[5] = (nint)(&nVal);
+            _stream.Launch(func, (uint)N, 1, 1, 64, 1, 1, dp4aSmem, kArgs);
+        }
+        else if (b.Type == GgmlType.Q4_1)
+        {
+            var func = _matmulModule.GetFunction("dequant_matmul_q4_1");
             int nVal = N;
             nint* kArgs = stackalloc nint[6];
             kArgs[0] = (nint)(&outPtr);
@@ -339,6 +450,7 @@ public sealed class CudaBackend : IComputeBackend
     /// <inheritdoc />
     public unsafe void RmsNorm(ITensor output, ITensor input, ITensor weight, float eps)
     {
+        _q8_1CacheGeneration++;
         var outT = (CudaTensor)output;
         var inT = (CudaTensor)input;
         var wT = (CudaTensor)weight;
@@ -540,6 +652,31 @@ public sealed class CudaBackend : IComputeBackend
         else if (table.Type == GgmlType.Q4_K)
         {
             var func = _elementwiseModule.GetFunction("embedding_lookup_q4_k");
+            nint* kArgs = stackalloc nint[4];
+            kArgs[0] = (nint)(&outPtr);
+            kArgs[1] = (nint)(&tablePtr);
+            kArgs[2] = (nint)(&hiddenDim);
+            kArgs[3] = (nint)(&tokenId);
+            _stream.Launch(func, grid, 1, 1, (uint)BlockSize, 1, 1, 0, kArgs);
+        }
+        else if (table.Type == GgmlType.Q4_0)
+        {
+            bool isAlignedQ4 = tableT is CudaTensor ct3 && ct3.IsAlignedQ4_0;
+            int blockStride = isAlignedQ4 ? 20 : 18;
+            int nibbleOffset = isAlignedQ4 ? 4 : 2;
+            var func = _elementwiseModule.GetFunction("embedding_lookup_q4_0_v2");
+            nint* kArgs = stackalloc nint[6];
+            kArgs[0] = (nint)(&outPtr);
+            kArgs[1] = (nint)(&tablePtr);
+            kArgs[2] = (nint)(&hiddenDim);
+            kArgs[3] = (nint)(&tokenId);
+            kArgs[4] = (nint)(&blockStride);
+            kArgs[5] = (nint)(&nibbleOffset);
+            _stream.Launch(func, grid, 1, 1, (uint)BlockSize, 1, 1, 0, kArgs);
+        }
+        else if (table.Type == GgmlType.Q4_1)
+        {
+            var func = _elementwiseModule.GetFunction("embedding_lookup_q4_1");
             nint* kArgs = stackalloc nint[4];
             kArgs[0] = (nint)(&outPtr);
             kArgs[1] = (nint)(&tablePtr);
@@ -1104,6 +1241,7 @@ public sealed class CudaBackend : IComputeBackend
     /// <inheritdoc />
     public unsafe void RmsNormResidual(ITensor output, ITensor residual, ITensor input, ITensor weight, float eps)
     {
+        _q8_1CacheGeneration++;
         var outT = (CudaTensor)output;
         var resT = (CudaTensor)residual;
         var inT = (CudaTensor)input;
@@ -1150,6 +1288,7 @@ public sealed class CudaBackend : IComputeBackend
     /// <inheritdoc />
     public unsafe void AddRmsNormResidual(ITensor output, ITensor hidden, ITensor residual, ITensor b, ITensor weight, float eps)
     {
+        _q8_1CacheGeneration++;
         var outT = (CudaTensor)output;
         var hidT = (CudaTensor)hidden;
         var resT = (CudaTensor)residual;
@@ -1174,6 +1313,7 @@ public sealed class CudaBackend : IComputeBackend
 
     public unsafe void AddRmsNorm(ITensor output, ITensor hidden, ITensor a, ITensor b, ITensor weight, float eps)
     {
+        _q8_1CacheGeneration++;
         var outT = (CudaTensor)output;
         var hidT = (CudaTensor)hidden;
         var aT = (CudaTensor)a;

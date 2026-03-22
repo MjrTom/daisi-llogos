@@ -343,6 +343,63 @@ __global__ void embedding_lookup_q4_k(float* output, const unsigned char* table,
     output[idx] = d * (float)sc * (float)nibble - dmin * (float)m;
 }
 
+// ── Q4_0 embedding lookup ─────────────────────────────────────────────────────
+// Flexible: handles both 18-byte and 20-byte (aligned) blocks via stride/offset params.
+
+__global__ void embedding_lookup_q4_0_v2(float* output, const unsigned char* table,
+                                          int hidden_dim, int token_id,
+                                          int block_stride, int nibble_offset)
+{
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= hidden_dim) return;
+
+    int blocks_per_row = hidden_dim / 32;
+    int bytes_per_row = blocks_per_row * block_stride;
+    const unsigned char* row = table + (long long)token_id * bytes_per_row;
+
+    int block_idx = idx / 32;
+    int elem_in_block = idx % 32;
+    const unsigned char* blk = row + block_idx * block_stride;
+
+    unsigned short scale_bits = ((unsigned short)blk[1] << 8) | blk[0];
+    float scale = fp16_to_fp32_emb(scale_bits);
+
+    int byte_idx = elem_in_block < 16 ? elem_in_block : (elem_in_block - 16);
+    unsigned char packed = blk[nibble_offset + byte_idx];
+    int nibble = (elem_in_block < 16) ? (packed & 0xF) : (packed >> 4);
+    output[idx] = scale * (float)(nibble - 8);
+}
+
+// ── Q4_1 embedding lookup ─────────────────────────────────────────────────────
+// Q4_1 block: 32 elements, 20 bytes.
+// Layout: 2b FP16 scale (d) + 2b FP16 min (m) + 16b packed nibbles.
+// Same nibble layout as Q4_0, but value = d * nibble + m (no subtract 8).
+
+__global__ void embedding_lookup_q4_1(float* output, const unsigned char* table,
+                                       int hidden_dim, int token_id)
+{
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= hidden_dim) return;
+
+    int blocks_per_row = hidden_dim / 32;
+    int bytes_per_row = blocks_per_row * 20;
+    const unsigned char* row = table + (long long)token_id * bytes_per_row;
+
+    int block_idx = idx / 32;
+    int elem_in_block = idx % 32;
+    const unsigned char* blk = row + block_idx * 20;
+
+    unsigned short d_bits = ((unsigned short)blk[1] << 8) | blk[0];
+    unsigned short m_bits = ((unsigned short)blk[3] << 8) | blk[2];
+    float d = fp16_to_fp32_emb(d_bits);
+    float m = fp16_to_fp32_emb(m_bits);
+
+    int byte_idx = elem_in_block < 16 ? elem_in_block : (elem_in_block - 16);
+    unsigned char packed = blk[4 + byte_idx];
+    int nibble = (elem_in_block < 16) ? (packed & 0xF) : (packed >> 4);
+    output[idx] = d * (float)nibble + m;
+}
+
 // ── Fused: Residual save + RMSNorm ────────────────────────────────────────────
 // residual[i] = input[i]; output[i] = (input[i] / rms) * weight[i]
 // Saves one kernel launch + one full read/write of the hidden state.

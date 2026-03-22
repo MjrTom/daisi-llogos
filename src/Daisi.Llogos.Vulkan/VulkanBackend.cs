@@ -92,6 +92,22 @@ public sealed class VulkanBackend : IComputeBackend
             return new VulkanTensor(_device, name, type, dimensions, aligned, isAlignedQ8_0: true);
         }
 
+        // Aligned Q4_0: repack 18→20 bytes for native uint32 reads
+        if (type == GgmlType.Q4_0 && dimensions.Length >= 2)
+        {
+            int blockCount = data.Length / 18;
+            var aligned = new byte[blockCount * 20];
+            for (int i = 0; i < blockCount; i++)
+            {
+                int srcOff = i * 18;
+                int dstOff = i * 20;
+                aligned[dstOff] = data[srcOff];
+                aligned[dstOff + 1] = data[srcOff + 1];
+                data.Slice(srcOff + 2, 16).CopyTo(aligned.AsSpan(dstOff + 4, 16));
+            }
+            return new VulkanTensor(_device, name, type, dimensions, aligned, isAlignedQ4_0: true);
+        }
+
         return new VulkanTensor(_device, name, type, dimensions, data);
     }
 
@@ -117,6 +133,9 @@ public sealed class VulkanBackend : IComputeBackend
             GgmlType.F16 => 4u,
             GgmlType.Q4_K => 5u,
             GgmlType.Q6_K => 6u,
+            GgmlType.Q4_0 => 8u,
+            GgmlType.Q4_1 => 9u,
+            GgmlType.Q5_K => 10u,
             _ => null,
         };
 
@@ -151,7 +170,7 @@ public sealed class VulkanBackend : IComputeBackend
         pc2[2] = (uint)N;
         pc2[3] = weightType;
 
-        uint rowsPerWg = weightType switch { 5 or 6 => 8u, 1 => 4u, _ => 1u };
+        uint rowsPerWg = weightType switch { 5 or 6 => 8u, 1 or 8 or 9 => 4u, _ => 1u };
         uint grid2 = ((uint)N + rowsPerWg - 1) / rowsPerWg;
         Dispatch(_matmulPipeline, ds2, pc2, 16, grid2, 1, 1);
     }
@@ -278,6 +297,8 @@ public sealed class VulkanBackend : IComputeBackend
             GgmlType.Q8_0 => 1u,
             GgmlType.F16 => 2u,
             GgmlType.Q4_K => 3u,
+            GgmlType.Q4_0 => 5u,
+            GgmlType.Q4_1 => 6u,
             _ => null,
         };
 

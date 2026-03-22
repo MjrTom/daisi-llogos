@@ -11,7 +11,7 @@ layout(push_constant) uniform PushConstants {
     uint M;
     uint K;
     uint N;
-    uint weightType; // 0=F32, 1=Q8_0, 2=TQ1_0, 3=I2_S, 4=F16, 5=Q4_K, 6=Q6_K
+    uint weightType; // 0=F32, 1=Q8_0, 2=TQ1_0, 3=I2_S, 4=F16, 5=Q4_K, 6=Q6_K, 8=Q4_0, 9=Q4_1, 10=Q5_K
 };
 
 layout(set = 0, binding = 0) buffer OutputBuf { float output_data[]; };
@@ -22,7 +22,7 @@ layout(set = 0, binding = 3) buffer WeightU32Buf { uint weight_u32[]; }; // uint
 shared float sdata[2]; // max 2 subgroups with local_size_x=64
 
 void main() {
-    uint rowsPerWg = (weightType == 5u || weightType == 6u || weightType == 7u) ? 8u : ((weightType == 1u) ? 4u : 1u);
+    uint rowsPerWg = (weightType == 5u || weightType == 6u || weightType == 7u) ? 8u : ((weightType == 1u || weightType == 8u || weightType == 9u) ? 4u : 1u);
     uint row = gl_WorkGroupID.x * rowsPerWg;
     uint tid = gl_LocalInvocationID.x;
     uint blockSize = gl_WorkGroupSize.x;
@@ -189,6 +189,129 @@ void main() {
             barrier();
         }
         return;
+    } else if (weightType == 8u) {
+        // Q4_0: 32 elements, 18 bytes per block (2b FP16 scale + 16b packed nibbles)
+        // lo nibble = elem[i], hi nibble = elem[i+16], values unsigned 0-15, subtract 8
+        // Multi-row: 4 output neurons per workgroup with activation reuse
+        const uint Q4_0_ROWS = 4;
+        uint blocksPerRow = K / 32;
+
+        float accs_q4_0[Q4_0_ROWS];
+        for (uint r = 0; r < Q4_0_ROWS; r++) accs_q4_0[r] = 0.0;
+
+        for (uint b = tid; b < blocksPerRow; b += blockSize) {
+            uint aBase = b * 32;
+
+            // Load activation (shared across rows)
+            vec4 a4[8];
+            for (uint i = 0; i < 8; i++)
+                a4[i] = vec4(input_data[aBase+i*4], input_data[aBase+i*4+1],
+                             input_data[aBase+i*4+2], input_data[aBase+i*4+3]);
+
+            for (uint r = 0; r < Q4_0_ROWS; r++) {
+                uint rn = row + r;
+                if (rn >= N) break;
+
+                uint blockOff = (rn * blocksPerRow + b) * 18;
+                uint scaleBits = uint(weight_data[blockOff]) | (uint(weight_data[blockOff + 1]) << 8);
+                float scale = unpackHalf2x16(scaleBits).x;
+
+                float blockSum = 0.0;
+                // Read nibbles from byte buffer (18-byte blocks are NOT 4-byte aligned)
+                for (uint i = 0; i < 4; i++) {
+                    uint qBase = blockOff + 2 + i * 4;
+                    uint packed = uint(weight_data[qBase])
+                                | (uint(weight_data[qBase+1]) << 8)
+                                | (uint(weight_data[qBase+2]) << 16)
+                                | (uint(weight_data[qBase+3]) << 24);
+                    // lo nibbles → elements [i*4 .. i*4+3]
+                    vec4 lo = vec4(float(int(packed       & 0xFu) - 8),
+                                   float(int((packed >> 8) & 0xFu) - 8),
+                                   float(int((packed >> 16)& 0xFu) - 8),
+                                   float(int((packed >> 24)& 0xFu) - 8));
+                    // hi nibbles → elements [i*4+16 .. i*4+19]
+                    vec4 hi = vec4(float(int((packed >> 4) & 0xFu) - 8),
+                                   float(int((packed >> 12)& 0xFu) - 8),
+                                   float(int((packed >> 20)& 0xFu) - 8),
+                                   float(int((packed >> 28)& 0xFu) - 8));
+                    blockSum += dot(a4[i], lo) + dot(a4[i + 4], hi);
+                }
+                accs_q4_0[r] += scale * blockSum;
+            }
+        }
+
+        for (uint r = 0; r < Q4_0_ROWS; r++) {
+            float val = subgroupAdd(accs_q4_0[r]);
+            if (gl_SubgroupInvocationID == 0) sdata[gl_SubgroupID] = val;
+            barrier();
+            if (gl_SubgroupID == 0) {
+                val = (gl_SubgroupInvocationID < gl_NumSubgroups) ? sdata[gl_SubgroupInvocationID] : 0.0;
+                val = subgroupAdd(val);
+                if (gl_SubgroupInvocationID == 0 && row + r < N) output_data[row + r] = val;
+            }
+            barrier();
+        }
+        return;
+    } else if (weightType == 9u) {
+        // Q4_1: 32 elements, 20 bytes per block (2b scale + 2b min + 16b nibbles)
+        // Same nibble layout as Q4_0, but value = d * nibble + m
+        // Multi-row: 4 output neurons per workgroup with activation reuse
+        const uint Q4_1_ROWS = 4;
+        uint blocksPerRow = K / 32;
+
+        float accs_q4_1[Q4_1_ROWS];
+        for (uint r = 0; r < Q4_1_ROWS; r++) accs_q4_1[r] = 0.0;
+
+        for (uint b = tid; b < blocksPerRow; b += blockSize) {
+            uint aBase = b * 32;
+
+            vec4 a4[8];
+            float asum = 0.0;
+            for (uint i = 0; i < 8; i++) {
+                a4[i] = vec4(input_data[aBase+i*4], input_data[aBase+i*4+1],
+                             input_data[aBase+i*4+2], input_data[aBase+i*4+3]);
+                asum += a4[i].x + a4[i].y + a4[i].z + a4[i].w;
+            }
+
+            for (uint r = 0; r < Q4_1_ROWS; r++) {
+                uint rn = row + r;
+                if (rn >= N) break;
+
+                uint blockOff = (rn * blocksPerRow + b) * 20;
+                uint dBits = uint(weight_data[blockOff]) | (uint(weight_data[blockOff + 1]) << 8);
+                uint mBits = uint(weight_data[blockOff + 2]) | (uint(weight_data[blockOff + 3]) << 8);
+                float d = unpackHalf2x16(dBits).x;
+                float m = unpackHalf2x16(mBits).x;
+
+                float blockSum = 0.0;
+                for (uint i = 0; i < 4; i++) {
+                    uint qBase = blockOff + 4 + i * 4;
+                    uint packed = uint(weight_data[qBase])
+                                | (uint(weight_data[qBase+1]) << 8)
+                                | (uint(weight_data[qBase+2]) << 16)
+                                | (uint(weight_data[qBase+3]) << 24);
+                    vec4 lo = vec4(float(packed & 0xFu), float((packed>>8)&0xFu),
+                                   float((packed>>16)&0xFu), float((packed>>24)&0xFu));
+                    vec4 hi = vec4(float((packed>>4)&0xFu), float((packed>>12)&0xFu),
+                                   float((packed>>20)&0xFu), float((packed>>28)&0xFu));
+                    blockSum += dot(a4[i], lo) + dot(a4[i + 4], hi);
+                }
+                accs_q4_1[r] += d * blockSum + m * asum;
+            }
+        }
+
+        for (uint r = 0; r < Q4_1_ROWS; r++) {
+            float val = subgroupAdd(accs_q4_1[r]);
+            if (gl_SubgroupInvocationID == 0) sdata[gl_SubgroupID] = val;
+            barrier();
+            if (gl_SubgroupID == 0) {
+                val = (gl_SubgroupInvocationID < gl_NumSubgroups) ? sdata[gl_SubgroupInvocationID] : 0.0;
+                val = subgroupAdd(val);
+                if (gl_SubgroupInvocationID == 0 && row + r < N) output_data[row + r] = val;
+            }
+            barrier();
+        }
+        return;
     } else if (weightType == 4u) {
         // F16 — read pairs via uint32 (2 × FP16 per uint32)
         uint pairsPerRow = K / 2;
@@ -336,6 +459,53 @@ void main() {
             barrier();
         }
         return;
+    } else if (weightType == 10u) {
+        // Q5_K: 256 elements, 176 bytes. Same scale structure as Q4_K but with 5-bit high bits.
+        // Layout: 2b d + 2b dmin + 12b scales/mins + 32b high bits (qh) + 128b low nibbles (qs)
+        uint sbPerRow = K / 256;
+        uint bytesPerRow = sbPerRow * 176;
+
+        for (uint sb = tid; sb < sbPerRow; sb += blockSize) {
+            uint sbOff = row * bytesPerRow + sb * 176;
+            uint aBase = sb * 256;
+
+            uint dWord = uint(weight_data[sbOff]) | (uint(weight_data[sbOff+1]) << 8);
+            uint dminWord = uint(weight_data[sbOff+2]) | (uint(weight_data[sbOff+3]) << 8);
+            float d = unpackHalf2x16(dWord).x;
+            float dmin = unpackHalf2x16(dminWord).x;
+
+            uint isIdx = 0;
+            uint u1 = 1u, u2 = 2u;
+            for (uint j = 0; j < 4; j++) {
+                // Unpack scales using same Q4_K method
+                uint j0 = isIdx, j1 = isIdx + 1;
+                int sc0, m0, sc1, m1;
+                if (j0 < 4) { sc0 = int(weight_data[sbOff+4+j0]) & 63; m0 = int(weight_data[sbOff+8+j0]) & 63; }
+                else { sc0 = (int(weight_data[sbOff+4+j0+4]) & 0xF) | ((int(weight_data[sbOff+4+j0-4]) >> 6) << 4);
+                       m0 = (int(weight_data[sbOff+4+j0+4]) >> 4) | ((int(weight_data[sbOff+4+j0]) >> 6) << 4); }
+                if (j1 < 4) { sc1 = int(weight_data[sbOff+4+j1]) & 63; m1 = int(weight_data[sbOff+8+j1]) & 63; }
+                else { sc1 = (int(weight_data[sbOff+4+j1+4]) & 0xF) | ((int(weight_data[sbOff+4+j1-4]) >> 6) << 4);
+                       m1 = (int(weight_data[sbOff+4+j1+4]) >> 4) | ((int(weight_data[sbOff+4+j1]) >> 6) << 4); }
+                float ss0 = d * float(sc0), sm0 = dmin * float(m0);
+                float ss1 = d * float(sc1), sm1 = dmin * float(m1);
+
+                for (uint l = 0; l < 32; l++) {
+                    uint qhByte = uint(weight_data[sbOff + 16 + l]);
+                    uint qsByte = uint(weight_data[sbOff + 48 + j * 32 + l]);
+
+                    int lo = int(qsByte & 0xFu);
+                    int hbLo = ((qhByte & u1) != 0u) ? 16 : 0;
+                    acc += input_data[aBase + j * 64 + l] * (ss0 * float(lo + hbLo) - sm0);
+
+                    int hi = int(qsByte >> 4);
+                    int hbHi = ((qhByte & u2) != 0u) ? 16 : 0;
+                    acc += input_data[aBase + j * 64 + l + 32] * (ss1 * float(hi + hbHi) - sm1);
+                }
+                u1 <<= 2;
+                u2 <<= 2;
+                isIdx += 2;
+            }
+        }
     }
 
     // Subgroup + cross-subgroup reduction

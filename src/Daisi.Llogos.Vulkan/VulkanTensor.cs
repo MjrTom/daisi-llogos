@@ -29,15 +29,18 @@ public sealed class VulkanTensor : ITensor
     }
 
     internal VulkanTensor(VulkanDevice vkDevice, string name, GgmlType type, ReadOnlySpan<long> dimensions, ReadOnlySpan<byte> data,
-        bool isAlignedQ8_0 = false)
+        bool isAlignedQ8_0 = false, bool isAlignedQ4_0 = false)
     {
         _vkDevice = vkDevice;
         Name = name;
         Type = type;
         IsAlignedQ8_0 = isAlignedQ8_0;
+        IsAlignedQ4_0 = isAlignedQ4_0;
         _dimensions = dimensions.ToArray();
         ElementCount = ComputeElementCount(dimensions);
-        ByteSize = isAlignedQ8_0 ? (ElementCount / 32) * 36 : (long)GgmlTypeInfo.ByteSize(type, (ulong)ElementCount);
+        ByteSize = isAlignedQ8_0 ? (ElementCount / 32) * 36
+                 : isAlignedQ4_0 ? (ElementCount / 32) * 20
+                 : (long)GgmlTypeInfo.ByteSize(type, (ulong)ElementCount);
 
         ulong bufSize = (ulong)Math.Max(ByteSize, 4);
         DeviceBuffer = new VulkanBuffer(vkDevice, bufSize, hostVisible: false, transferSrc: true, transferDst: true);
@@ -46,6 +49,7 @@ public sealed class VulkanTensor : ITensor
     }
 
     internal bool IsAlignedQ8_0 { get; }
+    internal bool IsAlignedQ4_0 { get; }
 
     public string Name { get; }
     public GgmlType Type { get; }
