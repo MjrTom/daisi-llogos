@@ -92,6 +92,14 @@ else
     if (options.VocabLimit.HasValue)
         forward.ArgMaxVocabLimit = config.VocabSize / options.VocabLimit.Value;
 
+    // Early exit profiling: measure at which layer the token prediction stabilizes
+    if (options.ProfileEarlyExit)
+    {
+        forward.EarlyExitProfile = true;
+        forward.EarlyExitTokens = new int[config.NumLayers];
+        Array.Fill(forward.EarlyExitTokens, -1);
+    }
+
     loadSw.Stop();
     var attnInfo = strategy.Mode switch
     {
@@ -146,6 +154,27 @@ else
                 Console.Write(token.Text);
             }
         }
+    }
+
+    // Print early exit profiling results
+    if (options.ProfileEarlyExit && forward.EarlyExitTokens != null)
+    {
+        Console.Error.WriteLine("\n[Early Exit Profile — token predicted at each layer]");
+        int finalToken = forward.EarlyExitTokens[config.NumLayers - 1];
+        int firstStableLayer = -1;
+        for (int i = config.NumLayers / 4; i < config.NumLayers; i++)
+        {
+            int tok = forward.EarlyExitTokens[i];
+            if (tok < 0) continue;
+            string tokStr = tok < tokenizer.Vocabulary.Count ? tokenizer.Vocabulary.IdToToken(tok) : $"<{tok}>";
+            bool isFinal = tok == finalToken;
+            Console.Error.Write($"  L{i}: {tok}({tokStr}){(isFinal ? " ✓" : " ✗")}");
+            if (isFinal && firstStableLayer < 0) firstStableLayer = i;
+            if ((i + 1) % 4 == 0) Console.Error.WriteLine();
+        }
+        if (firstStableLayer >= 0)
+            Console.Error.WriteLine($"\n  → Token stabilizes at layer {firstStableLayer}/{config.NumLayers} ({100 * firstStableLayer / config.NumLayers}% through)");
+        Console.Error.WriteLine();
     }
 
     forward.Dispose();
@@ -271,6 +300,9 @@ static CliArgs ParseArgs(string[] args)
             case "--vocab-limit":
                 result.VocabLimit = int.Parse(NextArg(args, ref i));
                 break;
+            case "--profile-early-exit":
+                result.ProfileEarlyExit = true;
+                break;
             case "--paged":
                 result.Paged = true;
                 break;
@@ -336,4 +368,5 @@ class CliArgs
     public bool Paged;
     public int OffloadPages;
     public int? VocabLimit;
+    public bool ProfileEarlyExit;
 }

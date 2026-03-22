@@ -49,6 +49,20 @@ internal static partial class CublasApi
         float* beta,
         ulong y, int incy);
 
+    /// <summary>
+    /// Single-precision GEMM: C = alpha * op(A) * op(B) + beta * C
+    /// </summary>
+    [LibraryImport(Lib, EntryPoint = "cublasSgemm_v2")]
+    internal static unsafe partial int Sgemm(
+        nint handle,
+        int transa, int transb,
+        int m, int n, int k,
+        float* alpha,
+        ulong A, int lda,
+        ulong B, int ldb,
+        float* beta,
+        ulong C, int ldc);
+
     // cuBLAS enums
     internal const int CUBLAS_OP_N = 0;
     internal const int CUBLAS_OP_T = 1;
