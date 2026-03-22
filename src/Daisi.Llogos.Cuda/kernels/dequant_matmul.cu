@@ -580,7 +580,7 @@ __global__ void dequant_matmul_f16(float* output, const float* a,
 // Multi-row: 2 output rows per CUDA block for weight data reuse.
 // Configurable thread count via template.
 
-#define Q4_0_DP4A_THREADS 128
+#define Q4_0_DP4A_THREADS 256
 #define Q4_0_DP4A_ROWS 8
 
 __global__ __launch_bounds__(Q4_0_DP4A_THREADS)

@@ -201,14 +201,14 @@ public sealed class CudaBackend : IComputeBackend
         ulong aPtr = aT.DevicePtr;
         ulong bPtr = bT.DevicePtr;
 
-        // Multi-row: Q8_0 = 4, Q4_0 = 4, Q4_K = 4, Q6_K = 2, others = 1 row per block
+        // Multi-row grid: must match each kernel's ROWS_PER_BLOCK constant
         uint gridX = b.Type switch {
-            GgmlType.Q8_0 => ((uint)N + 7) / 8,
-            GgmlType.Q4_0 => ((uint)N + 1) / 2,  // 2 rows per CUDA block (float kernel)
-            GgmlType.Q4_1 => ((uint)N + 7) / 8,  // 8 rows per block
-            GgmlType.Q4_K => ((uint)N + 7) / 8,  // 4 rows per block
-            GgmlType.Q6_K => ((uint)N + 7) / 8, // 2 rows per block
-            GgmlType.Q5_K => (uint)N, // 1 row per block (complex inner loop)
+            GgmlType.Q8_0 => ((uint)N + 3) / 4,  // Q8_ROWS_PER_BLOCK = 4
+            GgmlType.Q4_0 => ((uint)N + 1) / 2,  // Q4_0_ROWS_PER_BLOCK = 2 (float kernel)
+            GgmlType.Q4_1 => ((uint)N + 7) / 8,  // Q4_1_ROWS_PER_BLOCK = 8
+            GgmlType.Q4_K => ((uint)N + 3) / 4,  // Q4K_ROWS_PER_BLOCK = 4
+            GgmlType.Q6_K => ((uint)N + 1) / 2,  // Q6K_ROWS_PER_BLOCK = 2
+            GgmlType.Q5_K => (uint)N,             // Q5K_ROWS_PER_BLOCK = 1
             _ => (uint)N
         };
         // Adaptive block size: scale with the number of work items per row.
@@ -311,8 +311,8 @@ public sealed class CudaBackend : IComputeBackend
             ulong q8_1Ptr = _q8_1Scratch!.DevicePtr;
             var func = _matmulModule.GetFunction("dequant_matmul_q4_0_q8_1");
             int nVal = N;
-            uint dp4aGrid = ((uint)N + 7) / 8; // 2 rows per block
-            uint dp4aSmem = (128 / 32) * 8 * sizeof(float); // smem[nwarps][rows]
+            uint dp4aGrid = ((uint)N + 7) / 8; // Q4_0_DP4A_ROWS = 8
+            uint dp4aSmem = (256 / 32) * 8 * sizeof(float); // smem[8][8]
             nint* kArgs = stackalloc nint[6];
             kArgs[0] = (nint)(&outPtr);
             kArgs[1] = (nint)(&q8_1Ptr);
@@ -320,7 +320,7 @@ public sealed class CudaBackend : IComputeBackend
             kArgs[3] = (nint)(&M);
             kArgs[4] = (nint)(&K);
             kArgs[5] = (nint)(&nVal);
-            _stream.Launch(func, dp4aGrid, 1, 1, 128, 1, 1, dp4aSmem, kArgs);
+            _stream.Launch(func, dp4aGrid, 1, 1, 256, 1, 1, dp4aSmem, kArgs);
         }
         else if (b.Type == GgmlType.Q4_0 && _context.ComputeCapabilityMajor >= 12)
         {
@@ -359,8 +359,8 @@ public sealed class CudaBackend : IComputeBackend
 
             var func = _matmulModule.GetFunction("dequant_matmul_q4_0_q8_1");
             int nVal = N;
-            uint dp4aGrid = ((uint)N + 7) / 8; // 2 rows per block
-            uint dp4aSmem = (128 / 32) * 8 * sizeof(float); // smem[nwarps][rows]
+            uint dp4aGrid = ((uint)N + 7) / 8; // Q4_0_DP4A_ROWS = 8
+            uint dp4aSmem = (256 / 32) * 8 * sizeof(float); // smem[8][8]
             nint* kArgs = stackalloc nint[6];
             kArgs[0] = (nint)(&outPtr);
             kArgs[1] = (nint)(&q8_1Ptr);
@@ -368,7 +368,7 @@ public sealed class CudaBackend : IComputeBackend
             kArgs[3] = (nint)(&M);
             kArgs[4] = (nint)(&K);
             kArgs[5] = (nint)(&nVal);
-            _stream.Launch(func, dp4aGrid, 1, 1, 128, 1, 1, dp4aSmem, kArgs);
+            _stream.Launch(func, dp4aGrid, 1, 1, 256, 1, 1, dp4aSmem, kArgs);
         }
         else if (b.Type == GgmlType.Q4_1)
         {
