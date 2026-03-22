@@ -79,6 +79,8 @@ else
         kvCache = new KvCache(backend, config, maxSeqLen: maxContext, strategy: strategy);
     var deltaState = new DeltaNetState(backend, config, weights);
     var forward = new ForwardPass(backend, config, weights, kvCache, deltaState);
+    if (options.VocabLimit.HasValue)
+        forward.ArgMaxVocabLimit = config.VocabSize / options.VocabLimit.Value;
 
     loadSw.Stop();
     var attnInfo = strategy.Mode switch
@@ -256,6 +258,9 @@ static CliArgs ParseArgs(string[] args)
             case "--attention":
                 result.Attention = NextArg(args, ref i);
                 break;
+            case "--vocab-limit":
+                result.VocabLimit = int.Parse(NextArg(args, ref i));
+                break;
             case "--paged":
                 result.Paged = true;
                 break;
@@ -293,6 +298,7 @@ static void PrintUsage()
           --seed <n>               Random seed for reproducibility
           --backend, -b <name>     Compute backend: cpu, cuda, or vulkan (default: cpu)
           --bench                  Run benchmark (prefill + decode timing)
+          --vocab-limit <n>        Vocab divisor for greedy argmax (1=full, 32=3%, default: 32)
           --no-mmap                Disable memory-mapped loading (use stream loading)
           --attention <mode>       Attention strategy: full, window:<N>, sinks:<S>,<W> (default: full)
           --paged                  Use paged KV cache (dynamic allocation, grows with context)
@@ -319,4 +325,5 @@ class CliArgs
     public string Attention = "full";
     public bool Paged;
     public int OffloadPages;
+    public int? VocabLimit;
 }
