@@ -203,11 +203,11 @@ public sealed class CudaBackend : IComputeBackend
 
         // Multi-row: Q8_0 = 4, Q4_0 = 4, Q4_K = 4, Q6_K = 2, others = 1 row per block
         uint gridX = b.Type switch {
-            GgmlType.Q8_0 => ((uint)N + 3) / 4,
+            GgmlType.Q8_0 => ((uint)N + 7) / 8,
             GgmlType.Q4_0 => ((uint)N + 1) / 2,  // 2 rows per CUDA block (float kernel)
             GgmlType.Q4_1 => ((uint)N + 7) / 8,  // 8 rows per block
-            GgmlType.Q4_K => ((uint)N + 3) / 4,  // 4 rows per block
-            GgmlType.Q6_K => ((uint)N + 3) / 4, // 2 rows per block
+            GgmlType.Q4_K => ((uint)N + 7) / 8,  // 4 rows per block
+            GgmlType.Q6_K => ((uint)N + 7) / 8, // 2 rows per block
             _ => (uint)N
         };
         // Adaptive block size: scale with the number of work items per row.
@@ -310,8 +310,8 @@ public sealed class CudaBackend : IComputeBackend
             ulong q8_1Ptr = _q8_1Scratch!.DevicePtr;
             var func = _matmulModule.GetFunction("dequant_matmul_q4_0_q8_1");
             int nVal = N;
-            uint dp4aGrid = ((uint)N + 3) / 4; // 2 rows per block
-            uint dp4aSmem = (256 / 32) * 4 * sizeof(float); // smem[nwarps][rows]
+            uint dp4aGrid = ((uint)N + 7) / 8; // 2 rows per block
+            uint dp4aSmem = (256 / 32) * 8 * sizeof(float); // smem[nwarps][rows]
             nint* kArgs = stackalloc nint[6];
             kArgs[0] = (nint)(&outPtr);
             kArgs[1] = (nint)(&q8_1Ptr);
@@ -358,8 +358,8 @@ public sealed class CudaBackend : IComputeBackend
 
             var func = _matmulModule.GetFunction("dequant_matmul_q4_0_q8_1");
             int nVal = N;
-            uint dp4aGrid = ((uint)N + 3) / 4; // 2 rows per block
-            uint dp4aSmem = (256 / 32) * 4 * sizeof(float); // smem[nwarps][rows]
+            uint dp4aGrid = ((uint)N + 7) / 8; // 2 rows per block
+            uint dp4aSmem = (256 / 32) * 8 * sizeof(float); // smem[nwarps][rows]
             nint* kArgs = stackalloc nint[6];
             kArgs[0] = (nint)(&outPtr);
             kArgs[1] = (nint)(&q8_1Ptr);
