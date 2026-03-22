@@ -39,16 +39,18 @@ dp4a is now the default Q4_0 path on pre-Blackwell GPUs, with architecture-adapt
 
 ### Current Standing (RTX 5080, decode tok/s, 128 tokens)
 
-**Exceeding llama.cpp on 3 of 6 CUDA models, matching within 2% on a fourth.**
+**Exceeding llama.cpp on 4 of 8 CUDA models across three architectures.**
 
 | Model | Llogos CUDA | llama.cpp CUDA | % |
 |-------|--------:|--------:|--------:|
-| 0.8B Q8_0 | **436** | 399 | **109%** |
-| 4B Q8_0 | **142** | 135 | **105%** |
-| 8B Q8_0 | 90 | 92 | 98% |
-| 8B Q4_K_M | 122 | 138 | 88% |
-| 9B Q8_0 | **86** | 84 | **102%** |
-| 9B Q4_0 | 100 | 123 | 81% |
+| 0.8B Q8_0 | **441** | 399 | **110%** |
+| TinyLlama 1.1B Q8_0 | **448** | 443 | **101%** |
+| 4B Q8_0 | **144** | 135 | **107%** |
+| 8B Q8_0 | 91 | 92 | 99% |
+| DeepSeek R1 8B Q8_0 | 94 | 95 | 99% |
+| 8B Q4_K_M | 124 | 138 | 90% |
+| 9B Q8_0 | **88** | 84 | **105%** |
+| 9B Q4_0 | 101 | 123 | 82% |
 
 ### Remaining Gaps
 - **CUDA 4-bit quants** (81-88%): Q4_0 float kernel is compute-bound on nibble extraction; dp4a matches float on Blackwell but doesn't exceed it. Q4_K needs dp4a implementation.
