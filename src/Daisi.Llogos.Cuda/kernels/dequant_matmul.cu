@@ -843,7 +843,7 @@ void dequant_matmul_q4_0_q8_1(float* __restrict__ output,
     const int blocks_per_row = K / 32;
     const long bytes_per_row = (long)blocks_per_row * 20;
     const unsigned char* a_q8_1 = (const unsigned char*)vq8_1;
-    const int nwarps = Q4_0_DP4A_THREADS 256/ 32;
+    const int nwarps = Q4_0_DP4A_THREADS / 32;
 
     float sums[Q4_0_DP4A_ROWS] = {0};
 
@@ -898,7 +898,7 @@ void dequant_matmul_q4_0_q8_1(float* __restrict__ output,
     }
 
     // Warp + cross-warp reduction
-    __shared__ float smem[Q4_0_DP4A_THREADS 256/ 32][Q4_0_DP4A_ROWS];
+    __shared__ float smem[Q4_0_DP4A_THREADS / 32][Q4_0_DP4A_ROWS];
 
     #pragma unroll
     for (int r = 0; r < Q4_0_DP4A_ROWS; r++) {
