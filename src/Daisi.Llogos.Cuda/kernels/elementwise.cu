@@ -1141,7 +1141,8 @@ __device__ float fp16_to_fp32_dq(unsigned short h)
 
 __global__ void dequant_to_f32(float* __restrict__ output,
                                 const unsigned char* __restrict__ input,
-                                int totalElements, int typeTag, int blockSizeQ)
+                                int totalElements, int typeTag, int blockSizeQ,
+                                int isAligned)
 {
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
     if (idx >= totalElements) return;
@@ -1151,18 +1152,32 @@ __global__ void dequant_to_f32(float* __restrict__ output,
 
     float val = 0.0f;
 
-    if (typeTag == 8) { // Q8_0: 36 bytes per 32 elements (aligned: scale+pad+quants)
+    if (typeTag == 8 && isAligned) { // Q8_0 aligned: 36 bytes per 32 elements (scale+pad+quants)
         const unsigned char* bp = input + blk * 36;
         float scale = fp16_to_fp32_dq(((unsigned short)bp[1] << 8) | bp[0]);
         val = scale * (float)((signed char)bp[4 + elem]);
     }
-    else if (typeTag == 2) { // Q4_0: 20 bytes per 32 elements (aligned: scale+pad+nibbles)
+    else if (typeTag == 8) { // Q8_0 unaligned: 34 bytes per 32 elements (scale+quants)
+        const unsigned char* bp = input + blk * 34;
+        float scale = fp16_to_fp32_dq(((unsigned short)bp[1] << 8) | bp[0]);
+        val = scale * (float)((signed char)bp[2 + elem]);
+    }
+    else if (typeTag == 2 && isAligned) { // Q4_0 aligned: 20 bytes per 32 elements (scale+pad+nibbles)
         const unsigned char* bp = input + blk * 20;
         float scale = fp16_to_fp32_dq(((unsigned short)bp[1] << 8) | bp[0]);
         if (elem < 16) {
             val = scale * (float)((int)(bp[4 + elem] & 0xF) - 8);
         } else {
             val = scale * (float)((int)(bp[4 + elem - 16] >> 4) - 8);
+        }
+    }
+    else if (typeTag == 2) { // Q4_0 unaligned: 18 bytes per 32 elements (scale+nibbles)
+        const unsigned char* bp = input + blk * 18;
+        float scale = fp16_to_fp32_dq(((unsigned short)bp[1] << 8) | bp[0]);
+        if (elem < 16) {
+            val = scale * (float)((int)(bp[2 + elem] & 0xF) - 8);
+        } else {
+            val = scale * (float)((int)(bp[2 + elem - 16] >> 4) - 8);
         }
     }
     else if (typeTag == 1) { // F16: 2 bytes per element

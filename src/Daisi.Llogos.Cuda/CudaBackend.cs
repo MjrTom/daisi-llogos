@@ -133,16 +133,17 @@ public sealed class CudaBackend : IComputeBackend
             // GPU dequant kernel: expand quantized weight to FP32
             var func = _elementwiseModule.GetFunction("dequant_to_f32");
             int totalElements = K * N;
-            int typeSize = Gguf.GgmlTypeInfo.TypeSize(bT.Type);
             int blockSize = Gguf.GgmlTypeInfo.BlockSize(bT.Type);
             int typeTag = (int)bT.Type;
+            int isAligned = (bT.IsAlignedQ8_0 || bT.IsAlignedQ4_0) ? 1 : 0;
             uint grid = (uint)((totalElements + BlockSize - 1) / BlockSize);
-            nint* dArgs = stackalloc nint[5];
+            nint* dArgs = stackalloc nint[6];
             dArgs[0] = (nint)(&bF32Ptr);
             dArgs[1] = (nint)(&bPtr);
             dArgs[2] = (nint)(&totalElements);
             dArgs[3] = (nint)(&typeTag);
             dArgs[4] = (nint)(&blockSize);
+            dArgs[5] = (nint)(&isAligned);
             _stream.Launch(func, grid, 1, 1, (uint)BlockSize, 1, 1, 0, dArgs);
         }
         else
@@ -1237,6 +1238,7 @@ public sealed class CudaBackend : IComputeBackend
     /// <inheritdoc />
     public void CopyTensorSlice(ITensor dst, int dstOffset, ITensor src, int srcOffset, int count)
     {
+        _q8_1CacheGeneration++; // destination data changes — invalidate Q8_1 cache
         EnsureContext();
         var dstT = (CudaTensor)dst;
         var srcT = (CudaTensor)src;
