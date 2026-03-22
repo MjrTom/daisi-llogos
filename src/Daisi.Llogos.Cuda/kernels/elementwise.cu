@@ -1218,4 +1218,102 @@ __global__ void dequant_to_f32(float* __restrict__ output,
     output[idx] = val;
 }
 
+// ── FP32 → FP16 conversion (for tensor core batch matmul) ────────────────────
+
+__device__ unsigned short fp32_to_fp16_cvt(float val)
+{
+    unsigned short result;
+    asm("cvt.rn.f16.f32 %0, %1;" : "=h"(result) : "f"(val));
+    return result;
+}
+
+__global__ void fp32_to_fp16(unsigned short* output, const float* input, int n)
+{
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx < n)
+        output[idx] = fp32_to_fp16_cvt(input[idx]);
+}
+
+// ── Dequantize weight tensor to FP16 (for tensor core batch matmul) ─────────
+
+__global__ void dequant_to_f16(unsigned short* __restrict__ output,
+                                const unsigned char* __restrict__ input,
+                                int totalElements, int typeTag, int blockSizeQ,
+                                int isAligned)
+{
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= totalElements) return;
+
+    int blk = idx / blockSizeQ;
+    int elem = idx % blockSizeQ;
+
+    float val = 0.0f;
+
+    if (typeTag == 8 && isAligned) {
+        const unsigned char* bp = input + blk * 36;
+        float scale = fp16_to_fp32_dq(((unsigned short)bp[1] << 8) | bp[0]);
+        val = scale * (float)((signed char)bp[4 + elem]);
+    }
+    else if (typeTag == 8) {
+        const unsigned char* bp = input + blk * 34;
+        float scale = fp16_to_fp32_dq(((unsigned short)bp[1] << 8) | bp[0]);
+        val = scale * (float)((signed char)bp[2 + elem]);
+    }
+    else if (typeTag == 2 && isAligned) {
+        const unsigned char* bp = input + blk * 20;
+        float scale = fp16_to_fp32_dq(((unsigned short)bp[1] << 8) | bp[0]);
+        if (elem < 16) val = scale * (float)((int)(bp[4 + elem] & 0xF) - 8);
+        else val = scale * (float)((int)(bp[4 + elem - 16] >> 4) - 8);
+    }
+    else if (typeTag == 2) {
+        const unsigned char* bp = input + blk * 18;
+        float scale = fp16_to_fp32_dq(((unsigned short)bp[1] << 8) | bp[0]);
+        if (elem < 16) val = scale * (float)((int)(bp[2 + elem] & 0xF) - 8);
+        else val = scale * (float)((int)(bp[2 + elem - 16] >> 4) - 8);
+    }
+    else if (typeTag == 1) {
+        output[idx] = ((const unsigned short*)input)[idx];
+        return;
+    }
+    else if (typeTag == 12) { // Q4_K
+        const unsigned char* sbp = input + blk * 144;
+        float d = fp16_to_fp32_dq(((unsigned short)sbp[1] << 8) | sbp[0]);
+        float dmin = fp16_to_fp32_dq(((unsigned short)sbp[3] << 8) | sbp[2]);
+        int subBlock = elem / 32;
+        int subElem = elem % 32;
+        unsigned char rawScale = sbp[4 + subBlock];
+        float sc, mn;
+        if (subBlock < 4) {
+            sc = (float)(rawScale & 0x3F);
+            mn = (float)(sbp[4 + subBlock + 4] & 0x3F);
+        } else {
+            unsigned char low = rawScale;
+            unsigned char highBits = sbp[4 + subBlock - 4];
+            sc = (float)((low & 0x3F) | ((highBits >> 4) & 0x0C));
+            mn = (float)(((low >> 4) & 0x0F) | ((sbp[4 + subBlock] >> 2) & 0x30));
+        }
+        const unsigned char* qs = sbp + 16 + subBlock * 16 + (subElem < 16 ? 0 : -16);
+        int nibbleIdx = subElem < 16 ? subElem : subElem - 16;
+        unsigned char qByte = qs[nibbleIdx];
+        int qval = subElem < 16 ? (qByte & 0xF) : (qByte >> 4);
+        val = d * sc * (float)qval - dmin * mn;
+    }
+    else if (typeTag == 14) { // Q6_K
+        const unsigned char* sbp = input + blk * 210;
+        int subBlock = elem / 16;
+        int subElem = elem % 16;
+        float d = fp16_to_fp32_dq(((unsigned short)sbp[209] << 8) | sbp[208]);
+        signed char sc = ((const signed char*)sbp)[192 + subBlock];
+        const unsigned char* ql = sbp + subBlock * 16;
+        const unsigned char* qh = sbp + 128 + subBlock * 8;
+        int low, high;
+        if (subElem < 8) { low = ql[subElem] & 0xF; high = (qh[subElem] & 3) << 4; }
+        else { low = ql[subElem - 8] >> 4; high = ((qh[subElem - 8] >> 2) & 3) << 4; }
+        int qval = low | high;
+        val = d * (float)sc * ((float)qval - 32.0f);
+    }
+
+    output[idx] = fp32_to_fp16_cvt(val);
+}
+
 } // extern "C"
