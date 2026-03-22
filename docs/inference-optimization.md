@@ -20,19 +20,19 @@ RTX 5080, CUDA 12, greedy sampling (temperature=0). llama.cpp b8461 CUDA.
 
 ### Prefill (tok/s, 128 prompt tokens)
 
-| Model | Architecture | Llogos | llama.cpp | Ratio | Batched? |
-|-------|-------------|-------:|----------:|------:|----------|
-| Qwen3.5-0.8B Q8_0 | DeltaNet hybrid | 477 | 13,794 | 0.03x | No (sequential) |
-| TinyLlama 1.1B Q8_0 | LLaMA | **2,050** | 15,730 | 0.13x | **Yes** |
-| Qwen3.5-4B Q8_0 | DeltaNet hybrid | 151 | 5,704 | 0.03x | No (sequential) |
-| Qwen3-8B Q8_0 | Standard attention | **456** | 5,184 | 0.09x | **Yes** |
-| Qwen3-8B Q4_K_M | Standard attention | **462** | 5,278 | 0.09x | **Yes** |
-| Qwen3.5-9B Q8_0 | DeltaNet hybrid | 89 | 4,714 | 0.02x | No (sequential) |
-| Qwen3.5-9B Q4_0 | DeltaNet hybrid | 105 | 4,954 | 0.02x | No (sequential) |
+| Model | Architecture | Llogos | llama.cpp | Ratio | Batch mode |
+|-------|-------------|-------:|----------:|------:|------------|
+| Qwen3.5-0.8B Q8_0 | DeltaNet hybrid | 346 | 13,794 | 0.03x | Hybrid (too small to benefit) |
+| TinyLlama 1.1B Q8_0 | LLaMA | **2,050** | 15,730 | 0.13x | Full batch |
+| Qwen3.5-4B Q8_0 | DeltaNet hybrid | **224** | 5,704 | 0.04x | Hybrid (1.5x vs sequential) |
+| Qwen3-8B Q8_0 | Standard attention | **456** | 5,184 | 0.09x | Full batch |
+| Qwen3-8B Q4_K_M | Standard attention | **462** | 5,278 | 0.09x | Full batch |
+| Qwen3.5-9B Q8_0 | DeltaNet hybrid | **165** | 4,714 | 0.04x | Hybrid (1.8x vs sequential) |
+| Qwen3.5-9B Q4_0 | DeltaNet hybrid | **155** | 4,954 | 0.03x | Hybrid (1.5x vs sequential) |
 
 We exceed llama.cpp on decode for 3 of 7 models, across DeltaNet and standard attention architectures. The remaining decode gap on 4-bit quants is from our Q4_0 float kernel being compute-bound on nibble extraction.
 
-Prefill is a large gap: llama.cpp uses fused quantized GEMM via cuBLASLt with tensor cores, while our batched path dequantizes to FP32 then calls cuBLAS SGEMM. The batched models (TinyLlama, Qwen3) achieve 5-9x speedup over their own sequential prefill, but llama.cpp's fused approach is 8-12x faster still. DeltaNet models fall back to sequential prefill (no batching) due to sequential state dependencies.
+Prefill is a large gap: llama.cpp uses fused quantized GEMM via cuBLASLt with tensor cores, while our batched path dequantizes to FP32 then calls cuBLAS SGEMM. Pure attention models achieve 5-9x speedup over sequential prefill; DeltaNet hybrids achieve 1.5-1.8x (only RmsNorm, FFN, and attention layers are batched; DeltaNet state updates remain sequential). llama.cpp's fused approach is 8-30x faster on prefill overall.
 
 ## 1. Partial Vocabulary Logit Computation
 
