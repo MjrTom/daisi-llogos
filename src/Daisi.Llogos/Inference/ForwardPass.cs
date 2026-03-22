@@ -623,26 +623,47 @@ public sealed class ForwardPass : IForwardPass
         int M = tokenIds.Length;
         ForwardBatchedPrefill(tokenIds, startPosition);
 
-        // Compute argmax at each of the M positions
-        // _bHidden has [M × hiddenDim] after the forward pass
+        // Batched: norm all M hidden states, project through lm_head, per-row argmax
         int hDim = _config.HiddenDim;
         int vocabLimit = ArgMaxVocabLimit;
         var results = new int[M];
 
+        // _bHidden has [M × hiddenDim], _bNormOut has [M × hiddenDim]
+        // Batched RmsNorm: normalize each row independently
+        _backend.RmsNorm(_bNormOut!, _bHidden!, _weights.OutputNorm, _config.NormEps);
+
+        // Batched lm_head: [M × hiddenDim] × [hiddenDim × vocabLimit] → [M × vocabLimit]
+        // Need M-wide logits buffer
+        int K = (int)_weights.OutputWeight.Dimensions[0];
+        int N = Math.Min((int)_weights.OutputWeight.Dimensions[1], vocabLimit);
+        if (_bLogits == null || _bLogitsSize < M * N)
+        {
+            _bLogits?.Dispose();
+            _bLogits = _backend.CreateTensor("batch_logits", Gguf.GgmlType.F32, [(long)(M * N)]);
+            _bLogitsSize = M * N;
+        }
+        _backend.MatMul(_bLogits, _bNormOut!, _weights.OutputWeight, M, K, N);
+
+        // Per-row argmax
+        var logitsBuf = new float[_bLogitsSize];
+        _bLogits.DequantizeTo(logitsBuf);
         for (int t = 0; t < M; t++)
         {
-            // Extract token t's hidden state
-            _backend.CopyTensorSlice(_hidden, 0, _bHidden!, t * hDim, hDim);
-
-            _backend.BeginCommands();
-            _backend.RmsNorm(_normOut, _hidden, _weights.OutputNorm, _config.NormEps);
-            ProjectLinearPartial(_logits, _normOut, _weights.OutputWeight, vocabLimit);
-            _backend.FlushCommands();
-            results[t] = _backend.ArgMax(_logits, vocabLimit);
+            int bestIdx = 0;
+            float bestVal = logitsBuf[t * N];
+            for (int j = 1; j < N; j++)
+            {
+                float v = logitsBuf[t * N + j];
+                if (v > bestVal) { bestVal = v; bestIdx = j; }
+            }
+            results[t] = bestIdx;
         }
 
         return results;
     }
+
+    private ITensor? _bLogits;
+    private int _bLogitsSize;
 
     private void BatchedForwardStandardAttention(StandardAttentionWeights w, int startPosition, int layer, int M)
     {
@@ -777,6 +798,7 @@ public sealed class ForwardPass : IForwardPass
     public void Dispose()
     {
         DisposeBatchBuffers();
+        _bLogits?.Dispose();
         _hidden.Dispose();
         _residual.Dispose();
         _normOut.Dispose();

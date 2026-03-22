@@ -62,9 +62,11 @@ else
 {
     // ── Standard path (Qwen / hybrid) ───────────────────────────────────────
     // Build vocab remapper if partial vocab is active (vocab-limit > 1)
+    // Disable remapping when using speculative decoding (remapper doesn't work across model sizes)
+    // But still use partial vocab for faster argmax — common tokens are typically in the low ID range
     VocabRemapper? remapper = null;
     int vocabDivisor = options.VocabLimit ?? 32;
-    if (vocabDivisor > 1)
+    if (vocabDivisor > 1 && options.DraftModelPath == null)
     {
         var tokens = gguf.GetMetadata<string[]>("tokenizer.ggml.tokens")!;
         remapper = new VocabRemapper(tokens);
