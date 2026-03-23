@@ -130,6 +130,72 @@ function dequantizeToF32(buffer: ArrayBuffer, type: GgmlType, elementCount: numb
     return result;
   }
 
+  if (type === GgmlType.Q4_1) {
+    // Q4_1: 20 bytes per block of 32 elements = [f16 delta][f16 min][16 bytes nibbles]
+    const blockCount = Math.ceil(elementCount / 32);
+    for (let b = 0; b < blockCount; b++) {
+      const bo = b * 20;
+      const delta = f16ToF32(view.getUint16(bo, true));
+      const min = f16ToF32(view.getUint16(bo + 2, true));
+      for (let j = 0; j < 16; j++) {
+        const byteVal = bytes[bo + 4 + j];
+        const lo = byteVal & 0x0F;
+        const hi = (byteVal >> 4) & 0x0F;
+        const idx = b * 32;
+        if (idx + j < elementCount) result[idx + j] = delta * lo + min;
+        if (idx + j + 16 < elementCount) result[idx + j + 16] = delta * hi + min;
+      }
+    }
+    return result;
+  }
+
+  if (type === GgmlType.Q5_0) {
+    // Q5_0: 22 bytes per block of 32 elements = [f16 scale][4 bytes high-bits][16 bytes nibbles]
+    const blockCount = Math.ceil(elementCount / 32);
+    for (let b = 0; b < blockCount; b++) {
+      const bo = b * 22;
+      const scale = f16ToF32(view.getUint16(bo, true));
+      const highBits = view.getUint32(bo + 2, true);
+      for (let j = 0; j < 16; j++) {
+        const byteVal = bytes[bo + 6 + j];
+        const lo4 = byteVal & 0x0F;
+        const hi4 = (byteVal >> 4) & 0x0F;
+        const loBit = (highBits >> j) & 1;
+        const hiBit = (highBits >> (j + 16)) & 1;
+        const q5lo = lo4 | (loBit << 4);
+        const q5hi = hi4 | (hiBit << 4);
+        const idx = b * 32;
+        if (idx + j < elementCount) result[idx + j] = scale * (q5lo - 16);
+        if (idx + j + 16 < elementCount) result[idx + j + 16] = scale * (q5hi - 16);
+      }
+    }
+    return result;
+  }
+
+  if (type === GgmlType.Q5_1) {
+    // Q5_1: 24 bytes per block of 32 elements = [f16 delta][f16 min][4 bytes high-bits][16 bytes nibbles]
+    const blockCount = Math.ceil(elementCount / 32);
+    for (let b = 0; b < blockCount; b++) {
+      const bo = b * 24;
+      const delta = f16ToF32(view.getUint16(bo, true));
+      const min = f16ToF32(view.getUint16(bo + 2, true));
+      const highBits = view.getUint32(bo + 4, true);
+      for (let j = 0; j < 16; j++) {
+        const byteVal = bytes[bo + 8 + j];
+        const lo4 = byteVal & 0x0F;
+        const hi4 = (byteVal >> 4) & 0x0F;
+        const loBit = (highBits >> j) & 1;
+        const hiBit = (highBits >> (j + 16)) & 1;
+        const q5lo = lo4 | (loBit << 4);
+        const q5hi = hi4 | (hiBit << 4);
+        const idx = b * 32;
+        if (idx + j < elementCount) result[idx + j] = delta * q5lo + min;
+        if (idx + j + 16 < elementCount) result[idx + j + 16] = delta * q5hi + min;
+      }
+    }
+    return result;
+  }
+
   throw new Error(`Unsupported dequant type: ${GgmlType[type]} (${type})`);
 }
 
@@ -150,7 +216,7 @@ function f16ToF32(bits: number): number {
 }
 
 /** Quant types that have a GPU matmul shader. Others get dequanted to F32. */
-const GPU_MATMUL_TYPES = new Set([GgmlType.F32, GgmlType.Q8_0]);
+const GPU_MATMUL_TYPES = new Set([GgmlType.F32, GgmlType.Q4_0, GgmlType.Q8_0]);
 
 /** A weight tensor with its quant type. */
 interface WeightBuffer {

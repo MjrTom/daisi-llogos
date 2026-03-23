@@ -8,5 +8,6 @@ export { parseGguf, type GgufModelInfo, type GgufTensorInfo } from './gguf/gguf-
 export { GgmlType } from './gguf/quantization.js';
 export { type GpuCapabilities } from './gpu/device.js';
 export { type SamplerOptions } from './model/sampler.js';
+export { type ChatMessage } from './tokenizer/chat-template.js';
 export { BpeTokenizer } from './tokenizer/bpe-tokenizer.js';
 export { type DownloadProgress } from './storage/download-manager.js';

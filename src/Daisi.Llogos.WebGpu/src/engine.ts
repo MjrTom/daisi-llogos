@@ -12,9 +12,11 @@
 import { initGpu, isWebGpuAvailable, GpuCapabilities, GpuContext } from './gpu/device.js';
 import { ComputeEngine } from './gpu/compute.js';
 import { fetchGgufHeader, parseGguf, GgufModelInfo, GgufTensorInfo } from './gguf/gguf-parser.js';
+import { GgmlType } from './gguf/quantization.js';
 import { downloadFile, extractTensorData, DownloadProgress } from './storage/download-manager.js';
 import { GgmlType } from './gguf/quantization.js';
 import { BpeTokenizer, tokenizerFromGguf } from './tokenizer/bpe-tokenizer.js';
+import { applyTemplate, ChatMessage } from './tokenizer/chat-template.js';
 import { LlamaModel } from './model/llama-model.js';
 import { Sampler, SamplerOptions } from './model/sampler.js';
 
@@ -68,10 +70,18 @@ export class LlogosEngine {
     this._status = 'loading';
 
     try {
-      // Phase 1: Parse header
+      // Phase 1: Parse header and estimate VRAM
       options?.onProgress?.({ phase: 'Parsing header', bytesDownloaded: 0, totalBytes: 0 });
       let info = await fetchGgufHeader(url);
       this.modelInfo = info;
+
+      const estimate = this.estimateVram(info);
+      const maxBuffer = this.gpu?.capabilities.maxBufferSize ?? 0;
+      if (maxBuffer > 0 && estimate.totalBytes > maxBuffer * 4) {
+        // Rough check — maxBuffer is per-buffer limit, total can be higher,
+        // but if estimate is 4x the per-buffer limit, it probably won't fit
+        console.warn(`[llogos] Model may not fit: estimated ${Math.round(estimate.totalBytes / 1024 / 1024)} MB, max buffer ${Math.round(maxBuffer / 1024 / 1024)} MB`);
+      }
 
       // Download entire GGUF file (single fetch, cached)
       let isCached = false;
@@ -130,14 +140,10 @@ export class LlogosEngine {
         finalPrompt = this.applyChatTemplate(prompt);
       }
 
-      // Encode prompt — only add BOS for first message (no KV cache yet)
+      // Encode prompt
       const inputTokens: number[] = [];
-      if (this.model.position === 0 && this.tokenizer.bosTokenId >= 0) {
+      if (this.model.position === 0 && this.tokenizer.bosTokenId >= 0 && options?.raw) {
         inputTokens.push(this.tokenizer.bosTokenId);
-      }
-      // Add a newline separator between turns if continuing conversation
-      if (this.model.position > 0) {
-        inputTokens.push(...this.tokenizer.encode('\n'));
       }
       inputTokens.push(...this.tokenizer.encode(finalPrompt));
       const allTokens = [...inputTokens];
@@ -170,9 +176,10 @@ export class LlogosEngine {
     }
   }
 
-  /** Reset the KV cache for a new conversation. */
+  /** Reset the KV cache and conversation history for a new conversation. */
   resetSession(): void {
     this.model?.resetCache();
+    this.conversationHistory = [];
   }
 
   /** Unload model and free GPU memory. */
@@ -189,25 +196,94 @@ export class LlogosEngine {
     return this.compute?.buffers.vramUsage ?? 0;
   }
 
-  /**
-   * Apply chat template based on model architecture.
-   * Wraps user message in the appropriate format.
-   */
-  private applyChatTemplate(userMessage: string): string {
-    const arch = this.modelInfo?.architecture ?? '';
-    const chatTemplate = this.modelInfo?.metadata.get('tokenizer.chat_template') as string | undefined;
+  // GPU types that stay quantized (have native GPU shaders)
+  private static GPU_NATIVE_TYPES = new Set([GgmlType.F32, GgmlType.Q8_0, GgmlType.Q4_0]);
 
-    // ChatML format — only if the model actually has the special tokens
-    if (this.tokenizer && this.tokenizer.getTokenId('<|im_start|>') >= 0) {
-      return `<|im_start|>user\n${userMessage}<|im_end|>\n<|im_start|>assistant\n`;
+  /**
+   * Estimate VRAM needed for a model before downloading.
+   * Returns breakdown in bytes: weights, kvCache, working, total.
+   */
+  estimateVram(info: GgufModelInfo): { weightsBytes: number; kvCacheBytes: number; workingBytes: number; totalBytes: number } {
+    // Weights: native types keep their size, others dequant to F32
+    let weightsBytes = 0;
+    for (const tensor of info.tensors) {
+      if (LlogosEngine.GPU_NATIVE_TYPES.has(tensor.type)) {
+        weightsBytes += tensor.byteSize;
+      } else {
+        weightsBytes += tensor.elementCount * 4; // dequant to F32
+      }
     }
 
-    // Llama 2 format
+    // KV cache: 2 (K+V) * layers * kvHeads * maxSeq * headDim * 4 bytes
+    const maxSeq = Math.min(info.contextLength, 4096);
+    const headDim = info.embeddingLength / info.headCount;
+    const kvHeads = info.headCountKv || info.headCount;
+    const kvCacheBytes = 2 * info.blockCount * kvHeads * maxSeq * headDim * 4;
+
+    // Working buffers: hidden, residual, normed, q, k, v, attn_out, gate, up, ffn_out, temp, logits
+    const E = info.embeddingLength;
+    const F = info.feedForwardLength;
+    const V = info.vocabSize;
+    const workingBytes = (E * 11 + F * 3 + V) * 4;
+
+    return {
+      weightsBytes,
+      kvCacheBytes,
+      workingBytes,
+      totalBytes: weightsBytes + kvCacheBytes + workingBytes,
+    };
+  }
+
+  /**
+   * Apply chat template to format the prompt.
+   * Uses the Jinja2 template from GGUF metadata if available,
+   * falls back to ChatML/Llama2 heuristics.
+   */
+  private applyChatTemplate(userMessage: string): string {
+    const chatTemplate = this.modelInfo?.metadata.get('tokenizer.chat_template') as string | undefined;
+
+    // Build messages array for the template
+    const messages: ChatMessage[] = [
+      ...this.conversationHistory,
+      { role: 'user', content: userMessage },
+    ];
+
+    // Try Jinja2 template from GGUF metadata
+    if (chatTemplate) {
+      try {
+        const bosToken = this.tokenizer && this.tokenizer.bosTokenId >= 0
+          ? this.tokenizer.decode([this.tokenizer.bosTokenId]) : '';
+        const eosToken = this.tokenizer && this.tokenizer.eosTokenId >= 0
+          ? this.tokenizer.decode([this.tokenizer.eosTokenId]) : '';
+        return applyTemplate(chatTemplate, messages, {
+          bos_token: bosToken,
+          eos_token: eosToken,
+          add_generation_prompt: true,
+        });
+      } catch {
+        // Template parse error — fall through to heuristics
+      }
+    }
+
+    // ChatML heuristic — if model has the special tokens
+    if (this.tokenizer && this.tokenizer.getTokenId('<|im_start|>') >= 0) {
+      let prompt = '';
+      for (const msg of messages) {
+        prompt += `<|im_start|>${msg.role}\n${msg.content}<|im_end|>\n`;
+      }
+      prompt += '<|im_start|>assistant\n';
+      return prompt;
+    }
+
+    // Llama 2 heuristic
     if (chatTemplate?.includes('[INST]')) {
       return `[INST] ${userMessage} [/INST]`;
     }
 
-    // Fallback: just use the message directly
+    // Fallback: raw message
     return userMessage;
   }
+
+  /** Conversation history for multi-turn chat template support. */
+  private conversationHistory: ChatMessage[] = [];
 }

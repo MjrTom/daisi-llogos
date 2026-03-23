@@ -1185,6 +1185,236 @@ function tokenizerFromGguf(metadata) {
   return new BpeTokenizer(tokens, merges, bosTokenId, eosTokenId, padTokenId, useByteEncoding);
 }
 
+// src/tokenizer/chat-template.ts
+function tokenize(template) {
+  const tokens = [];
+  let i = 0;
+  while (i < template.length) {
+    if (template.startsWith("{%", i)) {
+      const end = template.indexOf("%}", i + 2);
+      if (end < 0) break;
+      tokens.push({ type: "tag", value: template.substring(i + 2, end).trim() });
+      i = end + 2;
+    } else if (template.startsWith("{{", i)) {
+      const end = template.indexOf("}}", i + 2);
+      if (end < 0) break;
+      tokens.push({ type: "expr", value: template.substring(i + 2, end).trim() });
+      i = end + 2;
+    } else if (template.startsWith("{#", i)) {
+      const end = template.indexOf("#}", i + 2);
+      i = end < 0 ? template.length : end + 2;
+    } else {
+      let next = template.length;
+      for (const marker of ["{%", "{{", "{#"]) {
+        const pos = template.indexOf(marker, i);
+        if (pos >= 0 && pos < next) next = pos;
+      }
+      tokens.push({ type: "text", value: template.substring(i, next) });
+      i = next;
+    }
+  }
+  return tokens;
+}
+function resolve(expr, ctx) {
+  expr = expr.trim();
+  if (expr.startsWith("'") && expr.endsWith("'") || expr.startsWith('"') && expr.endsWith('"')) {
+    return expr.slice(1, -1);
+  }
+  if (expr === "true" || expr === "True") return true;
+  if (expr === "false" || expr === "False") return false;
+  if (expr === "none" || expr === "None") return void 0;
+  if (/^\d+$/.test(expr)) return parseInt(expr, 10);
+  const parts = expr.split(".");
+  let val = ctx;
+  for (const part of parts) {
+    if (val == null || typeof val !== "object") return void 0;
+    val = val[part];
+  }
+  return val;
+}
+function evaluate(expr, ctx) {
+  expr = expr.trim();
+  if (expr.startsWith("not ")) {
+    return !truthy(evaluate(expr.substring(4), ctx));
+  }
+  for (const op of [" or ", " and "]) {
+    const idx = expr.lastIndexOf(op);
+    if (idx > 0) {
+      const left = evaluate(expr.substring(0, idx), ctx);
+      const right = evaluate(expr.substring(idx + op.length), ctx);
+      return op === " or " ? truthy(left) ? left : right : truthy(left) ? right : left;
+    }
+  }
+  if (expr.endsWith(" is defined")) {
+    const varName = expr.slice(0, -" is defined".length).trim();
+    return resolve(varName, ctx) !== void 0;
+  }
+  if (expr.endsWith(" is not defined")) {
+    const varName = expr.slice(0, -" is not defined".length).trim();
+    return resolve(varName, ctx) === void 0;
+  }
+  for (const op of ["!=", "=="]) {
+    const idx = expr.indexOf(op);
+    if (idx > 0) {
+      const left = evaluate(expr.substring(0, idx), ctx);
+      const right = evaluate(expr.substring(idx + op.length), ctx);
+      return op === "==" ? left === right : left !== right;
+    }
+  }
+  if (expr.includes("|")) {
+    const [base, ...filters] = expr.split("|");
+    let val = evaluate(base, ctx);
+    for (const f of filters) {
+      const filter = f.trim();
+      if (filter === "trim" && typeof val === "string") val = val.trim();
+    }
+    return val;
+  }
+  const bracketMatch = expr.match(/^(.+)\[(\d+)\]$/);
+  if (bracketMatch) {
+    const arr = resolve(bracketMatch[1], ctx);
+    if (Array.isArray(arr)) return arr[parseInt(bracketMatch[2], 10)];
+    return void 0;
+  }
+  if (expr.endsWith(".length") || expr.endsWith("|length")) {
+    const base = expr.replace(/[.|]length$/, "");
+    const val = resolve(base, ctx);
+    if (Array.isArray(val)) return val.length;
+    if (typeof val === "string") return val.length;
+    return 0;
+  }
+  return resolve(expr, ctx);
+}
+function truthy(val) {
+  if (val === void 0 || val === null || val === false || val === 0 || val === "") return false;
+  if (Array.isArray(val) && val.length === 0) return false;
+  return true;
+}
+function toString(val) {
+  if (val === void 0 || val === null) return "";
+  return String(val);
+}
+function execute(tokens, ctx) {
+  let output = "";
+  let i = 0;
+  while (i < tokens.length) {
+    const tok = tokens[i];
+    if (tok.type === "text") {
+      output += tok.value;
+      i++;
+    } else if (tok.type === "expr") {
+      output += toString(evaluate(tok.value, ctx));
+      i++;
+    } else if (tok.type === "tag") {
+      const tag = tok.value;
+      if (tag.startsWith("for ")) {
+        const forMatch = tag.match(/^for\s+(\w+)\s+in\s+(.+)$/);
+        if (!forMatch) {
+          i++;
+          continue;
+        }
+        const [, varName, iterExpr] = forMatch;
+        const iterable = evaluate(iterExpr, ctx);
+        const items = Array.isArray(iterable) ? iterable : [];
+        const body = [];
+        let depth = 1;
+        i++;
+        while (i < tokens.length && depth > 0) {
+          if (tokens[i].type === "tag") {
+            if (tokens[i].value.startsWith("for ")) depth++;
+            else if (tokens[i].value === "endfor") {
+              depth--;
+              if (depth === 0) {
+                i++;
+                break;
+              }
+            }
+          }
+          body.push(tokens[i]);
+          i++;
+        }
+        for (let idx = 0; idx < items.length; idx++) {
+          const loopCtx = {
+            ...ctx,
+            [varName]: items[idx],
+            loop: {
+              index0: idx,
+              index: idx + 1,
+              first: idx === 0,
+              last: idx === items.length - 1,
+              length: items.length
+            }
+          };
+          output += execute(body, loopCtx);
+        }
+      } else if (tag.startsWith("if ")) {
+        const branches = [];
+        let currentCond = tag.substring(3).trim();
+        let currentBody = [];
+        let depth = 1;
+        i++;
+        while (i < tokens.length && depth > 0) {
+          if (tokens[i].type === "tag") {
+            const inner = tokens[i].value;
+            if (inner.startsWith("if ")) {
+              depth++;
+              currentBody.push(tokens[i]);
+            } else if (inner === "endif") {
+              depth--;
+              if (depth === 0) {
+                branches.push({ cond: currentCond, body: currentBody });
+                i++;
+                break;
+              }
+              currentBody.push(tokens[i]);
+            } else if (depth === 1 && inner.startsWith("elif ")) {
+              branches.push({ cond: currentCond, body: currentBody });
+              currentCond = inner.substring(5).trim();
+              currentBody = [];
+            } else if (depth === 1 && inner === "else") {
+              branches.push({ cond: currentCond, body: currentBody });
+              currentCond = null;
+              currentBody = [];
+            } else {
+              currentBody.push(tokens[i]);
+            }
+          } else {
+            currentBody.push(tokens[i]);
+          }
+          i++;
+        }
+        for (const branch of branches) {
+          if (branch.cond === null || truthy(evaluate(branch.cond, ctx))) {
+            output += execute(branch.body, ctx);
+            break;
+          }
+        }
+      } else if (tag.startsWith("set ")) {
+        const setMatch = tag.match(/^set\s+(\w+)\s*=\s*(.+)$/);
+        if (setMatch) {
+          ctx[setMatch[1]] = evaluate(setMatch[2], ctx);
+        }
+        i++;
+      } else {
+        i++;
+      }
+    } else {
+      i++;
+    }
+  }
+  return output;
+}
+function applyTemplate(template, messages, options) {
+  const ctx = {
+    messages,
+    bos_token: options?.bos_token ?? "",
+    eos_token: options?.eos_token ?? "",
+    add_generation_prompt: options?.add_generation_prompt ?? true
+  };
+  const tokens = tokenize(template);
+  return execute(tokens, ctx);
+}
+
 // src/model/kv-cache.ts
 var KvCache = class {
   device;
@@ -1324,6 +1554,66 @@ function dequantizeToF32(buffer, type, elementCount) {
     }
     return result;
   }
+  if (type === 3 /* Q4_1 */) {
+    const blockCount = Math.ceil(elementCount / 32);
+    for (let b = 0; b < blockCount; b++) {
+      const bo = b * 20;
+      const delta = f16ToF32(view.getUint16(bo, true));
+      const min = f16ToF32(view.getUint16(bo + 2, true));
+      for (let j = 0; j < 16; j++) {
+        const byteVal = bytes[bo + 4 + j];
+        const lo = byteVal & 15;
+        const hi = byteVal >> 4 & 15;
+        const idx = b * 32;
+        if (idx + j < elementCount) result[idx + j] = delta * lo + min;
+        if (idx + j + 16 < elementCount) result[idx + j + 16] = delta * hi + min;
+      }
+    }
+    return result;
+  }
+  if (type === 6 /* Q5_0 */) {
+    const blockCount = Math.ceil(elementCount / 32);
+    for (let b = 0; b < blockCount; b++) {
+      const bo = b * 22;
+      const scale = f16ToF32(view.getUint16(bo, true));
+      const highBits = view.getUint32(bo + 2, true);
+      for (let j = 0; j < 16; j++) {
+        const byteVal = bytes[bo + 6 + j];
+        const lo4 = byteVal & 15;
+        const hi4 = byteVal >> 4 & 15;
+        const loBit = highBits >> j & 1;
+        const hiBit = highBits >> j + 16 & 1;
+        const q5lo = lo4 | loBit << 4;
+        const q5hi = hi4 | hiBit << 4;
+        const idx = b * 32;
+        if (idx + j < elementCount) result[idx + j] = scale * (q5lo - 16);
+        if (idx + j + 16 < elementCount) result[idx + j + 16] = scale * (q5hi - 16);
+      }
+    }
+    return result;
+  }
+  if (type === 7 /* Q5_1 */) {
+    const blockCount = Math.ceil(elementCount / 32);
+    for (let b = 0; b < blockCount; b++) {
+      const bo = b * 24;
+      const delta = f16ToF32(view.getUint16(bo, true));
+      const min = f16ToF32(view.getUint16(bo + 2, true));
+      const highBits = view.getUint32(bo + 4, true);
+      for (let j = 0; j < 16; j++) {
+        const byteVal = bytes[bo + 8 + j];
+        const lo4 = byteVal & 15;
+        const hi4 = byteVal >> 4 & 15;
+        const loBit = highBits >> j & 1;
+        const hiBit = highBits >> j + 16 & 1;
+        const q5lo = lo4 | loBit << 4;
+        const q5hi = hi4 | hiBit << 4;
+        const idx = b * 32;
+        if (idx + j < elementCount) result[idx + j] = delta * q5lo + min;
+        if (idx + j + 16 < elementCount) result[idx + j + 16] = delta * q5hi + min;
+      }
+    }
+    return result;
+  }
   throw new Error(`Unsupported dequant type: ${GgmlType[type]} (${type})`);
 }
 function f16ToF32(bits) {
@@ -1339,7 +1629,7 @@ function f16ToF32(bits) {
   const f = (1 + mant / 1024) * Math.pow(2, exp - 15);
   return sign ? -f : f;
 }
-var GPU_MATMUL_TYPES = /* @__PURE__ */ new Set([0 /* F32 */, 8 /* Q8_0 */]);
+var GPU_MATMUL_TYPES = /* @__PURE__ */ new Set([0 /* F32 */, 2 /* Q4_0 */, 8 /* Q8_0 */]);
 var LlamaModel = class {
   compute;
   info;
@@ -1769,7 +2059,7 @@ function argmax(arr) {
 }
 
 // src/engine.ts
-var LlogosEngine = class {
+var LlogosEngine = class _LlogosEngine {
   gpu = null;
   compute = null;
   model = null;
@@ -1810,6 +2100,11 @@ var LlogosEngine = class {
       options?.onProgress?.({ phase: "Parsing header", bytesDownloaded: 0, totalBytes: 0 });
       let info = await fetchGgufHeader(url);
       this.modelInfo = info;
+      const estimate = this.estimateVram(info);
+      const maxBuffer = this.gpu?.capabilities.maxBufferSize ?? 0;
+      if (maxBuffer > 0 && estimate.totalBytes > maxBuffer * 4) {
+        console.warn(`[llogos] Model may not fit: estimated ${Math.round(estimate.totalBytes / 1024 / 1024)} MB, max buffer ${Math.round(maxBuffer / 1024 / 1024)} MB`);
+      }
       let isCached = false;
       options?.onProgress?.({ phase: "Checking cache...", bytesDownloaded: 0, totalBytes: 0 });
       const fileBuffer = await downloadFile(url, (p) => {
@@ -1856,11 +2151,8 @@ var LlogosEngine = class {
         finalPrompt = this.applyChatTemplate(prompt);
       }
       const inputTokens = [];
-      if (this.model.position === 0 && this.tokenizer.bosTokenId >= 0) {
+      if (this.model.position === 0 && this.tokenizer.bosTokenId >= 0 && options?.raw) {
         inputTokens.push(this.tokenizer.bosTokenId);
-      }
-      if (this.model.position > 0) {
-        inputTokens.push(...this.tokenizer.encode("\n"));
       }
       inputTokens.push(...this.tokenizer.encode(finalPrompt));
       const allTokens = [...inputTokens];
@@ -1883,9 +2175,10 @@ var LlogosEngine = class {
       this._status = "loaded";
     }
   }
-  /** Reset the KV cache for a new conversation. */
+  /** Reset the KV cache and conversation history for a new conversation. */
   resetSession() {
     this.model?.resetCache();
+    this.conversationHistory = [];
   }
   /** Unload model and free GPU memory. */
   unloadModel() {
@@ -1899,24 +2192,76 @@ var LlogosEngine = class {
   get vramUsage() {
     return this.compute?.buffers.vramUsage ?? 0;
   }
+  // GPU types that stay quantized (have native GPU shaders)
+  static GPU_NATIVE_TYPES = /* @__PURE__ */ new Set([0 /* F32 */, 8 /* Q8_0 */, 2 /* Q4_0 */]);
   /**
-   * Apply chat template based on model architecture.
-   * Wraps user message in the appropriate format.
+   * Estimate VRAM needed for a model before downloading.
+   * Returns breakdown in bytes: weights, kvCache, working, total.
+   */
+  estimateVram(info) {
+    let weightsBytes = 0;
+    for (const tensor of info.tensors) {
+      if (_LlogosEngine.GPU_NATIVE_TYPES.has(tensor.type)) {
+        weightsBytes += tensor.byteSize;
+      } else {
+        weightsBytes += tensor.elementCount * 4;
+      }
+    }
+    const maxSeq = Math.min(info.contextLength, 4096);
+    const headDim = info.embeddingLength / info.headCount;
+    const kvHeads = info.headCountKv || info.headCount;
+    const kvCacheBytes = 2 * info.blockCount * kvHeads * maxSeq * headDim * 4;
+    const E = info.embeddingLength;
+    const F = info.feedForwardLength;
+    const V = info.vocabSize;
+    const workingBytes = (E * 11 + F * 3 + V) * 4;
+    return {
+      weightsBytes,
+      kvCacheBytes,
+      workingBytes,
+      totalBytes: weightsBytes + kvCacheBytes + workingBytes
+    };
+  }
+  /**
+   * Apply chat template to format the prompt.
+   * Uses the Jinja2 template from GGUF metadata if available,
+   * falls back to ChatML/Llama2 heuristics.
    */
   applyChatTemplate(userMessage) {
-    const arch = this.modelInfo?.architecture ?? "";
     const chatTemplate = this.modelInfo?.metadata.get("tokenizer.chat_template");
+    const messages = [
+      ...this.conversationHistory,
+      { role: "user", content: userMessage }
+    ];
+    if (chatTemplate) {
+      try {
+        const bosToken = this.tokenizer && this.tokenizer.bosTokenId >= 0 ? this.tokenizer.decode([this.tokenizer.bosTokenId]) : "";
+        const eosToken = this.tokenizer && this.tokenizer.eosTokenId >= 0 ? this.tokenizer.decode([this.tokenizer.eosTokenId]) : "";
+        return applyTemplate(chatTemplate, messages, {
+          bos_token: bosToken,
+          eos_token: eosToken,
+          add_generation_prompt: true
+        });
+      } catch {
+      }
+    }
     if (this.tokenizer && this.tokenizer.getTokenId("<|im_start|>") >= 0) {
-      return `<|im_start|>user
-${userMessage}<|im_end|>
-<|im_start|>assistant
+      let prompt = "";
+      for (const msg of messages) {
+        prompt += `<|im_start|>${msg.role}
+${msg.content}<|im_end|>
 `;
+      }
+      prompt += "<|im_start|>assistant\n";
+      return prompt;
     }
     if (chatTemplate?.includes("[INST]")) {
       return `[INST] ${userMessage} [/INST]`;
     }
     return userMessage;
   }
+  /** Conversation history for multi-turn chat template support. */
+  conversationHistory = [];
 };
 export {
   BpeTokenizer,
