@@ -1,0 +1,300 @@
+<!DOCTYPE html>
+<html lang="en" data-bs-theme="dark">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>DAISI LLogos WebGPU</title>
+  <link rel="icon" type="image/png" href="favicon.png">
+  <style>
+    * { box-sizing: border-box; margin: 0; padding: 0; }
+    body { font-family: system-ui, sans-serif; background: #1a1a2e; color: #e0e0e0; padding: 20px; max-width: 800px; margin: 0 auto; }
+    h1 { margin-bottom: 16px; color: #7fdbca; font-size: 24px; }
+    .card { background: #16213e; border-radius: 8px; padding: 16px; margin-bottom: 16px; }
+    .card h2 { font-size: 13px; color: #888; text-transform: uppercase; margin-bottom: 8px; letter-spacing: 0.5px; }
+    label { display: block; margin-bottom: 4px; font-size: 14px; }
+    select, input[type="text"] { width: 100%; padding: 8px 10px; background: #0f3460; border: 1px solid #333; border-radius: 4px; color: #e0e0e0; font-size: 14px; }
+    select { cursor: pointer; appearance: auto; }
+    button { padding: 8px 16px; background: #0f3460; border: 1px solid #7fdbca; border-radius: 4px; color: #7fdbca; cursor: pointer; font-size: 14px; margin-right: 6px; margin-top: 8px; }
+    button:hover { background: #1a4a7a; }
+    button:disabled { opacity: 0.4; cursor: not-allowed; }
+    .btn-danger { border-color: #ff6b6b; color: #ff6b6b; }
+    #gpu-status, #model-info { font-family: monospace; font-size: 13px; white-space: pre-wrap; }
+    #progress { font-family: monospace; font-size: 13px; margin-top: 8px; }
+    .progress-bar { width: 100%; height: 6px; background: #0f3460; border-radius: 3px; margin-top: 6px; overflow: hidden; display: none; }
+    .progress-bar-fill { height: 100%; background: #7fdbca; transition: width 0.2s; width: 0%; }
+    #chat-output { background: #0f3460; border-radius: 4px; padding: 12px; min-height: 150px; max-height: 400px; overflow-y: auto; font-family: monospace; font-size: 14px; white-space: pre-wrap; margin-top: 8px; }
+    #prompt-input { width: calc(100% - 80px); display: inline-block; }
+    #send-btn { width: 70px; }
+    .stat { color: #7fdbca; }
+    .chat-wrap { position: relative; }
+    .thinking { font-size: 12px; color: #7fdbca; position: absolute; top: 8px; right: 12px; display: flex; align-items: center; gap: 6px; z-index: 1; }
+    .spinner { width: 16px; height: 16px; border: 2px solid #333; border-top-color: #7fdbca; border-radius: 50%; animation: spin 0.8s linear infinite; display: inline-block; }
+    @keyframes spin { to { transform: rotate(360deg); } }
+    .row { display: flex; gap: 8px; align-items: end; }
+    .row > * { flex: 1; }
+    .row > button { flex: none; }
+  </style>
+</head>
+<body>
+  <h1>DAISI LLogos WebGPU</h1>
+
+  <div class="card">
+    <h2>GPU</h2>
+    <div id="gpu-status">Initializing...</div>
+  </div>
+
+  <div class="card">
+    <h2>Model</h2>
+    <div class="row">
+      <div>
+        <select id="model-select" onchange="onModelSelect()">
+          <option value="">-- Select a model --</option>
+          <option value="https://huggingface.co/TheBloke/TinyLlama-1.1B-Chat-v1.0-GGUF/resolve/main/tinyllama-1.1b-chat-v1.0.Q4_0.gguf">TinyLlama 1.1B Chat Q4_0 (637 MB)</option>
+          <option value="https://huggingface.co/TheBloke/TinyLlama-1.1B-Chat-v1.0-GGUF/resolve/main/tinyllama-1.1b-chat-v1.0.Q8_0.gguf">TinyLlama 1.1B Chat Q8_0 (1.1 GB)</option>
+          <option value="/test/tinyllama-q8.gguf">TinyLlama 1.1B Q8_0 (local, 1.1 GB)</option>
+          <option value="custom">Custom URL...</option>
+        </select>
+        <input type="text" id="custom-url" style="display:none; margin-top:6px;" placeholder="https://huggingface.co/.../model.gguf" oninput="localStorage.setItem('llogos-custom-url', this.value)">
+      </div>
+    </div>
+    <div style="margin-top: 8px;">
+      <button id="load-btn" onclick="loadModel()" disabled>Load Model</button>
+      <button id="unload-btn" onclick="unloadModel()" disabled>Unload</button>
+      <button class="btn-danger" onclick="clearCache()">Clear Cache</button>
+    </div>
+    <div id="progress"></div>
+    <div class="progress-bar" id="progress-bar"><div class="progress-bar-fill" id="progress-fill"></div></div>
+    <div id="model-info"></div>
+  </div>
+
+  <div class="card">
+    <h2>Chat</h2>
+    <div class="chat-wrap">
+      <div id="thinking" class="thinking" style="display:none;"><span class="spinner"></span> Thinking...</div>
+      <div id="chat-output"></div>
+    </div>
+    <div style="margin-top: 8px">
+      <input type="text" id="prompt-input" value="The capital of France is" placeholder="Type a message..." onkeydown="if(event.key==='Enter')sendMessage()">
+      <button id="send-btn" onclick="sendMessage()" disabled>Send</button>
+      <button id="stop-btn" onclick="window._abort?.abort()" style="display:none; border-color:#ff6b6b; color:#ff6b6b;">Stop</button>
+      <button onclick="newChat()">New Chat</button>
+    </div>
+    <div id="stats" style="margin-top: 8px; font-size: 12px; color: #888;"></div>
+  </div>
+
+  <script type="module">
+    import { LlogosEngine } from '../dist/index.js';
+
+    const engine = new LlogosEngine();
+    window.engine = engine;
+
+    const gpuStatus = document.getElementById('gpu-status');
+    const modelInfo = document.getElementById('model-info');
+    const progressEl = document.getElementById('progress');
+    const progressBar = document.getElementById('progress-bar');
+    const progressFill = document.getElementById('progress-fill');
+    const chatOutput = document.getElementById('chat-output');
+    const stats = document.getElementById('stats');
+
+    function setProgress(text, pct) {
+      progressEl.textContent = text;
+      if (pct !== undefined && pct >= 0) {
+        progressBar.style.display = 'block';
+        progressFill.style.width = pct + '%';
+      } else {
+        progressBar.style.display = 'none';
+      }
+    }
+
+    window.onModelSelect = () => {
+      const sel = document.getElementById('model-select');
+      const custom = document.getElementById('custom-url');
+      custom.style.display = sel.value === 'custom' ? 'block' : 'none';
+      document.getElementById('load-btn').disabled = !sel.value;
+      localStorage.setItem('llogos-model', sel.value);
+      if (sel.value === 'custom') localStorage.setItem('llogos-custom-url', custom.value);
+    };
+
+    // Restore last selection
+    const savedModel = localStorage.getItem('llogos-model');
+    if (savedModel) {
+      const sel = document.getElementById('model-select');
+      sel.value = savedModel;
+      if (savedModel === 'custom') {
+        const customUrl = localStorage.getItem('llogos-custom-url');
+        if (customUrl) document.getElementById('custom-url').value = customUrl;
+        document.getElementById('custom-url').style.display = 'block';
+      }
+    }
+
+    function getModelUrl() {
+      const sel = document.getElementById('model-select');
+      if (sel.value === 'custom') return document.getElementById('custom-url').value;
+      return sel.value;
+    }
+
+    // Auto-init GPU
+    (async () => {
+      try {
+        if (!LlogosEngine.isSupported()) {
+          gpuStatus.textContent = 'WebGPU is not available in this browser.';
+          return;
+        }
+        const caps = await engine.initGpu();
+        const info = caps.adapterInfo;
+        const desc = [info.vendor, info.architecture, info.device, info.description]
+          .filter(s => s && s.length > 0).join(' | ') || '(adapter info not available)';
+        gpuStatus.innerHTML = `<span class="stat">Ready</span> | ${desc} | Buffer: ${(caps.maxBufferSize / 1024 / 1024 / 1024).toFixed(1)} GB | F16: ${caps.supportsF16}`;
+        document.getElementById('load-btn').disabled = !getModelUrl();
+        // Auto-load if a model is selected and cached
+        if (getModelUrl()) {
+          try {
+            const c = await caches.open('llogos-webgpu-models');
+            if (await c.match(getModelUrl())) {
+              console.log('[llogos] Cached model found, auto-loading...');
+              window.loadModel();
+            }
+          } catch {}
+        }
+      } catch (e) {
+        gpuStatus.textContent = `Error: ${e.message}`;
+      }
+    })();
+
+    window.loadModel = async () => {
+      const url = getModelUrl();
+      if (!url) return;
+      try {
+        document.getElementById('load-btn').disabled = true;
+        document.getElementById('model-select').disabled = true;
+        await engine.loadModel(url, {
+          onProgress: (p) => {
+            const pct = p.totalBytes > 0 ? (p.bytesDownloaded / p.totalBytes) * 100 : -1;
+            const mb = (p.bytesDownloaded / 1024 / 1024).toFixed(0);
+            const total = p.totalBytes > 0 ? (p.totalBytes / 1024 / 1024).toFixed(0) : '?';
+            setProgress(`${p.phase}... ${mb} / ${total} MB`, pct);
+          },
+        });
+        const info = engine.info;
+        setProgress(`Loaded | VRAM: ${(engine.vramUsage / 1024 / 1024).toFixed(0)} MB`, 100);
+        modelInfo.textContent = `${info.architecture} | ${info.blockCount} layers | ${info.embeddingLength}D | ${info.vocabSize} vocab`;
+        document.getElementById('send-btn').disabled = false;
+        document.getElementById('unload-btn').disabled = false;
+      } catch (e) {
+        setProgress(`Error: ${e?.message || e}`, -1);
+        document.getElementById('load-btn').disabled = false;
+        document.getElementById('model-select').disabled = false;
+      }
+    };
+
+    window.unloadModel = async () => {
+      engine.unloadModel();
+      if (typeof caches !== 'undefined') await caches.delete('llogos-webgpu-models');
+      setProgress('Unloaded. Cache cleared.', -1);
+      modelInfo.textContent = '';
+      document.getElementById('send-btn').disabled = true;
+      document.getElementById('unload-btn').disabled = true;
+      document.getElementById('load-btn').disabled = !getModelUrl();
+      document.getElementById('model-select').disabled = false;
+    };
+
+    window.clearCache = async () => {
+      if (typeof caches !== 'undefined') await caches.delete('llogos-webgpu-models');
+      setProgress('Cache cleared.', -1);
+    };
+
+    window.newChat = () => {
+      engine.resetSession();
+      chatOutput.textContent = '';
+      stats.textContent = '';
+    };
+
+    window.sendMessage = async () => {
+      const input = document.getElementById('prompt-input');
+      const prompt = input.value.trim();
+      if (!prompt) return;
+      input.value = '';
+
+      chatOutput.textContent += `\n> ${prompt}\n`;
+      document.getElementById('send-btn').style.display = 'none';
+      document.getElementById('stop-btn').style.display = '';
+      document.getElementById('thinking').style.display = 'flex';
+
+      const abortController = new AbortController();
+      window._abort = abortController;
+      let tokenCount = 0;
+      const start = performance.now();
+
+      try {
+        for await (const token of engine.generate(prompt, { maxTokens: 256, temperature: 0, signal: abortController.signal })) {
+          if (tokenCount === 0) document.getElementById('thinking').style.display = 'none';
+          chatOutput.textContent += token;
+          chatOutput.scrollTop = chatOutput.scrollHeight;
+          tokenCount++;
+        }
+        const elapsed = (performance.now() - start) / 1000;
+        stats.textContent = `${tokenCount} tokens | ${elapsed.toFixed(1)}s | ${(tokenCount / elapsed).toFixed(1)} tok/s | VRAM: ${(engine.vramUsage / 1024 / 1024).toFixed(0)} MB`;
+      } catch (e) {
+        chatOutput.textContent += `\n[Error: ${e.message}]\n`;
+      }
+
+      document.getElementById('thinking').style.display = 'none';
+      document.getElementById('stop-btn').style.display = 'none';
+      document.getElementById('send-btn').style.display = '';
+      document.getElementById('send-btn').disabled = false;
+      chatOutput.textContent += '\n';
+    };
+    // Direct CPU test — bypasses engine, uses raw file data
+    window.cpuTest = async () => {
+      chatOutput.textContent += '\n[CPU TEST] Running...\n';
+      const { parseGguf, BpeTokenizer } = await import('../dist/index.js');
+
+      // Download/cache file
+      const resp = await fetch(getModelUrl());
+      const ab = await resp.arrayBuffer();
+      const info = parseGguf(ab);
+      const tokens = info.metadata.get('tokenizer.ggml.tokens');
+      const merges = info.metadata.get('tokenizer.ggml.merges');
+      const tok = new BpeTokenizer(tokens, merges, 1, 2, -1, false);
+      const E=info.embeddingLength, nH=info.headCount, nKV=info.headCountKv, hD=E/nH;
+      const ffn=info.feedForwardLength, V=info.vocabSize, nL=info.blockCount, mSL=512;
+      const eps=info.rmsNormEps, theta=info.ropeFreqBase;
+
+      function dq8(buf,ec){const b=new Uint8Array(buf),v=new DataView(buf),r=new Float32Array(ec);const bc=Math.ceil(ec/32);for(let i=0;i<bc;i++){const bo=i*34;const bits=v.getUint16(bo,true),s=(bits>>15)&1,e=(bits>>10)&0x1F,m=bits&0x3FF;let sc;if(e===0&&m===0)sc=0;else if(e===0){sc=(m/1024)*Math.pow(2,-14);if(s)sc=-sc;}else if(e===31)sc=0;else{sc=(1+m/1024)*Math.pow(2,e-15);if(s)sc=-sc;}for(let j=0;j<32;j++){let val=b[bo+2+j];if(val>=128)val-=256;r[i*32+j]=sc*val;}}return r;}
+      function dq6(buf,ec){const b=new Uint8Array(buf),v=new DataView(buf),r=new Float32Array(ec);const bc=Math.ceil(ec/256);for(let i=0;i<bc;i++){const bo=i*210,bits=v.getUint16(bo+208,true),s=(bits>>15)&1,e=(bits>>10)&0x1F,m=bits&0x3FF;let d;if(e===0&&m===0)d=0;else if(e===0){d=(m/1024)*Math.pow(2,-14);if(s)d=-d;}else if(e===31)d=0;else{d=(1+m/1024)*Math.pow(2,e-15);if(s)d=-d;}for(let n=0;n<256;n+=128)for(let l=0;l<32;l++){const is_=n/16;const a=bo+n/2+l,c=bo+n/2+l+32,h=bo+128+n/4+l;const qh=b[h];const q1=((b[a]&0xF)|((qh&3)<<4))-32,q2=((b[c]&0xF)|(((qh>>2)&3)<<4))-32,q3=((b[a]>>4)|(((qh>>4)&3)<<4))-32,q4=((b[c]>>4)|(((qh>>6)&3)<<4))-32;const s0=v.getInt8(bo+192+is_),s2=v.getInt8(bo+192+is_+2),s4=v.getInt8(bo+192+is_+4),s6=v.getInt8(bo+192+is_+6);const oi=i*256+n+l;if(oi<ec)r[oi]=d*s0*q1;if(oi+32<ec)r[oi+32]=d*s2*q2;if(oi+64<ec)r[oi+64]=d*s4*q3;if(oi+96<ec)r[oi+96]=d*s6*q4;}}return r;}
+      function ext(nm){const t=info.tensors.find(x=>x.name===nm);const b=ab.slice(info.tensorDataOffset+t.offset,info.tensorDataOffset+t.offset+t.byteSize);if(t.type===0)return new Float32Array(b);if(t.type===8)return dq8(b,t.elementCount);if(t.type===14)return dq6(b,t.elementCount);throw new Error('type:'+t.type);}
+
+      chatOutput.textContent += '[CPU TEST] Loading weights...\n';
+      await new Promise(r => setTimeout(r, 0));
+      const emb=ext('token_embd.weight'),oN=ext('output_norm.weight'),oW=ext('output.weight');
+      const L=[];for(let i=0;i<nL;i++){L.push({an:ext('blk.'+i+'.attn_norm.weight'),q:ext('blk.'+i+'.attn_q.weight'),k:ext('blk.'+i+'.attn_k.weight'),v:ext('blk.'+i+'.attn_v.weight'),o:ext('blk.'+i+'.attn_output.weight'),fn:ext('blk.'+i+'.ffn_norm.weight'),g:ext('blk.'+i+'.ffn_gate.weight'),u:ext('blk.'+i+'.ffn_up.weight'),d:ext('blk.'+i+'.ffn_down.weight')});}
+
+      function rn(i,w,n,e){let s=0;for(let j=0;j<n;j++)s+=i[j]*i[j];const r=Math.sqrt(s/n+e);const o=new Float32Array(n);for(let j=0;j<n;j++)o[j]=(i[j]/r)*w[j];return o;}
+      function mm(w,i,M,K){const o=new Float32Array(M);for(let r=0;r<M;r++){let s=0;const off=r*K;for(let k=0;k<K;k++)s+=w[off+k]*i[k];o[r]=s;}return o;}
+      function rp(d,hd,pos,th){for(let pi=0;pi<d.length/2;pi++){const hp=pi%(hd/2),df=(hp*2)/hd,fr=1/Math.pow(th,df),a=pos*fr,c=Math.cos(a),s=Math.sin(a);const i0=pi*2,i1=i0+1,x=d[i0],y=d[i1];d[i0]=x*c-y*s;d[i1]=x*s+y*c;}}
+
+      const kvK=L.map(()=>new Float32Array(nKV*mSL*hD)),kvV=L.map(()=>new Float32Array(nKV*mSL*hD));
+      let sl=0;
+      const inputTokens=[1,...tok.encode('The capital of France is')];
+      chatOutput.textContent += '[CPU TEST] Prefilling ' + inputTokens.length + ' tokens...\n';
+      await new Promise(r => setTimeout(r, 0));
+
+      function fwd(tid){const h=new Float32Array(E);for(let i=0;i<E;i++)h[i]=emb[tid*E+i];for(let layer=0;layer<nL;layer++){const lw=L[layer];const res=new Float32Array(h);const n1=rn(h,lw.an,E,eps);const qP=mm(lw.q,n1,nH*hD,E),kP=mm(lw.k,n1,nKV*hD,E),vP=mm(lw.v,n1,nKV*hD,E);rp(qP,hD,sl,theta);rp(kP,hD,sl,theta);for(let kh=0;kh<nKV;kh++)for(let d=0;d<hD;d++){kvK[layer][kh*mSL*hD+sl*hD+d]=kP[kh*hD+d];kvV[layer][kh*mSL*hD+sl*hD+d]=vP[kh*hD+d];}const cs=sl+1,sc=1/Math.sqrt(hD),hpg=nH/nKV;const ao=new Float32Array(nH*hD);for(let head=0;head<nH;head++){const kvH=Math.floor(head/hpg);const scores=new Float32Array(cs);for(let pos=0;pos<cs;pos++){let dot=0;for(let d=0;d<hD;d++)dot+=qP[head*hD+d]*kvK[layer][kvH*mSL*hD+pos*hD+d];scores[pos]=dot*sc;}let mx=-Infinity;for(let i=0;i<cs;i++)mx=Math.max(mx,scores[i]);let se=0;for(let i=0;i<cs;i++){scores[i]=Math.exp(scores[i]-mx);se+=scores[i];}for(let i=0;i<cs;i++)scores[i]/=se;for(let d=0;d<hD;d++){let a=0;for(let pos=0;pos<cs;pos++)a+=scores[pos]*kvV[layer][kvH*mSL*hD+pos*hD+d];ao[head*hD+d]=a;}}const oP=mm(lw.o,ao,E,nH*hD);for(let i=0;i<E;i++)h[i]=oP[i]+res[i];const r2=new Float32Array(h);const n2=rn(h,lw.fn,E,eps);const gO=mm(lw.g,n2,ffn,E),uO=mm(lw.u,n2,ffn,E);const ff=new Float32Array(ffn);for(let i=0;i<ffn;i++)ff[i]=(gO[i]/(1+Math.exp(-gO[i])))*uO[i];const dn=mm(lw.d,ff,E,ffn);for(let i=0;i<E;i++)h[i]=dn[i]+r2[i];}sl++;return h;}
+
+      let lastH;for(const tid of inputTokens)lastH=fwd(tid);
+      chatOutput.textContent += '[CPU TEST] Generating: ';
+      for(let step=0;step<20;step++){
+        const fn2=rn(lastH,oN,E,eps);const lg=mm(oW,fn2,V,E);
+        let maxI=0,maxV=lg[0];for(let i=1;i<V;i++)if(lg[i]>maxV){maxV=lg[i];maxI=i;}
+        if(maxI===2)break;
+        const tokStr=(tokens[maxI]||'').replace(/▁/g,' ');
+        chatOutput.textContent+=tokStr;
+        chatOutput.scrollTop=chatOutput.scrollHeight;
+        await new Promise(r=>setTimeout(r,0));
+        lastH=fwd(maxI);
+      }
+      chatOutput.textContent += '\n';
+    };
+  </script>
+</body>
+</html>

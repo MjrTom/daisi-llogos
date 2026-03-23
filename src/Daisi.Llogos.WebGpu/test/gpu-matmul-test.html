@@ -1,0 +1,131 @@
+<!DOCTYPE html><html><head><title>GPU Matmul Test</title></head><body>
+<pre id="out">Loading...</pre>
+<script type="module">
+import { LlogosEngine, parseGguf } from '../dist/index.js';
+
+const out = document.getElementById('out');
+const log = (s) => { out.textContent += s + '\n'; console.log(s); };
+
+(async () => {
+  // Init GPU
+  const engine = new LlogosEngine();
+  const caps = await engine.initGpu();
+  log('GPU ready');
+
+  // Load model
+  const resp = await fetch('https://huggingface.co/TheBloke/TinyLlama-1.1B-Chat-v1.0-GGUF/resolve/main/tinyllama-1.1b-chat-v1.0.Q8_0.gguf');
+  log('Downloading...');
+  const ab = await resp.arrayBuffer();
+  const info = parseGguf(ab);
+  log(`Parsed: ${info.tensors.length} tensors`);
+
+  // Get BOS embedding and Q weight row 0
+  function dq8(buf, ec) {
+    const b = new Uint8Array(buf), v = new DataView(buf), r = new Float32Array(ec);
+    const bc = Math.ceil(ec / 32);
+    for (let i = 0; i < bc; i++) {
+      const bo = i * 34;
+      const bits = v.getUint16(bo, true), s = (bits >> 15) & 1, e = (bits >> 10) & 0x1F, m = bits & 0x3FF;
+      let sc;
+      if (e === 0 && m === 0) sc = 0;
+      else if (e === 0) { sc = (m / 1024) * Math.pow(2, -14); if (s) sc = -sc; }
+      else if (e === 31) sc = 0;
+      else { sc = (1 + m / 1024) * Math.pow(2, e - 15); if (s) sc = -sc; }
+      for (let j = 0; j < 32; j++) { let val = b[bo + 2 + j]; if (val >= 128) val -= 256; r[i * 32 + j] = sc * val; }
+    }
+    return r;
+  }
+  function ext(nm) {
+    const t = info.tensors.find(x => x.name === nm);
+    const b = ab.slice(info.tensorDataOffset + t.offset, info.tensorDataOffset + t.offset + t.byteSize);
+    if (t.type === 0) return new Float32Array(b);
+    if (t.type === 8) return dq8(b, t.elementCount);
+    throw new Error('type:' + t.type);
+  }
+
+  const E = 2048;
+  const emb = ext('token_embd.weight');
+  const normW = ext('blk.0.attn_norm.weight');
+  const qW = ext('blk.0.attn_q.weight');
+
+  // BOS embedding
+  const h = new Float32Array(E);
+  for (let i = 0; i < E; i++) h[i] = emb[1 * E + i];
+
+  // RMSNorm on CPU
+  let sq = 0;
+  for (let i = 0; i < E; i++) sq += h[i] * h[i];
+  const rms = Math.sqrt(sq / E + 1e-5);
+  const normed = new Float32Array(E);
+  for (let i = 0; i < E; i++) normed[i] = (h[i] / rms) * normW[i];
+
+  // Q weight row 0
+  const qRow0 = qW.subarray(0, E);
+
+  // CPU f64 dot product
+  let cpuF64 = 0;
+  for (let i = 0; i < E; i++) cpuF64 += qRow0[i] * normed[i];
+
+  // CPU Math.fround dot product
+  let cpuF32 = Math.fround(0);
+  for (let i = 0; i < E; i++) cpuF32 = Math.fround(cpuF32 + Math.fround(qRow0[i] * normed[i]));
+
+  log(`CPU f64 Q[0]: ${cpuF64.toFixed(6)}`);
+  log(`CPU f32 Q[0]: ${cpuF32.toFixed(6)}`);
+
+  // GPU dot product
+  const device = navigator.gpu && (await (await navigator.gpu.requestAdapter()).requestDevice());
+  const shader = device.createShaderModule({ code: `
+    @group(0) @binding(0) var<storage, read> a: array<f32>;
+    @group(0) @binding(1) var<storage, read> b: array<f32>;
+    @group(0) @binding(2) var<storage, read_write> out: array<f32>;
+    @compute @workgroup_size(1)
+    fn main() {
+      var sum: f32 = 0.0;
+      for (var i = 0u; i < ${E}u; i++) { sum += a[i] * b[i]; }
+      out[0] = sum;
+    }
+  `});
+
+  const aBuf = device.createBuffer({ size: E * 4, usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST });
+  const bBuf = device.createBuffer({ size: E * 4, usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST });
+  const outBuf = device.createBuffer({ size: 4, usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_SRC });
+  const readBuf = device.createBuffer({ size: 4, usage: GPUBufferUsage.MAP_READ | GPUBufferUsage.COPY_DST });
+
+  device.queue.writeBuffer(aBuf, 0, qRow0);
+  device.queue.writeBuffer(bBuf, 0, normed);
+
+  const layout = device.createBindGroupLayout({ entries: [
+    { binding: 0, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'read-only-storage' } },
+    { binding: 1, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'read-only-storage' } },
+    { binding: 2, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'storage' } },
+  ]});
+  const pipeline = device.createComputePipeline({
+    layout: device.createPipelineLayout({ bindGroupLayouts: [layout] }),
+    compute: { module: shader, entryPoint: 'main' },
+  });
+  const bindGroup = device.createBindGroup({ layout, entries: [
+    { binding: 0, resource: { buffer: aBuf } },
+    { binding: 1, resource: { buffer: bBuf } },
+    { binding: 2, resource: { buffer: outBuf } },
+  ]});
+
+  const enc = device.createCommandEncoder();
+  const pass = enc.beginComputePass();
+  pass.setPipeline(pipeline);
+  pass.setBindGroup(0, bindGroup);
+  pass.dispatchWorkgroups(1);
+  pass.end();
+  enc.copyBufferToBuffer(outBuf, 0, readBuf, 0, 4);
+  device.queue.submit([enc.finish()]);
+
+  await readBuf.mapAsync(GPUMapMode.READ);
+  const gpuResult = new Float32Array(readBuf.getMappedRange().slice(0))[0];
+  readBuf.unmap();
+
+  log(`GPU f32 Q[0]: ${gpuResult.toFixed(6)}`);
+  log(`GPU == fround: ${gpuResult === cpuF32}`);
+  log(`GPU - f64: ${(gpuResult - cpuF64).toExponential(3)}`);
+  log(`GPU - f32: ${(gpuResult - cpuF32).toExponential(3)}`);
+})();
+</script></body></html>
