@@ -111,7 +111,6 @@ export class LlogosEngine {
       options?.onProgress?.({ phase: 'Uploading to GPU', bytesDownloaded: fileBuffer.byteLength, totalBytes: fileBuffer.byteLength });
       this.model = new LlamaModel(this.compute, info);
       await this.model.initWeights(tensorMap);
-      this.model.storeCpuWeights(tensorMap);
 
       this._status = 'loaded';
       return info;
