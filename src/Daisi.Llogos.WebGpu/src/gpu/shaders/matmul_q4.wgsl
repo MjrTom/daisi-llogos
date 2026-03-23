@@ -69,7 +69,7 @@ fn main(
   @builtin(workgroup_id) wg_id: vec3u,
   @builtin(local_invocation_id) lid: vec3u,
 ) {
-  let row = wg_id.x;
+  let row = wg_id.x + wg_id.y * 65535u;
   if (row >= params.M) { return; }
 
   let tid = lid.x;

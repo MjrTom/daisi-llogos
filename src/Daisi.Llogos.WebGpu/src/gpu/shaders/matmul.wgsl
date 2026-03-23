@@ -7,7 +7,7 @@ var<workgroup> shared_sum: array<f32, 256>;
 
 @compute @workgroup_size(256)
 fn main(@builtin(workgroup_id) wg: vec3u, @builtin(local_invocation_id) lid: vec3u) {
-  let row = wg.x;
+  let row = wg.x + wg.y * 65535u;
   if (row >= params.M) { return; }
   let tid = lid.x;
   let K = params.K;

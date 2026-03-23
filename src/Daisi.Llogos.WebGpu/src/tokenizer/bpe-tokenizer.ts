@@ -181,7 +181,8 @@ export class BpeTokenizer {
     // Some models have multiple EOS tokens
     const token = this.tokens[tokenId];
     return token === '<|endoftext|>' || token === '<|im_end|>'
-      || token === '<｜end▁of▁text｜>' || token === '<｜im_end｜>';
+      || token === '<｜end▁of▁text｜>' || token === '<｜im_end｜>'
+      || token === '<|eot_id|>' || token === '<|end_of_text|>';
   }
 
   // Direct encoding for SentencePiece/Llama style vocabs

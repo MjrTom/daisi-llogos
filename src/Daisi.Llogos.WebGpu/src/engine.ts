@@ -248,21 +248,17 @@ export class LlogosEngine {
       { role: 'user', content: userMessage },
     ];
 
-    // Try Jinja2 template from GGUF metadata
-    if (chatTemplate) {
-      try {
-        const bosToken = this.tokenizer && this.tokenizer.bosTokenId >= 0
-          ? this.tokenizer.decode([this.tokenizer.bosTokenId]) : '';
-        const eosToken = this.tokenizer && this.tokenizer.eosTokenId >= 0
-          ? this.tokenizer.decode([this.tokenizer.eosTokenId]) : '';
-        return applyTemplate(chatTemplate, messages, {
-          bos_token: bosToken,
-          eos_token: eosToken,
-          add_generation_prompt: true,
-        });
-      } catch {
-        // Template parse error — fall through to heuristics
+    // Llama 3 heuristic — uses <|start_header_id|> tokens (check before Jinja2,
+    // because the Llama 3 template uses complex Jinja2 features we can't parse)
+    if (this.tokenizer && this.tokenizer.getTokenId('<|start_header_id|>') >= 0) {
+      let prompt = '<|begin_of_text|>';
+      // System message
+      prompt += '<|start_header_id|>system<|end_header_id|>\n\nYou are a helpful assistant.<|eot_id|>';
+      for (const msg of messages) {
+        prompt += `<|start_header_id|>${msg.role}<|end_header_id|>\n\n${msg.content.trim()}<|eot_id|>`;
       }
+      prompt += '<|start_header_id|>assistant<|end_header_id|>\n\n';
+      return prompt;
     }
 
     // ChatML heuristic — if model has the special tokens
@@ -278,6 +274,25 @@ export class LlogosEngine {
     // Llama 2 heuristic
     if (chatTemplate?.includes('[INST]')) {
       return `[INST] ${userMessage} [/INST]`;
+    }
+
+    // Try Jinja2 template from GGUF metadata (for models with simple templates)
+    if (chatTemplate) {
+      try {
+        const bosToken = this.tokenizer && this.tokenizer.bosTokenId >= 0
+          ? this.tokenizer.decode([this.tokenizer.bosTokenId]) : '';
+        const eosToken = this.tokenizer && this.tokenizer.eosTokenId >= 0
+          ? this.tokenizer.decode([this.tokenizer.eosTokenId]) : '';
+        const result = applyTemplate(chatTemplate, messages, {
+          bos_token: bosToken,
+          eos_token: eosToken,
+          add_generation_prompt: true,
+        });
+        // Sanity check: if the result is mostly whitespace, the template probably failed
+        if (result.trim().length > 0) return result;
+      } catch {
+        // Template parse error — fall through
+      }
     }
 
     // Fallback: raw message

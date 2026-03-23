@@ -198,19 +198,25 @@ export class ComputeEngine {
       { binding: 1, resource: { buffer: input } },
       { binding: 2, resource: { buffer: output } },
       { binding: 3, resource: { buffer: params } },
-    ], [M]); // One workgroup per output row
+    ], M <= 65535 ? [M] : [65535, Math.ceil(M / 65535)]); // 2D dispatch for large vocabs
   }
 
-  /** Pre-built RoPE cos/sin tables indexed by position. */
-  private ropeTableCache = new Map<number, { cos: GPUBuffer; sin: GPUBuffer }>();
+  /** Pre-built RoPE cos/sin tables keyed by "theta,headDim,position". */
+  private ropeTableCache = new Map<string, { cos: GPUBuffer; sin: GPUBuffer }>();
+
+  /** Clear cached RoPE tables (call when loading a new model). */
+  clearRopeCache(): void {
+    this.ropeTableCache.clear();
+  }
 
   /** RoPE: apply rotary position embeddings using cached cos/sin tables. */
   rope(
     data: GPUBuffer, headDim: number, ropeDim: number,
     position: number, theta: number, nElements: number,
   ): void {
-    // Get or create cos/sin table for this position
-    let table = this.ropeTableCache.get(position);
+    // Get or create cos/sin table for this (theta, headDim, position) tuple
+    const cacheKey = `${theta},${headDim},${position}`;
+    let table = this.ropeTableCache.get(cacheKey);
     if (!table) {
       const halfDim = headDim / 2;
       const cosData = new Float32Array(halfDim);
@@ -223,10 +229,10 @@ export class ComputeEngine {
         sinData[i] = Math.fround(Math.sin(angle));
       }
       table = {
-        cos: this.buffers.createBufferWithData(`rope_cos_${position}`, cosData.buffer),
-        sin: this.buffers.createBufferWithData(`rope_sin_${position}`, sinData.buffer),
+        cos: this.buffers.createBufferWithData(`rope_cos_${cacheKey}`, cosData.buffer),
+        sin: this.buffers.createBufferWithData(`rope_sin_${cacheKey}`, sinData.buffer),
       };
-      this.ropeTableCache.set(position, table);
+      this.ropeTableCache.set(cacheKey, table);
     }
 
     const paramData = new Uint32Array(2);

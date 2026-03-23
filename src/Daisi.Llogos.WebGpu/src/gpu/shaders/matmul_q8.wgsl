@@ -17,7 +17,7 @@ fn read_i8(bo: u32) -> f32 {
 
 @compute @workgroup_size(256)
 fn main(@builtin(workgroup_id) wg: vec3u, @builtin(local_invocation_id) lid: vec3u) {
-  let row = wg.x;
+  let row = wg.x + wg.y * 65535u;
   if (row >= params.M) { return; }
   let tid = lid.x;
   let nblk = params.K / 32u;
