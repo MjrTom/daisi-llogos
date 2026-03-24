@@ -98,6 +98,7 @@ describe('Qwen 3.5 GPU Inference', () => {
 
   it('generates coherent text', async () => {
     model.resetCache();
+    model.resetCache();
     // Simple test matching C# diagnostic: just "Hello"
     const prompt = 'Hello';
     const inputTokens = tokenizer.encode(prompt);
@@ -115,7 +116,7 @@ describe('Qwen 3.5 GPU Inference', () => {
       if (tokenizer.isEos(next)) break;
       allTokens.push(next);
       generated.push(tokenizer.decode([next]));
-      model.forward(next);
+      await model.forward(next);
       logits = await model.readLogits();
     }
 
