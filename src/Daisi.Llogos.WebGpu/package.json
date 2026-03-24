@@ -25,6 +25,7 @@
     "esbuild": "^0.25.0",
     "serve": "^14.2.6",
     "typescript": "^5.7.0",
-    "vitest": "^4.1.1"
+    "vitest": "^4.1.1",
+    "webgpu": "^0.3.10"
   }
 }
