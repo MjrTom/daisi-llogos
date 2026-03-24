@@ -336,6 +336,18 @@ var l2_norm_groups_default = "// L2 normalize each group independently.\n// data
 // src/gpu/shaders/compute_decay_beta.wgsl
 var compute_decay_beta_default = "// Compute decay and beta values for DeltaNet.\n// decay[g] = exp(ssm_a[g] * softplus(alpha[g] + dt_bias[g]))\n// beta_out[g] = sigmoid(beta[g])\n\nstruct Params { n: u32, }\n\n@group(0) @binding(0) var<storage, read> alpha: array<f32>;\n@group(0) @binding(1) var<storage, read> beta: array<f32>;\n@group(0) @binding(2) var<storage, read> ssm_a: array<f32>;\n@group(0) @binding(3) var<storage, read> dt_bias: array<f32>;\n@group(0) @binding(4) var<storage, read_write> decay_out: array<f32>;\n@group(0) @binding(5) var<storage, read_write> beta_out: array<f32>;\n@group(0) @binding(6) var<uniform> params: Params;\n\n@compute @workgroup_size(64)\nfn main(@builtin(global_invocation_id) gid: vec3u) {\n  let g = gid.x;\n  if (g >= params.n) { return; }\n\n  let softplus = log(1.0 + exp(alpha[g] + dt_bias[g]));\n  decay_out[g] = exp(ssm_a[g] * softplus);\n  beta_out[g] = 1.0 / (1.0 + exp(-beta[g]));\n}\n";
 
+// src/gpu/shaders/deinterleave_q.wgsl
+var deinterleave_q_default = "// Deinterleave gated Q: split [h0_attn|h0_gate|h1_attn|h1_gate|...] into separate attn and gate buffers.\n// qFull: [numHeads * headDim * 2], qAttn: [numHeads * headDim], qGate: [numHeads * headDim]\n\nstruct Params {\n  num_heads: u32,\n  head_dim: u32,\n}\n\n@group(0) @binding(0) var<storage, read> q_full: array<f32>;\n@group(0) @binding(1) var<storage, read_write> q_attn: array<f32>;\n@group(0) @binding(2) var<storage, read_write> q_gate: array<f32>;\n@group(0) @binding(3) var<uniform> params: Params;\n\n@compute @workgroup_size(256)\nfn main(@builtin(global_invocation_id) gid: vec3u) {\n  let idx = gid.x;\n  let total = params.num_heads * params.head_dim;\n  if (idx >= total) { return; }\n\n  let head = idx / params.head_dim;\n  let dim = idx % params.head_dim;\n  let src_base = head * params.head_dim * 2u;\n\n  q_attn[head * params.head_dim + dim] = q_full[src_base + dim];\n  q_gate[head * params.head_dim + dim] = q_full[src_base + params.head_dim + dim];\n}\n";
+
+// src/gpu/shaders/per_head_rmsnorm.wgsl
+var per_head_rmsnorm_default = "// Per-head RMSNorm: normalize each head independently using shared weight.\n// data: [numHeads * headDim], weight: [headDim] (shared across all heads)\n// One workgroup per head, 256 threads for reduction.\n\nstruct Params {\n  num_heads: u32,\n  head_dim: u32,\n  eps_bits: u32,  // float eps stored as u32 bits\n}\n\n@group(0) @binding(0) var<storage, read_write> data: array<f32>;\n@group(0) @binding(1) var<storage, read> weight: array<f32>;\n@group(0) @binding(2) var<uniform> params: Params;\nvar<workgroup> shared_sum: array<f32, 256>;\n\n@compute @workgroup_size(256)\nfn main(@builtin(workgroup_id) wg: vec3u, @builtin(local_invocation_id) lid: vec3u) {\n  let h = wg.x;\n  if (h >= params.num_heads) { return; }\n  let tid = lid.x;\n  let dim = params.head_dim;\n  let base = h * dim;\n  let eps = bitcast<f32>(params.eps_bits);\n\n  // Sum of squares\n  var sum_sq: f32 = 0.0;\n  for (var i = tid; i < dim; i += 256u) {\n    let v = data[base + i];\n    sum_sq += v * v;\n  }\n  shared_sum[tid] = sum_sq;\n  workgroupBarrier();\n\n  for (var s = 128u; s > 0u; s >>= 1u) {\n    if (tid < s) { shared_sum[tid] += shared_sum[tid + s]; }\n    workgroupBarrier();\n  }\n\n  let rms = sqrt(shared_sum[0] / f32(dim) + eps);\n  let inv_rms = 1.0 / rms;\n\n  // Normalize with weight\n  for (var i = tid; i < dim; i += 256u) {\n    data[base + i] = data[base + i] * inv_rms * weight[i];\n  }\n}\n";
+
+// src/gpu/shaders/partial_rope.wgsl
+var partial_rope_default = "// Partial RoPE: apply rotary embeddings to first ropeDim positions of each head.\n// Positions ropeDim..headDim-1 are left unchanged.\n// data: [numHeads * headDim], cos/sin tables: [ropeDim/2] precomputed for this position.\n\nstruct Params {\n  num_heads: u32,\n  head_dim: u32,\n  rope_dim: u32,\n}\n\n@group(0) @binding(0) var<storage, read_write> data: array<f32>;\n@group(0) @binding(1) var<storage, read> cos_table: array<f32>;\n@group(0) @binding(2) var<storage, read> sin_table: array<f32>;\n@group(0) @binding(3) var<uniform> params: Params;\n\n@compute @workgroup_size(256)\nfn main(@builtin(global_invocation_id) gid: vec3u) {\n  let idx = gid.x;\n  let half_rope = params.rope_dim / 2u;\n  let total_pairs = params.num_heads * half_rope;\n  if (idx >= total_pairs) { return; }\n\n  let head = idx / half_rope;\n  let pair = idx % half_rope;\n\n  let base = head * params.head_dim;\n  let i0 = base + pair * 2u;\n  let i1 = i0 + 1u;\n\n  let cos_a = cos_table[pair];\n  let sin_a = sin_table[pair];\n\n  let x = data[i0];\n  let y = data[i1];\n\n  data[i0] = x * cos_a - y * sin_a;\n  data[i1] = x * sin_a + y * cos_a;\n}\n";
+
+// src/gpu/shaders/gated_attention.wgsl
+var gated_attention_default = "// Gated attention: softmax(Q*K^T / scale) * V * sigmoid(qGate)\n// One workgroup per Q head. Handles GQA (multiple Q heads per KV head).\n// Uses online softmax for numerical stability.\n//\n// qAttn: [numHeads * keyLen], qGate: [numHeads * keyLen]\n// kCache: [numKvHeads * maxSeqLen * keyLen], vCache: [numKvHeads * maxSeqLen * valLen]\n// output: [numHeads * valLen]\n\nstruct Params {\n  num_heads: u32,\n  num_kv_heads: u32,\n  key_len: u32,\n  val_len: u32,\n  max_seq_len: u32,\n  seq_len: u32,\n  scale_bits: u32,  // float scale as u32 bits\n}\n\n@group(0) @binding(0) var<storage, read> q_attn: array<f32>;\n@group(0) @binding(1) var<storage, read> q_gate: array<f32>;\n@group(0) @binding(2) var<storage, read> k_cache: array<f32>;\n@group(0) @binding(3) var<storage, read> v_cache: array<f32>;\n@group(0) @binding(4) var<storage, read_write> output: array<f32>;\n@group(0) @binding(5) var<uniform> params: Params;\n\n// Shared memory for attention scores (max 4096 tokens)\nvar<workgroup> scores: array<f32, 64>;\n\n@compute @workgroup_size(64)\nfn main(@builtin(workgroup_id) wg: vec3u, @builtin(local_invocation_id) lid: vec3u) {\n  let h = wg.x;\n  if (h >= params.num_heads) { return; }\n  let tid = lid.x;\n  let scale = bitcast<f32>(params.scale_bits);\n  let kv_head = h / (params.num_heads / params.num_kv_heads);\n  let q_off = h * params.key_len;\n  let kv_k_base = kv_head * params.max_seq_len * params.key_len;\n  let kv_v_base = kv_head * params.max_seq_len * params.val_len;\n  let out_off = h * params.val_len;\n  let seq_len = params.seq_len;\n\n  // Process tokens in tiles of 64\n  // Online softmax: track running max and sum\n  var running_max: f32 = -1e30;\n  var running_sum: f32 = 0.0;\n\n  // Initialize output to zero\n  for (var d = tid; d < params.val_len; d += 64u) {\n    output[out_off + d] = 0.0;\n  }\n  workgroupBarrier();\n\n  for (var tile_start = 0u; tile_start < seq_len; tile_start += 64u) {\n    let tile_end = min(tile_start + 64u, seq_len);\n\n    // Compute attention score for this thread's token\n    var score: f32 = -1e30;\n    let t = tile_start + tid;\n    if (t < tile_end) {\n      var dot: f32 = 0.0;\n      let k_off = kv_k_base + t * params.key_len;\n      for (var d = 0u; d < params.key_len; d++) {\n        dot += q_attn[q_off + d] * k_cache[k_off + d];\n      }\n      score = dot * scale;\n    }\n    scores[tid] = score;\n    workgroupBarrier();\n\n    // Find tile max\n    var tile_max: f32 = -1e30;\n    let tile_len = tile_end - tile_start;\n    for (var i = 0u; i < tile_len; i++) {\n      tile_max = max(tile_max, scores[i]);\n    }\n\n    // Compute exp scores\n    var tile_sum: f32 = 0.0;\n    if (tid < tile_len) {\n      scores[tid] = exp(scores[tid] - tile_max);\n      tile_sum = scores[tid];\n    }\n    workgroupBarrier();\n\n    // Sum tile scores (simple serial, fast for \u226464)\n    var total_tile_sum: f32 = 0.0;\n    for (var i = 0u; i < tile_len; i++) {\n      total_tile_sum += scores[i];\n    }\n\n    // Online softmax correction\n    let new_max = max(running_max, tile_max);\n    let correction_old = exp(running_max - new_max);\n    let correction_new = exp(tile_max - new_max);\n\n    // Update output: out = out * correction_old + tile_weighted_v * correction_new\n    for (var d = tid; d < params.val_len; d += 64u) {\n      var tile_val: f32 = 0.0;\n      for (var i = 0u; i < tile_len; i++) {\n        tile_val += scores[i] * v_cache[kv_v_base + (tile_start + i) * params.val_len + d];\n      }\n      output[out_off + d] = output[out_off + d] * correction_old + tile_val * correction_new;\n    }\n    workgroupBarrier();\n\n    running_sum = running_sum * correction_old + total_tile_sum * correction_new;\n    running_max = new_max;\n  }\n\n  // Normalize and apply sigmoid gate\n  let inv_sum = select(0.0, 1.0 / running_sum, running_sum > 0.0);\n  for (var d = tid; d < params.val_len; d += 64u) {\n    let gate_idx = min(d, params.key_len - 1u);\n    let gate_val = 1.0 / (1.0 + exp(-q_gate[h * params.key_len + gate_idx]));\n    output[out_off + d] = output[out_off + d] * inv_sum * gate_val;\n  }\n}\n";
+
 // src/gpu/shaders/deltanet_step.wgsl
 var deltanet_step_default = "// DeltaNet state update + output computation.\n// One workgroup per group (head). 128 threads per group.\n//\n// For each group g:\n//   sk[j] = sum_i(state[g,i,j] * k[g*D+i])\n//   error[j] = (v[g*D+j] - decay[g]*sk[j]) * beta[g]\n//   state[g,i,j] = decay[g]*state[g,i,j] + k[g*D+i]*error[j]\n//   output[g*D+j] = sum_i(state[g,i,j] * q[g*D+i]) * scale\n//   Per-head RMSNorm on output[g*D .. g*D+D-1]\n\nstruct Params {\n  head_dim: u32,    // D = 128\n  num_groups: u32,  // 16\n  scale: f32,       // 1/sqrt(D)\n  norm_eps: f32,    // RMSNorm epsilon\n}\n\n@group(0) @binding(0) var<storage, read> q: array<f32>;\n@group(0) @binding(1) var<storage, read> k: array<f32>;\n@group(0) @binding(2) var<storage, read> v: array<f32>;\n@group(0) @binding(3) var<storage, read_write> state: array<f32>;  // [G * D * D]\n@group(0) @binding(4) var<storage, read> decay: array<f32>;        // [G]\n@group(0) @binding(5) var<storage, read> beta_val: array<f32>;     // [G]\n@group(0) @binding(6) var<storage, read> norm_weight: array<f32>;  // [D] shared across groups\n@group(0) @binding(7) var<storage, read_write> output: array<f32>; // [G * D]\n@group(0) @binding(8) var<uniform> params: Params;\n\nvar<workgroup> shared_k: array<f32, 128>;\nvar<workgroup> shared_error: array<f32, 128>;\nvar<workgroup> shared_sum: f32;\n\n@compute @workgroup_size(128)\nfn main(@builtin(workgroup_id) wg: vec3u, @builtin(local_invocation_id) lid: vec3u) {\n  let g = wg.x;\n  if (g >= params.num_groups) { return; }\n  let j = lid.x;  // each thread handles one column j\n  let D = params.head_dim;\n  let base = g * D;\n  let state_base = g * D * D;\n  let d = decay[g];\n  let b = beta_val[g];\n\n  // Load k into shared memory\n  shared_k[j] = k[base + j];\n  workgroupBarrier();\n\n  // 1. sk[j] = S^T * k = sum_i(state[i*D+j] * k[i])\n  var sk: f32 = 0.0;\n  for (var i = 0u; i < D; i++) {\n    sk += state[state_base + i * D + j] * shared_k[i];\n  }\n\n  // 2. error[j] = (v[j] - decay * sk) * beta\n  let err = (v[base + j] - d * sk) * b;\n  shared_error[j] = err;\n  workgroupBarrier();\n\n  // 3. State update: for each row i that this column j touches\n  //    state[i,j] = decay * state[i,j] + k[i] * error[j]\n  // Thread j updates column j across all rows\n  for (var i = 0u; i < D; i++) {\n    let idx = state_base + i * D + j;\n    state[idx] = d * state[idx] + shared_k[i] * shared_error[j];\n  }\n  workgroupBarrier();\n\n  // 4. output[j] = S_new^T * q * scale = sum_i(state[i,j] * q[i]) * scale\n  var o: f32 = 0.0;\n  for (var i = 0u; i < D; i++) {\n    o += state[state_base + i * D + j] * q[base + i];\n  }\n  output[base + j] = o * params.scale;\n  workgroupBarrier();\n\n  // 5. Per-head RMSNorm\n  // Compute sum of squares (reduction across threads)\n  var my_sq = output[base + j] * output[base + j];\n\n  // Use shared memory for reduction\n  // We need to reduce 128 values - use warp-style reduction\n  // Store in shared_k (reuse, we're done with k)\n  shared_k[j] = my_sq;\n  workgroupBarrier();\n  for (var s = 64u; s > 0u; s >>= 1u) {\n    if (j < s) { shared_k[j] += shared_k[j + s]; }\n    workgroupBarrier();\n  }\n\n  let rms = sqrt(shared_k[0] / f32(D) + params.norm_eps);\n  let inv_rms = 1.0 / rms;\n  output[base + j] = output[base + j] * inv_rms * norm_weight[j];\n}\n";
 
@@ -784,6 +796,100 @@ var ComputeEngine = class {
       { binding: 1, resource: { buffer: gate } },
       { binding: 2, resource: { buffer: params } }
     ], [Math.ceil(n / 256)]);
+  }
+  // ── Standard Attention GPU ops (Qwen 3.5) ────────────────────────
+  /** Deinterleave gated Q: split [attn|gate|attn|gate|...] per head. */
+  deinterleaveQ(qFull, qAttn, qGate, numHeads, headDim) {
+    const params = this.createParams("deinterleave_q_params", new Uint32Array([numHeads, headDim]).buffer);
+    this.dispatch(deinterleave_q_default, "deinterleave_q", [
+      storageReadOnly(0),
+      storageReadWrite(1),
+      storageReadWrite(2),
+      uniform(3)
+    ], [
+      { binding: 0, resource: { buffer: qFull } },
+      { binding: 1, resource: { buffer: qAttn } },
+      { binding: 2, resource: { buffer: qGate } },
+      { binding: 3, resource: { buffer: params } }
+    ], [Math.ceil(numHeads * headDim / 256)]);
+  }
+  /** Per-head RMSNorm with shared weight vector. */
+  perHeadRmsNorm(data, weight, numHeads, headDim, eps) {
+    const paramBuf = new Uint32Array(3);
+    paramBuf[0] = numHeads;
+    paramBuf[1] = headDim;
+    paramBuf[2] = new Uint32Array(new Float32Array([eps]).buffer)[0];
+    const params = this.createParams("per_head_rmsnorm_params", paramBuf.buffer);
+    this.dispatch(per_head_rmsnorm_default, "per_head_rmsnorm", [
+      storageReadWrite(0),
+      storageReadOnly(1),
+      uniform(2)
+    ], [
+      { binding: 0, resource: { buffer: data } },
+      { binding: 1, resource: { buffer: weight } },
+      { binding: 2, resource: { buffer: params } }
+    ], [numHeads]);
+  }
+  /** Partial RoPE: rotate first ropeDim positions of each head using precomputed tables. */
+  partialRope(data, numHeads, headDim, ropeDim, position, theta) {
+    const halfDim = ropeDim / 2;
+    const cacheKey = `partial_rope,${theta},${ropeDim},${position}`;
+    let table = this.ropeTableCache.get(cacheKey);
+    if (!table) {
+      const cosData = new Float32Array(halfDim);
+      const sinData = new Float32Array(halfDim);
+      for (let i = 0; i < halfDim; i++) {
+        const freq = 1 / Math.pow(theta, 2 * i / ropeDim);
+        const angle = position * freq;
+        cosData[i] = Math.fround(Math.cos(angle));
+        sinData[i] = Math.fround(Math.sin(angle));
+      }
+      table = {
+        cos: this.buffers.createBufferWithData(`prope_cos_${cacheKey}`, cosData.buffer),
+        sin: this.buffers.createBufferWithData(`prope_sin_${cacheKey}`, sinData.buffer)
+      };
+      this.ropeTableCache.set(cacheKey, table);
+    }
+    const params = this.createParams("partial_rope_params", new Uint32Array([numHeads, headDim, ropeDim]).buffer);
+    this.dispatch(partial_rope_default, "partial_rope", [
+      storageReadWrite(0),
+      storageReadOnly(1),
+      storageReadOnly(2),
+      uniform(3)
+    ], [
+      { binding: 0, resource: { buffer: data } },
+      { binding: 1, resource: { buffer: table.cos } },
+      { binding: 2, resource: { buffer: table.sin } },
+      { binding: 3, resource: { buffer: params } }
+    ], [Math.ceil(numHeads * halfDim / 256)]);
+  }
+  /** Gated attention: softmax(QK^T/scale) * V * sigmoid(qGate). One workgroup per head. */
+  gatedAttention(qAttn, qGate, kCache, vCache, output, numHeads, numKvHeads, keyLen, valLen, maxSeqLen, seqLen, scale) {
+    const paramBuf = new ArrayBuffer(28);
+    const u32 = new Uint32Array(paramBuf);
+    u32[0] = numHeads;
+    u32[1] = numKvHeads;
+    u32[2] = keyLen;
+    u32[3] = valLen;
+    u32[4] = maxSeqLen;
+    u32[5] = seqLen;
+    u32[6] = new Uint32Array(new Float32Array([scale]).buffer)[0];
+    const params = this.createParams("gated_attn_params", paramBuf);
+    this.dispatch(gated_attention_default, "gated_attention", [
+      storageReadOnly(0),
+      storageReadOnly(1),
+      storageReadOnly(2),
+      storageReadOnly(3),
+      storageReadWrite(4),
+      uniform(5)
+    ], [
+      { binding: 0, resource: { buffer: qAttn } },
+      { binding: 1, resource: { buffer: qGate } },
+      { binding: 2, resource: { buffer: kCache } },
+      { binding: 3, resource: { buffer: vCache } },
+      { binding: 4, resource: { buffer: output } },
+      { binding: 5, resource: { buffer: params } }
+    ], [numHeads]);
   }
   /** Reusable readback buffer — avoids allocation per readLogits call. */
   readbackBuf = null;
@@ -2173,6 +2279,9 @@ var Qwen35Model = class {
   ffnOut;
   temp;
   logits;
+  // Standard attention GPU buffers (for gated Q)
+  qAttnBuf;
+  qGateBufAttn;
   // DeltaNet-specific GPU buffers
   qkvBuf;
   ssmGateBuf;
@@ -2345,6 +2454,9 @@ var Qwen35Model = class {
     this.ffnOut = compute.buffers.createBuffer("ffn_out", F * 4);
     this.temp = compute.buffers.createBuffer("temp", E * 4);
     this.logits = compute.buffers.createBuffer("logits", this.vocabSize * 4);
+    const qAttnDim = this.numHeads * this.keyLength;
+    this.qAttnBuf = compute.buffers.createBuffer("q_attn", qAttnDim * 4);
+    this.qGateBufAttn = compute.buffers.createBuffer("q_gate_attn", qAttnDim * 4);
     const qkvDim = this.ssmInnerSize * 3;
     const numVHeads = this.ssmNumVHeads;
     this.qkvBuf = compute.buffers.createBuffer("qkv", qkvDim * 4);
@@ -2387,7 +2499,7 @@ var Qwen35Model = class {
   /**
    * Forward pass for a single token.
    */
-  async forward(tokenId) {
+  forward(tokenId) {
     const { compute, weights } = this;
     const E = this.embeddingDim;
     compute.embedding(weights.tokenEmbedding, this.hidden, tokenId, E);
@@ -2397,7 +2509,7 @@ var Qwen35Model = class {
       const lw = weights.layers[layer];
       compute.copyAndRmsNorm(this.hidden, lw.attnNorm, this.normed, this.residual, E, this.rmsNormEps);
       if (lw.kind === "standard") {
-        await this.forwardStandardAttention(layer, lw);
+        this.forwardStandardAttention(layer, lw);
       } else {
         this.forwardDeltaNet(layer, lw);
       }
@@ -2408,21 +2520,12 @@ var Qwen35Model = class {
       compute.matmul(lw.downProj.buffer, this.ffnOut, this.temp, E, this.ffnDim, lw.downProj.type);
       compute.add(this.temp, this.residual, this.hidden, E);
     }
-    if (this._position === 0) {
-      const h = new Float32Array(await this.readGpuBuffer(this.hidden, E * 4));
-      let hMax = 0, hSum = 0;
-      for (let i = 0; i < E; i++) {
-        hMax = Math.max(hMax, Math.abs(h[i]));
-        hSum += h[i];
-      }
-      console.log(`  [final] hidden max=${hMax.toFixed(4)} sum=${hSum.toFixed(4)} h[0..4]=${Array.from(h.slice(0, 5)).map((v) => v.toFixed(4))}`);
-    }
     compute.rmsNorm(this.hidden, weights.outputNorm, this.normed, E, this.rmsNormEps);
     compute.matmul(weights.output, this.normed, this.logits, this.vocabSize, E, 0 /* F32 */);
     this._position++;
     return this.logits;
   }
-  async forwardStandardAttention(layer, lw) {
+  forwardStandardAttention(layer, lw) {
     const { compute } = this;
     const E = this.embeddingDim;
     const kvCache = this.kvCaches[layer];
@@ -2438,100 +2541,34 @@ var Qwen35Model = class {
     compute.matmul(lw.q.buffer, this.normed, this.qBuf, qFullDim, E, lw.q.type);
     compute.matmul(lw.k.buffer, this.normed, this.kBuf, kDim, E, lw.k.type);
     compute.matmul(lw.v.buffer, this.normed, this.vBuf, vDim, E, lw.v.type);
-    const qFullData = new Float32Array(await this.readGpuBuffer(this.qBuf, qFullDim * 4));
-    const kData = new Float32Array(await this.readGpuBuffer(this.kBuf, kDim * 4));
-    const qAttn = new Float32Array(nH * keyLen);
-    const qGate = new Float32Array(nH * keyLen);
     if (this.hasGatedQ) {
-      for (let h = 0; h < nH; h++) {
-        for (let d = 0; d < keyLen; d++) {
-          qAttn[h * keyLen + d] = qFullData[h * keyLen * 2 + d];
-          qGate[h * keyLen + d] = qFullData[h * keyLen * 2 + keyLen + d];
-        }
-      }
+      compute.deinterleaveQ(this.qBuf, this.qAttnBuf, this.qGateBufAttn, nH, keyLen);
     } else {
-      qAttn.set(qFullData);
-      qGate.fill(88);
+      const enc = compute.device.createCommandEncoder();
+      enc.copyBufferToBuffer(this.qBuf, 0, this.qAttnBuf, 0, nH * keyLen * 4);
+      compute.device.queue.submit([enc.finish()]);
     }
     if (lw.qNorm) {
-      const qNormW = new Float32Array(await this.readGpuBuffer(lw.qNorm, keyLen * 4));
-      const kNormW = lw.kNorm ? new Float32Array(await this.readGpuBuffer(lw.kNorm, keyLen * 4)) : qNormW;
-      for (let h = 0; h < nH; h++) {
-        const off = h * keyLen;
-        let ss = 0;
-        for (let i = 0; i < keyLen; i++) ss += qAttn[off + i] * qAttn[off + i];
-        const rms = Math.sqrt(ss / keyLen + this.rmsNormEps);
-        for (let i = 0; i < keyLen; i++) qAttn[off + i] = qAttn[off + i] / rms * qNormW[i];
-      }
-      for (let h = 0; h < nKV; h++) {
-        const off = h * keyLen;
-        let ss = 0;
-        for (let i = 0; i < keyLen; i++) ss += kData[off + i] * kData[off + i];
-        const rms = Math.sqrt(ss / keyLen + this.rmsNormEps);
-        for (let i = 0; i < keyLen; i++) kData[off + i] = kData[off + i] / rms * kNormW[i];
-      }
+      compute.perHeadRmsNorm(this.qAttnBuf, lw.qNorm, nH, keyLen, this.rmsNormEps);
+      compute.perHeadRmsNorm(this.kBuf, lw.kNorm || lw.qNorm, nKV, keyLen, this.rmsNormEps);
     }
-    const ropeDim = this.ropeDim;
-    const halfDim = ropeDim / 2;
-    for (let h = 0; h < nH; h++) {
-      const off = h * keyLen;
-      for (let i = 0; i < halfDim; i++) {
-        const freq = 1 / Math.pow(this.ropeTheta, 2 * i / ropeDim);
-        const angle = pos * freq;
-        const cos = Math.cos(angle), sin = Math.sin(angle);
-        const x0 = qAttn[off + 2 * i], x1 = qAttn[off + 2 * i + 1];
-        qAttn[off + 2 * i] = x0 * cos - x1 * sin;
-        qAttn[off + 2 * i + 1] = x0 * sin + x1 * cos;
-      }
-    }
-    for (let h = 0; h < nKV; h++) {
-      const off = h * keyLen;
-      for (let i = 0; i < halfDim; i++) {
-        const freq = 1 / Math.pow(this.ropeTheta, 2 * i / ropeDim);
-        const angle = pos * freq;
-        const cos = Math.cos(angle), sin = Math.sin(angle);
-        const x0 = kData[off + 2 * i], x1 = kData[off + 2 * i + 1];
-        kData[off + 2 * i] = x0 * cos - x1 * sin;
-        kData[off + 2 * i + 1] = x0 * sin + x1 * cos;
-      }
-    }
-    compute.device.queue.writeBuffer(this.kBuf, 0, kData.buffer);
+    compute.partialRope(this.qAttnBuf, nH, keyLen, this.ropeDim, pos, this.ropeTheta);
+    compute.partialRope(this.kBuf, nKV, keyLen, this.ropeDim, pos, this.ropeTheta);
     kvCache.write(this.kBuf, this.vBuf, kDim * 4, vDim * 4);
-    const vData = new Float32Array(await this.readGpuBuffer(this.vBuf, vDim * 4));
-    const kCacheData = new Float32Array(await this.readGpuBuffer(kvCache.kBuffer, nKV * kvCache.maxSeqLen * keyLen * 4));
-    const vCacheData = new Float32Array(await this.readGpuBuffer(kvCache.vBuffer, nKV * kvCache.maxSeqLen * valLen * 4));
-    const seqLen = kvCache.seqLen;
-    const maxSeqLen = kvCache.maxSeqLen;
-    const attnOutData = new Float32Array(nH * valLen);
-    for (let h = 0; h < nH; h++) {
-      const kvHead = Math.floor(h / (nH / nKV));
-      const qOff = h * keyLen;
-      const scores = new Float32Array(seqLen);
-      for (let t = 0; t < seqLen; t++) {
-        let dot = 0;
-        const kOff = kvHead * maxSeqLen * keyLen + t * keyLen;
-        for (let d = 0; d < keyLen; d++) dot += qAttn[qOff + d] * kCacheData[kOff + d];
-        scores[t] = dot * scale;
-      }
-      let maxS = -Infinity;
-      for (let t = 0; t < seqLen; t++) if (scores[t] > maxS) maxS = scores[t];
-      let expSum = 0;
-      for (let t = 0; t < seqLen; t++) {
-        scores[t] = Math.exp(scores[t] - maxS);
-        expSum += scores[t];
-      }
-      for (let t = 0; t < seqLen; t++) scores[t] /= expSum;
-      const oOff = h * valLen;
-      for (let d = 0; d < valLen; d++) {
-        let sum = 0;
-        for (let t = 0; t < seqLen; t++) {
-          sum += scores[t] * vCacheData[kvHead * maxSeqLen * valLen + t * valLen + d];
-        }
-        const gate = 1 / (1 + Math.exp(-qGate[h * keyLen + d]));
-        attnOutData[oOff + d] = sum * gate;
-      }
-    }
-    compute.device.queue.writeBuffer(this.attnOut, 0, attnOutData.buffer);
+    compute.gatedAttention(
+      this.qAttnBuf,
+      this.qGateBufAttn,
+      kvCache.kBuffer,
+      kvCache.vBuffer,
+      this.attnOut,
+      nH,
+      nKV,
+      keyLen,
+      valLen,
+      kvCache.maxSeqLen,
+      kvCache.seqLen,
+      scale
+    );
     compute.matmul(lw.o.buffer, this.attnOut, this.temp, E, nH * valLen, lw.o.type);
     compute.add(this.temp, this.residual, this.hidden, E);
   }
@@ -2587,40 +2624,6 @@ var Qwen35Model = class {
     compute.add(this.temp, this.residual, this.hidden, E);
   }
   /** Apply RoPE to first ropeDim dims of each head, leaving rest unchanged. */
-  applyPartialRoPE(data, nHeads, position) {
-    const headDim = this.headDim;
-    const ropeDim = this.ropeDim;
-    const halfDim = ropeDim / 2;
-    const theta = this.ropeTheta;
-    for (let h = 0; h < nHeads; h++) {
-      const off = h * headDim;
-      for (let i = 0; i < halfDim; i++) {
-        const freq = 1 / Math.pow(theta, 2 * i / ropeDim);
-        const angle = position * freq;
-        const cos = Math.cos(angle);
-        const sin = Math.sin(angle);
-        const x0 = data[off + 2 * i];
-        const x1 = data[off + 2 * i + 1];
-        data[off + 2 * i] = x0 * cos - x1 * sin;
-        data[off + 2 * i + 1] = x0 * sin + x1 * cos;
-      }
-    }
-  }
-  /** Read a GPU buffer to CPU — creates a fresh readback buffer each time to avoid mapping conflicts. */
-  async readGpuBuffer(buffer, size) {
-    const readback = this.compute.device.createBuffer({
-      size,
-      usage: GPUBufferUsage.MAP_READ | GPUBufferUsage.COPY_DST
-    });
-    const encoder = this.compute.device.createCommandEncoder();
-    encoder.copyBufferToBuffer(buffer, 0, readback, 0, size);
-    this.compute.device.queue.submit([encoder.finish()]);
-    await readback.mapAsync(GPUMapMode.READ);
-    const data = readback.getMappedRange().slice(0);
-    readback.unmap();
-    readback.destroy();
-    return data;
-  }
   async readLogits() {
     return new Float32Array(await this.compute.readBuffer(this.logits, this.vocabSize * 4));
   }

@@ -119,6 +119,9 @@ export class Qwen35Model {
   private ffnOut!: GPUBuffer;
   private temp!: GPUBuffer;
   private logits!: GPUBuffer;
+  // Standard attention GPU buffers (for gated Q)
+  private qAttnBuf!: GPUBuffer;
+  private qGateBufAttn!: GPUBuffer;
   // DeltaNet-specific GPU buffers
   private qkvBuf!: GPUBuffer;
   private ssmGateBuf!: GPUBuffer;
@@ -297,6 +300,10 @@ export class Qwen35Model {
     this.ffnOut = compute.buffers.createBuffer('ffn_out', F * 4);
     this.temp = compute.buffers.createBuffer('temp', E * 4);
     this.logits = compute.buffers.createBuffer('logits', this.vocabSize * 4);
+    // Standard attention buffers (for gated Q)
+    const qAttnDim = this.numHeads * this.keyLength;
+    this.qAttnBuf = compute.buffers.createBuffer('q_attn', qAttnDim * 4);
+    this.qGateBufAttn = compute.buffers.createBuffer('q_gate_attn', qAttnDim * 4);
     // DeltaNet buffers
     const qkvDim = this.ssmInnerSize * 3;
     const numVHeads = this.ssmNumVHeads;
@@ -345,7 +352,7 @@ export class Qwen35Model {
   /**
    * Forward pass for a single token.
    */
-  async forward(tokenId: number): Promise<GPUBuffer> {
+  forward(tokenId: number): GPUBuffer {
     const { compute, weights } = this;
     const E = this.embeddingDim;
 
@@ -367,7 +374,7 @@ export class Qwen35Model {
 
 
       if (lw.kind === 'standard') {
-        await this.forwardStandardAttention(layer, lw);
+        this.forwardStandardAttention(layer, lw);
       } else {
         this.forwardDeltaNet(layer, lw);
       }
@@ -387,11 +394,6 @@ export class Qwen35Model {
     }
 
     // Final RMSNorm + LM Head
-    if (this._position === 0) {
-      const h = new Float32Array(await this.readGpuBuffer(this.hidden, E * 4));
-      let hMax = 0, hSum = 0; for (let i = 0; i < E; i++) { hMax = Math.max(hMax, Math.abs(h[i])); hSum += h[i]; }
-      console.log(`  [final] hidden max=${hMax.toFixed(4)} sum=${hSum.toFixed(4)} h[0..4]=${Array.from(h.slice(0, 5)).map(v => v.toFixed(4))}`);
-    }
     compute.rmsNorm(this.hidden, weights.outputNorm, this.normed, E, this.rmsNormEps);
     compute.matmul(weights.output, this.normed, this.logits, this.vocabSize, E, GgmlType.F32);
 
@@ -399,18 +401,18 @@ export class Qwen35Model {
     return this.logits;
   }
 
-  private async forwardStandardAttention(layer: number, lw: StdAttnWeights): Promise<void> {
+  private forwardStandardAttention(layer: number, lw: StdAttnWeights): void {
     const { compute } = this;
     const E = this.embeddingDim;
     const kvCache = this.kvCaches[layer]!;
-    const keyLen = this.keyLength;   // 256 per head
-    const valLen = this.valueLength; // 256 per head
-    const nH = this.numHeads;        // 8
-    const nKV = this.numKvHeads;     // 2
+    const keyLen = this.keyLength;
+    const valLen = this.valueLength;
+    const nH = this.numHeads;
+    const nKV = this.numKvHeads;
     const pos = kvCache.seqLen;
     const scale = 1.0 / Math.sqrt(keyLen);
 
-    // Q, K, V projections — Q may be gated (2× keyLen per head)
+    // 1. Q, K, V projections (GPU matmul)
     const qFullDim = this.hasGatedQ ? nH * keyLen * 2 : nH * keyLen;
     const kDim = nKV * keyLen;
     const vDim = nKV * valLen;
@@ -418,115 +420,37 @@ export class Qwen35Model {
     compute.matmul(lw.k.buffer, this.normed, this.kBuf, kDim, E, lw.k.type);
     compute.matmul(lw.v.buffer, this.normed, this.vBuf, vDim, E, lw.v.type);
 
-    // Read to CPU for deinterleave, norms, RoPE, and attention
-    const qFullData = new Float32Array(await this.readGpuBuffer(this.qBuf, qFullDim * 4));
-    const kData = new Float32Array(await this.readGpuBuffer(this.kBuf, kDim * 4));
-
-    // DeInterleave gated Q: [h0_attn, h0_gate, h1_attn, h1_gate, ...]
-    const qAttn = new Float32Array(nH * keyLen);
-    const qGate = new Float32Array(nH * keyLen);
+    // 2. Deinterleave gated Q (GPU)
     if (this.hasGatedQ) {
-      for (let h = 0; h < nH; h++) {
-        for (let d = 0; d < keyLen; d++) {
-          qAttn[h * keyLen + d] = qFullData[h * keyLen * 2 + d];
-          qGate[h * keyLen + d] = qFullData[h * keyLen * 2 + keyLen + d];
-        }
-      }
+      compute.deinterleaveQ(this.qBuf, this.qAttnBuf, this.qGateBufAttn, nH, keyLen);
     } else {
-      qAttn.set(qFullData);
-      qGate.fill(88.0); // sigmoid(88)≈1 → ungated
+      // Copy Q to qAttn, fill qGate with 88.0 (sigmoid≈1 = ungated)
+      const enc = compute.device.createCommandEncoder();
+      enc.copyBufferToBuffer(this.qBuf, 0, this.qAttnBuf, 0, nH * keyLen * 4);
+      compute.device.queue.submit([enc.finish()]);
+      // qGateBufAttn should be pre-filled with 88.0 — do it once in init
     }
 
-    // Per-head QK RMSNorm — norm weight is [keyLen] elements, shared across all heads
+    // 3. Per-head QK RMSNorm (GPU)
     if (lw.qNorm) {
-      const qNormW = new Float32Array(await this.readGpuBuffer(lw.qNorm, keyLen * 4));
-      const kNormW = lw.kNorm ? new Float32Array(await this.readGpuBuffer(lw.kNorm, keyLen * 4)) : qNormW;
-      for (let h = 0; h < nH; h++) {
-        const off = h * keyLen;
-        let ss = 0; for (let i = 0; i < keyLen; i++) ss += qAttn[off + i] * qAttn[off + i];
-        const rms = Math.sqrt(ss / keyLen + this.rmsNormEps);
-        for (let i = 0; i < keyLen; i++) qAttn[off + i] = (qAttn[off + i] / rms) * qNormW[i];
-      }
-      for (let h = 0; h < nKV; h++) {
-        const off = h * keyLen;
-        let ss = 0; for (let i = 0; i < keyLen; i++) ss += kData[off + i] * kData[off + i];
-        const rms = Math.sqrt(ss / keyLen + this.rmsNormEps);
-        for (let i = 0; i < keyLen; i++) kData[off + i] = (kData[off + i] / rms) * kNormW[i];
-      }
+      compute.perHeadRmsNorm(this.qAttnBuf, lw.qNorm, nH, keyLen, this.rmsNormEps);
+      compute.perHeadRmsNorm(this.kBuf, lw.kNorm || lw.qNorm, nKV, keyLen, this.rmsNormEps);
     }
 
-    // Partial RoPE (only first ropeDim of each head)
-    const ropeDim = this.ropeDim;
-    const halfDim = ropeDim / 2;
-    for (let h = 0; h < nH; h++) {
-      const off = h * keyLen;
-      for (let i = 0; i < halfDim; i++) {
-        const freq = 1.0 / Math.pow(this.ropeTheta, (2 * i) / ropeDim);
-        const angle = pos * freq;
-        const cos = Math.cos(angle), sin = Math.sin(angle);
-        const x0 = qAttn[off + 2 * i], x1 = qAttn[off + 2 * i + 1];
-        qAttn[off + 2 * i] = x0 * cos - x1 * sin;
-        qAttn[off + 2 * i + 1] = x0 * sin + x1 * cos;
-      }
-    }
-    for (let h = 0; h < nKV; h++) {
-      const off = h * keyLen;
-      for (let i = 0; i < halfDim; i++) {
-        const freq = 1.0 / Math.pow(this.ropeTheta, (2 * i) / ropeDim);
-        const angle = pos * freq;
-        const cos = Math.cos(angle), sin = Math.sin(angle);
-        const x0 = kData[off + 2 * i], x1 = kData[off + 2 * i + 1];
-        kData[off + 2 * i] = x0 * cos - x1 * sin;
-        kData[off + 2 * i + 1] = x0 * sin + x1 * cos;
-      }
-    }
+    // 4. Partial RoPE (GPU)
+    compute.partialRope(this.qAttnBuf, nH, keyLen, this.ropeDim, pos, this.ropeTheta);
+    compute.partialRope(this.kBuf, nKV, keyLen, this.ropeDim, pos, this.ropeTheta);
 
-    // Write K to GPU for KV cache, V already on GPU
-    compute.device.queue.writeBuffer(this.kBuf, 0, kData.buffer);
+    // 5. KV cache write
     kvCache.write(this.kBuf, this.vBuf, kDim * 4, vDim * 4);
 
-    // CPU gated attention — needed because of different head dims and gating
-    const vData = new Float32Array(await this.readGpuBuffer(this.vBuf, vDim * 4));
-    const kCacheData = new Float32Array(await this.readGpuBuffer(kvCache.kBuffer, nKV * kvCache.maxSeqLen * keyLen * 4));
-    const vCacheData = new Float32Array(await this.readGpuBuffer(kvCache.vBuffer, nKV * kvCache.maxSeqLen * valLen * 4));
-    const seqLen = kvCache.seqLen;
-    const maxSeqLen = kvCache.maxSeqLen;
-    const attnOutData = new Float32Array(nH * valLen);
+    // 6. Gated attention (GPU)
+    compute.gatedAttention(
+      this.qAttnBuf, this.qGateBufAttn, kvCache.kBuffer, kvCache.vBuffer, this.attnOut,
+      nH, nKV, keyLen, valLen, kvCache.maxSeqLen, kvCache.seqLen, scale,
+    );
 
-    for (let h = 0; h < nH; h++) {
-      const kvHead = Math.floor(h / (nH / nKV));
-      const qOff = h * keyLen;
-
-      // Attention scores
-      const scores = new Float32Array(seqLen);
-      for (let t = 0; t < seqLen; t++) {
-        let dot = 0;
-        const kOff = kvHead * maxSeqLen * keyLen + t * keyLen;
-        for (let d = 0; d < keyLen; d++) dot += qAttn[qOff + d] * kCacheData[kOff + d];
-        scores[t] = dot * scale;
-      }
-
-      // Softmax
-      let maxS = -Infinity;
-      for (let t = 0; t < seqLen; t++) if (scores[t] > maxS) maxS = scores[t];
-      let expSum = 0;
-      for (let t = 0; t < seqLen; t++) { scores[t] = Math.exp(scores[t] - maxS); expSum += scores[t]; }
-      for (let t = 0; t < seqLen; t++) scores[t] /= expSum;
-
-      // Weighted V + Q gate
-      const oOff = h * valLen;
-      for (let d = 0; d < valLen; d++) {
-        let sum = 0;
-        for (let t = 0; t < seqLen; t++) {
-          sum += scores[t] * vCacheData[kvHead * maxSeqLen * valLen + t * valLen + d];
-        }
-        const gate = 1.0 / (1.0 + Math.exp(-qGate[h * keyLen + d]));
-        attnOutData[oOff + d] = sum * gate;
-      }
-    }
-
-    // Upload and project
-    compute.device.queue.writeBuffer(this.attnOut, 0, attnOutData.buffer);
+    // 7. Output projection + residual (GPU)
     compute.matmul(lw.o.buffer, this.attnOut, this.temp, E, nH * valLen, lw.o.type);
     compute.add(this.temp, this.residual, this.hidden, E);
   }
@@ -618,44 +542,6 @@ export class Qwen35Model {
   }
 
   /** Apply RoPE to first ropeDim dims of each head, leaving rest unchanged. */
-  private applyPartialRoPE(data: Float32Array, nHeads: number, position: number): void {
-    const headDim = this.headDim;
-    const ropeDim = this.ropeDim;
-    const halfDim = ropeDim / 2;
-    const theta = this.ropeTheta;
-
-    for (let h = 0; h < nHeads; h++) {
-      const off = h * headDim;
-      for (let i = 0; i < halfDim; i++) {
-        const freq = 1.0 / Math.pow(theta, (2 * i) / ropeDim);
-        const angle = position * freq;
-        const cos = Math.cos(angle);
-        const sin = Math.sin(angle);
-        const x0 = data[off + 2 * i];
-        const x1 = data[off + 2 * i + 1];
-        data[off + 2 * i] = x0 * cos - x1 * sin;
-        data[off + 2 * i + 1] = x0 * sin + x1 * cos;
-      }
-      // Dimensions beyond ropeDim are left unchanged
-    }
-  }
-
-  /** Read a GPU buffer to CPU — creates a fresh readback buffer each time to avoid mapping conflicts. */
-  private async readGpuBuffer(buffer: GPUBuffer, size: number): Promise<ArrayBuffer> {
-    const readback = this.compute.device.createBuffer({
-      size,
-      usage: GPUBufferUsage.MAP_READ | GPUBufferUsage.COPY_DST,
-    });
-    const encoder = this.compute.device.createCommandEncoder();
-    encoder.copyBufferToBuffer(buffer, 0, readback, 0, size);
-    this.compute.device.queue.submit([encoder.finish()]);
-    await readback.mapAsync(GPUMapMode.READ);
-    const data = readback.getMappedRange().slice(0);
-    readback.unmap();
-    readback.destroy();
-    return data;
-  }
-
   async readLogits(): Promise<Float32Array> {
     return new Float32Array(await this.compute.readBuffer(this.logits, this.vocabSize * 4));
   }
