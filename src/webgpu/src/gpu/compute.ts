@@ -25,6 +25,10 @@ import conv1dSiluWgsl from './shaders/conv1d_silu.wgsl';
 import siluInplaceWgsl from './shaders/silu_inplace.wgsl';
 import l2NormGroupsWgsl from './shaders/l2_norm_groups.wgsl';
 import computeDecayBetaWgsl from './shaders/compute_decay_beta.wgsl';
+import deinterleaveQWgsl from './shaders/deinterleave_q.wgsl';
+import perHeadRmsnormWgsl from './shaders/per_head_rmsnorm.wgsl';
+import partialRopeWgsl from './shaders/partial_rope.wgsl';
+import gatedAttentionWgsl from './shaders/gated_attention.wgsl';
 import deltanetStepWgsl from './shaders/deltanet_step.wgsl';
 import siluGateWgsl from './shaders/silu_gate.wgsl';
 
@@ -484,6 +488,99 @@ export class ComputeEngine {
       { binding: 1, resource: { buffer: gate } },
       { binding: 2, resource: { buffer: params } },
     ], [Math.ceil(n / 256)]);
+  }
+
+  // ── Standard Attention GPU ops (Qwen 3.5) ────────────────────────
+
+  /** Deinterleave gated Q: split [attn|gate|attn|gate|...] per head. */
+  deinterleaveQ(qFull: GPUBuffer, qAttn: GPUBuffer, qGate: GPUBuffer, numHeads: number, headDim: number): void {
+    const params = this.createParams('deinterleave_q_params', new Uint32Array([numHeads, headDim]).buffer);
+    this.dispatch(deinterleaveQWgsl, 'deinterleave_q', [
+      storageReadOnly(0), storageReadWrite(1), storageReadWrite(2), uniform(3),
+    ], [
+      { binding: 0, resource: { buffer: qFull } },
+      { binding: 1, resource: { buffer: qAttn } },
+      { binding: 2, resource: { buffer: qGate } },
+      { binding: 3, resource: { buffer: params } },
+    ], [Math.ceil(numHeads * headDim / 256)]);
+  }
+
+  /** Per-head RMSNorm with shared weight vector. */
+  perHeadRmsNorm(data: GPUBuffer, weight: GPUBuffer, numHeads: number, headDim: number, eps: number): void {
+    const paramBuf = new Uint32Array(3);
+    paramBuf[0] = numHeads;
+    paramBuf[1] = headDim;
+    paramBuf[2] = new Uint32Array(new Float32Array([eps]).buffer)[0]; // bitcast float to u32
+    const params = this.createParams('per_head_rmsnorm_params', paramBuf.buffer);
+    this.dispatch(perHeadRmsnormWgsl, 'per_head_rmsnorm', [
+      storageReadWrite(0), storageReadOnly(1), uniform(2),
+    ], [
+      { binding: 0, resource: { buffer: data } },
+      { binding: 1, resource: { buffer: weight } },
+      { binding: 2, resource: { buffer: params } },
+    ], [numHeads]);
+  }
+
+  /** Partial RoPE: rotate first ropeDim positions of each head using precomputed tables. */
+  partialRope(data: GPUBuffer, numHeads: number, headDim: number, ropeDim: number,
+    position: number, theta: number): void {
+    const halfDim = ropeDim / 2;
+    // Precompute cos/sin tables for this position
+    const cacheKey = `partial_rope,${theta},${ropeDim},${position}`;
+    let table = this.ropeTableCache.get(cacheKey);
+    if (!table) {
+      const cosData = new Float32Array(halfDim);
+      const sinData = new Float32Array(halfDim);
+      for (let i = 0; i < halfDim; i++) {
+        const freq = 1.0 / Math.pow(theta, (2 * i) / ropeDim);
+        const angle = position * freq;
+        cosData[i] = Math.fround(Math.cos(angle));
+        sinData[i] = Math.fround(Math.sin(angle));
+      }
+      table = {
+        cos: this.buffers.createBufferWithData(`prope_cos_${cacheKey}`, cosData.buffer),
+        sin: this.buffers.createBufferWithData(`prope_sin_${cacheKey}`, sinData.buffer),
+      };
+      this.ropeTableCache.set(cacheKey, table);
+    }
+    const params = this.createParams('partial_rope_params', new Uint32Array([numHeads, headDim, ropeDim]).buffer);
+    this.dispatch(partialRopeWgsl, 'partial_rope', [
+      storageReadWrite(0), storageReadOnly(1), storageReadOnly(2), uniform(3),
+    ], [
+      { binding: 0, resource: { buffer: data } },
+      { binding: 1, resource: { buffer: table.cos } },
+      { binding: 2, resource: { buffer: table.sin } },
+      { binding: 3, resource: { buffer: params } },
+    ], [Math.ceil(numHeads * halfDim / 256)]);
+  }
+
+  /** Gated attention: softmax(QK^T/scale) * V * sigmoid(qGate). One workgroup per head. */
+  gatedAttention(
+    qAttn: GPUBuffer, qGate: GPUBuffer, kCache: GPUBuffer, vCache: GPUBuffer, output: GPUBuffer,
+    numHeads: number, numKvHeads: number, keyLen: number, valLen: number,
+    maxSeqLen: number, seqLen: number, scale: number,
+  ): void {
+    const paramBuf = new ArrayBuffer(28);
+    const u32 = new Uint32Array(paramBuf);
+    u32[0] = numHeads;
+    u32[1] = numKvHeads;
+    u32[2] = keyLen;
+    u32[3] = valLen;
+    u32[4] = maxSeqLen;
+    u32[5] = seqLen;
+    u32[6] = new Uint32Array(new Float32Array([scale]).buffer)[0];
+    const params = this.createParams('gated_attn_params', paramBuf);
+    this.dispatch(gatedAttentionWgsl, 'gated_attention', [
+      storageReadOnly(0), storageReadOnly(1), storageReadOnly(2), storageReadOnly(3),
+      storageReadWrite(4), uniform(5),
+    ], [
+      { binding: 0, resource: { buffer: qAttn } },
+      { binding: 1, resource: { buffer: qGate } },
+      { binding: 2, resource: { buffer: kCache } },
+      { binding: 3, resource: { buffer: vCache } },
+      { binding: 4, resource: { buffer: output } },
+      { binding: 5, resource: { buffer: params } },
+    ], [numHeads]);
   }
 
   /** Reusable readback buffer — avoids allocation per readLogits call. */
