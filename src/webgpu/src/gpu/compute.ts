@@ -21,6 +21,7 @@ import copyWgsl from './shaders/copy.wgsl';
 import copyRmsnormWgsl from './shaders/copy_rmsnorm.wgsl';
 import addWgsl from './shaders/add.wgsl';
 import addBiasWgsl from './shaders/add_bias.wgsl';
+import embeddingQ8Wgsl from './shaders/embedding_q8.wgsl';
 import conv1dSiluWgsl from './shaders/conv1d_silu.wgsl';
 import siluInplaceWgsl from './shaders/silu_inplace.wgsl';
 import l2NormGroupsWgsl from './shaders/l2_norm_groups.wgsl';
@@ -29,6 +30,7 @@ import deinterleaveQWgsl from './shaders/deinterleave_q.wgsl';
 import perHeadRmsnormWgsl from './shaders/per_head_rmsnorm.wgsl';
 import partialRopeWgsl from './shaders/partial_rope.wgsl';
 import gatedAttentionWgsl from './shaders/gated_attention.wgsl';
+import repeatTileWgsl from './shaders/repeat_tile.wgsl';
 import deltanetStepWgsl from './shaders/deltanet_step.wgsl';
 import siluGateWgsl from './shaders/silu_gate.wgsl';
 
@@ -129,6 +131,18 @@ export class ComputeEngine {
   embedding(weights: GPUBuffer, output: GPUBuffer, tokenId: number, embDim: number): void {
     const params = this.createParams('embedding_params', new Uint32Array([tokenId, embDim]).buffer);
     this.dispatch(embeddingWgsl, 'embedding', [
+      storageReadOnly(0), storageReadWrite(1), uniform(2),
+    ], [
+      { binding: 0, resource: { buffer: weights } },
+      { binding: 1, resource: { buffer: output } },
+      { binding: 2, resource: { buffer: params } },
+    ], [Math.ceil(embDim / 256)]);
+  }
+
+  /** Token embedding lookup for Q8_0 quantized weights. */
+  embeddingQ8(weights: GPUBuffer, output: GPUBuffer, tokenId: number, embDim: number): void {
+    const params = this.createParams('embedding_q8_params', new Uint32Array([tokenId, embDim]).buffer);
+    this.dispatch(embeddingQ8Wgsl, 'embedding_q8', [
       storageReadOnly(0), storageReadWrite(1), uniform(2),
     ], [
       { binding: 0, resource: { buffer: weights } },
@@ -581,6 +595,19 @@ export class ComputeEngine {
       { binding: 4, resource: { buffer: output } },
       { binding: 5, resource: { buffer: params } },
     ], [numHeads]);
+  }
+
+  /** Repeat-tile: expand numKHeads groups to numVHeads groups by repeating. */
+  repeatTile(src: GPUBuffer, dst: GPUBuffer, numKHeads: number, headDim: number, factor: number): void {
+    const params = this.createParams('repeat_tile_params', new Uint32Array([numKHeads, headDim, factor]).buffer);
+    const total = numKHeads * headDim * factor;
+    this.dispatch(repeatTileWgsl, 'repeat_tile', [
+      storageReadOnly(0), storageReadWrite(1), uniform(2),
+    ], [
+      { binding: 0, resource: { buffer: src } },
+      { binding: 1, resource: { buffer: dst } },
+      { binding: 2, resource: { buffer: params } },
+    ], [Math.ceil(total / 256)]);
   }
 
   /** Reusable readback buffer — avoids allocation per readLogits call. */

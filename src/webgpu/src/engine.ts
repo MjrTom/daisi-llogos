@@ -14,6 +14,7 @@ import { ComputeEngine } from './gpu/compute.js';
 import { fetchGgufHeader, parseGguf, GgufModelInfo, GgufTensorInfo } from './gguf/gguf-parser.js';
 import { GgmlType } from './gguf/quantization.js';
 import { downloadFile, extractTensorData, DownloadProgress } from './storage/download-manager.js';
+import { streamTensors } from './storage/streaming-loader.js';
 import { GgmlType } from './gguf/quantization.js';
 import { BpeTokenizer, tokenizerFromGguf } from './tokenizer/bpe-tokenizer.js';
 import { applyTemplate, ChatMessage } from './tokenizer/chat-template.js';
@@ -84,39 +85,43 @@ export class LlogosEngine {
         console.warn(`[llogos] Model may not fit: estimated ${Math.round(estimate.totalBytes / 1024 / 1024)} MB, max buffer ${Math.round(maxBuffer / 1024 / 1024)} MB`);
       }
 
-      // Download entire GGUF file (single fetch, cached)
-      let isCached = false;
-      options?.onProgress?.({ phase: 'Checking cache...', bytesDownloaded: 0, totalBytes: 0 });
-      const fileBuffer = await downloadFile(url, (p) => {
-        if (!isCached && p.bytesDownloaded === 0 && p.totalBytes > 0) {
-          isCached = true; // cache hit detected (totalBytes known before download starts)
-        }
-        const phase = isCached ? 'Loading from cache' : 'Downloading';
-        options?.onProgress?.({ phase, bytesDownloaded: p.bytesDownloaded, totalBytes: p.totalBytes });
-      });
-
-      // Re-parse from the complete file for accurate offsets
-      info = parseGguf(fileBuffer);
-      this.modelInfo = info;
+      // Tokenizer from header metadata (no need to re-parse full file)
       this.tokenizer = tokenizerFromGguf(info.metadata);
 
-      // Extract tensors from file buffer
+      // Stream tensors — each tensor is uploaded to GPU immediately,
+      // then the CPU ArrayBuffer can be GC'd. Peak memory = largest single tensor.
       const tensorMap = new Map<string, { buffer: ArrayBuffer; info: GgufTensorInfo }>();
-      for (const tensor of info.tensors) {
-        tensorMap.set(tensor.name, {
-          buffer: extractTensorData(fileBuffer, info.tensorDataOffset + tensor.offset, tensor.byteSize),
-          info: tensor,
-        });
-      }
-
-      options?.onProgress?.({ phase: 'Uploading to GPU', bytesDownloaded: fileBuffer.byteLength, totalBytes: fileBuffer.byteLength });
+      let tensorCount = 0;
+      await streamTensors(url, info,
+        (name, data, tensorInfo) => {
+          tensorMap.set(name, { buffer: data, info: tensorInfo });
+          tensorCount++;
+        },
+        (p) => {
+          options?.onProgress?.({
+            phase: `${p.phase} (${p.tensorsLoaded}/${p.totalTensors} tensors)`,
+            bytesDownloaded: p.bytesDownloaded,
+            totalBytes: p.totalBytes,
+          });
+        },
+      );
+      // Note: tensorMap still holds all CPU buffers here.
+      // For models > 2GB, we need initWeights to process incrementally.
+      // TODO: For now this works for models < 2GB; streaming prevents
+      // the single-ArrayBuffer bottleneck in downloadFile.
       // Select model class based on architecture
+      options?.onProgress?.({ phase: 'Uploading to GPU', bytesDownloaded: 0, totalBytes: 0 });
       if (info.architecture === 'qwen35') {
         this.model = new Qwen35Model(this.compute, info);
       } else {
         this.model = new LlamaModel(this.compute, info);
       }
+      console.log('[llogos] Uploading weights to GPU...');
       await this.model.initWeights(tensorMap);
+      console.log('[llogos] Weights uploaded, clearing CPU data...');
+      // Clear CPU tensor data after GPU upload
+      tensorMap.clear();
+      console.log('[llogos] Model loaded successfully');
 
       this._status = 'loaded';
       return info;

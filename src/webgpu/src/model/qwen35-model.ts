@@ -102,7 +102,8 @@ interface DeltaNetGpuState {
 export class Qwen35Model {
   private compute: ComputeEngine;
   private info: GgufModelInfo;
-  private weights!: { tokenEmbedding: GPUBuffer; outputNorm: GPUBuffer; output: GPUBuffer; layers: LayerWeights[] };
+  private weights!: { tokenEmbedding: WeightBuffer; outputNorm: GPUBuffer; output: WeightBuffer; layers: LayerWeights[] };
+  private qkvDims!: number[]; // per-layer QKV output dimension (from weight)
   private kvCaches!: (KvCache | null)[]; // null for DeltaNet layers
   private deltaStates!: (DeltaNetGpuState | null)[]; // null for standard attn layers
 
@@ -123,6 +124,8 @@ export class Qwen35Model {
   private qAttnBuf!: GPUBuffer;
   private qGateBufAttn!: GPUBuffer;
   // DeltaNet-specific GPU buffers
+  private qTiledBuf!: GPUBuffer;  // tiled Q for deltanet [numVHeads * headDim]
+  private kTiledBuf!: GPUBuffer;  // tiled K for deltanet [numVHeads * headDim]
   private qkvBuf!: GPUBuffer;
   private ssmGateBuf!: GPUBuffer;
   private ssmOutputBuf!: GPUBuffer;
@@ -231,12 +234,13 @@ export class Qwen35Model {
       this.ssmNumVHeads = alpha0.info.elementCount / this.embeddingDim;
     }
 
-    // Global weights
-    const tokenEmbedding = uploadAsF32('token_embd.weight');
-    const output = tensorMap.has('output.weight') ? uploadAsF32('output.weight') : tokenEmbedding;
+    // Global weights — keep embedding in native format (avoids huge F32 allocation)
+    const tokenEmbedding = uploadWeight('token_embd.weight');
+    const output = tensorMap.has('output.weight') ? uploadWeight('output.weight') : tokenEmbedding;
     const outputNorm = uploadAsF32('output_norm.weight');
 
     // Layer weights
+    this.qkvDims = [];
     const layers: LayerWeights[] = [];
     for (let i = 0; i < this.numLayers; i++) {
       const shared = {
@@ -247,6 +251,7 @@ export class Qwen35Model {
       };
 
       if (this.isStandardAttention(i)) {
+        this.qkvDims.push(0); // not used for standard attention
         layers.push({
           kind: 'standard',
           attnNorm: uploadAsF32(`blk.${i}.attn_norm.weight`),
@@ -259,6 +264,8 @@ export class Qwen35Model {
           ...shared,
         });
       } else {
+        const qkvTensor = tensorMap.get(`blk.${i}.attn_qkv.weight`)!;
+        this.qkvDims.push(qkvTensor.info.elementCount / this.embeddingDim);
         layers.push({
           kind: 'deltanet',
           attnNorm: uploadAsF32(`blk.${i}.attn_norm.weight`),
@@ -305,9 +312,11 @@ export class Qwen35Model {
     this.qAttnBuf = compute.buffers.createBuffer('q_attn', qAttnDim * 4);
     this.qGateBufAttn = compute.buffers.createBuffer('q_gate_attn', qAttnDim * 4);
     // DeltaNet buffers
-    const qkvDim = this.ssmInnerSize * 3;
+    const maxQkvDim = Math.max(...this.qkvDims, this.ssmInnerSize * 3);
     const numVHeads = this.ssmNumVHeads;
-    this.qkvBuf = compute.buffers.createBuffer('qkv', qkvDim * 4);
+    this.qTiledBuf = compute.buffers.createBuffer('q_tiled', numVHeads * this.ssmHeadDim * 4);
+    this.kTiledBuf = compute.buffers.createBuffer('k_tiled', numVHeads * this.ssmHeadDim * 4);
+    this.qkvBuf = compute.buffers.createBuffer('qkv', maxQkvDim * 4);
     this.ssmGateBuf = compute.buffers.createBuffer('ssm_gate', this.ssmInnerSize * 4);
     this.ssmOutputBuf = compute.buffers.createBuffer('ssm_output', this.ssmInnerSize * 4);
     this.alphaBuf = compute.buffers.createBuffer('alpha', numVHeads * 4);
@@ -326,7 +335,7 @@ export class Qwen35Model {
       } else {
         this.kvCaches.push(null);
         const stateSize = this.ssmNumVHeads * this.ssmHeadDim * this.ssmHeadDim;
-        const convBufSize = qkvDim * (this.ssmConvKernel - 1);
+        const convBufSize = this.qkvDims[i] * (this.ssmConvKernel - 1);
         this.deltaStates.push({
           state: compute.buffers.createBuffer(`dn_state_${i}`, stateSize * 4),
           convBuf: compute.buffers.createBuffer(`dn_conv_${i}`, convBufSize * 4),
@@ -338,13 +347,13 @@ export class Qwen35Model {
   resetCache(): void {
     this._position = 0;
     for (const kv of this.kvCaches) kv?.reset();
-    for (const ds of this.deltaStates) {
+    for (let i = 0; i < this.deltaStates.length; i++) {
+      const ds = this.deltaStates[i];
       if (ds) {
-        // Zero GPU state buffers
         const stateSize = this.ssmNumVHeads * this.ssmHeadDim * this.ssmHeadDim;
-        const convBufSize = this.ssmInnerSize * 3 * (this.ssmConvKernel - 1);
+        const convBufSize = this.qkvDims[i] * (this.ssmConvKernel - 1);
         this.compute.device.queue.writeBuffer(ds.state, 0, new Float32Array(stateSize));
-        this.compute.device.queue.writeBuffer(ds.convBuf, 0, new Float32Array(convBufSize));
+        if (convBufSize > 0) this.compute.device.queue.writeBuffer(ds.convBuf, 0, new Float32Array(convBufSize));
       }
     }
   }
@@ -356,8 +365,12 @@ export class Qwen35Model {
     const { compute, weights } = this;
     const E = this.embeddingDim;
 
-    // 1. Token embedding
-    compute.embedding(weights.tokenEmbedding, this.hidden, tokenId, E);
+    // 1. Token embedding (use Q8_0 shader if weights are quantized)
+    if (weights.tokenEmbedding.type === GgmlType.Q8_0) {
+      compute.embeddingQ8(weights.tokenEmbedding.buffer, this.hidden, tokenId, E);
+    } else {
+      compute.embedding(weights.tokenEmbedding.buffer, this.hidden, tokenId, E);
+    }
 
     if (this._position === 0) {
 
@@ -395,7 +408,7 @@ export class Qwen35Model {
 
     // Final RMSNorm + LM Head
     compute.rmsNorm(this.hidden, weights.outputNorm, this.normed, E, this.rmsNormEps);
-    compute.matmul(weights.output, this.normed, this.logits, this.vocabSize, E, GgmlType.F32);
+    compute.matmul(weights.output.buffer, this.normed, this.logits, this.vocabSize, E, weights.output.type);
 
     this._position++;
     return this.logits;
@@ -460,11 +473,15 @@ export class Qwen35Model {
     const E = this.embeddingDim;
     const ds = this.deltaStates[layer]!;
     const innerSize = this.ssmInnerSize;
-    const qkvDim = innerSize * 3;
     const numVHeads = this.ssmNumVHeads;
     const numKHeads = this.ssmGroupCount;
     const headDim = this.ssmHeadDim;
-    const groupDim = innerSize / numKHeads;
+
+    // Derive actual Q/K/V dimensions from weight size (may be unequal)
+    const valueDim = numVHeads * headDim; // V = numVHeads × headDim
+    const qkvDim = this.qkvDims[layer]; // actual QKV output size from weight
+    const keyDim = (qkvDim - valueDim) / 2; // Q and K are equal
+    const groupDim = keyDim / numKHeads;
 
     // 1. QKV projection (GPU matmul)
     compute.matmul(lw.qkv.buffer, this.normed, this.qkvBuf, qkvDim, E, lw.qkv.type);
@@ -472,49 +489,27 @@ export class Qwen35Model {
     // 2+3. Fused causal conv1d + SiLU (GPU)
     compute.conv1dSilu(this.qkvBuf, ds.convBuf, lw.ssmConv1d, qkvDim, this.ssmConvKernel);
 
-    // 4. Split Q/K/V — the qkvBuf is [Q|K|V] contiguous, each innerSize
-    // We use buffer offsets via sub-buffers. For L2 norm, we normalize Q and K in-place.
-    // Q = qkvBuf[0..innerSize), K = qkvBuf[innerSize..innerSize*2), V = qkvBuf[innerSize*2..innerSize*3)
-    // L2 norm operates on Q and K regions via offset. But our l2NormGroups shader
-    // expects contiguous data at offset 0. We can run it on the full qkvBuf and
-    // normalize Q groups and K groups separately.
-
-    // 5. L2 normalize Q and K per group (GPU)
-    // Q is at offset 0, K is at offset innerSize*4 bytes
-    // We need to normalize numKHeads groups of groupDim elements
-    // For simplicity, use the existing qkvBuf — Q is first innerSize elements
-    compute.l2NormGroups(this.qkvBuf, numKHeads, groupDim); // normalizes Q
-
-    // For K, we need to create a view starting at offset innerSize.
-    // WebGPU doesn't support buffer offsets in bind groups directly.
-    // Workaround: copy K to a temp buffer, normalize, copy back.
-    // OR: use a shader that takes an offset parameter.
-    // For now, use a simpler approach: split QKV into separate Q, K, V buffers.
-
-    // Actually, the simplest GPU approach: write a single shader that handles
-    // the QKV buffer with offsets. But that complicates things.
-    // Let me use the existing buffers: copy Q, K, V parts to qBuf, kBuf, vBuf.
-
-    // TODO: This is a CPU readback workaround. Optimize later with offset-aware shaders.
-    // For now, just use the matmul output directly and do L2 norm on sub-ranges.
-
-    // Alternative: use separate Q, K, V buffers from the start.
-    // The QKV matmul produces [Q|K|V] in qkvBuf. We can split via GPU copy:
-
-    // Split Q/K/V via GPU copies would require CopyBufferToBuffer with offsets.
-    // Let's do that:
+    // 4. Split Q/K/V via GPU copy — layout: [Q: keyDim | K: keyDim | V: valueDim]
     const enc = compute.device.createCommandEncoder();
-    enc.copyBufferToBuffer(this.qkvBuf, 0, this.qBuf, 0, innerSize * 4);
-    enc.copyBufferToBuffer(this.qkvBuf, innerSize * 4, this.kBuf, 0, innerSize * 4);
-    enc.copyBufferToBuffer(this.qkvBuf, innerSize * 2 * 4, this.vBuf, 0, innerSize * 4);
+    enc.copyBufferToBuffer(this.qkvBuf, 0, this.qBuf, 0, keyDim * 4);
+    enc.copyBufferToBuffer(this.qkvBuf, keyDim * 4, this.kBuf, 0, keyDim * 4);
+    enc.copyBufferToBuffer(this.qkvBuf, keyDim * 2 * 4, this.vBuf, 0, valueDim * 4);
     compute.device.queue.submit([enc.finish()]);
 
-    // 5. L2 normalize Q and K (GPU) — now they're in separate buffers
+    // 5. L2 normalize Q and K (GPU) — numKHeads groups of groupDim
     compute.l2NormGroups(this.qBuf, numKHeads, groupDim);
     compute.l2NormGroups(this.kBuf, numKHeads, groupDim);
 
-    // 6. Repeat-tile Q and K if needed (skip for 0.8B where numVHeads == numKHeads)
-    // TODO: Add GPU repeat-tile shader for larger models
+    // 6. Repeat-tile Q and K if numVHeads > numKHeads
+    const repeatFactor = numVHeads / numKHeads;
+    let qForDelta = this.qBuf;
+    let kForDelta = this.kBuf;
+    if (repeatFactor > 1) {
+      compute.repeatTile(this.qBuf, this.qTiledBuf, numKHeads, groupDim, repeatFactor);
+      compute.repeatTile(this.kBuf, this.kTiledBuf, numKHeads, groupDim, repeatFactor);
+      qForDelta = this.qTiledBuf;
+      kForDelta = this.kTiledBuf;
+    }
 
     // 7. Alpha and Beta projections (GPU matmul — small: numVHeads outputs from E inputs)
     compute.matmul(lw.ssmAlpha.buffer, this.normed, this.alphaBuf, numVHeads, E, lw.ssmAlpha.type);
@@ -526,7 +521,7 @@ export class Qwen35Model {
 
     // 9. DeltaNet state update + output + per-head norm (GPU)
     const scale = 1.0 / Math.sqrt(headDim);
-    compute.deltanetStep(this.qBuf, this.kBuf, this.vBuf, ds.state,
+    compute.deltanetStep(qForDelta, kForDelta, this.vBuf, ds.state,
       this.decayBuf, this.betaValBuf, lw.ssmNorm, this.ssmOutputBuf,
       numVHeads, headDim, scale, this.rmsNormEps);
 
