@@ -366,6 +366,15 @@ var rmsnorm_batch_default = "// Batched RMSNorm: normalize N rows independently.
 // src/gpu/shaders/attention_batch.wgsl
 var attention_batch_default = "// Batched causal attention for prefill.\n// Processes N query tokens simultaneously. Each query attends to all previous tokens + itself.\n// Q: [N * numHeads * headDim], K/V written to cache during this call.\n//\n// For each token n and head h:\n//   scores[t] = Q[n,h] \xB7 K[t,kvh] / sqrt(headDim) for t in 0..startPos+n\n//   output[n,h] = softmax(scores) \xB7 V[kvh]\n//\n// Dispatch: [numHeads, N] workgroups, 64 threads per workgroup.\n\nstruct Params {\n  num_heads: u32,\n  num_kv_heads: u32,\n  head_dim: u32,\n  max_seq_len: u32,\n  start_pos: u32,   // KV cache position of first token in batch\n  num_tokens: u32,   // N\n  scale_bits: u32,   // float as u32 bits\n}\n\n@group(0) @binding(0) var<storage, read> q: array<f32>;       // [N * numHeads * headDim]\n@group(0) @binding(1) var<storage, read> k_cache: array<f32>; // [numKvHeads * maxSeqLen * headDim]\n@group(0) @binding(2) var<storage, read> v_cache: array<f32>;\n@group(0) @binding(3) var<storage, read_write> output: array<f32>; // [N * numHeads * headDim]\n@group(0) @binding(4) var<uniform> params: Params;\n\nvar<workgroup> scores: array<f32, 64>;\n\n@compute @workgroup_size(64)\nfn main(@builtin(workgroup_id) wg: vec3u, @builtin(local_invocation_id) lid: vec3u) {\n  let h = wg.x;\n  let n = wg.y;  // token index within batch\n  if (h >= params.num_heads || n >= params.num_tokens) { return; }\n\n  let tid = lid.x;\n  let scale = bitcast<f32>(params.scale_bits);\n  let kv_head = h / (params.num_heads / params.num_kv_heads);\n  let head_dim = params.head_dim;\n  let max_seq = params.max_seq_len;\n\n  // This query attends to tokens 0..startPos+n (inclusive) \u2014 causal mask\n  let seq_len = params.start_pos + n + 1u;\n\n  let q_off = (n * params.num_heads + h) * head_dim;\n  let kv_k_base = kv_head * max_seq * head_dim;\n  let kv_v_base = kv_head * max_seq * head_dim;\n  let out_off = (n * params.num_heads + h) * head_dim;\n\n  // Initialize output\n  for (var d = tid; d < head_dim; d += 64u) {\n    output[out_off + d] = 0.0;\n  }\n  workgroupBarrier();\n\n  var running_max: f32 = -1e30;\n  var running_sum: f32 = 0.0;\n\n  // Process in tiles of 64\n  for (var tile_start = 0u; tile_start < seq_len; tile_start += 64u) {\n    let tile_end = min(tile_start + 64u, seq_len);\n    let tile_len = tile_end - tile_start;\n\n    var score: f32 = -1e30;\n    let t = tile_start + tid;\n    if (t < tile_end) {\n      var dot: f32 = 0.0;\n      let k_off = kv_k_base + t * head_dim;\n      for (var d = 0u; d < head_dim; d++) {\n        dot += q[q_off + d] * k_cache[k_off + d];\n      }\n      score = dot * scale;\n    }\n    scores[tid] = score;\n    workgroupBarrier();\n\n    var tile_max: f32 = -1e30;\n    for (var i = 0u; i < tile_len; i++) {\n      tile_max = max(tile_max, scores[i]);\n    }\n\n    if (tid < tile_len) {\n      scores[tid] = exp(scores[tid] - tile_max);\n    }\n    workgroupBarrier();\n\n    var tile_sum: f32 = 0.0;\n    for (var i = 0u; i < tile_len; i++) {\n      tile_sum += scores[i];\n    }\n\n    let new_max = max(running_max, tile_max);\n    let corr_old = exp(running_max - new_max);\n    let corr_new = exp(tile_max - new_max);\n\n    for (var d = tid; d < head_dim; d += 64u) {\n      var tile_val: f32 = 0.0;\n      for (var i = 0u; i < tile_len; i++) {\n        tile_val += scores[i] * v_cache[kv_v_base + (tile_start + i) * head_dim + d];\n      }\n      output[out_off + d] = output[out_off + d] * corr_old + tile_val * corr_new;\n    }\n    workgroupBarrier();\n\n    running_sum = running_sum * corr_old + tile_sum * corr_new;\n    running_max = new_max;\n  }\n\n  // Normalize\n  let inv_sum = select(0.0, 1.0 / running_sum, running_sum > 0.0);\n  for (var d = tid; d < head_dim; d += 64u) {\n    output[out_off + d] *= inv_sum;\n  }\n}\n";
 
+// src/gpu/shaders/rope_batch.wgsl
+var rope_batch_default = "// Batched RoPE: apply rotary embeddings to N tokens at different positions.\n// data: [N * numHeads * headDim], each token has its own position.\n// positions: [N] \u2014 position index for each token.\n// Precomputed cos/sin per dimension pair, looked up per position.\n\nstruct Params {\n  num_heads: u32,\n  head_dim: u32,\n  num_tokens: u32,\n  theta_bits: u32,  // float theta as u32 bits\n}\n\n@group(0) @binding(0) var<storage, read_write> data: array<f32>;\n@group(0) @binding(1) var<storage, read> positions: array<u32>;\n@group(0) @binding(2) var<uniform> params: Params;\n\n@compute @workgroup_size(256)\nfn main(@builtin(global_invocation_id) gid: vec3u) {\n  let idx = gid.x;\n  let half_dim = params.head_dim / 2u;\n  let total_pairs = params.num_tokens * params.num_heads * half_dim;\n  if (idx >= total_pairs) { return; }\n\n  let theta = bitcast<f32>(params.theta_bits);\n  let pairs_per_token = params.num_heads * half_dim;\n  let n = idx / pairs_per_token;\n  let rem = idx % pairs_per_token;\n  let head = rem / half_dim;\n  let pair = rem % half_dim;\n  let pos = positions[n];\n\n  let dim_frac = f32(pair * 2u) / f32(params.head_dim);\n  let freq = 1.0 / pow(theta, dim_frac);\n  let angle = f32(pos) * freq;\n  let cos_a = cos(angle);\n  let sin_a = sin(angle);\n\n  let base = (n * params.num_heads + head) * params.head_dim;\n  let i0 = base + pair * 2u;\n  let i1 = i0 + 1u;\n\n  let x = data[i0];\n  let y = data[i1];\n  data[i0] = x * cos_a - y * sin_a;\n  data[i1] = x * sin_a + y * cos_a;\n}\n";
+
+// src/gpu/shaders/kv_cache_write_batch.wgsl
+var kv_cache_write_batch_default = "// Batched KV cache write: write N K/V vectors at consecutive positions.\n// k_in: [N * nKvHeads * headDim], v_in: [N * nKvHeads * headDim]\n// kCache/vCache: [nKvHeads * maxSeqLen * headDim]\n// Writes k_in[n] to kCache[kvh, startPos+n, :] for each KV head.\n\nstruct Params {\n  n_kv_heads: u32,\n  head_dim: u32,\n  max_seq_len: u32,\n  start_pos: u32,\n  num_tokens: u32,\n}\n\n@group(0) @binding(0) var<storage, read> k_in: array<f32>;\n@group(0) @binding(1) var<storage, read> v_in: array<f32>;\n@group(0) @binding(2) var<storage, read_write> k_cache: array<f32>;\n@group(0) @binding(3) var<storage, read_write> v_cache: array<f32>;\n@group(0) @binding(4) var<uniform> params: Params;\n\n@compute @workgroup_size(256)\nfn main(@builtin(global_invocation_id) gid: vec3u) {\n  let idx = gid.x;\n  let total = params.num_tokens * params.n_kv_heads * params.head_dim;\n  if (idx >= total) { return; }\n\n  let kv_size = params.n_kv_heads * params.head_dim;\n  let n = idx / kv_size;\n  let rem = idx % kv_size;\n  let kvh = rem / params.head_dim;\n  let d = rem % params.head_dim;\n\n  let cache_idx = kvh * params.max_seq_len * params.head_dim +\n                  (params.start_pos + n) * params.head_dim + d;\n  let in_idx = n * kv_size + kvh * params.head_dim + d;\n\n  k_cache[cache_idx] = k_in[in_idx];\n  v_cache[cache_idx] = v_in[in_idx];\n}\n";
+
+// src/gpu/shaders/matmul_q8_batch.wgsl
+var matmul_q8_batch_default = "// Batched Q8_0 matrix-vector multiply: process N tokens simultaneously.\n// Same as matmul_q8 but with batch dimension in z workgroup.\n// output[n * M + m] = sum_k(dequant(weights[m, k]) * input[n * K + k])\n\nstruct Params {\n  M: u32,\n  K: u32,\n  N: u32,\n}\n\n@group(0) @binding(0) var<storage, read> weights: array<u32>;\n@group(0) @binding(1) var<storage, read> input: array<f32>;\n@group(0) @binding(2) var<storage, read_write> output: array<f32>;\n@group(0) @binding(3) var<uniform> params: Params;\nvar<workgroup> shared_sum: array<f32, 256>;\n\nfn read_scale(bo: u32) -> f32 {\n  let w = weights[bo / 4u];\n  let bits = select(w & 0xFFFFu, (w >> 16u) & 0xFFFFu, (bo % 4u) != 0u);\n  return unpack2x16float(bits).x;\n}\nfn read_i8(bo: u32) -> f32 {\n  let v = (weights[bo / 4u] >> ((bo % 4u) * 8u)) & 0xFFu;\n  return select(f32(v), f32(v) - 256.0, v >= 128u);\n}\n\n@compute @workgroup_size(256)\nfn main(@builtin(workgroup_id) wg: vec3u, @builtin(local_invocation_id) lid: vec3u) {\n  let row = wg.x + wg.y * 65535u;\n  let n = wg.z;\n  if (row >= params.M || n >= params.N) { return; }\n\n  let tid = lid.x;\n  let nblk = params.K / 32u;\n  let roff = row * nblk * 34u;\n  var sum: f32 = 0.0;\n  for (var b = tid; b < nblk; b += 256u) {\n    let bo = roff + b * 34u;\n    let sc = read_scale(bo);\n    let bk = b * 32u;\n    for (var q = 0u; q < 32u; q++) {\n      sum += sc * read_i8(bo + 2u + q) * input[n * params.K + bk + q];\n    }\n  }\n  shared_sum[tid] = sum;\n  workgroupBarrier();\n  for (var s = 128u; s > 0u; s >>= 1u) {\n    if (tid < s) { shared_sum[tid] += shared_sum[tid + s]; }\n    workgroupBarrier();\n  }\n  if (tid == 0u) { output[n * params.M + row] = shared_sum[0]; }\n}\n";
+
 // src/gpu/shaders/deltanet_step.wgsl
 var deltanet_step_default = "// DeltaNet state update + output computation.\n// One workgroup per group (head). 128 threads per group.\n//\n// For each group g:\n//   sk[j] = sum_i(state[g,i,j] * k[g*D+i])\n//   error[j] = (v[g*D+j] - decay[g]*sk[j]) * beta[g]\n//   state[g,i,j] = decay[g]*state[g,i,j] + k[g*D+i]*error[j]\n//   output[g*D+j] = sum_i(state[g,i,j] * q[g*D+i]) * scale\n//   Per-head RMSNorm on output[g*D .. g*D+D-1]\n\nstruct Params {\n  head_dim: u32,    // D = 128\n  num_groups: u32,  // 16\n  scale: f32,       // 1/sqrt(D)\n  norm_eps: f32,    // RMSNorm epsilon\n}\n\n@group(0) @binding(0) var<storage, read> q: array<f32>;\n@group(0) @binding(1) var<storage, read> k: array<f32>;\n@group(0) @binding(2) var<storage, read> v: array<f32>;\n@group(0) @binding(3) var<storage, read_write> state: array<f32>;  // [G * D * D]\n@group(0) @binding(4) var<storage, read> decay: array<f32>;        // [G]\n@group(0) @binding(5) var<storage, read> beta_val: array<f32>;     // [G]\n@group(0) @binding(6) var<storage, read> norm_weight: array<f32>;  // [D] shared across groups\n@group(0) @binding(7) var<storage, read_write> output: array<f32>; // [G * D]\n@group(0) @binding(8) var<uniform> params: Params;\n\nvar<workgroup> shared_k: array<f32, 128>;\nvar<workgroup> shared_error: array<f32, 128>;\nvar<workgroup> shared_sum: f32;\n\n@compute @workgroup_size(128)\nfn main(@builtin(workgroup_id) wg: vec3u, @builtin(local_invocation_id) lid: vec3u) {\n  let g = wg.x;\n  if (g >= params.num_groups) { return; }\n  let j = lid.x;  // each thread handles one column j\n  let D = params.head_dim;\n  let base = g * D;\n  let state_base = g * D * D;\n  let d = decay[g];\n  let b = beta_val[g];\n\n  // Load k into shared memory\n  shared_k[j] = k[base + j];\n  workgroupBarrier();\n\n  // 1. sk[j] = S^T * k = sum_i(state[i*D+j] * k[i])\n  var sk: f32 = 0.0;\n  for (var i = 0u; i < D; i++) {\n    sk += state[state_base + i * D + j] * shared_k[i];\n  }\n\n  // 2. error[j] = (v[j] - decay * sk) * beta\n  let err = (v[base + j] - d * sk) * b;\n  shared_error[j] = err;\n  workgroupBarrier();\n\n  // 3. State update: for each row i that this column j touches\n  //    state[i,j] = decay * state[i,j] + k[i] * error[j]\n  // Thread j updates column j across all rows\n  for (var i = 0u; i < D; i++) {\n    let idx = state_base + i * D + j;\n    state[idx] = d * state[idx] + shared_k[i] * shared_error[j];\n  }\n  workgroupBarrier();\n\n  // 4. output[j] = S_new^T * q * scale = sum_i(state[i,j] * q[i]) * scale\n  var o: f32 = 0.0;\n  for (var i = 0u; i < D; i++) {\n    o += state[state_base + i * D + j] * q[base + i];\n  }\n  output[base + j] = o * params.scale;\n  workgroupBarrier();\n\n  // 5. Per-head RMSNorm\n  // Compute sum of squares (reduction across threads)\n  var my_sq = output[base + j] * output[base + j];\n\n  // Use shared memory for reduction\n  // We need to reduce 128 values - use warp-style reduction\n  // Store in shared_k (reuse, we're done with k)\n  shared_k[j] = my_sq;\n  workgroupBarrier();\n  for (var s = 64u; s > 0u; s >>= 1u) {\n    if (j < s) { shared_k[j] += shared_k[j + s]; }\n    workgroupBarrier();\n  }\n\n  let rms = sqrt(shared_k[0] / f32(D) + params.norm_eps);\n  let inv_rms = 1.0 / rms;\n  output[base + j] = output[base + j] * inv_rms * norm_weight[j];\n}\n";
 
@@ -927,13 +936,25 @@ var ComputeEngine = class {
     ], [numHeads]);
   }
   // ── Batched prefill ops ──────────────────────────────────────────
-  /** Batched F32 matmul: output[n,m] = sum_k(weights[m,k] * input[n,k]) for N tokens. */
-  matmulBatch(weights, input, output, M, K, N) {
+  /** Batched matmul: output[n,m] = sum_k(weights[m,k] * input[n,k]) for N tokens. */
+  matmulBatch(weights, input, output, M, K, N, quantType = 0 /* F32 */) {
     const paramData = new Uint32Array([M, K, N]);
     const params = this.createParams("matmul_batch_params", paramData.buffer);
     const xGroups = M <= 65535 ? M : 65535;
     const yGroups = M <= 65535 ? 1 : Math.ceil(M / 65535);
-    this.dispatch(matmul_batch_default, "matmul_batch", [
+    let shader;
+    switch (quantType) {
+      case 0 /* F32 */:
+        shader = matmul_batch_default;
+        break;
+      case 8 /* Q8_0 */:
+        shader = matmul_q8_batch_default;
+        break;
+      default:
+        shader = matmul_batch_default;
+        break;
+    }
+    this.dispatch(shader, "matmul_batch", [
       storageReadOnly(0),
       storageReadOnly(1),
       storageReadWrite(2),
@@ -1005,6 +1026,44 @@ var ComputeEngine = class {
       { binding: 3, resource: { buffer: output } },
       { binding: 4, resource: { buffer: params } }
     ], [numHeads, numTokens]);
+  }
+  /** Batched RoPE: apply rotary embeddings to N tokens at different positions. */
+  ropeBatch(data, positions, numHeads, headDim, numTokens, theta) {
+    const paramBuf = new Uint32Array(4);
+    paramBuf[0] = numHeads;
+    paramBuf[1] = headDim;
+    paramBuf[2] = numTokens;
+    paramBuf[3] = new Uint32Array(new Float32Array([theta]).buffer)[0];
+    const params = this.createParams("rope_batch_params", paramBuf.buffer);
+    const totalPairs = numTokens * numHeads * (headDim / 2);
+    this.dispatch(rope_batch_default, "rope_batch", [
+      storageReadWrite(0),
+      storageReadOnly(1),
+      uniform(2)
+    ], [
+      { binding: 0, resource: { buffer: data } },
+      { binding: 1, resource: { buffer: positions } },
+      { binding: 2, resource: { buffer: params } }
+    ], [Math.ceil(totalPairs / 256)]);
+  }
+  /** Batched KV cache write: write N K/V vectors at consecutive positions. */
+  kvCacheWriteBatch(kIn, vIn, kCache, vCache, nKvHeads, headDim, maxSeqLen, startPos, numTokens) {
+    const paramBuf = new Uint32Array([nKvHeads, headDim, maxSeqLen, startPos, numTokens]);
+    const params = this.createParams("kv_write_batch_params", paramBuf.buffer);
+    const total = numTokens * nKvHeads * headDim;
+    this.dispatch(kv_cache_write_batch_default, "kv_cache_write_batch", [
+      storageReadOnly(0),
+      storageReadOnly(1),
+      storageReadWrite(2),
+      storageReadWrite(3),
+      uniform(4)
+    ], [
+      { binding: 0, resource: { buffer: kIn } },
+      { binding: 1, resource: { buffer: vIn } },
+      { binding: 2, resource: { buffer: kCache } },
+      { binding: 3, resource: { buffer: vCache } },
+      { binding: 4, resource: { buffer: params } }
+    ], [Math.ceil(total / 256)]);
   }
   /** Repeat-tile: expand numKHeads groups to numVHeads groups by repeating. */
   repeatTile(src, dst, numKHeads, headDim, factor) {
@@ -1866,6 +1925,9 @@ var KvCache = class {
   get seqLen() {
     return this._seqLen;
   }
+  set seqLen(val) {
+    this._seqLen = val;
+  }
   /**
    * Write K and V vectors for the current position.
    * k, v: [numKvHeads * headDim] float32
@@ -2251,6 +2313,112 @@ var LlamaModel = class {
     }
     compute.rmsNorm(this.hidden, weights.outputNorm, this.normed, E, this.rmsNormEps);
     compute.matmul(weights.output.buffer, this.normed, this.logits, this.vocabSize, E, weights.output.type);
+    return this.logits;
+  }
+  /**
+   * Batched prefill: process all prompt tokens at once per layer.
+   * Much faster than calling forward() N times for long prompts.
+   * Returns logits buffer for the LAST token only.
+   */
+  forwardPrefill(tokenIds) {
+    const { compute, weights } = this;
+    const E = this.embeddingDim;
+    const N = tokenIds.length;
+    if (N === 0) return this.logits;
+    if (N === 1) return this.forward(tokenIds[0]);
+    const H = this.numHeads * this.headDim;
+    const KV = this.numKvHeads * this.headDim;
+    const F = this.ffnDim;
+    const bHidden = compute.buffers.createBuffer("b_hidden", N * E * 4);
+    const bResidual = compute.buffers.createBuffer("b_residual", N * E * 4);
+    const bNormed = compute.buffers.createBuffer("b_normed", N * E * 4);
+    const bQ = compute.buffers.createBuffer("b_q", N * H * 4);
+    const bK = compute.buffers.createBuffer("b_k", N * KV * 4);
+    const bV = compute.buffers.createBuffer("b_v", N * KV * 4);
+    const bAttnOut = compute.buffers.createBuffer("b_attn", N * E * 4);
+    const bGate = compute.buffers.createBuffer("b_gate", N * F * 4);
+    const bUp = compute.buffers.createBuffer("b_up", N * F * 4);
+    const bFfnOut = compute.buffers.createBuffer("b_ffn", N * F * 4);
+    const bTemp = compute.buffers.createBuffer("b_temp", N * E * 4);
+    const tokenIdBuf = compute.buffers.createBuffer("b_tokens", N * 4);
+    const positionBuf = compute.buffers.createBuffer("b_positions", N * 4);
+    const startPos = this.kvCaches[0].seqLen;
+    const posData = new Uint32Array(N);
+    for (let i = 0; i < N; i++) posData[i] = startPos + i;
+    compute.device.queue.writeBuffer(tokenIdBuf, 0, new Uint32Array(tokenIds));
+    compute.device.queue.writeBuffer(positionBuf, 0, posData);
+    if (weights.tokenEmbedding.type === 0 /* F32 */) {
+      compute.embeddingBatch(weights.tokenEmbedding.buffer, tokenIdBuf, bHidden, N, E);
+    } else {
+      for (let i = 0; i < N; i++) {
+        compute.embeddingQ8(weights.tokenEmbedding.buffer, this.hidden, tokenIds[i], E);
+        compute.copyBufferRegion(this.hidden, 0, bHidden, i * E * 4, E * 4);
+      }
+    }
+    for (let layer = 0; layer < this.numLayers; layer++) {
+      const lw = weights.layers[layer];
+      const kvCache = this.kvCaches[layer];
+      compute.copyBuffer(bHidden, bResidual, N * E * 4);
+      compute.rmsNormBatch(bHidden, lw.attnNorm, bNormed, E, N, this.rmsNormEps);
+      compute.matmulBatch(lw.q.buffer, bNormed, bQ, H, E, N, lw.q.type);
+      compute.matmulBatch(lw.k.buffer, bNormed, bK, KV, E, N, lw.k.type);
+      compute.matmulBatch(lw.v.buffer, bNormed, bV, KV, E, N, lw.v.type);
+      if (lw.qBias) {
+        for (let n = 0; n < N; n++) {
+        }
+      }
+      compute.ropeBatch(bQ, positionBuf, this.numHeads, this.headDim, N, this.ropeTheta);
+      compute.ropeBatch(bK, positionBuf, this.numKvHeads, this.headDim, N, this.ropeTheta);
+      compute.kvCacheWriteBatch(
+        bK,
+        bV,
+        kvCache.kBuffer,
+        kvCache.vBuffer,
+        this.numKvHeads,
+        this.headDim,
+        kvCache.maxSeqLen,
+        startPos,
+        N
+      );
+      kvCache.seqLen = startPos + N;
+      compute.attentionBatch(
+        bQ,
+        kvCache.kBuffer,
+        kvCache.vBuffer,
+        bAttnOut,
+        this.numHeads,
+        this.numKvHeads,
+        this.headDim,
+        kvCache.maxSeqLen,
+        startPos,
+        N
+      );
+      compute.matmulBatch(lw.o.buffer, bAttnOut, bTemp, E, H, N, lw.o.type);
+      compute.add(bTemp, bResidual, bHidden, N * E);
+      compute.copyBuffer(bHidden, bResidual, N * E * 4);
+      compute.rmsNormBatch(bHidden, lw.postAttnNorm, bNormed, E, N, this.rmsNormEps);
+      compute.matmulBatch(lw.gateProj.buffer, bNormed, bGate, F, E, N, lw.gateProj.type);
+      compute.matmulBatch(lw.upProj.buffer, bNormed, bUp, F, E, N, lw.upProj.type);
+      compute.siluMul(bGate, bUp, bFfnOut, N * F);
+      compute.matmulBatch(lw.downProj.buffer, bFfnOut, bTemp, E, F, N, lw.downProj.type);
+      compute.add(bTemp, bResidual, bHidden, N * E);
+    }
+    compute.copyBufferRegion(bHidden, (N - 1) * E * 4, this.hidden, 0, E * 4);
+    compute.rmsNorm(this.hidden, weights.outputNorm, this.normed, E, this.rmsNormEps);
+    compute.matmul(weights.output.buffer, this.normed, this.logits, this.vocabSize, E, weights.output.type);
+    bHidden.destroy();
+    bResidual.destroy();
+    bNormed.destroy();
+    bQ.destroy();
+    bK.destroy();
+    bV.destroy();
+    bAttnOut.destroy();
+    bGate.destroy();
+    bUp.destroy();
+    bFfnOut.destroy();
+    bTemp.destroy();
+    tokenIdBuf.destroy();
+    positionBuf.destroy();
     return this.logits;
   }
   // ── CPU forward pass (for verification / fallback) ──────────────────
@@ -3036,8 +3204,12 @@ var LlogosEngine = class _LlogosEngine {
       }
       inputTokens.push(...this.tokenizer.encode(finalPrompt));
       const allTokens = [...inputTokens];
-      for (let i = 0; i < inputTokens.length; i++) {
-        await this.model.forward(inputTokens[i]);
+      if (inputTokens.length > 1 && "forwardPrefill" in this.model) {
+        this.model.forwardPrefill(inputTokens);
+      } else {
+        for (let i = 0; i < inputTokens.length; i++) {
+          await this.model.forward(inputTokens[i]);
+        }
       }
       let logits = await this.model.readLogits();
       const thinkStartId = this.tokenizer.getTokenId("<think>");

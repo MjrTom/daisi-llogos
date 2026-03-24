@@ -158,9 +158,13 @@ export class LlogosEngine {
       inputTokens.push(...this.tokenizer.encode(finalPrompt));
       const allTokens = [...inputTokens];
 
-      // GPU forward pass — prefill
-      for (let i = 0; i < inputTokens.length; i++) {
-        await this.model.forward(inputTokens[i]);
+      // GPU forward pass — use batched prefill for LlamaModel, per-token for Qwen35
+      if (inputTokens.length > 1 && 'forwardPrefill' in this.model) {
+        (this.model as any).forwardPrefill(inputTokens);
+      } else {
+        for (let i = 0; i < inputTokens.length; i++) {
+          await this.model.forward(inputTokens[i]);
+        }
       }
       let logits = await this.model.readLogits();
 

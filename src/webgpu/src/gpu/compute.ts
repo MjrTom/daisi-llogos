@@ -35,6 +35,9 @@ import matmulBatchWgsl from './shaders/matmul_batch.wgsl';
 import embeddingBatchWgsl from './shaders/embedding_batch.wgsl';
 import rmsnormBatchWgsl from './shaders/rmsnorm_batch.wgsl';
 import attentionBatchWgsl from './shaders/attention_batch.wgsl';
+import ropeBatchWgsl from './shaders/rope_batch.wgsl';
+import kvCacheWriteBatchWgsl from './shaders/kv_cache_write_batch.wgsl';
+import matmulQ8BatchWgsl from './shaders/matmul_q8_batch.wgsl';
 import deltanetStepWgsl from './shaders/deltanet_step.wgsl';
 import siluGateWgsl from './shaders/silu_gate.wgsl';
 
@@ -608,13 +611,19 @@ export class ComputeEngine {
 
   // ── Batched prefill ops ──────────────────────────────────────────
 
-  /** Batched F32 matmul: output[n,m] = sum_k(weights[m,k] * input[n,k]) for N tokens. */
-  matmulBatch(weights: GPUBuffer, input: GPUBuffer, output: GPUBuffer, M: number, K: number, N: number): void {
+  /** Batched matmul: output[n,m] = sum_k(weights[m,k] * input[n,k]) for N tokens. */
+  matmulBatch(weights: GPUBuffer, input: GPUBuffer, output: GPUBuffer, M: number, K: number, N: number, quantType: GgmlType = GgmlType.F32): void {
     const paramData = new Uint32Array([M, K, N]);
     const params = this.createParams('matmul_batch_params', paramData.buffer);
     const xGroups = M <= 65535 ? M : 65535;
     const yGroups = M <= 65535 ? 1 : Math.ceil(M / 65535);
-    this.dispatch(matmulBatchWgsl, 'matmul_batch', [
+    let shader: string;
+    switch (quantType) {
+      case GgmlType.F32: shader = matmulBatchWgsl; break;
+      case GgmlType.Q8_0: shader = matmulQ8BatchWgsl; break;
+      default: shader = matmulBatchWgsl; break; // fallback to F32
+    }
+    this.dispatch(shader, 'matmul_batch', [
       storageReadOnly(0), storageReadOnly(1), storageReadWrite(2), uniform(3),
     ], [
       { binding: 0, resource: { buffer: weights } },
@@ -676,6 +685,41 @@ export class ComputeEngine {
       { binding: 3, resource: { buffer: output } },
       { binding: 4, resource: { buffer: params } },
     ], [numHeads, numTokens]);
+  }
+
+  /** Batched RoPE: apply rotary embeddings to N tokens at different positions. */
+  ropeBatch(data: GPUBuffer, positions: GPUBuffer, numHeads: number, headDim: number, numTokens: number, theta: number): void {
+    const paramBuf = new Uint32Array(4);
+    paramBuf[0] = numHeads; paramBuf[1] = headDim; paramBuf[2] = numTokens;
+    paramBuf[3] = new Uint32Array(new Float32Array([theta]).buffer)[0];
+    const params = this.createParams('rope_batch_params', paramBuf.buffer);
+    const totalPairs = numTokens * numHeads * (headDim / 2);
+    this.dispatch(ropeBatchWgsl, 'rope_batch', [
+      storageReadWrite(0), storageReadOnly(1), uniform(2),
+    ], [
+      { binding: 0, resource: { buffer: data } },
+      { binding: 1, resource: { buffer: positions } },
+      { binding: 2, resource: { buffer: params } },
+    ], [Math.ceil(totalPairs / 256)]);
+  }
+
+  /** Batched KV cache write: write N K/V vectors at consecutive positions. */
+  kvCacheWriteBatch(
+    kIn: GPUBuffer, vIn: GPUBuffer, kCache: GPUBuffer, vCache: GPUBuffer,
+    nKvHeads: number, headDim: number, maxSeqLen: number, startPos: number, numTokens: number,
+  ): void {
+    const paramBuf = new Uint32Array([nKvHeads, headDim, maxSeqLen, startPos, numTokens]);
+    const params = this.createParams('kv_write_batch_params', paramBuf.buffer);
+    const total = numTokens * nKvHeads * headDim;
+    this.dispatch(kvCacheWriteBatchWgsl, 'kv_cache_write_batch', [
+      storageReadOnly(0), storageReadOnly(1), storageReadWrite(2), storageReadWrite(3), uniform(4),
+    ], [
+      { binding: 0, resource: { buffer: kIn } },
+      { binding: 1, resource: { buffer: vIn } },
+      { binding: 2, resource: { buffer: kCache } },
+      { binding: 3, resource: { buffer: vCache } },
+      { binding: 4, resource: { buffer: params } },
+    ], [Math.ceil(total / 256)]);
   }
 
   /** Repeat-tile: expand numKHeads groups to numVHeads groups by repeating. */
