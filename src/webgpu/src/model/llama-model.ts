@@ -393,10 +393,7 @@ export class LlamaModel {
     const { compute, weights } = this;
     const E = this.embeddingDim;
 
-    // Individual submits — the only reliable sync approach;
-
-    // 1. Token embedding
-    // Token embedding — use Q8_0 shader if quantized, F32 otherwise
+    // 1. Token embedding — use Q8_0 shader if quantized, F32 otherwise
     if (weights.tokenEmbedding.type === GgmlType.Q8_0) {
       compute.embeddingQ8(weights.tokenEmbedding.buffer, this.hidden, tokenId, E);
     } else {

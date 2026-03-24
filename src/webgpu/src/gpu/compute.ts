@@ -31,6 +31,10 @@ import perHeadRmsnormWgsl from './shaders/per_head_rmsnorm.wgsl';
 import partialRopeWgsl from './shaders/partial_rope.wgsl';
 import gatedAttentionWgsl from './shaders/gated_attention.wgsl';
 import repeatTileWgsl from './shaders/repeat_tile.wgsl';
+import matmulBatchWgsl from './shaders/matmul_batch.wgsl';
+import embeddingBatchWgsl from './shaders/embedding_batch.wgsl';
+import rmsnormBatchWgsl from './shaders/rmsnorm_batch.wgsl';
+import attentionBatchWgsl from './shaders/attention_batch.wgsl';
 import deltanetStepWgsl from './shaders/deltanet_step.wgsl';
 import siluGateWgsl from './shaders/silu_gate.wgsl';
 
@@ -96,8 +100,13 @@ export class ComputeEngine {
 
   /** Copy buffer — uses batch encoder if active. */
   copyBuffer(src: GPUBuffer, dst: GPUBuffer, size: number): void {
+    this.copyBufferRegion(src, 0, dst, 0, size);
+  }
+
+  /** Copy buffer region with offsets — uses batch encoder if active. */
+  copyBufferRegion(src: GPUBuffer, srcOffset: number, dst: GPUBuffer, dstOffset: number, size: number): void {
     const encoder = this.batchEncoder ?? this.device.createCommandEncoder();
-    encoder.copyBufferToBuffer(src, 0, dst, 0, size);
+    encoder.copyBufferToBuffer(src, srcOffset, dst, dstOffset, size);
     if (!this.batchEncoder) {
       this.device.queue.submit([encoder.finish()]);
     }
@@ -595,6 +604,78 @@ export class ComputeEngine {
       { binding: 4, resource: { buffer: output } },
       { binding: 5, resource: { buffer: params } },
     ], [numHeads]);
+  }
+
+  // ── Batched prefill ops ──────────────────────────────────────────
+
+  /** Batched F32 matmul: output[n,m] = sum_k(weights[m,k] * input[n,k]) for N tokens. */
+  matmulBatch(weights: GPUBuffer, input: GPUBuffer, output: GPUBuffer, M: number, K: number, N: number): void {
+    const paramData = new Uint32Array([M, K, N]);
+    const params = this.createParams('matmul_batch_params', paramData.buffer);
+    const xGroups = M <= 65535 ? M : 65535;
+    const yGroups = M <= 65535 ? 1 : Math.ceil(M / 65535);
+    this.dispatch(matmulBatchWgsl, 'matmul_batch', [
+      storageReadOnly(0), storageReadOnly(1), storageReadWrite(2), uniform(3),
+    ], [
+      { binding: 0, resource: { buffer: weights } },
+      { binding: 1, resource: { buffer: input } },
+      { binding: 2, resource: { buffer: output } },
+      { binding: 3, resource: { buffer: params } },
+    ], [xGroups, yGroups, N]);
+  }
+
+  /** Batched embedding lookup: look up N token IDs at once. weights must be F32. */
+  embeddingBatch(weights: GPUBuffer, tokenIds: GPUBuffer, output: GPUBuffer, numTokens: number, embDim: number): void {
+    const params = this.createParams('emb_batch_params', new Uint32Array([numTokens, embDim]).buffer);
+    this.dispatch(embeddingBatchWgsl, 'embedding_batch', [
+      storageReadOnly(0), storageReadOnly(1), storageReadWrite(2), uniform(3),
+    ], [
+      { binding: 0, resource: { buffer: weights } },
+      { binding: 1, resource: { buffer: tokenIds } },
+      { binding: 2, resource: { buffer: output } },
+      { binding: 3, resource: { buffer: params } },
+    ], [Math.ceil(numTokens * embDim / 256)]);
+  }
+
+  /** Batched RMSNorm: normalize N rows independently. */
+  rmsNormBatch(input: GPUBuffer, weight: GPUBuffer, output: GPUBuffer, dim: number, numRows: number, eps: number): void {
+    const paramBuf = new Uint32Array(3);
+    paramBuf[0] = dim;
+    paramBuf[1] = numRows;
+    paramBuf[2] = new Uint32Array(new Float32Array([eps]).buffer)[0];
+    const params = this.createParams('rmsnorm_batch_params', paramBuf.buffer);
+    this.dispatch(rmsnormBatchWgsl, 'rmsnorm_batch', [
+      storageReadOnly(0), storageReadOnly(1), storageReadWrite(2), uniform(3),
+    ], [
+      { binding: 0, resource: { buffer: input } },
+      { binding: 1, resource: { buffer: weight } },
+      { binding: 2, resource: { buffer: output } },
+      { binding: 3, resource: { buffer: params } },
+    ], [numRows]);
+  }
+
+  /** Batched causal attention for prefill. Dispatch: [numHeads, numTokens]. */
+  attentionBatch(
+    q: GPUBuffer, kCache: GPUBuffer, vCache: GPUBuffer, output: GPUBuffer,
+    numHeads: number, numKvHeads: number, headDim: number,
+    maxSeqLen: number, startPos: number, numTokens: number,
+  ): void {
+    const scale = 1.0 / Math.sqrt(headDim);
+    const paramBuf = new ArrayBuffer(28);
+    const u32 = new Uint32Array(paramBuf);
+    u32[0] = numHeads; u32[1] = numKvHeads; u32[2] = headDim;
+    u32[3] = maxSeqLen; u32[4] = startPos; u32[5] = numTokens;
+    u32[6] = new Uint32Array(new Float32Array([scale]).buffer)[0];
+    const params = this.createParams('attn_batch_params', paramBuf);
+    this.dispatch(attentionBatchWgsl, 'attention_batch', [
+      storageReadOnly(0), storageReadOnly(1), storageReadOnly(2), storageReadWrite(3), uniform(4),
+    ], [
+      { binding: 0, resource: { buffer: q } },
+      { binding: 1, resource: { buffer: kCache } },
+      { binding: 2, resource: { buffer: vCache } },
+      { binding: 3, resource: { buffer: output } },
+      { binding: 4, resource: { buffer: params } },
+    ], [numHeads, numTokens]);
   }
 
   /** Repeat-tile: expand numKHeads groups to numVHeads groups by repeating. */
