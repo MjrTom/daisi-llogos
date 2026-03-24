@@ -1102,7 +1102,8 @@ var ComputeEngine = class {
     encoder.copyBufferToBuffer(buffer, 0, this.readbackBuf, 0, size);
     this.device.queue.submit([encoder.finish()]);
     await this.readbackBuf.mapAsync(GPUMapMode.READ);
-    const data = new Float32Array(this.readbackBuf.getMappedRange().slice(0));
+    const mapped = this.readbackBuf.getMappedRange();
+    const data = new Float32Array(mapped.slice(0, size));
     this.readbackBuf.unmap();
     return data;
   }
@@ -1907,6 +1908,71 @@ function applyTemplate(template, messages, options) {
   };
   const tokens = tokenize(template);
   return execute(tokens, ctx);
+}
+
+// src/tokenizer/vocab-remapper.ts
+var VocabRemapper = class {
+  /** Old ID → New ID. */
+  oldToNew;
+  /** New ID → Old ID. */
+  newToOld;
+  vocabSize;
+  constructor(tokens) {
+    const n = tokens.length;
+    this.vocabSize = n;
+    this.oldToNew = new Int32Array(n);
+    this.newToOld = new Int32Array(n);
+    const scores = [];
+    for (let i = 0; i < n; i++) {
+      scores.push({ oldId: i, score: scoreToken(tokens[i], i, n) });
+    }
+    scores.sort((a, b) => b.score - a.score);
+    for (let newId = 0; newId < n; newId++) {
+      const oldId = scores[newId].oldId;
+      this.oldToNew[oldId] = newId;
+      this.newToOld[newId] = oldId;
+    }
+  }
+  /** Remap token ID from original to remapped space. */
+  remapEncode(oldId) {
+    return oldId >= 0 && oldId < this.vocabSize ? this.oldToNew[oldId] : oldId;
+  }
+  /** Remap token ID from remapped back to original space. */
+  remapDecode(newId) {
+    return newId >= 0 && newId < this.vocabSize ? this.newToOld[newId] : newId;
+  }
+  /**
+   * Permute rows of a weight buffer. Each row is one token's vector.
+   * Returns new buffer with rows reordered so newRow[i] = oldRow[newToOld[i]].
+   */
+  permuteRows(data, rowCount, bytesPerRow) {
+    const src = new Uint8Array(data);
+    const dst = new Uint8Array(data.byteLength);
+    for (let newRow = 0; newRow < rowCount; newRow++) {
+      const oldRow = this.newToOld[newRow];
+      dst.set(
+        src.subarray(oldRow * bytesPerRow, oldRow * bytesPerRow + bytesPerRow),
+        newRow * bytesPerRow
+      );
+    }
+    return dst.buffer;
+  }
+};
+function scoreToken(token, originalId, vocabSize) {
+  let score = (vocabSize - originalId) * 4;
+  if (token.length > 0 && token.length <= 10) {
+    let hasPrintable = false;
+    for (let i = 0; i < token.length; i++) {
+      const c = token.charCodeAt(i);
+      if (c >= 32 && c <= 126) hasPrintable = true;
+      if (c >= 19968 && c <= 40959) hasPrintable = true;
+    }
+    if (hasPrintable) score += vocabSize;
+  }
+  if (token.startsWith("<|") || token.startsWith("<\uFF5C")) {
+    score -= vocabSize * 8;
+  }
+  return score;
 }
 
 // src/model/kv-cache.ts
@@ -3130,6 +3196,7 @@ var LlogosEngine = class _LlogosEngine {
   compute = null;
   model = null;
   tokenizer = null;
+  vocabRemapper = null;
   modelInfo = null;
   _status = "uninitialized";
   get status() {
@@ -3189,6 +3256,22 @@ var LlogosEngine = class _LlogosEngine {
           });
         }
       );
+      const vocabTokens = info.metadata.get("tokenizer.ggml.tokens");
+      if (vocabTokens) {
+        this.vocabRemapper = new VocabRemapper(vocabTokens);
+        const embTensor = tensorMap.get("token_embd.weight");
+        if (embTensor) {
+          const bytesPerRow = embTensor.info.byteSize / info.vocabSize;
+          embTensor.buffer = this.vocabRemapper.permuteRows(embTensor.buffer, info.vocabSize, bytesPerRow);
+        }
+        if (tensorMap.has("output.weight")) {
+          const outTensor = tensorMap.get("output.weight");
+          const bytesPerRow = outTensor.info.byteSize / info.vocabSize;
+          outTensor.buffer = this.vocabRemapper.permuteRows(outTensor.buffer, info.vocabSize, bytesPerRow);
+        }
+        const defaultLimit = Math.ceil(info.vocabSize / 32);
+        console.log(`[llogos] Vocab remapped. Default limit: ${defaultLimit}/${info.vocabSize}`);
+      }
       options?.onProgress?.({ phase: "Uploading to GPU", bytesDownloaded: 0, totalBytes: 0 });
       if (info.architecture === "qwen35") {
         this.model = new Qwen35Model(this.compute, info);
@@ -3214,12 +3297,14 @@ var LlogosEngine = class _LlogosEngine {
     if (!this.model || !this.tokenizer || !this.compute) {
       throw new Error("Model not loaded. Call loadModel() first.");
     }
+    const defaultLimit = this.vocabRemapper ? Math.ceil(this.tokenizer.vocabSize / 32) : 0;
     if ("vocabLimit" in this.model) {
-      this.model.vocabLimit = options?.vocabLimit ?? 0;
+      this.model.vocabLimit = options?.vocabLimit ?? defaultLimit;
     }
     this._status = "generating";
     const maxTokens = options?.maxTokens ?? 512;
     const sampler = new Sampler(options);
+    const remap = this.vocabRemapper;
     try {
       let finalPrompt = prompt;
       if (!options?.raw) {
@@ -3227,9 +3312,10 @@ var LlogosEngine = class _LlogosEngine {
       }
       const inputTokens = [];
       if (this.model.position === 0 && this.tokenizer.bosTokenId >= 0 && options?.raw) {
-        inputTokens.push(this.tokenizer.bosTokenId);
+        inputTokens.push(remap ? remap.remapEncode(this.tokenizer.bosTokenId) : this.tokenizer.bosTokenId);
       }
-      inputTokens.push(...this.tokenizer.encode(finalPrompt));
+      const rawTokens = this.tokenizer.encode(finalPrompt);
+      inputTokens.push(...remap ? rawTokens.map((t) => remap.remapEncode(t)) : rawTokens);
       const allTokens = [...inputTokens];
       if (inputTokens.length > 1 && "forwardPrefill" in this.model) {
         this.model.forwardPrefill(inputTokens);
@@ -3239,21 +3325,24 @@ var LlogosEngine = class _LlogosEngine {
         }
       }
       let logits = await this.model.readLogits();
-      const thinkStartId = this.tokenizer.getTokenId("<think>");
-      const thinkEndId = this.tokenizer.getTokenId("</think>");
+      const thinkStartOrig = this.tokenizer.getTokenId("<think>");
+      const thinkEndOrig = this.tokenizer.getTokenId("</think>");
+      const thinkStartId = remap && thinkStartOrig >= 0 ? remap.remapEncode(thinkStartOrig) : thinkStartOrig;
+      const thinkEndId = remap && thinkEndOrig >= 0 ? remap.remapEncode(thinkEndOrig) : thinkEndOrig;
       let inThinking = false;
       for (let step = 0; step < maxTokens; step++) {
         if (options?.signal?.aborted) break;
         const nextToken = sampler.sample(logits, allTokens);
-        if (this.tokenizer.isEos(nextToken)) break;
+        const origToken = remap ? remap.remapDecode(nextToken) : nextToken;
+        if (this.tokenizer.isEos(origToken)) break;
         allTokens.push(nextToken);
         if (nextToken === thinkStartId) {
           inThinking = true;
         } else if (nextToken === thinkEndId) {
           inThinking = false;
         } else if (!inThinking) {
-          const text = this.tokenizer.decode([nextToken]);
-          options?.onToken?.(text, nextToken);
+          const text = this.tokenizer.decode([origToken]);
+          options?.onToken?.(text, origToken);
           yield text;
         }
         await this.model.forward(nextToken);

@@ -766,7 +766,8 @@ export class ComputeEngine {
     this.device.queue.submit([encoder.finish()]);
 
     await this.readbackBuf.mapAsync(GPUMapMode.READ);
-    const data = new Float32Array(this.readbackBuf.getMappedRange().slice(0));
+    const mapped = this.readbackBuf.getMappedRange();
+    const data = new Float32Array(mapped.slice(0, size));
     this.readbackBuf.unmap();
     return data;
   }
