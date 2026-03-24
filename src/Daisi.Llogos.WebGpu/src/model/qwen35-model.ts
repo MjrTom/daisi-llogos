@@ -152,8 +152,24 @@ export class Qwen35Model {
   get numHeads(): number { return this.info.headCount; }
   get numKvHeads(): number { return this.info.headCountKv || this.info.headCount; }
   get headDim(): number {
-    const kl = this.info.metadata.get(`${this.info.architecture}.attention.key_length`) as number;
-    return kl ? kl / this.numKvHeads : this.embeddingDim / this.numHeads;
+    // For DeltaNet: ssmStateSize = 128
+    return this.ssmHeadDim;
+  }
+  /** Per-head key/value dimension for standard attention */
+  get keyLength(): number {
+    return (this.info.metadata.get(`${this.info.architecture}.attention.key_length`) as number) || (this.embeddingDim / this.numHeads);
+  }
+  get valueLength(): number {
+    return (this.info.metadata.get(`${this.info.architecture}.attention.value_length`) as number) || this.keyLength;
+  }
+  /** Whether Q projection is gated (Q dim = 2 × keyLength per head) */
+  get hasGatedQ(): boolean {
+    // Check if Q weight has double the expected rows
+    const qTensor = this.info.tensors.find(t => t.name === 'blk.3.attn_q.weight');
+    if (!qTensor) return false;
+    const qRows = qTensor.elementCount / this.embeddingDim;
+    const expectedQ = this.numHeads * this.keyLength;
+    return qRows > expectedQ * 1.5; // gated Q = 2× expected
   }
   get ffnDim(): number { return this.info.feedForwardLength; }
   get vocabSize(): number { return this.info.vocabSize; }
@@ -257,8 +273,12 @@ export class Qwen35Model {
     // Allocate working buffers
     const E = this.embeddingDim;
     const F = this.ffnDim;
-    const H = this.numHeads * this.headDim;
-    const KV = this.numKvHeads * this.headDim;
+    // Standard attention dims (may differ from DeltaNet headDim)
+    const qFullDim = this.hasGatedQ ? this.numHeads * this.keyLength * 2 : this.numHeads * this.keyLength;
+    const kDim = this.numKvHeads * this.keyLength;
+    const vDim = this.numKvHeads * this.valueLength;
+    const H = Math.max(this.numHeads * this.headDim, qFullDim); // largest Q dim needed
+    const KV = Math.max(this.numKvHeads * this.headDim, kDim);  // largest K/V dim needed
 
     this.hidden = compute.buffers.createBuffer('hidden', E * 4);
     this.residual = compute.buffers.createBuffer('residual', E * 4);
@@ -283,7 +303,7 @@ export class Qwen35Model {
     this.deltaStates = [];
     for (let i = 0; i < this.numLayers; i++) {
       if (this.isStandardAttention(i)) {
-        this.kvCaches.push(new KvCache(compute.device, compute.buffers, this.numKvHeads, this.headDim, maxCtx, i));
+        this.kvCaches.push(new KvCache(compute.device, compute.buffers, this.numKvHeads, this.keyLength, maxCtx, i));
         this.deltaStates.push(null);
       } else {
         this.kvCaches.push(null);
@@ -321,6 +341,12 @@ export class Qwen35Model {
       const h = new Float32Array(await this.readGpuBuffer(this.hidden, E * 4));
       let hMax = 0; for (let i = 0; i < E; i++) hMax = Math.max(hMax, Math.abs(h[i]));
       console.log(`  [embed] token=${tokenId} max=${hMax.toFixed(4)} h[0..4]=${Array.from(h.slice(0, 5)).map(v => v.toFixed(4))}`);
+
+      // Check normed after copyAndRmsNorm will be called for layer 0
+      // Compute expected normed on CPU for comparison
+      let ss = 0; for (let i = 0; i < E; i++) ss += h[i] * h[i];
+      const normRms = Math.sqrt(ss / E + this.rmsNormEps);
+      console.log(`  [embed] RMS=${normRms.toFixed(6)} (should match RMSNorm divisor)`);
     }
 
     // Transformer layers
@@ -329,6 +355,12 @@ export class Qwen35Model {
 
       // Pre-attention RMSNorm + residual copy
       compute.copyAndRmsNorm(this.hidden, lw.attnNorm, this.normed, this.residual, E, this.rmsNormEps);
+
+      // DEBUG: normed state after RMSNorm for layer 0
+      if (this._position === 0 && layer === 0) {
+        const n = new Float32Array(await this.readGpuBuffer(this.normed, E * 4));
+        console.log(`  [L0 normed] GPU n[0..4]=${Array.from(n.slice(0, 5)).map(v => v.toFixed(4))}`);
+      }
 
       if (lw.kind === 'standard') {
         await this.forwardStandardAttention(layer, lw);
@@ -347,6 +379,13 @@ export class Qwen35Model {
 
       // Residual add
       compute.add(this.temp, this.residual, this.hidden, E);
+
+      // DEBUG: hidden after each layer
+      if (this._position === 0 && layer < 8) {
+        const h = new Float32Array(await this.readGpuBuffer(this.hidden, E * 4));
+        let hMax = 0; for (let i = 0; i < E; i++) hMax = Math.max(hMax, Math.abs(h[i]));
+        console.log(`  [after L${layer}] hidden max=${hMax.toFixed(4)} h[0..4]=${Array.from(h.slice(0, 5)).map(v => v.toFixed(4))}`);
+      }
     }
 
     // Final RMSNorm + LM Head
@@ -366,65 +405,132 @@ export class Qwen35Model {
     const { compute } = this;
     const E = this.embeddingDim;
     const kvCache = this.kvCaches[layer]!;
-
-    // Q, K, V projections
-    compute.matmul(lw.q.buffer, this.normed, this.qBuf, this.numHeads * this.headDim, E, lw.q.type);
-    compute.matmul(lw.k.buffer, this.normed, this.kBuf, this.numKvHeads * this.headDim, E, lw.k.type);
-    compute.matmul(lw.v.buffer, this.normed, this.vBuf, this.numKvHeads * this.headDim, E, lw.v.type);
-
-    // QK norms (per-head RMSNorm) — required for Qwen 3.5 standard attention layers
-    if (lw.qNorm) {
-      const qData = new Float32Array(await this.readGpuBuffer(this.qBuf, this.numHeads * this.headDim * 4));
-      const kData = new Float32Array(await this.readGpuBuffer(this.kBuf, this.numKvHeads * this.headDim * 4));
-      const qNormW = new Float32Array(await this.readGpuBuffer(lw.qNorm, this.numKvHeads * this.headDim * 4));
-      const kNormW = lw.kNorm ? new Float32Array(await this.readGpuBuffer(lw.kNorm, this.numKvHeads * this.headDim * 4)) : qNormW;
-
-      // Apply per-head RMSNorm to Q (using KV-group-shared weights)
-      for (let h = 0; h < this.numHeads; h++) {
-        const off = h * this.headDim;
-        const kvGroup = Math.floor(h / (this.numHeads / this.numKvHeads));
-        const wOff = kvGroup * this.headDim;
-        let sumSq = 0;
-        for (let i = 0; i < this.headDim; i++) sumSq += qData[off + i] * qData[off + i];
-        const rms = Math.sqrt(sumSq / this.headDim + this.rmsNormEps);
-        for (let i = 0; i < this.headDim; i++) qData[off + i] = (qData[off + i] / rms) * qNormW[wOff + i];
-      }
-      // Apply per-head RMSNorm to K
-      for (let h = 0; h < this.numKvHeads; h++) {
-        const off = h * this.headDim;
-        let sumSq = 0;
-        for (let i = 0; i < this.headDim; i++) sumSq += kData[off + i] * kData[off + i];
-        const rms = Math.sqrt(sumSq / this.headDim + this.rmsNormEps);
-        for (let i = 0; i < this.headDim; i++) kData[off + i] = (kData[off + i] / rms) * kNormW[off + i];
-      }
-      compute.device.queue.writeBuffer(this.qBuf, 0, qData.buffer);
-      compute.device.queue.writeBuffer(this.kBuf, 0, kData.buffer);
-    }
-
-    // RoPE
+    const keyLen = this.keyLength;   // 256 per head
+    const valLen = this.valueLength; // 256 per head
+    const nH = this.numHeads;        // 8
+    const nKV = this.numKvHeads;     // 2
     const pos = kvCache.seqLen;
-    // Partial RoPE: only first ropeDim positions per head get rotated (CPU for partial support)
-    if (this.ropeDim < this.headDim) {
-      const qData = new Float32Array(await this.readGpuBuffer(this.qBuf, this.numHeads * this.headDim * 4));
-      const kData = new Float32Array(await this.readGpuBuffer(this.kBuf, this.numKvHeads * this.headDim * 4));
-      this.applyPartialRoPE(qData, this.numHeads, pos);
-      this.applyPartialRoPE(kData, this.numKvHeads, pos);
-      compute.device.queue.writeBuffer(this.qBuf, 0, qData.buffer);
-      compute.device.queue.writeBuffer(this.kBuf, 0, kData.buffer);
+    const scale = 1.0 / Math.sqrt(keyLen);
+
+    // Q, K, V projections — Q may be gated (2× keyLen per head)
+    const qFullDim = this.hasGatedQ ? nH * keyLen * 2 : nH * keyLen;
+    const kDim = nKV * keyLen;
+    const vDim = nKV * valLen;
+    compute.matmul(lw.q.buffer, this.normed, this.qBuf, qFullDim, E, lw.q.type);
+    compute.matmul(lw.k.buffer, this.normed, this.kBuf, kDim, E, lw.k.type);
+    compute.matmul(lw.v.buffer, this.normed, this.vBuf, vDim, E, lw.v.type);
+
+    // Read to CPU for deinterleave, norms, RoPE, and attention
+    const qFullData = new Float32Array(await this.readGpuBuffer(this.qBuf, qFullDim * 4));
+    const kData = new Float32Array(await this.readGpuBuffer(this.kBuf, kDim * 4));
+
+    // DeInterleave gated Q: [h0_attn, h0_gate, h1_attn, h1_gate, ...]
+    const qAttn = new Float32Array(nH * keyLen);
+    const qGate = new Float32Array(nH * keyLen);
+    if (this.hasGatedQ) {
+      for (let h = 0; h < nH; h++) {
+        for (let d = 0; d < keyLen; d++) {
+          qAttn[h * keyLen + d] = qFullData[h * keyLen * 2 + d];
+          qGate[h * keyLen + d] = qFullData[h * keyLen * 2 + keyLen + d];
+        }
+      }
     } else {
-      compute.rope(this.qBuf, this.headDim, this.headDim, pos, this.ropeTheta, this.numHeads * this.headDim);
-      compute.rope(this.kBuf, this.headDim, this.headDim, pos, this.ropeTheta, this.numKvHeads * this.headDim);
+      qAttn.set(qFullData);
+      qGate.fill(88.0); // sigmoid(88)≈1 → ungated
     }
 
-    // KV cache write
-    kvCache.write(this.kBuf, this.vBuf, this.numKvHeads * this.headDim * 4, this.numKvHeads * this.headDim * 4);
+    // Per-head QK RMSNorm
+    if (lw.qNorm) {
+      const qNormW = new Float32Array(await this.readGpuBuffer(lw.qNorm, nKV * keyLen * 4));
+      const kNormW = lw.kNorm ? new Float32Array(await this.readGpuBuffer(lw.kNorm, nKV * keyLen * 4)) : qNormW;
+      for (let h = 0; h < nH; h++) {
+        const off = h * keyLen;
+        let ss = 0; for (let i = 0; i < keyLen; i++) ss += qAttn[off + i] * qAttn[off + i];
+        const rms = Math.sqrt(ss / keyLen + this.rmsNormEps);
+        // Norm weights cycle over nKV*keyLen (shared across Q head groups)
+        for (let i = 0; i < keyLen; i++) qAttn[off + i] = (qAttn[off + i] / rms) * qNormW[i % (nKV * keyLen)];
+      }
+      for (let h = 0; h < nKV; h++) {
+        const off = h * keyLen;
+        let ss = 0; for (let i = 0; i < keyLen; i++) ss += kData[off + i] * kData[off + i];
+        const rms = Math.sqrt(ss / keyLen + this.rmsNormEps);
+        for (let i = 0; i < keyLen; i++) kData[off + i] = (kData[off + i] / rms) * kNormW[off + i];
+      }
+    }
 
-    // Attention
-    compute.attention(this.qBuf, kvCache.kBuffer, kvCache.vBuffer, this.attnOut,
-      this.numHeads, this.numKvHeads, this.headDim, kvCache.seqLen, kvCache.maxSeqLen);
+    // Partial RoPE (only first ropeDim of each head)
+    const ropeDim = this.ropeDim;
+    const halfDim = ropeDim / 2;
+    for (let h = 0; h < nH; h++) {
+      const off = h * keyLen;
+      for (let i = 0; i < halfDim; i++) {
+        const freq = 1.0 / Math.pow(this.ropeTheta, (2 * i) / ropeDim);
+        const angle = pos * freq;
+        const cos = Math.cos(angle), sin = Math.sin(angle);
+        const x0 = qAttn[off + 2 * i], x1 = qAttn[off + 2 * i + 1];
+        qAttn[off + 2 * i] = x0 * cos - x1 * sin;
+        qAttn[off + 2 * i + 1] = x0 * sin + x1 * cos;
+      }
+    }
+    for (let h = 0; h < nKV; h++) {
+      const off = h * keyLen;
+      for (let i = 0; i < halfDim; i++) {
+        const freq = 1.0 / Math.pow(this.ropeTheta, (2 * i) / ropeDim);
+        const angle = pos * freq;
+        const cos = Math.cos(angle), sin = Math.sin(angle);
+        const x0 = kData[off + 2 * i], x1 = kData[off + 2 * i + 1];
+        kData[off + 2 * i] = x0 * cos - x1 * sin;
+        kData[off + 2 * i + 1] = x0 * sin + x1 * cos;
+      }
+    }
 
-    // Output projection + residual
-    compute.matmul(lw.o.buffer, this.attnOut, this.temp, E, this.numHeads * this.headDim, lw.o.type);
+    // Write K to GPU for KV cache, V already on GPU
+    compute.device.queue.writeBuffer(this.kBuf, 0, kData.buffer);
+    kvCache.write(this.kBuf, this.vBuf, kDim * 4, vDim * 4);
+
+    // CPU gated attention — needed because of different head dims and gating
+    const vData = new Float32Array(await this.readGpuBuffer(this.vBuf, vDim * 4));
+    const kCacheData = new Float32Array(await this.readGpuBuffer(kvCache.kBuffer, nKV * kvCache.maxSeqLen * keyLen * 4));
+    const vCacheData = new Float32Array(await this.readGpuBuffer(kvCache.vBuffer, nKV * kvCache.maxSeqLen * valLen * 4));
+    const seqLen = kvCache.seqLen;
+    const maxSeqLen = kvCache.maxSeqLen;
+    const attnOutData = new Float32Array(nH * valLen);
+
+    for (let h = 0; h < nH; h++) {
+      const kvHead = Math.floor(h / (nH / nKV));
+      const qOff = h * keyLen;
+
+      // Attention scores
+      const scores = new Float32Array(seqLen);
+      for (let t = 0; t < seqLen; t++) {
+        let dot = 0;
+        const kOff = kvHead * maxSeqLen * keyLen + t * keyLen;
+        for (let d = 0; d < keyLen; d++) dot += qAttn[qOff + d] * kCacheData[kOff + d];
+        scores[t] = dot * scale;
+      }
+
+      // Softmax
+      let maxS = -Infinity;
+      for (let t = 0; t < seqLen; t++) if (scores[t] > maxS) maxS = scores[t];
+      let expSum = 0;
+      for (let t = 0; t < seqLen; t++) { scores[t] = Math.exp(scores[t] - maxS); expSum += scores[t]; }
+      for (let t = 0; t < seqLen; t++) scores[t] /= expSum;
+
+      // Weighted V + Q gate
+      const oOff = h * valLen;
+      for (let d = 0; d < valLen; d++) {
+        let sum = 0;
+        for (let t = 0; t < seqLen; t++) {
+          sum += scores[t] * vCacheData[kvHead * maxSeqLen * valLen + t * valLen + d];
+        }
+        const gate = 1.0 / (1.0 + Math.exp(-qGate[h * keyLen + d]));
+        attnOutData[oOff + d] = sum * gate;
+      }
+    }
+
+    // Upload and project
+    compute.device.queue.writeBuffer(this.attnOut, 0, attnOutData.buffer);
+    compute.matmul(lw.o.buffer, this.attnOut, this.temp, E, nH * valLen, lw.o.type);
     compute.add(this.temp, this.residual, this.hidden, E);
   }
 
