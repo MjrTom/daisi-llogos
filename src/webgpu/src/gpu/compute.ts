@@ -13,6 +13,7 @@ import ropeWgsl from './shaders/rope.wgsl';
 import matmulWgsl from './shaders/matmul.wgsl';
 import matmulQ4Wgsl from './shaders/matmul_q4.wgsl';
 import matmulQ8Wgsl from './shaders/matmul_q8.wgsl';
+import matmulQ8MrWgsl from './shaders/matmul_q8_mr.wgsl';
 import attentionWgsl from './shaders/attention.wgsl';
 import softmaxWgsl from './shaders/softmax.wgsl';
 import siluWgsl from './shaders/silu.wgsl';
@@ -217,13 +218,22 @@ export class ComputeEngine {
     const params = this.createParams('matmul_params', paramData.buffer);
 
     let shader: string;
+    let workgroups: [number, number?, number?];
     switch (quantType) {
       case GgmlType.F32:
-        shader = matmulWgsl; break;
+        shader = matmulWgsl;
+        workgroups = M <= 65535 ? [M] : [65535, Math.ceil(M / 65535)];
+        break;
       case GgmlType.Q4_0:
-        shader = matmulQ4Wgsl; break;
+        shader = matmulQ4Wgsl;
+        workgroups = M <= 65535 ? [M] : [65535, Math.ceil(M / 65535)];
+        break;
       case GgmlType.Q8_0:
-        shader = matmulQ8Wgsl; break;
+        // Multi-row: 2 rows per workgroup → halves dispatch count
+        shader = matmulQ8MrWgsl;
+        const halfM = Math.ceil(M / 2);
+        workgroups = halfM <= 65535 ? [halfM] : [65535, Math.ceil(halfM / 65535)];
+        break;
       default:
         throw new Error(`Unsupported quantization type for matmul: ${quantType}`);
     }
@@ -235,7 +245,7 @@ export class ComputeEngine {
       { binding: 1, resource: { buffer: input } },
       { binding: 2, resource: { buffer: output } },
       { binding: 3, resource: { buffer: params } },
-    ], M <= 65535 ? [M] : [65535, Math.ceil(M / 65535)]); // 2D dispatch for large vocabs
+    ], workgroups);
   }
 
   /** Pre-built RoPE cos/sin tables keyed by "theta,headDim,position". */

@@ -451,7 +451,6 @@ export class LlamaModel {
 
       // Residual add → hidden
       compute.add(this.temp, this.residual, this.hidden, E);
-
     }
 
     // 3. Final RMSNorm
