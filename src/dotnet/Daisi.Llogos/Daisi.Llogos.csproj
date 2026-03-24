@@ -4,6 +4,6 @@
     <AssemblyName>Daisi.Llogos</AssemblyName>
   </PropertyGroup>
   <ItemGroup>
-    <ProjectReference Include="..\..\..\daisi-sdk-dotnet\Daisi.Inference\Daisi.Inference.csproj" />
+    <ProjectReference Include="..\..\..\..\daisi-sdk-dotnet\Daisi.Inference\Daisi.Inference.csproj" />
   </ItemGroup>
 </Project>

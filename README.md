@@ -22,7 +22,7 @@ A suite of inference engines for GGUF models — from native C# backends (CPU, C
 ### WebGPU (Browser / Node.js)
 
 ```bash
-cd src/Daisi.Llogos.WebGpu
+cd src/webgpu
 npm install
 npm run build
 npm test  # 72 tests including GPU inference via Dawn
@@ -232,16 +232,19 @@ flowchart LR
 ```
 daisi-llogos/
 ├── src/
-│   ├── Daisi.Llogos/            Core library (GGUF, model, inference, tokenizer) [C#]
-│   ├── Daisi.Llogos.Cpu/        CPU compute backend (AVX2/AVX-512 SIMD) [C#]
-│   ├── Daisi.Llogos.Cuda/       NVIDIA CUDA backend (dp4a, fused kernels) [C#]
-│   ├── Daisi.Llogos.Vulkan/     Vulkan compute backend (SPIR-V shaders) [C#]
-│   ├── Daisi.Llogos.Metal/      Apple Metal backend [C#]
-│   ├── Daisi.Llogos.Cli/        Command-line interface [C#]
-│   └── Daisi.Llogos.WebGpu/     Browser WebGPU engine (WGSL shaders) [TypeScript]
-├── tests/
-│   └── Daisi.Llogos.Tests/      Unit and integration tests [C#]
-└── docs/                        Architecture and roadmap documentation
+│   ├── dotnet/                      .NET inference engine suite
+│   │   ├── Daisi.Llogos/            Core library (GGUF, model, inference, tokenizer)
+│   │   ├── Daisi.Llogos.Cpu/        CPU compute backend (AVX2/AVX-512 SIMD)
+│   │   ├── Daisi.Llogos.Cuda/       NVIDIA CUDA backend (dp4a, fused kernels)
+│   │   ├── Daisi.Llogos.Vulkan/     Vulkan compute backend (SPIR-V shaders)
+│   │   ├── Daisi.Llogos.Cli/        Command-line interface
+│   │   ├── tests/                   Unit and integration tests
+│   │   └── Daisi.Llogos.sln         Solution file
+│   └── webgpu/                      Browser/Node.js inference engine [TypeScript]
+│       ├── src/                     Engine source (GGUF, GPU, model, tokenizer)
+│       ├── test/                    72 automated tests (including GPU via Dawn)
+│       └── package.json             @daisinet/llogos-webgpu
+└── docs/                            Architecture and roadmap documentation
 ```
 
 ## License
