@@ -159,6 +159,11 @@ export class LlogosEngine {
       }
       let logits = await this.model.readLogits();
 
+      // Detect <think>/</ think> tokens for thinking models (Qwen 3.5)
+      const thinkStartId = this.tokenizer.getTokenId('<think>');
+      const thinkEndId = this.tokenizer.getTokenId('</think>');
+      let inThinking = false;
+
       // Generate tokens autoregressively
       for (let step = 0; step < maxTokens; step++) {
         if (options?.signal?.aborted) break;
@@ -169,9 +174,15 @@ export class LlogosEngine {
         if (this.tokenizer.isEos(nextToken)) break;
 
         allTokens.push(nextToken);
-        const text = this.tokenizer.decode([nextToken]);
-        options?.onToken?.(text, nextToken);
-        yield text;
+
+        // Track thinking state
+        if (nextToken === thinkStartId) { inThinking = true; }
+        else if (nextToken === thinkEndId) { inThinking = false; }
+        else if (!inThinking) {
+          const text = this.tokenizer.decode([nextToken]);
+          options?.onToken?.(text, nextToken);
+          yield text;
+        }
 
         await this.model.forward(nextToken);
         logits = await this.model.readLogits();
