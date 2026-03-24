@@ -321,6 +321,27 @@ var copy_rmsnorm_default = "// Fused: copy input\u2192residual AND compute RMSNo
 // src/gpu/shaders/add.wgsl
 var add_default = "// Element-wise add: output[i] = a[i] + b[i]\r\n// Used for residual connections.\r\n\r\nstruct Params {\r\n  n: u32,\r\n}\r\n\r\n@group(0) @binding(0) var<storage, read> a: array<f32>;\r\n@group(0) @binding(1) var<storage, read> b: array<f32>;\r\n@group(0) @binding(2) var<storage, read_write> output: array<f32>;\r\n@group(0) @binding(3) var<uniform> params: Params;\r\n\r\n@compute @workgroup_size(256)\r\nfn main(@builtin(global_invocation_id) gid: vec3u) {\r\n  let i = gid.x;\r\n  if (i >= params.n) { return; }\r\n  output[i] = a[i] + b[i];\r\n}\r\n";
 
+// src/gpu/shaders/add_bias.wgsl
+var add_bias_default = "// In-place bias add: data[i] += bias[i]\n\nstruct Params {\n  n: u32,\n}\n\n@group(0) @binding(0) var<storage, read_write> data: array<f32>;\n@group(0) @binding(1) var<storage, read> bias: array<f32>;\n@group(0) @binding(2) var<uniform> params: Params;\n\n@compute @workgroup_size(256)\nfn main(@builtin(global_invocation_id) gid: vec3u) {\n  let i = gid.x;\n  if (i >= params.n) { return; }\n  data[i] += bias[i];\n}\n";
+
+// src/gpu/shaders/conv1d_silu.wgsl
+var conv1d_silu_default = "// Fused causal conv1d + SiLU activation.\n// Processes all channels in parallel. Uses persistent conv buffer.\n//\n// For each channel c:\n//   result = sum(buf[k] * weight[c*K+k]) + input[c] * weight[c*K+(K-1)]\n//   shift buffer: discard oldest, add current pre-conv input\n//   output[c] = silu(result)\n//\n// conv_buf: [(K-1) * channels] \u2014 persistent between tokens\n// weights: [channels * K] \u2014 conv kernel\n// data: [channels] \u2014 input/output (in-place)\n\nstruct Params {\n  channels: u32,\n  kernel_size: u32,\n}\n\n@group(0) @binding(0) var<storage, read_write> data: array<f32>;     // [channels] in/out\n@group(0) @binding(1) var<storage, read_write> conv_buf: array<f32>; // [(K-1) * channels]\n@group(0) @binding(2) var<storage, read> weights: array<f32>;        // [channels * K]\n@group(0) @binding(3) var<uniform> params: Params;\n\n@compute @workgroup_size(256)\nfn main(@builtin(global_invocation_id) gid: vec3u) {\n  let c = gid.x;\n  if (c >= params.channels) { return; }\n\n  let K = params.kernel_size;\n  let C = params.channels;\n  let buf_slots = K - 1u;\n\n  // Save pre-conv input for buffer shift\n  let pre_conv = data[c];\n\n  // Compute conv: sum(buf[k*C+c] * w[c*K+k]) + data[c] * w[c*K+(K-1)]\n  var s: f32 = 0.0;\n  for (var k = 0u; k < buf_slots; k++) {\n    s += conv_buf[k * C + c] * weights[c * K + k];\n  }\n  s += pre_conv * weights[c * K + buf_slots];\n\n  // Shift buffer: slot[k] = slot[k+1], newest = pre_conv\n  for (var k = 0u; k < buf_slots - 1u; k++) {\n    conv_buf[k * C + c] = conv_buf[(k + 1u) * C + c];\n  }\n  if (buf_slots > 0u) {\n    conv_buf[(buf_slots - 1u) * C + c] = pre_conv;\n  }\n\n  // SiLU activation + write output\n  data[c] = s / (1.0 + exp(-s));\n}\n";
+
+// src/gpu/shaders/silu_inplace.wgsl
+var silu_inplace_default = "// In-place SiLU activation: data[i] = data[i] * sigmoid(data[i])\n\nstruct Params { n: u32, }\n\n@group(0) @binding(0) var<storage, read_write> data: array<f32>;\n@group(0) @binding(1) var<uniform> params: Params;\n\n@compute @workgroup_size(256)\nfn main(@builtin(global_invocation_id) gid: vec3u) {\n  let i = gid.x;\n  if (i >= params.n) { return; }\n  let x = data[i];\n  data[i] = x / (1.0 + exp(-x));\n}\n";
+
+// src/gpu/shaders/l2_norm_groups.wgsl
+var l2_norm_groups_default = "// L2 normalize each group independently.\n// data: [numGroups * groupDim], each group of groupDim elements is normalized.\n// One workgroup per group, 256 threads for reduction.\n\nstruct Params {\n  num_groups: u32,\n  group_dim: u32,\n}\n\n@group(0) @binding(0) var<storage, read_write> data: array<f32>;\n@group(0) @binding(1) var<uniform> params: Params;\nvar<workgroup> shared_sum: array<f32, 256>;\n\n@compute @workgroup_size(256)\nfn main(@builtin(workgroup_id) wg: vec3u, @builtin(local_invocation_id) lid: vec3u) {\n  let g = wg.x;\n  if (g >= params.num_groups) { return; }\n  let tid = lid.x;\n  let base = g * params.group_dim;\n  let dim = params.group_dim;\n\n  // Sum of squares\n  var sum_sq: f32 = 0.0;\n  for (var i = tid; i < dim; i += 256u) {\n    let v = data[base + i];\n    sum_sq += v * v;\n  }\n  shared_sum[tid] = sum_sq;\n  workgroupBarrier();\n\n  // Reduction\n  for (var s = 128u; s > 0u; s >>= 1u) {\n    if (tid < s) { shared_sum[tid] += shared_sum[tid + s]; }\n    workgroupBarrier();\n  }\n\n  let norm = sqrt(shared_sum[0]);\n  let inv_norm = select(1.0, 1.0 / norm, norm > 0.0);\n\n  // Normalize\n  for (var i = tid; i < dim; i += 256u) {\n    data[base + i] *= inv_norm;\n  }\n}\n";
+
+// src/gpu/shaders/compute_decay_beta.wgsl
+var compute_decay_beta_default = "// Compute decay and beta values for DeltaNet.\n// decay[g] = exp(ssm_a[g] * softplus(alpha[g] + dt_bias[g]))\n// beta_out[g] = sigmoid(beta[g])\n\nstruct Params { n: u32, }\n\n@group(0) @binding(0) var<storage, read> alpha: array<f32>;\n@group(0) @binding(1) var<storage, read> beta: array<f32>;\n@group(0) @binding(2) var<storage, read> ssm_a: array<f32>;\n@group(0) @binding(3) var<storage, read> dt_bias: array<f32>;\n@group(0) @binding(4) var<storage, read_write> decay_out: array<f32>;\n@group(0) @binding(5) var<storage, read_write> beta_out: array<f32>;\n@group(0) @binding(6) var<uniform> params: Params;\n\n@compute @workgroup_size(64)\nfn main(@builtin(global_invocation_id) gid: vec3u) {\n  let g = gid.x;\n  if (g >= params.n) { return; }\n\n  let softplus = log(1.0 + exp(alpha[g] + dt_bias[g]));\n  decay_out[g] = exp(ssm_a[g] * softplus);\n  beta_out[g] = 1.0 / (1.0 + exp(-beta[g]));\n}\n";
+
+// src/gpu/shaders/deltanet_step.wgsl
+var deltanet_step_default = "// DeltaNet state update + output computation.\n// One workgroup per group (head). 128 threads per group.\n//\n// For each group g:\n//   sk[j] = sum_i(state[g,i,j] * k[g*D+i])\n//   error[j] = (v[g*D+j] - decay[g]*sk[j]) * beta[g]\n//   state[g,i,j] = decay[g]*state[g,i,j] + k[g*D+i]*error[j]\n//   output[g*D+j] = sum_i(state[g,i,j] * q[g*D+i]) * scale\n//   Per-head RMSNorm on output[g*D .. g*D+D-1]\n\nstruct Params {\n  head_dim: u32,    // D = 128\n  num_groups: u32,  // 16\n  scale: f32,       // 1/sqrt(D)\n  norm_eps: f32,    // RMSNorm epsilon\n}\n\n@group(0) @binding(0) var<storage, read> q: array<f32>;\n@group(0) @binding(1) var<storage, read> k: array<f32>;\n@group(0) @binding(2) var<storage, read> v: array<f32>;\n@group(0) @binding(3) var<storage, read_write> state: array<f32>;  // [G * D * D]\n@group(0) @binding(4) var<storage, read> decay: array<f32>;        // [G]\n@group(0) @binding(5) var<storage, read> beta_val: array<f32>;     // [G]\n@group(0) @binding(6) var<storage, read> norm_weight: array<f32>;  // [D] shared across groups\n@group(0) @binding(7) var<storage, read_write> output: array<f32>; // [G * D]\n@group(0) @binding(8) var<uniform> params: Params;\n\nvar<workgroup> shared_k: array<f32, 128>;\nvar<workgroup> shared_error: array<f32, 128>;\nvar<workgroup> shared_sum: f32;\n\n@compute @workgroup_size(128)\nfn main(@builtin(workgroup_id) wg: vec3u, @builtin(local_invocation_id) lid: vec3u) {\n  let g = wg.x;\n  if (g >= params.num_groups) { return; }\n  let j = lid.x;  // each thread handles one column j\n  let D = params.head_dim;\n  let base = g * D;\n  let state_base = g * D * D;\n  let d = decay[g];\n  let b = beta_val[g];\n\n  // Load k into shared memory\n  shared_k[j] = k[base + j];\n  workgroupBarrier();\n\n  // 1. sk[j] = S^T * k = sum_i(state[i*D+j] * k[i])\n  var sk: f32 = 0.0;\n  for (var i = 0u; i < D; i++) {\n    sk += state[state_base + i * D + j] * shared_k[i];\n  }\n\n  // 2. error[j] = (v[j] - decay * sk) * beta\n  let err = (v[base + j] - d * sk) * b;\n  shared_error[j] = err;\n  workgroupBarrier();\n\n  // 3. State update: for each row i that this column j touches\n  //    state[i,j] = decay * state[i,j] + k[i] * error[j]\n  // Thread j updates column j across all rows\n  for (var i = 0u; i < D; i++) {\n    let idx = state_base + i * D + j;\n    state[idx] = d * state[idx] + shared_k[i] * shared_error[j];\n  }\n  workgroupBarrier();\n\n  // 4. output[j] = S_new^T * q * scale = sum_i(state[i,j] * q[i]) * scale\n  var o: f32 = 0.0;\n  for (var i = 0u; i < D; i++) {\n    o += state[state_base + i * D + j] * q[base + i];\n  }\n  output[base + j] = o * params.scale;\n  workgroupBarrier();\n\n  // 5. Per-head RMSNorm\n  // Compute sum of squares (reduction across threads)\n  var my_sq = output[base + j] * output[base + j];\n\n  // Use shared memory for reduction\n  // We need to reduce 128 values - use warp-style reduction\n  // Store in shared_k (reuse, we're done with k)\n  shared_k[j] = my_sq;\n  workgroupBarrier();\n  for (var s = 64u; s > 0u; s >>= 1u) {\n    if (j < s) { shared_k[j] += shared_k[j + s]; }\n    workgroupBarrier();\n  }\n\n  let rms = sqrt(shared_k[0] / f32(D) + params.norm_eps);\n  let inv_rms = 1.0 / rms;\n  output[base + j] = output[base + j] * inv_rms * norm_weight[j];\n}\n";
+
+// src/gpu/shaders/silu_gate.wgsl
+var silu_gate_default = "// SiLU gate: output[i] = data[i] * silu(gate[i])\n// where silu(x) = x / (1 + exp(-x))\n\nstruct Params { n: u32, }\n\n@group(0) @binding(0) var<storage, read_write> data: array<f32>;\n@group(0) @binding(1) var<storage, read> gate: array<f32>;\n@group(0) @binding(2) var<uniform> params: Params;\n\n@compute @workgroup_size(256)\nfn main(@builtin(global_invocation_id) gid: vec3u) {\n  let i = gid.x;\n  if (i >= params.n) { return; }\n  let g = gate[i];\n  data[i] = data[i] * g / (1.0 + exp(-g));\n}\n";
+
 // src/gpu/compute.ts
 function storageReadOnly(binding) {
   return { binding, visibility: GPUShaderStage.COMPUTE, buffer: { type: "read-only-storage" } };
@@ -645,6 +666,123 @@ var ComputeEngine = class {
       { binding: 1, resource: { buffer: b } },
       { binding: 2, resource: { buffer: output } },
       { binding: 3, resource: { buffer: params } }
+    ], [Math.ceil(n / 256)]);
+  }
+  /** In-place bias add: data[i] += bias[i]. */
+  addBias(data, bias, n) {
+    const params = this.createParams("add_bias_params", new Uint32Array([n]).buffer);
+    this.dispatch(add_bias_default, "add_bias", [
+      storageReadWrite(0),
+      storageReadOnly(1),
+      uniform(2)
+    ], [
+      { binding: 0, resource: { buffer: data } },
+      { binding: 1, resource: { buffer: bias } },
+      { binding: 2, resource: { buffer: params } }
+    ], [Math.ceil(n / 256)]);
+  }
+  // ── DeltaNet GPU ops ─────────────────────────────────────────────
+  /** Fused causal conv1d + SiLU: convolve data with persistent buffer, apply SiLU. */
+  conv1dSilu(data, convBuf, weights, channels, kernelSize) {
+    const params = this.createParams("conv1d_silu_params", new Uint32Array([channels, kernelSize]).buffer);
+    this.dispatch(conv1d_silu_default, "conv1d_silu", [
+      storageReadWrite(0),
+      storageReadWrite(1),
+      storageReadOnly(2),
+      uniform(3)
+    ], [
+      { binding: 0, resource: { buffer: data } },
+      { binding: 1, resource: { buffer: convBuf } },
+      { binding: 2, resource: { buffer: weights } },
+      { binding: 3, resource: { buffer: params } }
+    ], [Math.ceil(channels / 256)]);
+  }
+  /** In-place SiLU activation. */
+  siluInplace(data, n) {
+    const params = this.createParams("silu_ip_params", new Uint32Array([n]).buffer);
+    this.dispatch(silu_inplace_default, "silu_inplace", [
+      storageReadWrite(0),
+      uniform(1)
+    ], [
+      { binding: 0, resource: { buffer: data } },
+      { binding: 1, resource: { buffer: params } }
+    ], [Math.ceil(n / 256)]);
+  }
+  /** L2 normalize each group independently. */
+  l2NormGroups(data, numGroups, groupDim) {
+    const params = this.createParams("l2norm_params", new Uint32Array([numGroups, groupDim]).buffer);
+    this.dispatch(l2_norm_groups_default, "l2_norm_groups", [
+      storageReadWrite(0),
+      uniform(1)
+    ], [
+      { binding: 0, resource: { buffer: data } },
+      { binding: 1, resource: { buffer: params } }
+    ], [numGroups]);
+  }
+  /** Compute DeltaNet decay and beta values. */
+  computeDecayBeta(alpha, beta, ssmA, dtBias, decayOut, betaOut, n) {
+    const params = this.createParams("decay_beta_params", new Uint32Array([n]).buffer);
+    this.dispatch(compute_decay_beta_default, "compute_decay_beta", [
+      storageReadOnly(0),
+      storageReadOnly(1),
+      storageReadOnly(2),
+      storageReadOnly(3),
+      storageReadWrite(4),
+      storageReadWrite(5),
+      uniform(6)
+    ], [
+      { binding: 0, resource: { buffer: alpha } },
+      { binding: 1, resource: { buffer: beta } },
+      { binding: 2, resource: { buffer: ssmA } },
+      { binding: 3, resource: { buffer: dtBias } },
+      { binding: 4, resource: { buffer: decayOut } },
+      { binding: 5, resource: { buffer: betaOut } },
+      { binding: 6, resource: { buffer: params } }
+    ], [Math.ceil(n / 64)]);
+  }
+  /** DeltaNet state update + output + per-head RMSNorm. One dispatch for all groups. */
+  deltanetStep(q, k, v, state, decay, betaVal, normWeight, output, numGroups, headDim, scale, normEps) {
+    const paramBuf = new ArrayBuffer(16);
+    const u32 = new Uint32Array(paramBuf);
+    const f32 = new Float32Array(paramBuf);
+    u32[0] = headDim;
+    u32[1] = numGroups;
+    f32[2] = scale;
+    f32[3] = normEps;
+    const params = this.createParams("deltanet_step_params", paramBuf);
+    this.dispatch(deltanet_step_default, "deltanet_step", [
+      storageReadOnly(0),
+      storageReadOnly(1),
+      storageReadOnly(2),
+      storageReadWrite(3),
+      storageReadOnly(4),
+      storageReadOnly(5),
+      storageReadOnly(6),
+      storageReadWrite(7),
+      uniform(8)
+    ], [
+      { binding: 0, resource: { buffer: q } },
+      { binding: 1, resource: { buffer: k } },
+      { binding: 2, resource: { buffer: v } },
+      { binding: 3, resource: { buffer: state } },
+      { binding: 4, resource: { buffer: decay } },
+      { binding: 5, resource: { buffer: betaVal } },
+      { binding: 6, resource: { buffer: normWeight } },
+      { binding: 7, resource: { buffer: output } },
+      { binding: 8, resource: { buffer: params } }
+    ], [numGroups]);
+  }
+  /** SiLU gate: data[i] *= silu(gate[i]). */
+  siluGate(data, gate, n) {
+    const params = this.createParams("silu_gate_params", new Uint32Array([n]).buffer);
+    this.dispatch(silu_gate_default, "silu_gate", [
+      storageReadWrite(0),
+      storageReadOnly(1),
+      uniform(2)
+    ], [
+      { binding: 0, resource: { buffer: data } },
+      { binding: 1, resource: { buffer: gate } },
+      { binding: 2, resource: { buffer: params } }
     ], [Math.ceil(n / 256)]);
   }
   /** Reusable readback buffer — avoids allocation per readLogits call. */
@@ -1721,6 +1859,9 @@ var LlamaModel = class {
       outputWeight = tokenEmbedding;
     }
     const outputNorm = uploadAsF32("output_norm.weight");
+    const tryUploadAsF32 = (name) => {
+      return tensorMap.has(name) ? uploadAsF32(name) : void 0;
+    };
     const layers = [];
     for (let i = 0; i < this.numLayers; i++) {
       layers.push({
@@ -1729,6 +1870,9 @@ var LlamaModel = class {
         k: uploadWeight(`blk.${i}.attn_k.weight`),
         v: uploadWeight(`blk.${i}.attn_v.weight`),
         o: uploadWeight(`blk.${i}.attn_output.weight`),
+        qBias: tryUploadAsF32(`blk.${i}.attn_q.bias`),
+        kBias: tryUploadAsF32(`blk.${i}.attn_k.bias`),
+        vBias: tryUploadAsF32(`blk.${i}.attn_v.bias`),
         postAttnNorm: uploadAsF32(`blk.${i}.ffn_norm.weight`),
         gateProj: uploadWeight(`blk.${i}.ffn_gate.weight`),
         upProj: uploadWeight(`blk.${i}.ffn_up.weight`),
@@ -1786,6 +1930,9 @@ var LlamaModel = class {
       compute.matmul(lw.q.buffer, this.normed, this.qBuf, this.numHeads * this.headDim, E, lw.q.type);
       compute.matmul(lw.k.buffer, this.normed, this.kBuf, this.numKvHeads * this.headDim, E, lw.k.type);
       compute.matmul(lw.v.buffer, this.normed, this.vBuf, this.numKvHeads * this.headDim, E, lw.v.type);
+      if (lw.qBias) compute.addBias(this.qBuf, lw.qBias, this.numHeads * this.headDim);
+      if (lw.kBias) compute.addBias(this.kBuf, lw.kBias, this.numKvHeads * this.headDim);
+      if (lw.vBias) compute.addBias(this.vBuf, lw.vBias, this.numKvHeads * this.headDim);
       const kvCache = this.kvCaches[layer];
       const pos = kvCache.seqLen;
       compute.rope(this.qBuf, this.headDim, this.headDim, pos, this.ropeTheta, this.numHeads * this.headDim);

@@ -1,21 +1,49 @@
 # daisi-llogos
 
-A ground-up C# reimplementation of llama.cpp targeting .NET 10. Native performance through direct hardware access — SIMD intrinsics on CPU, raw P/Invoke to CUDA/Vulkan/Metal on GPU. No managed wrapper libraries, no ONNX, no Python.
+A suite of inference engines for GGUF models — from native C# backends (CPU, CUDA, Vulkan, Metal) to a browser-native TypeScript/WebGPU engine. Native performance through direct hardware access across every platform: SIMD intrinsics on CPU, P/Invoke to CUDA/Vulkan/Metal on GPU, and WGSL compute shaders in the browser. No managed wrapper libraries, no ONNX, no Python.
 
 ## Platform Support
 
-| Platform | Backend | Status |
-|----------|---------|--------|
-| Windows x64 | CPU (AVX2/AVX-512) | Priority |
-| Windows x64 | CUDA 13 (NVIDIA) | Priority |
-| Windows x64 | Vulkan (NVIDIA/AMD/Intel) | Done |
-| Linux x64 | CPU (AVX2/AVX-512) | Planned |
-| Linux x64 | Vulkan (NVIDIA/AMD/Intel) | Planned |
-| macOS arm64 | Metal (Apple Silicon) | Planned |
-| macOS x64 | Metal (Intel/AMD) | Planned |
-| iOS arm64 | Metal (XCFramework) | Planned |
+| Platform | Backend | Language | Status |
+|----------|---------|----------|--------|
+| Windows x64 | CPU (AVX2/AVX-512) | C# | Priority |
+| Windows x64 | CUDA 13 (NVIDIA) | C# | Priority |
+| Windows x64 | Vulkan (NVIDIA/AMD/Intel) | C# | Done |
+| **Browser** | **WebGPU (any GPU)** | **TypeScript** | **Done** |
+| Linux x64 | CPU (AVX2/AVX-512) | C# | Planned |
+| Linux x64 | Vulkan (NVIDIA/AMD/Intel) | C# | Planned |
+| macOS arm64 | Metal (Apple Silicon) | C# | Planned |
+| macOS x64 | Metal (Intel/AMD) | C# | Planned |
+| iOS arm64 | Metal (XCFramework) | C# | Planned |
+| Android | WebGPU (Adreno/Mali) | TypeScript | Tested |
 
 ## Quick Start
+
+### WebGPU (Browser / Node.js)
+
+```bash
+cd src/webgpu
+npm install
+npm run build
+npm test  # 72 tests including GPU inference via Dawn
+
+# Benchmark
+npx vitest run test/benchmark.test.ts
+```
+
+```typescript
+import { LlogosEngine } from '@daisinet/llogos-webgpu';
+
+const engine = new LlogosEngine();
+await engine.initGpu();
+await engine.loadModel('https://huggingface.co/.../model.gguf');
+
+for await (const token of engine.generate('Hello, world')) {
+  process.stdout.write(token);
+}
+```
+
+### .NET (CPU / CUDA / Vulkan)
 
 ```bash
 # Build
@@ -82,6 +110,19 @@ Measured on AMD Ryzen 9 9900X + NVIDIA RTX 5080, 128 decode tokens, FP16 KV cach
 
 **Exceeding llama.cpp** on 4 of 8 models across three architectures (DeltaNet, LLaMA, standard attention). See [Inference Optimization White Paper](docs/inference-optimization.md) for technical details.
 
+### WebGPU Benchmarks
+
+Measured via Dawn WebGPU (Node.js), NVIDIA RTX 5090 (Blackwell), 32 decode tokens.
+
+| Model | Prefill | Decode | VRAM |
+|-------|---------|--------|------|
+| TinyLlama 1.1B Q8_0 | 45 tok/s | — | 1570 MB |
+| Llama 3.2 1B Q8_0 | 61 tok/s | 54 tok/s | 2787 MB |
+| Qwen 2.5 0.5B Q8_0 | 42 tok/s | 37 tok/s | 1592 MB |
+| Qwen 3.5 0.8B Q8_0 | 17 tok/s | 17 tok/s | 1592 MB |
+
+DeltaNet (Qwen 3.5) runs entirely on GPU with zero CPU readbacks — 6 custom WGSL shaders for the state-space computation. See [WebGPU Backend](docs/webgpu-backend.md) for details.
+
 ### Key Optimizations
 
 **CUDA:** CUDA graph capture, dp4a integer dot product for 4-bit quants, fused RmsNorm+Q8_1 quantization (zero-overhead dp4a activation prep), partial vocab logit computation (lm_head computes top ~5K tokens instead of full 152K vocab), architecture-adaptive dispatch (Blackwell float vs pre-Blackwell dp4a), per-quant row count tuning, aligned block repacking (Q8_0 34→36, Q4_0 18→20), multi-row activation reuse, cuBLAS F32 GEMV, GPU-side argmax, NVRTC with PTX disk cache.
@@ -106,6 +147,16 @@ What works today:
 - Memory-mapped model loading (zero intermediate byte[] copies)
 - Benchmark suite with separate prefill/decode timing (`--bench`)
 - CLI: `--backend cpu|cuda|vulkan`, `--bench`, `--no-mmap`, `--attention`, `--paged`, `--offload-pages`, `--vocab-limit`, model path, prompt, sampling parameters
+
+**WebGPU** (TypeScript, browser + Node.js):
+- Runs in Chrome 113+, Edge 113+, or Node.js via Dawn bindings
+- 20+ WGSL compute shaders: matmul (F32, Q4_0, Q8_0), attention with GQA, RMSNorm, RoPE, SwiGLU, embedding
+- 6 DeltaNet-specific GPU shaders: conv1d, L2 norm, decay/beta, state update, SiLU gate
+- Supports Llama, Qwen 2/2.5, Qwen 3.5 (DeltaNet hybrid) architectures
+- Chat template engine with Llama 3, ChatML, and Jinja2 support
+- HTTP model loading with browser Cache API persistence
+- DAISI network integration via gRPC-web (Browser Host)
+- 72 automated tests including GPU inference via Dawn WebGPU Node bindings
 
 ## Roadmap
 
@@ -171,6 +222,7 @@ flowchart LR
 | [CUDA Backend](docs/cuda-backend.md) | P/Invoke design, kernel compilation, fused operations |
 | [DeltaNet](docs/deltanet.md) | Gated DeltaNet linear attention and hybrid architecture |
 | [Vulkan Backend](docs/vulkan-backend.md) | P/Invoke design, SPIR-V shaders, cross-platform GPU compute |
+| [WebGPU Backend](docs/webgpu-backend.md) | Browser-native GPU inference, WGSL shaders, DeltaNet on GPU |
 | [Long Context](docs/roadmap/phase-11-long-context.md) | Flash attention, paged KV cache, RAM offloading for 200K+ context |
 | [Tested Models](docs/tested-models.md) | Verified models, performance benchmarks, supported quantization formats |
 | [Known Issues](docs/known-issues.md) | Investigation notes on K-quant accumulation errors and DeltaNet architecture |
@@ -180,15 +232,19 @@ flowchart LR
 ```
 daisi-llogos/
 ├── src/
-│   ├── Daisi.Llogos/            Core library (GGUF, model, inference, tokenizer)
-│   ├── Daisi.Llogos.Cpu/        CPU compute backend (SIMD)
-│   ├── Daisi.Llogos.Cuda/       NVIDIA CUDA backend
-│   ├── Daisi.Llogos.Vulkan/     Vulkan compute backend (SPIR-V shaders)
-│   ├── Daisi.Llogos.Metal/      Apple Metal backend
-│   └── Daisi.Llogos.Cli/        Command-line interface
-├── tests/
-│   └── Daisi.Llogos.Tests/      Unit and integration tests
-└── docs/                        Architecture and roadmap documentation
+│   ├── dotnet/                      .NET inference engine suite
+│   │   ├── Daisi.Llogos/            Core library (GGUF, model, inference, tokenizer)
+│   │   ├── Daisi.Llogos.Cpu/        CPU compute backend (AVX2/AVX-512 SIMD)
+│   │   ├── Daisi.Llogos.Cuda/       NVIDIA CUDA backend (dp4a, fused kernels)
+│   │   ├── Daisi.Llogos.Vulkan/     Vulkan compute backend (SPIR-V shaders)
+│   │   ├── Daisi.Llogos.Cli/        Command-line interface
+│   │   ├── tests/                   Unit and integration tests
+│   │   └── Daisi.Llogos.sln         Solution file
+│   └── webgpu/                      Browser/Node.js inference engine [TypeScript]
+│       ├── src/                     Engine source (GGUF, GPU, model, tokenizer)
+│       ├── test/                    72 automated tests (including GPU via Dawn)
+│       └── package.json             @daisinet/llogos-webgpu
+└── docs/                            Architecture and roadmap documentation
 ```
 
 ## License

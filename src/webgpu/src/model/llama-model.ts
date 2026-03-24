@@ -238,6 +238,9 @@ export interface LayerWeights {
   k: WeightBuffer;
   v: WeightBuffer;
   o: WeightBuffer;
+  qBias?: GPUBuffer;
+  kBias?: GPUBuffer;
+  vBias?: GPUBuffer;
   postAttnNorm: GPUBuffer;
   gateProj: WeightBuffer;
   upProj: WeightBuffer;
@@ -320,6 +323,10 @@ export class LlamaModel {
     }
     const outputNorm = uploadAsF32('output_norm.weight');
 
+    const tryUploadAsF32 = (name: string): GPUBuffer | undefined => {
+      return tensorMap.has(name) ? uploadAsF32(name) : undefined;
+    };
+
     const layers: LayerWeights[] = [];
     for (let i = 0; i < this.numLayers; i++) {
       layers.push({
@@ -328,6 +335,9 @@ export class LlamaModel {
         k: uploadWeight(`blk.${i}.attn_k.weight`),
         v: uploadWeight(`blk.${i}.attn_v.weight`),
         o: uploadWeight(`blk.${i}.attn_output.weight`),
+        qBias: tryUploadAsF32(`blk.${i}.attn_q.bias`),
+        kBias: tryUploadAsF32(`blk.${i}.attn_k.bias`),
+        vBias: tryUploadAsF32(`blk.${i}.attn_v.bias`),
         postAttnNorm: uploadAsF32(`blk.${i}.ffn_norm.weight`),
         gateProj: uploadWeight(`blk.${i}.ffn_gate.weight`),
         upProj: uploadWeight(`blk.${i}.ffn_up.weight`),
@@ -402,6 +412,11 @@ export class LlamaModel {
       compute.matmul(lw.q.buffer, this.normed, this.qBuf, this.numHeads * this.headDim, E, lw.q.type);
       compute.matmul(lw.k.buffer, this.normed, this.kBuf, this.numKvHeads * this.headDim, E, lw.k.type);
       compute.matmul(lw.v.buffer, this.normed, this.vBuf, this.numKvHeads * this.headDim, E, lw.v.type);
+
+      // Add attention biases (Qwen 2 models)
+      if (lw.qBias) compute.addBias(this.qBuf, lw.qBias, this.numHeads * this.headDim);
+      if (lw.kBias) compute.addBias(this.kBuf, lw.kBias, this.numKvHeads * this.headDim);
+      if (lw.vBias) compute.addBias(this.vBuf, lw.vBias, this.numKvHeads * this.headDim);
 
       // RoPE on Q and K
       const kvCache = this.kvCaches[layer];
