@@ -20,6 +20,7 @@ import siluMulWgsl from './shaders/silu_mul.wgsl';
 import copyWgsl from './shaders/copy.wgsl';
 import copyRmsnormWgsl from './shaders/copy_rmsnorm.wgsl';
 import addWgsl from './shaders/add.wgsl';
+import addBiasWgsl from './shaders/add_bias.wgsl';
 
 /** Helpers for creating bind group layout entries. */
 function storageReadOnly(binding: number): GPUBindGroupLayoutEntry {
@@ -365,6 +366,18 @@ export class ComputeEngine {
       { binding: 1, resource: { buffer: b } },
       { binding: 2, resource: { buffer: output } },
       { binding: 3, resource: { buffer: params } },
+    ], [Math.ceil(n / 256)]);
+  }
+
+  /** In-place bias add: data[i] += bias[i]. */
+  addBias(data: GPUBuffer, bias: GPUBuffer, n: number): void {
+    const params = this.createParams('add_bias_params', new Uint32Array([n]).buffer);
+    this.dispatch(addBiasWgsl, 'add_bias', [
+      storageReadWrite(0), storageReadOnly(1), uniform(2),
+    ], [
+      { binding: 0, resource: { buffer: data } },
+      { binding: 1, resource: { buffer: bias } },
+      { binding: 2, resource: { buffer: params } },
     ], [Math.ceil(n / 256)]);
   }
 

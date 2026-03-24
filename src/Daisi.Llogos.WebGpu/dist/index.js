@@ -321,6 +321,9 @@ var copy_rmsnorm_default = "// Fused: copy input\u2192residual AND compute RMSNo
 // src/gpu/shaders/add.wgsl
 var add_default = "// Element-wise add: output[i] = a[i] + b[i]\r\n// Used for residual connections.\r\n\r\nstruct Params {\r\n  n: u32,\r\n}\r\n\r\n@group(0) @binding(0) var<storage, read> a: array<f32>;\r\n@group(0) @binding(1) var<storage, read> b: array<f32>;\r\n@group(0) @binding(2) var<storage, read_write> output: array<f32>;\r\n@group(0) @binding(3) var<uniform> params: Params;\r\n\r\n@compute @workgroup_size(256)\r\nfn main(@builtin(global_invocation_id) gid: vec3u) {\r\n  let i = gid.x;\r\n  if (i >= params.n) { return; }\r\n  output[i] = a[i] + b[i];\r\n}\r\n";
 
+// src/gpu/shaders/add_bias.wgsl
+var add_bias_default = "// In-place bias add: data[i] += bias[i]\n\nstruct Params {\n  n: u32,\n}\n\n@group(0) @binding(0) var<storage, read_write> data: array<f32>;\n@group(0) @binding(1) var<storage, read> bias: array<f32>;\n@group(0) @binding(2) var<uniform> params: Params;\n\n@compute @workgroup_size(256)\nfn main(@builtin(global_invocation_id) gid: vec3u) {\n  let i = gid.x;\n  if (i >= params.n) { return; }\n  data[i] += bias[i];\n}\n";
+
 // src/gpu/compute.ts
 function storageReadOnly(binding) {
   return { binding, visibility: GPUShaderStage.COMPUTE, buffer: { type: "read-only-storage" } };
@@ -645,6 +648,19 @@ var ComputeEngine = class {
       { binding: 1, resource: { buffer: b } },
       { binding: 2, resource: { buffer: output } },
       { binding: 3, resource: { buffer: params } }
+    ], [Math.ceil(n / 256)]);
+  }
+  /** In-place bias add: data[i] += bias[i]. */
+  addBias(data, bias, n) {
+    const params = this.createParams("add_bias_params", new Uint32Array([n]).buffer);
+    this.dispatch(add_bias_default, "add_bias", [
+      storageReadWrite(0),
+      storageReadOnly(1),
+      uniform(2)
+    ], [
+      { binding: 0, resource: { buffer: data } },
+      { binding: 1, resource: { buffer: bias } },
+      { binding: 2, resource: { buffer: params } }
     ], [Math.ceil(n / 256)]);
   }
   /** Reusable readback buffer — avoids allocation per readLogits call. */
@@ -1721,6 +1737,9 @@ var LlamaModel = class {
       outputWeight = tokenEmbedding;
     }
     const outputNorm = uploadAsF32("output_norm.weight");
+    const tryUploadAsF32 = (name) => {
+      return tensorMap.has(name) ? uploadAsF32(name) : void 0;
+    };
     const layers = [];
     for (let i = 0; i < this.numLayers; i++) {
       layers.push({
@@ -1729,6 +1748,9 @@ var LlamaModel = class {
         k: uploadWeight(`blk.${i}.attn_k.weight`),
         v: uploadWeight(`blk.${i}.attn_v.weight`),
         o: uploadWeight(`blk.${i}.attn_output.weight`),
+        qBias: tryUploadAsF32(`blk.${i}.attn_q.bias`),
+        kBias: tryUploadAsF32(`blk.${i}.attn_k.bias`),
+        vBias: tryUploadAsF32(`blk.${i}.attn_v.bias`),
         postAttnNorm: uploadAsF32(`blk.${i}.ffn_norm.weight`),
         gateProj: uploadWeight(`blk.${i}.ffn_gate.weight`),
         upProj: uploadWeight(`blk.${i}.ffn_up.weight`),
@@ -1786,6 +1808,9 @@ var LlamaModel = class {
       compute.matmul(lw.q.buffer, this.normed, this.qBuf, this.numHeads * this.headDim, E, lw.q.type);
       compute.matmul(lw.k.buffer, this.normed, this.kBuf, this.numKvHeads * this.headDim, E, lw.k.type);
       compute.matmul(lw.v.buffer, this.normed, this.vBuf, this.numKvHeads * this.headDim, E, lw.v.type);
+      if (lw.qBias) compute.addBias(this.qBuf, lw.qBias, this.numHeads * this.headDim);
+      if (lw.kBias) compute.addBias(this.kBuf, lw.kBias, this.numKvHeads * this.headDim);
+      if (lw.vBias) compute.addBias(this.vBuf, lw.vBias, this.numKvHeads * this.headDim);
       const kvCache = this.kvCaches[layer];
       const pos = kvCache.seqLen;
       compute.rope(this.qBuf, this.headDim, this.headDim, pos, this.ropeTheta, this.numHeads * this.headDim);
