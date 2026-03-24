@@ -336,17 +336,10 @@ export class Qwen35Model {
     // 1. Token embedding
     compute.embedding(weights.tokenEmbedding, this.hidden, tokenId, E);
 
-    // DEBUG: Check embedding output
     if (this._position === 0) {
-      const h = new Float32Array(await this.readGpuBuffer(this.hidden, E * 4));
-      let hMax = 0; for (let i = 0; i < E; i++) hMax = Math.max(hMax, Math.abs(h[i]));
-      console.log(`  [embed] token=${tokenId} max=${hMax.toFixed(4)} h[0..4]=${Array.from(h.slice(0, 5)).map(v => v.toFixed(4))}`);
 
       // Check normed after copyAndRmsNorm will be called for layer 0
       // Compute expected normed on CPU for comparison
-      let ss = 0; for (let i = 0; i < E; i++) ss += h[i] * h[i];
-      const normRms = Math.sqrt(ss / E + this.rmsNormEps);
-      console.log(`  [embed] RMS=${normRms.toFixed(6)} (should match RMSNorm divisor)`);
     }
 
     // Transformer layers
@@ -356,11 +349,6 @@ export class Qwen35Model {
       // Pre-attention RMSNorm + residual copy
       compute.copyAndRmsNorm(this.hidden, lw.attnNorm, this.normed, this.residual, E, this.rmsNormEps);
 
-      // DEBUG: normed state after RMSNorm for layer 0
-      if (this._position === 0 && layer === 0) {
-        const n = new Float32Array(await this.readGpuBuffer(this.normed, E * 4));
-        console.log(`  [L0 normed] GPU n[0..4]=${Array.from(n.slice(0, 5)).map(v => v.toFixed(4))}`);
-      }
 
       if (lw.kind === 'standard') {
         await this.forwardStandardAttention(layer, lw);
@@ -380,12 +368,6 @@ export class Qwen35Model {
       // Residual add
       compute.add(this.temp, this.residual, this.hidden, E);
 
-      // DEBUG: hidden after each layer
-      if (this._position === 0 && layer < 8) {
-        const h = new Float32Array(await this.readGpuBuffer(this.hidden, E * 4));
-        let hMax = 0; for (let i = 0; i < E; i++) hMax = Math.max(hMax, Math.abs(h[i]));
-        console.log(`  [after L${layer}] hidden max=${hMax.toFixed(4)} h[0..4]=${Array.from(h.slice(0, 5)).map(v => v.toFixed(4))}`);
-      }
     }
 
     // Final RMSNorm + LM Head
@@ -553,33 +535,18 @@ export class Qwen35Model {
     // 2. Causal Conv1d (CPU)
     this.causalConv1d(qkvData, ds.convBuffer, lw.ssmConv1d, qkvDim, kernelSize);
 
-    // DEBUG: check QKV before SiLU
-    const dbg = this._position === 0 && layer === 0;
-    if (dbg) {
-      let qkvMax = 0; for (let i = 0; i < qkvDim; i++) qkvMax = Math.max(qkvMax, Math.abs(qkvData[i]));
-      console.log(`  [L0] after conv1d: qkv max=${qkvMax.toFixed(4)} qkv[0..4]=${Array.from(qkvData.slice(0, 5)).map(v => v.toFixed(4))}`);
-    }
 
     // 3. SiLU activation (in-place)
     for (let i = 0; i < qkvDim; i++) {
       qkvData[i] = qkvData[i] / (1 + Math.exp(-qkvData[i]));
     }
 
-    if (dbg) {
-      let qkvMax = 0; for (let i = 0; i < qkvDim; i++) qkvMax = Math.max(qkvMax, Math.abs(qkvData[i]));
-      console.log(`  [L0] after SiLU: qkv max=${qkvMax.toFixed(4)} qkv[0..4]=${Array.from(qkvData.slice(0, 5)).map(v => v.toFixed(4))}`);
-    }
 
     // 4. Split Q/K/V — equal split
     const q = qkvData.subarray(0, innerSize);
     const k = qkvData.subarray(innerSize, innerSize * 2);
     const v = qkvData.subarray(innerSize * 2, innerSize * 3);
 
-    if (dbg) {
-      let qMax = 0, kMax = 0, vMax = 0;
-      for (let i = 0; i < innerSize; i++) { qMax = Math.max(qMax, Math.abs(q[i])); kMax = Math.max(kMax, Math.abs(k[i])); vMax = Math.max(vMax, Math.abs(v[i])); }
-      console.log(`  [L0] after split: Q max=${qMax.toFixed(4)} K max=${kMax.toFixed(4)} V max=${vMax.toFixed(4)}`);
-    }
 
     // 5. L2 normalize Q and K per group (numKHeads groups)
     const groupDim = innerSize / numKHeads;
@@ -596,11 +563,6 @@ export class Qwen35Model {
       for (let i = 0; i < groupDim; i++) k[off + i] /= kNorm;
     }
 
-    if (dbg) {
-      let qMax = 0, kMax = 0;
-      for (let i = 0; i < innerSize; i++) { qMax = Math.max(qMax, Math.abs(q[i])); kMax = Math.max(kMax, Math.abs(k[i])); }
-      console.log(`  [L0] after L2 norm: Q max=${qMax.toFixed(4)} K max=${kMax.toFixed(4)}`);
-    }
 
     // 6. Repeat-tile Q and K if numVHeads > numKHeads
     let qExpanded = q;
@@ -693,10 +655,6 @@ export class Qwen35Model {
       }
     }
 
-    if (dbg) {
-      let oMax = 0; for (let i = 0; i < numVHeads * headDim; i++) oMax = Math.max(oMax, Math.abs(output[i]));
-      console.log(`  [L0] after DeltaNetStep: output max=${oMax.toFixed(4)} output[0..4]=${Array.from(output.slice(0, 5)).map(v => v.toFixed(4))}`);
-    }
 
     // 10. Gate: output *= silu(gate(normOut))
     const gateData = new Float32Array(innerSize);
@@ -708,24 +666,11 @@ export class Qwen35Model {
       gateData[h] = silu;
     }
 
-    // DEBUG
-    if (this._position === 0 && layer === 0) {
-      let oMax = 0, gMax = 0;
-      for (let i = 0; i < innerSize; i++) { oMax = Math.max(oMax, Math.abs(output[i])); gMax = Math.max(gMax, Math.abs(gateData[i])); }
-      console.log(`  [L0 gate] output max BEFORE gate=${oMax.toFixed(4)} gate max=${gMax.toFixed(4)}`);
-      console.log(`  [L0 gate] output[0..4]=${Array.from(output.slice(0, 5)).map(v => v.toFixed(4))}`);
-      console.log(`  [L0 gate] gate[0..4]=${Array.from(gateData.slice(0, 5)).map(v => v.toFixed(4))}`);
-    }
 
     for (let i = 0; i < innerSize; i++) {
       output[i] *= gateData[i];
     }
 
-    if (this._position === 0 && layer === 0) {
-      let oMax = 0;
-      for (let i = 0; i < innerSize; i++) oMax = Math.max(oMax, Math.abs(output[i]));
-      console.log(`  [L0 gate] output max AFTER gate=${oMax.toFixed(4)}`);
-    }
 
     // 11. Output projection (GPU)
     compute.device.queue.writeBuffer(this.ssmGateBuf, 0, output.buffer, 0, innerSize * 4);
@@ -734,22 +679,8 @@ export class Qwen35Model {
     // Residual add
     compute.add(this.temp, this.residual, this.hidden, E);
 
-    // DEBUG: Check hidden state after DeltaNet
     if (layer === 0 && this._position < 3) {
       const stateNorm = Math.sqrt(ds.state.reduce((s, v) => s + v * v, 0));
-      console.log(`  [L0 pos=${this._position}] state L2 norm=${stateNorm.toFixed(4)}`);
-    }
-    if (this._position === 0 && layer === 0) {
-      const h = new Float32Array(await this.readGpuBuffer(this.hidden, E * 4));
-      const t = new Float32Array(await this.readGpuBuffer(this.temp, E * 4));
-      let hMax = 0, tMax = 0;
-      for (let i = 0; i < E; i++) { hMax = Math.max(hMax, Math.abs(h[i])); tMax = Math.max(tMax, Math.abs(t[i])); }
-      console.log(`  [L0 DN] temp max=${tMax.toFixed(4)} hidden max=${hMax.toFixed(4)} temp[0..4]=${Array.from(t.slice(0, 5)).map(v => v.toFixed(4))}`);
-      // Also check ssmGateBuf (output before final projection)
-      const g = new Float32Array(await this.readGpuBuffer(this.ssmGateBuf, innerSize * 4));
-      let gMax = 0, gNonZero = 0;
-      for (let i = 0; i < innerSize; i++) { gMax = Math.max(gMax, Math.abs(g[i])); if (g[i] !== 0) gNonZero++; }
-      console.log(`  [L0 DN] ssmGateBuf max=${gMax.toFixed(4)} nonzero=${gNonZero}/${innerSize} first5=${Array.from(g.slice(0, 5)).map(v => v.toFixed(4))}`);
     }
   }
 
