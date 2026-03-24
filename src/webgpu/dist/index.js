@@ -324,6 +324,9 @@ var add_default = "// Element-wise add: output[i] = a[i] + b[i]\r\n// Used for r
 // src/gpu/shaders/add_bias.wgsl
 var add_bias_default = "// In-place bias add: data[i] += bias[i]\n\nstruct Params {\n  n: u32,\n}\n\n@group(0) @binding(0) var<storage, read_write> data: array<f32>;\n@group(0) @binding(1) var<storage, read> bias: array<f32>;\n@group(0) @binding(2) var<uniform> params: Params;\n\n@compute @workgroup_size(256)\nfn main(@builtin(global_invocation_id) gid: vec3u) {\n  let i = gid.x;\n  if (i >= params.n) { return; }\n  data[i] += bias[i];\n}\n";
 
+// src/gpu/shaders/embedding_q8.wgsl
+var embedding_q8_default = "// Token embedding lookup for Q8_0 quantized weights.\n// Q8_0 block: [f16 scale][32 x int8] = 34 bytes per 32 elements.\n// output[i] = scale * int8_value for the token's embedding row.\n\nstruct Params {\n  token_id: u32,\n  embedding_dim: u32,\n}\n\n@group(0) @binding(0) var<storage, read> weights: array<u32>;  // Q8_0 packed as u32\n@group(0) @binding(1) var<storage, read_write> output: array<f32>;\n@group(0) @binding(2) var<uniform> params: Params;\n\nfn read_scale(byte_offset: u32) -> f32 {\n  let w = weights[byte_offset / 4u];\n  let bits = select(w & 0xFFFFu, (w >> 16u) & 0xFFFFu, (byte_offset % 4u) != 0u);\n  return unpack2x16float(bits).x;\n}\n\nfn read_i8(byte_offset: u32) -> f32 {\n  let v = (weights[byte_offset / 4u] >> ((byte_offset % 4u) * 8u)) & 0xFFu;\n  return select(f32(v), f32(v) - 256.0, v >= 128u);\n}\n\n@compute @workgroup_size(256)\nfn main(@builtin(global_invocation_id) gid: vec3u) {\n  let i = gid.x;\n  if (i >= params.embedding_dim) { return; }\n\n  let dim = params.embedding_dim;\n  let nblk = dim / 32u;\n  let row_bytes = nblk * 34u;  // Q8_0: 34 bytes per block of 32 elements\n  let row_start = params.token_id * row_bytes;\n\n  let block = i / 32u;\n  let idx_in_block = i % 32u;\n  let block_start = row_start + block * 34u;\n  let scale = read_scale(block_start);\n  let val = read_i8(block_start + 2u + idx_in_block);\n\n  output[i] = scale * val;\n}\n";
+
 // src/gpu/shaders/conv1d_silu.wgsl
 var conv1d_silu_default = "// Fused causal conv1d + SiLU activation.\n// Processes all channels in parallel. Uses persistent conv buffer.\n//\n// For each channel c:\n//   result = sum(buf[k] * weight[c*K+k]) + input[c] * weight[c*K+(K-1)]\n//   shift buffer: discard oldest, add current pre-conv input\n//   output[c] = silu(result)\n//\n// conv_buf: [(K-1) * channels] \u2014 persistent between tokens\n// weights: [channels * K] \u2014 conv kernel\n// data: [channels] \u2014 input/output (in-place)\n\nstruct Params {\n  channels: u32,\n  kernel_size: u32,\n}\n\n@group(0) @binding(0) var<storage, read_write> data: array<f32>;     // [channels] in/out\n@group(0) @binding(1) var<storage, read_write> conv_buf: array<f32>; // [(K-1) * channels]\n@group(0) @binding(2) var<storage, read> weights: array<f32>;        // [channels * K]\n@group(0) @binding(3) var<uniform> params: Params;\n\n@compute @workgroup_size(256)\nfn main(@builtin(global_invocation_id) gid: vec3u) {\n  let c = gid.x;\n  if (c >= params.channels) { return; }\n\n  let K = params.kernel_size;\n  let C = params.channels;\n  let buf_slots = K - 1u;\n\n  // Save pre-conv input for buffer shift\n  let pre_conv = data[c];\n\n  // Compute conv: sum(buf[k*C+c] * w[c*K+k]) + data[c] * w[c*K+(K-1)]\n  var s: f32 = 0.0;\n  for (var k = 0u; k < buf_slots; k++) {\n    s += conv_buf[k * C + c] * weights[c * K + k];\n  }\n  s += pre_conv * weights[c * K + buf_slots];\n\n  // Shift buffer: slot[k] = slot[k+1], newest = pre_conv\n  for (var k = 0u; k < buf_slots - 1u; k++) {\n    conv_buf[k * C + c] = conv_buf[(k + 1u) * C + c];\n  }\n  if (buf_slots > 0u) {\n    conv_buf[(buf_slots - 1u) * C + c] = pre_conv;\n  }\n\n  // SiLU activation + write output\n  data[c] = s / (1.0 + exp(-s));\n}\n";
 
@@ -347,6 +350,9 @@ var partial_rope_default = "// Partial RoPE: apply rotary embeddings to first ro
 
 // src/gpu/shaders/gated_attention.wgsl
 var gated_attention_default = "// Gated attention: softmax(Q*K^T / scale) * V * sigmoid(qGate)\n// One workgroup per Q head. Handles GQA (multiple Q heads per KV head).\n// Uses online softmax for numerical stability.\n//\n// qAttn: [numHeads * keyLen], qGate: [numHeads * keyLen]\n// kCache: [numKvHeads * maxSeqLen * keyLen], vCache: [numKvHeads * maxSeqLen * valLen]\n// output: [numHeads * valLen]\n\nstruct Params {\n  num_heads: u32,\n  num_kv_heads: u32,\n  key_len: u32,\n  val_len: u32,\n  max_seq_len: u32,\n  seq_len: u32,\n  scale_bits: u32,  // float scale as u32 bits\n}\n\n@group(0) @binding(0) var<storage, read> q_attn: array<f32>;\n@group(0) @binding(1) var<storage, read> q_gate: array<f32>;\n@group(0) @binding(2) var<storage, read> k_cache: array<f32>;\n@group(0) @binding(3) var<storage, read> v_cache: array<f32>;\n@group(0) @binding(4) var<storage, read_write> output: array<f32>;\n@group(0) @binding(5) var<uniform> params: Params;\n\n// Shared memory for attention scores (max 4096 tokens)\nvar<workgroup> scores: array<f32, 64>;\n\n@compute @workgroup_size(64)\nfn main(@builtin(workgroup_id) wg: vec3u, @builtin(local_invocation_id) lid: vec3u) {\n  let h = wg.x;\n  if (h >= params.num_heads) { return; }\n  let tid = lid.x;\n  let scale = bitcast<f32>(params.scale_bits);\n  let kv_head = h / (params.num_heads / params.num_kv_heads);\n  let q_off = h * params.key_len;\n  let kv_k_base = kv_head * params.max_seq_len * params.key_len;\n  let kv_v_base = kv_head * params.max_seq_len * params.val_len;\n  let out_off = h * params.val_len;\n  let seq_len = params.seq_len;\n\n  // Process tokens in tiles of 64\n  // Online softmax: track running max and sum\n  var running_max: f32 = -1e30;\n  var running_sum: f32 = 0.0;\n\n  // Initialize output to zero\n  for (var d = tid; d < params.val_len; d += 64u) {\n    output[out_off + d] = 0.0;\n  }\n  workgroupBarrier();\n\n  for (var tile_start = 0u; tile_start < seq_len; tile_start += 64u) {\n    let tile_end = min(tile_start + 64u, seq_len);\n\n    // Compute attention score for this thread's token\n    var score: f32 = -1e30;\n    let t = tile_start + tid;\n    if (t < tile_end) {\n      var dot: f32 = 0.0;\n      let k_off = kv_k_base + t * params.key_len;\n      for (var d = 0u; d < params.key_len; d++) {\n        dot += q_attn[q_off + d] * k_cache[k_off + d];\n      }\n      score = dot * scale;\n    }\n    scores[tid] = score;\n    workgroupBarrier();\n\n    // Find tile max\n    var tile_max: f32 = -1e30;\n    let tile_len = tile_end - tile_start;\n    for (var i = 0u; i < tile_len; i++) {\n      tile_max = max(tile_max, scores[i]);\n    }\n\n    // Compute exp scores\n    var tile_sum: f32 = 0.0;\n    if (tid < tile_len) {\n      scores[tid] = exp(scores[tid] - tile_max);\n      tile_sum = scores[tid];\n    }\n    workgroupBarrier();\n\n    // Sum tile scores (simple serial, fast for \u226464)\n    var total_tile_sum: f32 = 0.0;\n    for (var i = 0u; i < tile_len; i++) {\n      total_tile_sum += scores[i];\n    }\n\n    // Online softmax correction\n    let new_max = max(running_max, tile_max);\n    let correction_old = exp(running_max - new_max);\n    let correction_new = exp(tile_max - new_max);\n\n    // Update output: out = out * correction_old + tile_weighted_v * correction_new\n    for (var d = tid; d < params.val_len; d += 64u) {\n      var tile_val: f32 = 0.0;\n      for (var i = 0u; i < tile_len; i++) {\n        tile_val += scores[i] * v_cache[kv_v_base + (tile_start + i) * params.val_len + d];\n      }\n      output[out_off + d] = output[out_off + d] * correction_old + tile_val * correction_new;\n    }\n    workgroupBarrier();\n\n    running_sum = running_sum * correction_old + total_tile_sum * correction_new;\n    running_max = new_max;\n  }\n\n  // Normalize and apply sigmoid gate\n  let inv_sum = select(0.0, 1.0 / running_sum, running_sum > 0.0);\n  for (var d = tid; d < params.val_len; d += 64u) {\n    let gate_idx = min(d, params.key_len - 1u);\n    let gate_val = 1.0 / (1.0 + exp(-q_gate[h * params.key_len + gate_idx]));\n    output[out_off + d] = output[out_off + d] * inv_sum * gate_val;\n  }\n}\n";
+
+// src/gpu/shaders/repeat_tile.wgsl
+var repeat_tile_default = "// Repeat-tile: expand data from numKHeads groups to numVHeads groups.\n// src: [numKHeads * headDim], dst: [numVHeads * headDim]\n// factor = numVHeads / numKHeads\n// dst[rep * numKHeads * headDim + g * headDim + d] = src[g * headDim + d]\n\nstruct Params {\n  num_k_heads: u32,\n  head_dim: u32,\n  factor: u32,\n}\n\n@group(0) @binding(0) var<storage, read> src: array<f32>;\n@group(0) @binding(1) var<storage, read_write> dst: array<f32>;\n@group(0) @binding(2) var<uniform> params: Params;\n\n@compute @workgroup_size(256)\nfn main(@builtin(global_invocation_id) gid: vec3u) {\n  let idx = gid.x;\n  let total = params.num_k_heads * params.head_dim * params.factor;\n  if (idx >= total) { return; }\n\n  let k_total = params.num_k_heads * params.head_dim;\n  let src_idx = idx % k_total;\n  dst[idx] = src[src_idx];\n}\n";
 
 // src/gpu/shaders/deltanet_step.wgsl
 var deltanet_step_default = "// DeltaNet state update + output computation.\n// One workgroup per group (head). 128 threads per group.\n//\n// For each group g:\n//   sk[j] = sum_i(state[g,i,j] * k[g*D+i])\n//   error[j] = (v[g*D+j] - decay[g]*sk[j]) * beta[g]\n//   state[g,i,j] = decay[g]*state[g,i,j] + k[g*D+i]*error[j]\n//   output[g*D+j] = sum_i(state[g,i,j] * q[g*D+i]) * scale\n//   Per-head RMSNorm on output[g*D .. g*D+D-1]\n\nstruct Params {\n  head_dim: u32,    // D = 128\n  num_groups: u32,  // 16\n  scale: f32,       // 1/sqrt(D)\n  norm_eps: f32,    // RMSNorm epsilon\n}\n\n@group(0) @binding(0) var<storage, read> q: array<f32>;\n@group(0) @binding(1) var<storage, read> k: array<f32>;\n@group(0) @binding(2) var<storage, read> v: array<f32>;\n@group(0) @binding(3) var<storage, read_write> state: array<f32>;  // [G * D * D]\n@group(0) @binding(4) var<storage, read> decay: array<f32>;        // [G]\n@group(0) @binding(5) var<storage, read> beta_val: array<f32>;     // [G]\n@group(0) @binding(6) var<storage, read> norm_weight: array<f32>;  // [D] shared across groups\n@group(0) @binding(7) var<storage, read_write> output: array<f32>; // [G * D]\n@group(0) @binding(8) var<uniform> params: Params;\n\nvar<workgroup> shared_k: array<f32, 128>;\nvar<workgroup> shared_error: array<f32, 128>;\nvar<workgroup> shared_sum: f32;\n\n@compute @workgroup_size(128)\nfn main(@builtin(workgroup_id) wg: vec3u, @builtin(local_invocation_id) lid: vec3u) {\n  let g = wg.x;\n  if (g >= params.num_groups) { return; }\n  let j = lid.x;  // each thread handles one column j\n  let D = params.head_dim;\n  let base = g * D;\n  let state_base = g * D * D;\n  let d = decay[g];\n  let b = beta_val[g];\n\n  // Load k into shared memory\n  shared_k[j] = k[base + j];\n  workgroupBarrier();\n\n  // 1. sk[j] = S^T * k = sum_i(state[i*D+j] * k[i])\n  var sk: f32 = 0.0;\n  for (var i = 0u; i < D; i++) {\n    sk += state[state_base + i * D + j] * shared_k[i];\n  }\n\n  // 2. error[j] = (v[j] - decay * sk) * beta\n  let err = (v[base + j] - d * sk) * b;\n  shared_error[j] = err;\n  workgroupBarrier();\n\n  // 3. State update: for each row i that this column j touches\n  //    state[i,j] = decay * state[i,j] + k[i] * error[j]\n  // Thread j updates column j across all rows\n  for (var i = 0u; i < D; i++) {\n    let idx = state_base + i * D + j;\n    state[idx] = d * state[idx] + shared_k[i] * shared_error[j];\n  }\n  workgroupBarrier();\n\n  // 4. output[j] = S_new^T * q * scale = sum_i(state[i,j] * q[i]) * scale\n  var o: f32 = 0.0;\n  for (var i = 0u; i < D; i++) {\n    o += state[state_base + i * D + j] * q[base + i];\n  }\n  output[base + j] = o * params.scale;\n  workgroupBarrier();\n\n  // 5. Per-head RMSNorm\n  // Compute sum of squares (reduction across threads)\n  var my_sq = output[base + j] * output[base + j];\n\n  // Use shared memory for reduction\n  // We need to reduce 128 values - use warp-style reduction\n  // Store in shared_k (reuse, we're done with k)\n  shared_k[j] = my_sq;\n  workgroupBarrier();\n  for (var s = 64u; s > 0u; s >>= 1u) {\n    if (j < s) { shared_k[j] += shared_k[j + s]; }\n    workgroupBarrier();\n  }\n\n  let rms = sqrt(shared_k[0] / f32(D) + params.norm_eps);\n  let inv_rms = 1.0 / rms;\n  output[base + j] = output[base + j] * inv_rms * norm_weight[j];\n}\n";
@@ -432,6 +438,19 @@ var ComputeEngine = class {
   embedding(weights, output, tokenId, embDim) {
     const params = this.createParams("embedding_params", new Uint32Array([tokenId, embDim]).buffer);
     this.dispatch(embedding_default, "embedding", [
+      storageReadOnly(0),
+      storageReadWrite(1),
+      uniform(2)
+    ], [
+      { binding: 0, resource: { buffer: weights } },
+      { binding: 1, resource: { buffer: output } },
+      { binding: 2, resource: { buffer: params } }
+    ], [Math.ceil(embDim / 256)]);
+  }
+  /** Token embedding lookup for Q8_0 quantized weights. */
+  embeddingQ8(weights, output, tokenId, embDim) {
+    const params = this.createParams("embedding_q8_params", new Uint32Array([tokenId, embDim]).buffer);
+    this.dispatch(embedding_q8_default, "embedding_q8", [
       storageReadOnly(0),
       storageReadWrite(1),
       uniform(2)
@@ -891,6 +910,20 @@ var ComputeEngine = class {
       { binding: 5, resource: { buffer: params } }
     ], [numHeads]);
   }
+  /** Repeat-tile: expand numKHeads groups to numVHeads groups by repeating. */
+  repeatTile(src, dst, numKHeads, headDim, factor) {
+    const params = this.createParams("repeat_tile_params", new Uint32Array([numKHeads, headDim, factor]).buffer);
+    const total = numKHeads * headDim * factor;
+    this.dispatch(repeat_tile_default, "repeat_tile", [
+      storageReadOnly(0),
+      storageReadWrite(1),
+      uniform(2)
+    ], [
+      { binding: 0, resource: { buffer: src } },
+      { binding: 1, resource: { buffer: dst } },
+      { binding: 2, resource: { buffer: params } }
+    ], [Math.ceil(total / 256)]);
+  }
   /** Reusable readback buffer — avoids allocation per readLogits call. */
   readbackBuf = null;
   readbackSize = 0;
@@ -1121,86 +1154,138 @@ async function fetchGgufHeader(url, maxBytes = 4 * 1024 * 1024) {
   }
 }
 
-// src/storage/download-manager.ts
+// src/storage/streaming-loader.ts
 var CACHE_NAME = "llogos-webgpu-models";
-async function downloadFile(url, onProgress) {
+async function streamTensors(url, info, onTensor, onProgress) {
+  const tensorDataStart = info.tensorDataOffset;
+  const totalTensors = info.tensors.length;
+  const sortedTensors = [...info.tensors].sort((a, b) => a.offset - b.offset);
+  const extractions = sortedTensors.map((t) => ({
+    tensor: t,
+    start: tensorDataStart + t.offset,
+    end: tensorDataStart + t.offset + t.byteSize
+  }));
+  const response = await getResponse(url, onProgress);
+  const contentLength = parseInt(response.headers.get("content-length") ?? "0", 10);
+  const reader = response.body?.getReader();
+  if (!reader) {
+    throw new Error("Response body is not readable as a stream");
+  }
+  let filePos = 0;
+  let extractIdx = 0;
+  let tensorsLoaded = 0;
+  let pendingBuffer = null;
+  let pendingStart = 0;
+  let pendingNeeded = 0;
+  while (extractIdx < extractions.length) {
+    const { done, value } = await reader.read();
+    if (done) break;
+    const chunk = value;
+    const chunkStart = filePos;
+    const chunkEnd = filePos + chunk.byteLength;
+    filePos = chunkEnd;
+    onProgress?.({
+      phase: "Loading tensors",
+      bytesDownloaded: filePos,
+      totalBytes: contentLength || filePos,
+      tensorsLoaded,
+      totalTensors
+    });
+    if (pendingBuffer) {
+      const needed = pendingNeeded - (pendingBuffer.byteLength - pendingStart);
+      const available = Math.min(chunk.byteLength, needed);
+      const newBuf = new Uint8Array(pendingBuffer.byteLength - pendingStart + available);
+      newBuf.set(new Uint8Array(pendingBuffer.buffer, pendingBuffer.byteOffset + pendingStart, pendingBuffer.byteLength - pendingStart));
+      newBuf.set(chunk.subarray(0, available), pendingBuffer.byteLength - pendingStart);
+      if (newBuf.byteLength >= pendingNeeded) {
+        const ext = extractions[extractIdx];
+        onTensor(ext.tensor.name, newBuf.buffer.slice(newBuf.byteOffset, newBuf.byteOffset + ext.tensor.byteSize), ext.tensor);
+        tensorsLoaded++;
+        extractIdx++;
+        pendingBuffer = null;
+        pendingStart = 0;
+        pendingNeeded = 0;
+      } else {
+        pendingBuffer = newBuf;
+        pendingStart = 0;
+        pendingNeeded = pendingNeeded;
+        continue;
+      }
+    }
+    while (extractIdx < extractions.length) {
+      const ext = extractions[extractIdx];
+      if (ext.start >= chunkEnd) break;
+      if (ext.start >= chunkStart && ext.end <= chunkEnd) {
+        const localStart = ext.start - chunkStart;
+        const tensorData = chunk.buffer.slice(
+          chunk.byteOffset + localStart,
+          chunk.byteOffset + localStart + ext.tensor.byteSize
+        );
+        onTensor(ext.tensor.name, tensorData, ext.tensor);
+        tensorsLoaded++;
+        extractIdx++;
+      } else if (ext.start >= chunkStart && ext.start < chunkEnd) {
+        const localStart = ext.start - chunkStart;
+        pendingBuffer = chunk.subarray(localStart);
+        pendingStart = 0;
+        pendingNeeded = ext.tensor.byteSize;
+        if (pendingBuffer.byteLength >= pendingNeeded) {
+          onTensor(ext.tensor.name, pendingBuffer.buffer.slice(
+            pendingBuffer.byteOffset,
+            pendingBuffer.byteOffset + ext.tensor.byteSize
+          ), ext.tensor);
+          tensorsLoaded++;
+          extractIdx++;
+          pendingBuffer = null;
+          pendingNeeded = 0;
+        }
+        break;
+      } else {
+        extractIdx++;
+      }
+    }
+  }
+  while (true) {
+    const { done } = await reader.read();
+    if (done) break;
+  }
+  onProgress?.({
+    phase: "Complete",
+    bytesDownloaded: filePos,
+    totalBytes: contentLength || filePos,
+    tensorsLoaded,
+    totalTensors
+  });
+}
+async function getResponse(url, onProgress) {
   let cache = null;
   try {
     if (typeof caches !== "undefined") {
       cache = await caches.open(CACHE_NAME);
       const cached = await cache.match(url);
       if (cached) {
-        const total = parseInt(cached.headers.get("content-length") ?? "0", 10);
-        const reader2 = cached.body?.getReader();
-        if (reader2 && total > 0) {
-          onProgress?.({ bytesDownloaded: 0, totalBytes: total });
-          const chunks2 = [];
-          let loaded = 0;
-          while (true) {
-            const { done, value } = await reader2.read();
-            if (done) break;
-            chunks2.push(value);
-            loaded += value.byteLength;
-            onProgress?.({ bytesDownloaded: loaded, totalBytes: total });
-          }
-          const result2 = new Uint8Array(loaded);
-          let off = 0;
-          for (const c of chunks2) {
-            result2.set(c, off);
-            off += c.byteLength;
-          }
-          return result2.buffer;
-        }
-        const buf = await cached.arrayBuffer();
-        onProgress?.({ bytesDownloaded: buf.byteLength, totalBytes: buf.byteLength });
-        return buf;
+        onProgress?.({ phase: "Loading from cache", bytesDownloaded: 0, totalBytes: 0, tensorsLoaded: 0, totalTensors: 0 });
+        return cached;
       }
     }
   } catch {
   }
+  onProgress?.({ phase: "Downloading", bytesDownloaded: 0, totalBytes: 0, tensorsLoaded: 0, totalTensors: 0 });
   const response = await fetch(url);
-  if (!response.ok) {
-    throw new Error(`Download failed: ${response.status} ${response.statusText}`);
-  }
-  const contentLength = parseInt(response.headers.get("content-length") ?? "0", 10);
-  const reader = response.body?.getReader();
-  if (!reader) {
-    const buf = await response.arrayBuffer();
-    if (cache) {
-      try {
-        await cache.put(url, new Response(buf.slice(0)));
-      } catch {
-      }
-    }
-    return buf;
-  }
-  const chunks = [];
-  let downloaded = 0;
-  while (true) {
-    const { done, value } = await reader.read();
-    if (done) break;
-    chunks.push(value);
-    downloaded += value.byteLength;
-    onProgress?.({ bytesDownloaded: downloaded, totalBytes: contentLength || downloaded });
-  }
-  const result = new Uint8Array(downloaded);
-  let offset = 0;
-  for (const chunk of chunks) {
-    result.set(chunk, offset);
-    offset += chunk.byteLength;
-  }
+  if (!response.ok) throw new Error(`Download failed: ${response.status}`);
   if (cache) {
     try {
-      await cache.put(url, new Response(result.buffer.slice(0), {
-        headers: { "content-length": String(downloaded) }
-      }));
+      const [stream1, stream2] = response.body.tee();
+      const cachedResponse = new Response(stream2, {
+        headers: { "content-length": response.headers.get("content-length") ?? "0" }
+      });
+      cache.put(url, cachedResponse).catch(() => {
+      });
+      return new Response(stream1, { headers: response.headers });
     } catch {
     }
   }
-  return result.buffer;
-}
-function extractTensorData(fileBuffer, absoluteOffset, byteSize) {
-  return fileBuffer.slice(absoluteOffset, absoluteOffset + byteSize);
+  return response;
 }
 
 // src/tokenizer/bpe-tokenizer.ts
@@ -1957,10 +2042,10 @@ var LlamaModel = class {
       const f32Data = dequantizeToF32(tensor.buffer, tensor.info.type, tensor.info.elementCount);
       return { buffer: compute.buffers.createBufferWithData(name, f32Data.buffer), type: 0 /* F32 */ };
     };
-    const tokenEmbedding = uploadAsF32("token_embd.weight");
+    const tokenEmbedding = uploadWeight("token_embd.weight");
     let outputWeight;
     if (tensorMap.has("output.weight")) {
-      outputWeight = uploadAsF32("output.weight");
+      outputWeight = uploadWeight("output.weight");
     } else {
       outputWeight = tokenEmbedding;
     }
@@ -2029,7 +2114,11 @@ var LlamaModel = class {
   forward(tokenId) {
     const { compute, weights } = this;
     const E = this.embeddingDim;
-    compute.embedding(weights.tokenEmbedding, this.hidden, tokenId, E);
+    if (weights.tokenEmbedding.type === 8 /* Q8_0 */) {
+      compute.embeddingQ8(weights.tokenEmbedding.buffer, this.hidden, tokenId, E);
+    } else {
+      compute.embedding(weights.tokenEmbedding.buffer, this.hidden, tokenId, E);
+    }
     for (let layer = 0; layer < this.numLayers; layer++) {
       const lw = weights.layers[layer];
       compute.copyAndRmsNorm(this.hidden, lw.attnNorm, this.normed, this.residual, E, this.rmsNormEps);
@@ -2065,7 +2154,7 @@ var LlamaModel = class {
       compute.add(this.temp, this.residual, this.hidden, E);
     }
     compute.rmsNorm(this.hidden, weights.outputNorm, this.normed, E, this.rmsNormEps);
-    compute.matmul(weights.output, this.normed, this.logits, this.vocabSize, E, 0 /* F32 */);
+    compute.matmul(weights.output.buffer, this.normed, this.logits, this.vocabSize, E, weights.output.type);
     return this.logits;
   }
   // ── CPU forward pass (for verification / fallback) ──────────────────
@@ -2262,6 +2351,8 @@ var Qwen35Model = class {
   compute;
   info;
   weights;
+  qkvDims;
+  // per-layer QKV output dimension (from weight)
   kvCaches;
   // null for DeltaNet layers
   deltaStates;
@@ -2283,6 +2374,10 @@ var Qwen35Model = class {
   qAttnBuf;
   qGateBufAttn;
   // DeltaNet-specific GPU buffers
+  qTiledBuf;
+  // tiled Q for deltanet [numVHeads * headDim]
+  kTiledBuf;
+  // tiled K for deltanet [numVHeads * headDim]
   qkvBuf;
   ssmGateBuf;
   ssmOutputBuf;
@@ -2394,9 +2489,10 @@ var Qwen35Model = class {
     if (alpha0) {
       this.ssmNumVHeads = alpha0.info.elementCount / this.embeddingDim;
     }
-    const tokenEmbedding = uploadAsF32("token_embd.weight");
-    const output = tensorMap.has("output.weight") ? uploadAsF32("output.weight") : tokenEmbedding;
+    const tokenEmbedding = uploadWeight("token_embd.weight");
+    const output = tensorMap.has("output.weight") ? uploadWeight("output.weight") : tokenEmbedding;
     const outputNorm = uploadAsF32("output_norm.weight");
+    this.qkvDims = [];
     const layers = [];
     for (let i = 0; i < this.numLayers; i++) {
       const shared = {
@@ -2406,6 +2502,7 @@ var Qwen35Model = class {
         downProj: uploadWeight(`blk.${i}.ffn_down.weight`)
       };
       if (this.isStandardAttention(i)) {
+        this.qkvDims.push(0);
         layers.push({
           kind: "standard",
           attnNorm: uploadAsF32(`blk.${i}.attn_norm.weight`),
@@ -2418,6 +2515,8 @@ var Qwen35Model = class {
           ...shared
         });
       } else {
+        const qkvTensor = tensorMap.get(`blk.${i}.attn_qkv.weight`);
+        this.qkvDims.push(qkvTensor.info.elementCount / this.embeddingDim);
         layers.push({
           kind: "deltanet",
           attnNorm: uploadAsF32(`blk.${i}.attn_norm.weight`),
@@ -2457,9 +2556,11 @@ var Qwen35Model = class {
     const qAttnDim = this.numHeads * this.keyLength;
     this.qAttnBuf = compute.buffers.createBuffer("q_attn", qAttnDim * 4);
     this.qGateBufAttn = compute.buffers.createBuffer("q_gate_attn", qAttnDim * 4);
-    const qkvDim = this.ssmInnerSize * 3;
+    const maxQkvDim = Math.max(...this.qkvDims, this.ssmInnerSize * 3);
     const numVHeads = this.ssmNumVHeads;
-    this.qkvBuf = compute.buffers.createBuffer("qkv", qkvDim * 4);
+    this.qTiledBuf = compute.buffers.createBuffer("q_tiled", numVHeads * this.ssmHeadDim * 4);
+    this.kTiledBuf = compute.buffers.createBuffer("k_tiled", numVHeads * this.ssmHeadDim * 4);
+    this.qkvBuf = compute.buffers.createBuffer("qkv", maxQkvDim * 4);
     this.ssmGateBuf = compute.buffers.createBuffer("ssm_gate", this.ssmInnerSize * 4);
     this.ssmOutputBuf = compute.buffers.createBuffer("ssm_output", this.ssmInnerSize * 4);
     this.alphaBuf = compute.buffers.createBuffer("alpha", numVHeads * 4);
@@ -2476,7 +2577,7 @@ var Qwen35Model = class {
       } else {
         this.kvCaches.push(null);
         const stateSize = this.ssmNumVHeads * this.ssmHeadDim * this.ssmHeadDim;
-        const convBufSize = qkvDim * (this.ssmConvKernel - 1);
+        const convBufSize = this.qkvDims[i] * (this.ssmConvKernel - 1);
         this.deltaStates.push({
           state: compute.buffers.createBuffer(`dn_state_${i}`, stateSize * 4),
           convBuf: compute.buffers.createBuffer(`dn_conv_${i}`, convBufSize * 4)
@@ -2487,12 +2588,13 @@ var Qwen35Model = class {
   resetCache() {
     this._position = 0;
     for (const kv of this.kvCaches) kv?.reset();
-    for (const ds of this.deltaStates) {
+    for (let i = 0; i < this.deltaStates.length; i++) {
+      const ds = this.deltaStates[i];
       if (ds) {
         const stateSize = this.ssmNumVHeads * this.ssmHeadDim * this.ssmHeadDim;
-        const convBufSize = this.ssmInnerSize * 3 * (this.ssmConvKernel - 1);
+        const convBufSize = this.qkvDims[i] * (this.ssmConvKernel - 1);
         this.compute.device.queue.writeBuffer(ds.state, 0, new Float32Array(stateSize));
-        this.compute.device.queue.writeBuffer(ds.convBuf, 0, new Float32Array(convBufSize));
+        if (convBufSize > 0) this.compute.device.queue.writeBuffer(ds.convBuf, 0, new Float32Array(convBufSize));
       }
     }
   }
@@ -2502,7 +2604,11 @@ var Qwen35Model = class {
   forward(tokenId) {
     const { compute, weights } = this;
     const E = this.embeddingDim;
-    compute.embedding(weights.tokenEmbedding, this.hidden, tokenId, E);
+    if (weights.tokenEmbedding.type === 8 /* Q8_0 */) {
+      compute.embeddingQ8(weights.tokenEmbedding.buffer, this.hidden, tokenId, E);
+    } else {
+      compute.embedding(weights.tokenEmbedding.buffer, this.hidden, tokenId, E);
+    }
     if (this._position === 0) {
     }
     for (let layer = 0; layer < this.numLayers; layer++) {
@@ -2521,7 +2627,7 @@ var Qwen35Model = class {
       compute.add(this.temp, this.residual, this.hidden, E);
     }
     compute.rmsNorm(this.hidden, weights.outputNorm, this.normed, E, this.rmsNormEps);
-    compute.matmul(weights.output, this.normed, this.logits, this.vocabSize, E, 0 /* F32 */);
+    compute.matmul(weights.output.buffer, this.normed, this.logits, this.vocabSize, E, weights.output.type);
     this._position++;
     return this.logits;
   }
@@ -2577,21 +2683,31 @@ var Qwen35Model = class {
     const E = this.embeddingDim;
     const ds = this.deltaStates[layer];
     const innerSize = this.ssmInnerSize;
-    const qkvDim = innerSize * 3;
     const numVHeads = this.ssmNumVHeads;
     const numKHeads = this.ssmGroupCount;
     const headDim = this.ssmHeadDim;
-    const groupDim = innerSize / numKHeads;
+    const valueDim = numVHeads * headDim;
+    const qkvDim = this.qkvDims[layer];
+    const keyDim = (qkvDim - valueDim) / 2;
+    const groupDim = keyDim / numKHeads;
     compute.matmul(lw.qkv.buffer, this.normed, this.qkvBuf, qkvDim, E, lw.qkv.type);
     compute.conv1dSilu(this.qkvBuf, ds.convBuf, lw.ssmConv1d, qkvDim, this.ssmConvKernel);
-    compute.l2NormGroups(this.qkvBuf, numKHeads, groupDim);
     const enc = compute.device.createCommandEncoder();
-    enc.copyBufferToBuffer(this.qkvBuf, 0, this.qBuf, 0, innerSize * 4);
-    enc.copyBufferToBuffer(this.qkvBuf, innerSize * 4, this.kBuf, 0, innerSize * 4);
-    enc.copyBufferToBuffer(this.qkvBuf, innerSize * 2 * 4, this.vBuf, 0, innerSize * 4);
+    enc.copyBufferToBuffer(this.qkvBuf, 0, this.qBuf, 0, keyDim * 4);
+    enc.copyBufferToBuffer(this.qkvBuf, keyDim * 4, this.kBuf, 0, keyDim * 4);
+    enc.copyBufferToBuffer(this.qkvBuf, keyDim * 2 * 4, this.vBuf, 0, valueDim * 4);
     compute.device.queue.submit([enc.finish()]);
     compute.l2NormGroups(this.qBuf, numKHeads, groupDim);
     compute.l2NormGroups(this.kBuf, numKHeads, groupDim);
+    const repeatFactor = numVHeads / numKHeads;
+    let qForDelta = this.qBuf;
+    let kForDelta = this.kBuf;
+    if (repeatFactor > 1) {
+      compute.repeatTile(this.qBuf, this.qTiledBuf, numKHeads, groupDim, repeatFactor);
+      compute.repeatTile(this.kBuf, this.kTiledBuf, numKHeads, groupDim, repeatFactor);
+      qForDelta = this.qTiledBuf;
+      kForDelta = this.kTiledBuf;
+    }
     compute.matmul(lw.ssmAlpha.buffer, this.normed, this.alphaBuf, numVHeads, E, lw.ssmAlpha.type);
     compute.matmul(lw.ssmBeta.buffer, this.normed, this.betaBuf, numVHeads, E, lw.ssmBeta.type);
     compute.computeDecayBeta(
@@ -2605,8 +2721,8 @@ var Qwen35Model = class {
     );
     const scale = 1 / Math.sqrt(headDim);
     compute.deltanetStep(
-      this.qBuf,
-      this.kBuf,
+      qForDelta,
+      kForDelta,
       this.vBuf,
       ds.state,
       this.decayBuf,
@@ -2771,32 +2887,35 @@ var LlogosEngine = class _LlogosEngine {
       if (maxBuffer > 0 && estimate.totalBytes > maxBuffer * 4) {
         console.warn(`[llogos] Model may not fit: estimated ${Math.round(estimate.totalBytes / 1024 / 1024)} MB, max buffer ${Math.round(maxBuffer / 1024 / 1024)} MB`);
       }
-      let isCached = false;
-      options?.onProgress?.({ phase: "Checking cache...", bytesDownloaded: 0, totalBytes: 0 });
-      const fileBuffer = await downloadFile(url, (p) => {
-        if (!isCached && p.bytesDownloaded === 0 && p.totalBytes > 0) {
-          isCached = true;
-        }
-        const phase = isCached ? "Loading from cache" : "Downloading";
-        options?.onProgress?.({ phase, bytesDownloaded: p.bytesDownloaded, totalBytes: p.totalBytes });
-      });
-      info = parseGguf(fileBuffer);
-      this.modelInfo = info;
       this.tokenizer = tokenizerFromGguf(info.metadata);
       const tensorMap = /* @__PURE__ */ new Map();
-      for (const tensor of info.tensors) {
-        tensorMap.set(tensor.name, {
-          buffer: extractTensorData(fileBuffer, info.tensorDataOffset + tensor.offset, tensor.byteSize),
-          info: tensor
-        });
-      }
-      options?.onProgress?.({ phase: "Uploading to GPU", bytesDownloaded: fileBuffer.byteLength, totalBytes: fileBuffer.byteLength });
+      let tensorCount = 0;
+      await streamTensors(
+        url,
+        info,
+        (name, data, tensorInfo) => {
+          tensorMap.set(name, { buffer: data, info: tensorInfo });
+          tensorCount++;
+        },
+        (p) => {
+          options?.onProgress?.({
+            phase: `${p.phase} (${p.tensorsLoaded}/${p.totalTensors} tensors)`,
+            bytesDownloaded: p.bytesDownloaded,
+            totalBytes: p.totalBytes
+          });
+        }
+      );
+      options?.onProgress?.({ phase: "Uploading to GPU", bytesDownloaded: 0, totalBytes: 0 });
       if (info.architecture === "qwen35") {
         this.model = new Qwen35Model(this.compute, info);
       } else {
         this.model = new LlamaModel(this.compute, info);
       }
+      console.log("[llogos] Uploading weights to GPU...");
       await this.model.initWeights(tensorMap);
+      console.log("[llogos] Weights uploaded, clearing CPU data...");
+      tensorMap.clear();
+      console.log("[llogos] Model loaded successfully");
       this._status = "loaded";
       return info;
     } catch (e) {

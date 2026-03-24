@@ -226,9 +226,9 @@ interface WeightBuffer {
 
 /** GPU weight buffers for the model. */
 export interface ModelWeights {
-  tokenEmbedding: GPUBuffer;
+  tokenEmbedding: WeightBuffer;
   outputNorm: GPUBuffer;
-  output: GPUBuffer;
+  output: WeightBuffer;
   layers: LayerWeights[];
 }
 
@@ -313,11 +313,11 @@ export class LlamaModel {
       return { buffer: compute.buffers.createBufferWithData(name, f32Data.buffer), type: GgmlType.F32 };
     };
 
-    // Upload weights
-    const tokenEmbedding = uploadAsF32('token_embd.weight');
-    let outputWeight: GPUBuffer;
+    // Upload weights — keep embedding in native format (avoids huge F32 allocation for large vocabs)
+    const tokenEmbedding = uploadWeight('token_embd.weight');
+    let outputWeight: WeightBuffer;
     if (tensorMap.has('output.weight')) {
-      outputWeight = uploadAsF32('output.weight');
+      outputWeight = uploadWeight('output.weight');
     } else {
       outputWeight = tokenEmbedding;
     }
@@ -396,7 +396,12 @@ export class LlamaModel {
     // Individual submits — the only reliable sync approach;
 
     // 1. Token embedding
-    compute.embedding(weights.tokenEmbedding, this.hidden, tokenId, E);
+    // Token embedding — use Q8_0 shader if quantized, F32 otherwise
+    if (weights.tokenEmbedding.type === GgmlType.Q8_0) {
+      compute.embeddingQ8(weights.tokenEmbedding.buffer, this.hidden, tokenId, E);
+    } else {
+      compute.embedding(weights.tokenEmbedding.buffer, this.hidden, tokenId, E);
+    }
 
 
     // Transformer layers
@@ -456,7 +461,7 @@ export class LlamaModel {
     compute.rmsNorm(this.hidden, weights.outputNorm, this.normed, E, this.rmsNormEps);
 
     // 4. LM Head
-    compute.matmul(weights.output, this.normed, this.logits, this.vocabSize, E, GgmlType.F32);
+    compute.matmul(weights.output.buffer, this.normed, this.logits, this.vocabSize, E, weights.output.type);
 
     return this.logits;
   }
