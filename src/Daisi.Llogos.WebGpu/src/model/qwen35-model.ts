@@ -286,7 +286,7 @@ export class Qwen35Model {
     this.qBuf = compute.buffers.createBuffer('q_proj', H * 4);
     this.kBuf = compute.buffers.createBuffer('k_proj', KV * 4);
     this.vBuf = compute.buffers.createBuffer('v_proj', KV * 4);
-    this.attnOut = compute.buffers.createBuffer('attn_out', E * 4);
+    this.attnOut = compute.buffers.createBuffer('attn_out', Math.max(E, this.numHeads * this.valueLength) * 4);
     this.gateBuf = compute.buffers.createBuffer('gate', F * 4);
     this.upBuf = compute.buffers.createBuffer('up', F * 4);
     this.ffnOut = compute.buffers.createBuffer('ffn_out', F * 4);
@@ -439,22 +439,21 @@ export class Qwen35Model {
       qGate.fill(88.0); // sigmoid(88)≈1 → ungated
     }
 
-    // Per-head QK RMSNorm
+    // Per-head QK RMSNorm — norm weight is [keyLen] elements, shared across all heads
     if (lw.qNorm) {
-      const qNormW = new Float32Array(await this.readGpuBuffer(lw.qNorm, nKV * keyLen * 4));
-      const kNormW = lw.kNorm ? new Float32Array(await this.readGpuBuffer(lw.kNorm, nKV * keyLen * 4)) : qNormW;
+      const qNormW = new Float32Array(await this.readGpuBuffer(lw.qNorm, keyLen * 4));
+      const kNormW = lw.kNorm ? new Float32Array(await this.readGpuBuffer(lw.kNorm, keyLen * 4)) : qNormW;
       for (let h = 0; h < nH; h++) {
         const off = h * keyLen;
         let ss = 0; for (let i = 0; i < keyLen; i++) ss += qAttn[off + i] * qAttn[off + i];
         const rms = Math.sqrt(ss / keyLen + this.rmsNormEps);
-        // Norm weights cycle over nKV*keyLen (shared across Q head groups)
-        for (let i = 0; i < keyLen; i++) qAttn[off + i] = (qAttn[off + i] / rms) * qNormW[i % (nKV * keyLen)];
+        for (let i = 0; i < keyLen; i++) qAttn[off + i] = (qAttn[off + i] / rms) * qNormW[i];
       }
       for (let h = 0; h < nKV; h++) {
         const off = h * keyLen;
         let ss = 0; for (let i = 0; i < keyLen; i++) ss += kData[off + i] * kData[off + i];
         const rms = Math.sqrt(ss / keyLen + this.rmsNormEps);
-        for (let i = 0; i < keyLen; i++) kData[off + i] = (kData[off + i] / rms) * kNormW[off + i];
+        for (let i = 0; i < keyLen; i++) kData[off + i] = (kData[off + i] / rms) * kNormW[i];
       }
     }
 
