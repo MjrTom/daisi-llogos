@@ -158,6 +158,9 @@ export class Qwen35Model {
   get ffnDim(): number { return this.info.feedForwardLength; }
   get vocabSize(): number { return this.info.vocabSize; }
   get ropeTheta(): number { return this.info.ropeFreqBase; }
+  get ropeDim(): number {
+    return (this.info.metadata.get(`${this.info.architecture}.rope.dimension_count`) as number) || this.headDim;
+  }
   get rmsNormEps(): number { return this.info.rmsNormEps; }
   get position(): number { return this._position; }
   private _position = 0;
@@ -313,6 +316,13 @@ export class Qwen35Model {
     // 1. Token embedding
     compute.embedding(weights.tokenEmbedding, this.hidden, tokenId, E);
 
+    // DEBUG: Check embedding output
+    if (this._position === 0) {
+      const h = new Float32Array(await this.readGpuBuffer(this.hidden, E * 4));
+      let hMax = 0; for (let i = 0; i < E; i++) hMax = Math.max(hMax, Math.abs(h[i]));
+      console.log(`  [embed] token=${tokenId} max=${hMax.toFixed(4)} h[0..4]=${Array.from(h.slice(0, 5)).map(v => v.toFixed(4))}`);
+    }
+
     // Transformer layers
     for (let layer = 0; layer < this.numLayers; layer++) {
       const lw = weights.layers[layer];
@@ -340,6 +350,11 @@ export class Qwen35Model {
     }
 
     // Final RMSNorm + LM Head
+    if (this._position === 0) {
+      const h = new Float32Array(await this.readGpuBuffer(this.hidden, E * 4));
+      let hMax = 0, hSum = 0; for (let i = 0; i < E; i++) { hMax = Math.max(hMax, Math.abs(h[i])); hSum += h[i]; }
+      console.log(`  [final] hidden max=${hMax.toFixed(4)} sum=${hSum.toFixed(4)} h[0..4]=${Array.from(h.slice(0, 5)).map(v => v.toFixed(4))}`);
+    }
     compute.rmsNorm(this.hidden, weights.outputNorm, this.normed, E, this.rmsNormEps);
     compute.matmul(weights.output, this.normed, this.logits, this.vocabSize, E, GgmlType.F32);
 
@@ -388,8 +403,18 @@ export class Qwen35Model {
 
     // RoPE
     const pos = kvCache.seqLen;
-    compute.rope(this.qBuf, this.headDim, this.headDim, pos, this.ropeTheta, this.numHeads * this.headDim);
-    compute.rope(this.kBuf, this.headDim, this.headDim, pos, this.ropeTheta, this.numKvHeads * this.headDim);
+    // Partial RoPE: only first ropeDim positions per head get rotated (CPU for partial support)
+    if (this.ropeDim < this.headDim) {
+      const qData = new Float32Array(await this.readGpuBuffer(this.qBuf, this.numHeads * this.headDim * 4));
+      const kData = new Float32Array(await this.readGpuBuffer(this.kBuf, this.numKvHeads * this.headDim * 4));
+      this.applyPartialRoPE(qData, this.numHeads, pos);
+      this.applyPartialRoPE(kData, this.numKvHeads, pos);
+      compute.device.queue.writeBuffer(this.qBuf, 0, qData.buffer);
+      compute.device.queue.writeBuffer(this.kBuf, 0, kData.buffer);
+    } else {
+      compute.rope(this.qBuf, this.headDim, this.headDim, pos, this.ropeTheta, this.numHeads * this.headDim);
+      compute.rope(this.kBuf, this.headDim, this.headDim, pos, this.ropeTheta, this.numKvHeads * this.headDim);
+    }
 
     // KV cache write
     kvCache.write(this.kBuf, this.vBuf, this.numKvHeads * this.headDim * 4, this.numKvHeads * this.headDim * 4);
@@ -423,15 +448,33 @@ export class Qwen35Model {
     // 2. Causal Conv1d (CPU)
     this.causalConv1d(qkvData, ds.convBuffer, lw.ssmConv1d, qkvDim, kernelSize);
 
+    // DEBUG: check QKV before SiLU
+    const dbg = this._position === 0 && layer === 0;
+    if (dbg) {
+      let qkvMax = 0; for (let i = 0; i < qkvDim; i++) qkvMax = Math.max(qkvMax, Math.abs(qkvData[i]));
+      console.log(`  [L0] after conv1d: qkv max=${qkvMax.toFixed(4)} qkv[0..4]=${Array.from(qkvData.slice(0, 5)).map(v => v.toFixed(4))}`);
+    }
+
     // 3. SiLU activation (in-place)
     for (let i = 0; i < qkvDim; i++) {
       qkvData[i] = qkvData[i] / (1 + Math.exp(-qkvData[i]));
+    }
+
+    if (dbg) {
+      let qkvMax = 0; for (let i = 0; i < qkvDim; i++) qkvMax = Math.max(qkvMax, Math.abs(qkvData[i]));
+      console.log(`  [L0] after SiLU: qkv max=${qkvMax.toFixed(4)} qkv[0..4]=${Array.from(qkvData.slice(0, 5)).map(v => v.toFixed(4))}`);
     }
 
     // 4. Split Q/K/V — equal split
     const q = qkvData.subarray(0, innerSize);
     const k = qkvData.subarray(innerSize, innerSize * 2);
     const v = qkvData.subarray(innerSize * 2, innerSize * 3);
+
+    if (dbg) {
+      let qMax = 0, kMax = 0, vMax = 0;
+      for (let i = 0; i < innerSize; i++) { qMax = Math.max(qMax, Math.abs(q[i])); kMax = Math.max(kMax, Math.abs(k[i])); vMax = Math.max(vMax, Math.abs(v[i])); }
+      console.log(`  [L0] after split: Q max=${qMax.toFixed(4)} K max=${kMax.toFixed(4)} V max=${vMax.toFixed(4)}`);
+    }
 
     // 5. L2 normalize Q and K per group (numKHeads groups)
     const groupDim = innerSize / numKHeads;
@@ -446,6 +489,12 @@ export class Qwen35Model {
       for (let i = 0; i < groupDim; i++) normSq += k[off + i] * k[off + i];
       const kNorm = Math.sqrt(normSq) || 1;
       for (let i = 0; i < groupDim; i++) k[off + i] /= kNorm;
+    }
+
+    if (dbg) {
+      let qMax = 0, kMax = 0;
+      for (let i = 0; i < innerSize; i++) { qMax = Math.max(qMax, Math.abs(q[i])); kMax = Math.max(kMax, Math.abs(k[i])); }
+      console.log(`  [L0] after L2 norm: Q max=${qMax.toFixed(4)} K max=${kMax.toFixed(4)}`);
     }
 
     // 6. Repeat-tile Q and K if numVHeads > numKHeads
@@ -539,6 +588,11 @@ export class Qwen35Model {
       }
     }
 
+    if (dbg) {
+      let oMax = 0; for (let i = 0; i < numVHeads * headDim; i++) oMax = Math.max(oMax, Math.abs(output[i]));
+      console.log(`  [L0] after DeltaNetStep: output max=${oMax.toFixed(4)} output[0..4]=${Array.from(output.slice(0, 5)).map(v => v.toFixed(4))}`);
+    }
+
     // 10. Gate: output *= silu(gate(normOut))
     const gateData = new Float32Array(innerSize);
     const gateW = lw.gate;
@@ -548,8 +602,24 @@ export class Qwen35Model {
       const silu = sum / (1 + Math.exp(-sum));
       gateData[h] = silu;
     }
+
+    // DEBUG
+    if (this._position === 0 && layer === 0) {
+      let oMax = 0, gMax = 0;
+      for (let i = 0; i < innerSize; i++) { oMax = Math.max(oMax, Math.abs(output[i])); gMax = Math.max(gMax, Math.abs(gateData[i])); }
+      console.log(`  [L0 gate] output max BEFORE gate=${oMax.toFixed(4)} gate max=${gMax.toFixed(4)}`);
+      console.log(`  [L0 gate] output[0..4]=${Array.from(output.slice(0, 5)).map(v => v.toFixed(4))}`);
+      console.log(`  [L0 gate] gate[0..4]=${Array.from(gateData.slice(0, 5)).map(v => v.toFixed(4))}`);
+    }
+
     for (let i = 0; i < innerSize; i++) {
       output[i] *= gateData[i];
+    }
+
+    if (this._position === 0 && layer === 0) {
+      let oMax = 0;
+      for (let i = 0; i < innerSize; i++) oMax = Math.max(oMax, Math.abs(output[i]));
+      console.log(`  [L0 gate] output max AFTER gate=${oMax.toFixed(4)}`);
     }
 
     // 11. Output projection (GPU)
@@ -558,27 +628,77 @@ export class Qwen35Model {
 
     // Residual add
     compute.add(this.temp, this.residual, this.hidden, E);
+
+    // DEBUG: Check hidden state after DeltaNet
+    if (layer === 0 && this._position < 3) {
+      const stateNorm = Math.sqrt(ds.state.reduce((s, v) => s + v * v, 0));
+      console.log(`  [L0 pos=${this._position}] state L2 norm=${stateNorm.toFixed(4)}`);
+    }
+    if (this._position === 0 && layer === 0) {
+      const h = new Float32Array(await this.readGpuBuffer(this.hidden, E * 4));
+      const t = new Float32Array(await this.readGpuBuffer(this.temp, E * 4));
+      let hMax = 0, tMax = 0;
+      for (let i = 0; i < E; i++) { hMax = Math.max(hMax, Math.abs(h[i])); tMax = Math.max(tMax, Math.abs(t[i])); }
+      console.log(`  [L0 DN] temp max=${tMax.toFixed(4)} hidden max=${hMax.toFixed(4)} temp[0..4]=${Array.from(t.slice(0, 5)).map(v => v.toFixed(4))}`);
+      // Also check ssmGateBuf (output before final projection)
+      const g = new Float32Array(await this.readGpuBuffer(this.ssmGateBuf, innerSize * 4));
+      let gMax = 0, gNonZero = 0;
+      for (let i = 0; i < innerSize; i++) { gMax = Math.max(gMax, Math.abs(g[i])); if (g[i] !== 0) gNonZero++; }
+      console.log(`  [L0 DN] ssmGateBuf max=${gMax.toFixed(4)} nonzero=${gNonZero}/${innerSize} first5=${Array.from(g.slice(0, 5)).map(v => v.toFixed(4))}`);
+    }
+  }
+
+  /** Apply RoPE to first ropeDim dims of each head, leaving rest unchanged. */
+  private applyPartialRoPE(data: Float32Array, nHeads: number, position: number): void {
+    const headDim = this.headDim;
+    const ropeDim = this.ropeDim;
+    const halfDim = ropeDim / 2;
+    const theta = this.ropeTheta;
+
+    for (let h = 0; h < nHeads; h++) {
+      const off = h * headDim;
+      for (let i = 0; i < halfDim; i++) {
+        const freq = 1.0 / Math.pow(theta, (2 * i) / ropeDim);
+        const angle = position * freq;
+        const cos = Math.cos(angle);
+        const sin = Math.sin(angle);
+        const x0 = data[off + 2 * i];
+        const x1 = data[off + 2 * i + 1];
+        data[off + 2 * i] = x0 * cos - x1 * sin;
+        data[off + 2 * i + 1] = x0 * sin + x1 * cos;
+      }
+      // Dimensions beyond ropeDim are left unchanged
+    }
   }
 
   private causalConv1d(data: Float32Array, convBuf: Float32Array, weights: Float32Array, channels: number, kernelSize: number): void {
-    const bufSize = kernelSize - 1;
-    for (let c = 0; c < channels; c++) {
-      // Compute conv output for this channel
-      let sum = 0;
-      for (let k = 0; k < bufSize; k++) {
-        sum += convBuf[k * channels + c] * weights[c * kernelSize + k];
-      }
-      sum += data[c] * weights[c * kernelSize + bufSize];
+    const bufSlots = kernelSize - 1;
 
-      // Shift buffer: discard oldest, add current pre-conv value
-      const preConvVal = data[c];
-      for (let k = 0; k < bufSize - 1; k++) {
+    // Compute all channel outputs into separate array (C# reference: CpuBackend.cs:482)
+    const result = new Float32Array(channels);
+    for (let c = 0; c < channels; c++) {
+      let s = 0;
+      for (let k = 0; k < bufSlots; k++) {
+        s += convBuf[k * channels + c] * weights[c * kernelSize + k];
+      }
+      s += data[c] * weights[c * kernelSize + bufSlots];
+      result[c] = s;
+    }
+
+    // Shift buffer: discard oldest row, add current pre-conv values as newest
+    for (let k = 0; k < bufSlots - 1; k++) {
+      for (let c = 0; c < channels; c++) {
         convBuf[k * channels + c] = convBuf[(k + 1) * channels + c];
       }
-      convBuf[(bufSize - 1) * channels + c] = preConvVal;
-
-      data[c] = sum;
     }
+    if (bufSlots > 0) {
+      for (let c = 0; c < channels; c++) {
+        convBuf[(bufSlots - 1) * channels + c] = data[c];
+      }
+    }
+
+    // Write result back
+    data.set(result);
   }
 
   /** Read a GPU buffer to CPU — creates a fresh readback buffer each time to avoid mapping conflicts. */
