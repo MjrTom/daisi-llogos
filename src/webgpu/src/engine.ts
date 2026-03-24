@@ -29,6 +29,7 @@ export interface GenerateOptions extends SamplerOptions {
   onToken?: (token: string, tokenId: number) => void;
   signal?: AbortSignal;
   raw?: boolean; // if true, skip chat template wrapping
+  vocabLimit?: number; // if set, only compute first N logits (partial vocab — faster for greedy/low-temp)
 }
 
 export class LlogosEngine {
@@ -137,6 +138,11 @@ export class LlogosEngine {
   async *generate(prompt: string, options?: GenerateOptions): AsyncGenerator<string> {
     if (!this.model || !this.tokenizer || !this.compute) {
       throw new Error('Model not loaded. Call loadModel() first.');
+    }
+
+    // Set vocab limit for partial logit computation
+    if ('vocabLimit' in this.model) {
+      (this.model as any).vocabLimit = options?.vocabLimit ?? 0;
     }
 
     this._status = 'generating';

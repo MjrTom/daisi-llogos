@@ -408,7 +408,9 @@ export class Qwen35Model {
 
     // Final RMSNorm + LM Head
     compute.rmsNorm(this.hidden, weights.outputNorm, this.normed, E, this.rmsNormEps);
-    compute.matmul(weights.output.buffer, this.normed, this.logits, this.vocabSize, E, weights.output.type);
+    // LM Head — optionally compute only first vocabLimit rows
+    const lmRows = this._vocabLimit > 0 ? Math.min(this._vocabLimit, this.vocabSize) : this.vocabSize;
+    compute.matmul(weights.output.buffer, this.normed, this.logits, lmRows, E, weights.output.type);
 
     this._position++;
     return this.logits;
@@ -530,8 +532,13 @@ export class Qwen35Model {
     compute.add(this.temp, this.residual, this.hidden, E);
   }
 
-  /** Apply RoPE to first ropeDim dims of each head, leaving rest unchanged. */
+  /** Set vocab limit for partial logit computation. 0 = full vocab. */
+  private _vocabLimit = 0;
+  set vocabLimit(n: number) { this._vocabLimit = n; }
+  get vocabLimit(): number { return this._vocabLimit; }
+
   async readLogits(): Promise<Float32Array> {
-    return new Float32Array(await this.compute.readBuffer(this.logits, this.vocabSize * 4));
+    const size = this._vocabLimit > 0 ? Math.min(this._vocabLimit, this.vocabSize) : this.vocabSize;
+    return new Float32Array(await this.compute.readBuffer(this.logits, size * 4));
   }
 }

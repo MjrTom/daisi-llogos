@@ -2317,8 +2317,17 @@ var LlamaModel = class {
       compute.add(this.temp, this.residual, this.hidden, E);
     }
     compute.rmsNorm(this.hidden, weights.outputNorm, this.normed, E, this.rmsNormEps);
-    compute.matmul(weights.output.buffer, this.normed, this.logits, this.vocabSize, E, weights.output.type);
+    const lmRows = this._vocabLimit > 0 ? Math.min(this._vocabLimit, this.vocabSize) : this.vocabSize;
+    compute.matmul(weights.output.buffer, this.normed, this.logits, lmRows, E, weights.output.type);
     return this.logits;
+  }
+  /** Set vocab limit for partial logit computation. 0 = full vocab. */
+  _vocabLimit = 0;
+  set vocabLimit(n) {
+    this._vocabLimit = n;
+  }
+  get vocabLimit() {
+    return this._vocabLimit;
   }
   /**
    * Batched prefill: process all prompt tokens at once per layer.
@@ -2540,7 +2549,8 @@ var LlamaModel = class {
    * Read logits back to CPU for sampling.
    */
   async readLogits() {
-    const logits = await this.compute.readBuffer(this.logits, this.vocabSize * 4);
+    const size = this._vocabLimit > 0 ? Math.min(this._vocabLimit, this.vocabSize) : this.vocabSize;
+    const logits = await this.compute.readBuffer(this.logits, size * 4);
     this.compute.cleanupParams();
     return logits;
   }
@@ -2896,7 +2906,8 @@ var Qwen35Model = class {
       compute.add(this.temp, this.residual, this.hidden, E);
     }
     compute.rmsNorm(this.hidden, weights.outputNorm, this.normed, E, this.rmsNormEps);
-    compute.matmul(weights.output.buffer, this.normed, this.logits, this.vocabSize, E, weights.output.type);
+    const lmRows = this._vocabLimit > 0 ? Math.min(this._vocabLimit, this.vocabSize) : this.vocabSize;
+    compute.matmul(weights.output.buffer, this.normed, this.logits, lmRows, E, weights.output.type);
     this._position++;
     return this.logits;
   }
@@ -3004,9 +3015,17 @@ var Qwen35Model = class {
     compute.matmul(lw.ssmOut.buffer, this.ssmOutputBuf, this.temp, E, innerSize, lw.ssmOut.type);
     compute.add(this.temp, this.residual, this.hidden, E);
   }
-  /** Apply RoPE to first ropeDim dims of each head, leaving rest unchanged. */
+  /** Set vocab limit for partial logit computation. 0 = full vocab. */
+  _vocabLimit = 0;
+  set vocabLimit(n) {
+    this._vocabLimit = n;
+  }
+  get vocabLimit() {
+    return this._vocabLimit;
+  }
   async readLogits() {
-    return new Float32Array(await this.compute.readBuffer(this.logits, this.vocabSize * 4));
+    const size = this._vocabLimit > 0 ? Math.min(this._vocabLimit, this.vocabSize) : this.vocabSize;
+    return new Float32Array(await this.compute.readBuffer(this.logits, size * 4));
   }
 };
 
@@ -3194,6 +3213,9 @@ var LlogosEngine = class _LlogosEngine {
   async *generate(prompt, options) {
     if (!this.model || !this.tokenizer || !this.compute) {
       throw new Error("Model not loaded. Call loadModel() first.");
+    }
+    if ("vocabLimit" in this.model) {
+      this.model.vocabLimit = options?.vocabLimit ?? 0;
     }
     this._status = "generating";
     const maxTokens = options?.maxTokens ?? 512;

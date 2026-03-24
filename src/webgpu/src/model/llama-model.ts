@@ -456,11 +456,17 @@ export class LlamaModel {
     // 3. Final RMSNorm
     compute.rmsNorm(this.hidden, weights.outputNorm, this.normed, E, this.rmsNormEps);
 
-    // 4. LM Head
-    compute.matmul(weights.output.buffer, this.normed, this.logits, this.vocabSize, E, weights.output.type);
+    // 4. LM Head — optionally compute only first vocabLimit rows (partial vocab)
+    const lmRows = this._vocabLimit > 0 ? Math.min(this._vocabLimit, this.vocabSize) : this.vocabSize;
+    compute.matmul(weights.output.buffer, this.normed, this.logits, lmRows, E, weights.output.type);
 
     return this.logits;
   }
+
+  /** Set vocab limit for partial logit computation. 0 = full vocab. */
+  private _vocabLimit = 0;
+  set vocabLimit(n: number) { this._vocabLimit = n; }
+  get vocabLimit(): number { return this._vocabLimit; }
 
   /**
    * Batched prefill: process all prompt tokens at once per layer.
@@ -726,7 +732,8 @@ export class LlamaModel {
    * Read logits back to CPU for sampling.
    */
   async readLogits(): Promise<Float32Array> {
-    const logits = await this.compute.readBuffer(this.logits, this.vocabSize * 4);
+    const size = this._vocabLimit > 0 ? Math.min(this._vocabLimit, this.vocabSize) : this.vocabSize;
+    const logits = await this.compute.readBuffer(this.logits, size * 4);
     this.compute.cleanupParams();
     return logits;
   }
