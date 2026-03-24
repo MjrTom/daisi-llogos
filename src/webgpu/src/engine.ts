@@ -18,6 +18,7 @@ import { GgmlType } from './gguf/quantization.js';
 import { BpeTokenizer, tokenizerFromGguf } from './tokenizer/bpe-tokenizer.js';
 import { applyTemplate, ChatMessage } from './tokenizer/chat-template.js';
 import { LlamaModel } from './model/llama-model.js';
+import { Qwen35Model } from './model/qwen35-model.js';
 import { Sampler, SamplerOptions } from './model/sampler.js';
 
 export type EngineStatus = 'uninitialized' | 'ready' | 'loading' | 'loaded' | 'generating' | 'error';
@@ -32,7 +33,7 @@ export interface GenerateOptions extends SamplerOptions {
 export class LlogosEngine {
   private gpu: GpuContext | null = null;
   private compute: ComputeEngine | null = null;
-  private model: LlamaModel | null = null;
+  private model: LlamaModel | Qwen35Model | null = null;
   private tokenizer: BpeTokenizer | null = null;
   private modelInfo: GgufModelInfo | null = null;
   private _status: EngineStatus = 'uninitialized';
@@ -109,7 +110,12 @@ export class LlogosEngine {
       }
 
       options?.onProgress?.({ phase: 'Uploading to GPU', bytesDownloaded: fileBuffer.byteLength, totalBytes: fileBuffer.byteLength });
-      this.model = new LlamaModel(this.compute, info);
+      // Select model class based on architecture
+      if (info.architecture === 'qwen35') {
+        this.model = new Qwen35Model(this.compute, info);
+      } else {
+        this.model = new LlamaModel(this.compute, info);
+      }
       await this.model.initWeights(tensorMap);
 
       this._status = 'loaded';
@@ -149,7 +155,7 @@ export class LlogosEngine {
 
       // GPU forward pass — prefill
       for (let i = 0; i < inputTokens.length; i++) {
-        this.model.forward(inputTokens[i]);
+        await this.model.forward(inputTokens[i]);
       }
       let logits = await this.model.readLogits();
 
@@ -167,7 +173,7 @@ export class LlogosEngine {
         options?.onToken?.(text, nextToken);
         yield text;
 
-        this.model.forward(nextToken);
+        await this.model.forward(nextToken);
         logits = await this.model.readLogits();
       }
     } finally {
