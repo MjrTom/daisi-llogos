@@ -21,6 +21,12 @@ import copyWgsl from './shaders/copy.wgsl';
 import copyRmsnormWgsl from './shaders/copy_rmsnorm.wgsl';
 import addWgsl from './shaders/add.wgsl';
 import addBiasWgsl from './shaders/add_bias.wgsl';
+import conv1dSiluWgsl from './shaders/conv1d_silu.wgsl';
+import siluInplaceWgsl from './shaders/silu_inplace.wgsl';
+import l2NormGroupsWgsl from './shaders/l2_norm_groups.wgsl';
+import computeDecayBetaWgsl from './shaders/compute_decay_beta.wgsl';
+import deltanetStepWgsl from './shaders/deltanet_step.wgsl';
+import siluGateWgsl from './shaders/silu_gate.wgsl';
 
 /** Helpers for creating bind group layout entries. */
 function storageReadOnly(binding: number): GPUBindGroupLayoutEntry {
@@ -377,6 +383,105 @@ export class ComputeEngine {
     ], [
       { binding: 0, resource: { buffer: data } },
       { binding: 1, resource: { buffer: bias } },
+      { binding: 2, resource: { buffer: params } },
+    ], [Math.ceil(n / 256)]);
+  }
+
+  // ── DeltaNet GPU ops ─────────────────────────────────────────────
+
+  /** Fused causal conv1d + SiLU: convolve data with persistent buffer, apply SiLU. */
+  conv1dSilu(data: GPUBuffer, convBuf: GPUBuffer, weights: GPUBuffer, channels: number, kernelSize: number): void {
+    const params = this.createParams('conv1d_silu_params', new Uint32Array([channels, kernelSize]).buffer);
+    this.dispatch(conv1dSiluWgsl, 'conv1d_silu', [
+      storageReadWrite(0), storageReadWrite(1), storageReadOnly(2), uniform(3),
+    ], [
+      { binding: 0, resource: { buffer: data } },
+      { binding: 1, resource: { buffer: convBuf } },
+      { binding: 2, resource: { buffer: weights } },
+      { binding: 3, resource: { buffer: params } },
+    ], [Math.ceil(channels / 256)]);
+  }
+
+  /** In-place SiLU activation. */
+  siluInplace(data: GPUBuffer, n: number): void {
+    const params = this.createParams('silu_ip_params', new Uint32Array([n]).buffer);
+    this.dispatch(siluInplaceWgsl, 'silu_inplace', [
+      storageReadWrite(0), uniform(1),
+    ], [
+      { binding: 0, resource: { buffer: data } },
+      { binding: 1, resource: { buffer: params } },
+    ], [Math.ceil(n / 256)]);
+  }
+
+  /** L2 normalize each group independently. */
+  l2NormGroups(data: GPUBuffer, numGroups: number, groupDim: number): void {
+    const params = this.createParams('l2norm_params', new Uint32Array([numGroups, groupDim]).buffer);
+    this.dispatch(l2NormGroupsWgsl, 'l2_norm_groups', [
+      storageReadWrite(0), uniform(1),
+    ], [
+      { binding: 0, resource: { buffer: data } },
+      { binding: 1, resource: { buffer: params } },
+    ], [numGroups]);
+  }
+
+  /** Compute DeltaNet decay and beta values. */
+  computeDecayBeta(
+    alpha: GPUBuffer, beta: GPUBuffer, ssmA: GPUBuffer, dtBias: GPUBuffer,
+    decayOut: GPUBuffer, betaOut: GPUBuffer, n: number,
+  ): void {
+    const params = this.createParams('decay_beta_params', new Uint32Array([n]).buffer);
+    this.dispatch(computeDecayBetaWgsl, 'compute_decay_beta', [
+      storageReadOnly(0), storageReadOnly(1), storageReadOnly(2), storageReadOnly(3),
+      storageReadWrite(4), storageReadWrite(5), uniform(6),
+    ], [
+      { binding: 0, resource: { buffer: alpha } },
+      { binding: 1, resource: { buffer: beta } },
+      { binding: 2, resource: { buffer: ssmA } },
+      { binding: 3, resource: { buffer: dtBias } },
+      { binding: 4, resource: { buffer: decayOut } },
+      { binding: 5, resource: { buffer: betaOut } },
+      { binding: 6, resource: { buffer: params } },
+    ], [Math.ceil(n / 64)]);
+  }
+
+  /** DeltaNet state update + output + per-head RMSNorm. One dispatch for all groups. */
+  deltanetStep(
+    q: GPUBuffer, k: GPUBuffer, v: GPUBuffer, state: GPUBuffer,
+    decay: GPUBuffer, betaVal: GPUBuffer, normWeight: GPUBuffer, output: GPUBuffer,
+    numGroups: number, headDim: number, scale: number, normEps: number,
+  ): void {
+    const paramBuf = new ArrayBuffer(16);
+    const u32 = new Uint32Array(paramBuf);
+    const f32 = new Float32Array(paramBuf);
+    u32[0] = headDim;
+    u32[1] = numGroups;
+    f32[2] = scale;
+    f32[3] = normEps;
+    const params = this.createParams('deltanet_step_params', paramBuf);
+    this.dispatch(deltanetStepWgsl, 'deltanet_step', [
+      storageReadOnly(0), storageReadOnly(1), storageReadOnly(2), storageReadWrite(3),
+      storageReadOnly(4), storageReadOnly(5), storageReadOnly(6), storageReadWrite(7), uniform(8),
+    ], [
+      { binding: 0, resource: { buffer: q } },
+      { binding: 1, resource: { buffer: k } },
+      { binding: 2, resource: { buffer: v } },
+      { binding: 3, resource: { buffer: state } },
+      { binding: 4, resource: { buffer: decay } },
+      { binding: 5, resource: { buffer: betaVal } },
+      { binding: 6, resource: { buffer: normWeight } },
+      { binding: 7, resource: { buffer: output } },
+      { binding: 8, resource: { buffer: params } },
+    ], [numGroups]);
+  }
+
+  /** SiLU gate: data[i] *= silu(gate[i]). */
+  siluGate(data: GPUBuffer, gate: GPUBuffer, n: number): void {
+    const params = this.createParams('silu_gate_params', new Uint32Array([n]).buffer);
+    this.dispatch(siluGateWgsl, 'silu_gate', [
+      storageReadWrite(0), storageReadOnly(1), uniform(2),
+    ], [
+      { binding: 0, resource: { buffer: data } },
+      { binding: 1, resource: { buffer: gate } },
       { binding: 2, resource: { buffer: params } },
     ], [Math.ceil(n / 256)]);
   }
