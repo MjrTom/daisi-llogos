@@ -9,7 +9,7 @@ function loadGguf(path: string) {
 
 describe('GGUF Parser', () => {
   describe('TinyLlama 1.1B Q8_0', () => {
-    const info = loadGguf('test/tinyllama-q8.gguf');
+    const info = loadGguf('C:/GGUFS/tinyllama-q8.gguf');
 
     it('parses architecture', () => {
       expect(info.architecture).toBe('llama');
@@ -45,7 +45,7 @@ describe('GGUF Parser', () => {
   });
 
   describe('Llama 3.2 1B Q8_0', () => {
-    const info = loadGguf('test/llama32-1b-q8.gguf');
+    const info = loadGguf('C:/GGUFS/llama32-1b-q8.gguf');
 
     it('parses architecture', () => {
       expect(info.architecture).toBe('llama');
@@ -78,7 +78,7 @@ describe('GGUF Parser', () => {
   });
 
   describe('Qwen 2.5 0.5B Q8_0 (partial header)', () => {
-    const info = loadGguf('test/qwen25-header.bin');
+    const info = loadGguf('C:/GGUFS/qwen25-0.5b-q8.gguf');
 
     it('parses qwen2 architecture', () => {
       expect(info.architecture).toBe('qwen2');

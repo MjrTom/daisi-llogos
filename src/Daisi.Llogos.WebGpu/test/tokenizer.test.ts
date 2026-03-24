@@ -11,7 +11,7 @@ function loadTokenizer(path: string) {
 
 describe('BPE Tokenizer', () => {
   describe('TinyLlama', () => {
-    const { tok } = loadTokenizer('test/tinyllama-q8.gguf');
+    const { tok } = loadTokenizer('C:/GGUFS/tinyllama-q8.gguf');
 
     it('encodes simple text', () => {
       const tokens = tok.encode('hello');
@@ -41,7 +41,7 @@ describe('BPE Tokenizer', () => {
   });
 
   describe('Llama 3.2', () => {
-    const { tok } = loadTokenizer('test/llama32-1b-q8.gguf');
+    const { tok } = loadTokenizer('C:/GGUFS/llama32-1b-q8.gguf');
 
     it('encodes special tokens correctly', () => {
       const tokens = tok.encode('<|begin_of_text|>hello');
@@ -74,7 +74,7 @@ describe('BPE Tokenizer', () => {
   });
 
   describe('Qwen 2.5', () => {
-    const { tok } = loadTokenizer('test/qwen25-header.bin');
+    const { tok } = loadTokenizer('C:/GGUFS/qwen25-0.5b-q8.gguf');
 
     it('has ChatML tokens', () => {
       expect(tok.getTokenId('<|im_start|>')).toBeGreaterThanOrEqual(0);

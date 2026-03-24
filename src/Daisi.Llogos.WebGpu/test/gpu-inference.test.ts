@@ -39,7 +39,7 @@ describe('GPU Inference — TinyLlama 1.1B Q8_0', () => {
     const gpu = await initGpu();
     compute = new ComputeEngine(gpu.device);
 
-    const { info, tokenizer: tok, tensorMap } = loadModel('test/tinyllama-q8.gguf');
+    const { info, tokenizer: tok, tensorMap } = loadModel('C:/GGUFS/tinyllama-q8.gguf');
     tokenizer = tok;
     model = new LlamaModel(compute, info);
     await model.initWeights(tensorMap);
@@ -111,7 +111,7 @@ describe('GPU Inference — Llama 3.2 1B Q8_0 (GQA)', () => {
     const gpu = await initGpu();
     compute = new ComputeEngine(gpu.device);
 
-    const { info, tokenizer: tok, tensorMap } = loadModel('test/llama32-1b-q8.gguf');
+    const { info, tokenizer: tok, tensorMap } = loadModel('C:/GGUFS/llama32-1b-q8.gguf');
     tokenizer = tok;
     model = new LlamaModel(compute, info);
     await model.initWeights(tensorMap);
@@ -165,5 +165,82 @@ describe('GPU Inference — Llama 3.2 1B Q8_0 (GQA)', () => {
     expect(generated.length).toBeGreaterThan(0);
     // Should mention 4 somewhere
     expect(text).toContain('4');
+  });
+});
+
+describe('GPU Inference — Qwen 2.5 0.5B Q8_0 (attention biases)', () => {
+  let compute: ComputeEngine;
+  let model: LlamaModel;
+  let tokenizer: ReturnType<typeof tokenizerFromGguf>;
+  let info: ReturnType<typeof parseGguf>;
+
+  beforeAll(async () => {
+    const gpu = await initGpu();
+    compute = new ComputeEngine(gpu.device);
+
+    const loaded = loadModel('C:/GGUFS/qwen25-0.5b-q8.gguf');
+    info = loaded.info;
+    tokenizer = loaded.tokenizer;
+    model = new LlamaModel(compute, info);
+    await model.initWeights(loaded.tensorMap);
+  }, 120000);
+
+  it('has qwen2 architecture with biases', () => {
+    expect(info.architecture).toBe('qwen2');
+    expect(info.tensors.some(t => t.name === 'blk.0.attn_q.bias')).toBe(true);
+  });
+
+  it('has correct dimensions', () => {
+    expect(model.embeddingDim).toBe(896);
+    expect(model.numHeads).toBe(14);
+    expect(model.numKvHeads).toBe(2);
+    expect(model.numLayers).toBe(24);
+    expect(model.vocabSize).toBe(151936);
+  });
+
+  it('forward pass produces valid logits', async () => {
+    const tokens = tokenizer.encode('Hello');
+    model.forward(tokens[0]);
+    const logits = await model.readLogits();
+    expect(logits.length).toBe(151936);
+
+    let max = -Infinity, nonZero = 0;
+    for (const v of logits) { if (v > max) max = v; if (v !== 0) nonZero++; }
+    expect(nonZero).toBeGreaterThan(0);
+    expect(isFinite(max)).toBe(true);
+  });
+
+  it('generates coherent text with ChatML format', async () => {
+    model.resetCache();
+    // ChatML prompt for Qwen
+    const prompt = '<|im_start|>user\nWhat is 2+2?<|im_end|>\n<|im_start|>assistant\n';
+    const inputTokens = tokenizer.encode(prompt);
+    const sampler = new Sampler({ temperature: 0, topK: 1 });
+
+    // Verify special tokens encoded correctly
+    const imStartId = tokenizer.getTokenId('<|im_start|>');
+    expect(inputTokens[0]).toBe(imStartId);
+
+    for (const t of inputTokens) {
+      model.forward(t);
+    }
+    let logits = await model.readLogits();
+
+    const allTokens = [...inputTokens];
+    const generated: string[] = [];
+    for (let i = 0; i < 30; i++) {
+      const next = sampler.sample(logits, allTokens);
+      if (tokenizer.isEos(next)) break;
+      allTokens.push(next);
+      generated.push(tokenizer.decode([next]));
+      model.forward(next);
+      logits = await model.readLogits();
+    }
+
+    const text = generated.join('');
+    console.log(`  Qwen 2.5 generated: "${text}"`);
+    expect(generated.length).toBeGreaterThan(0);
+    // Should generate coherent English (not gibberish)
+    expect(/[a-zA-Z]/.test(text)).toBe(true);
   });
 });
