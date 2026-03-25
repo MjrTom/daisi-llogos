@@ -3406,13 +3406,14 @@ var LlogosEngine = class _LlogosEngine {
    */
   applyChatTemplate(userMessage) {
     const chatTemplate = this.modelInfo?.metadata.get("tokenizer.chat_template");
+    const hasSystemMessage = this.conversationHistory.some((m) => m.role === "system");
     const messages = [
+      ...!hasSystemMessage ? [{ role: "system", content: "You are a helpful assistant. Be concise. Answer in plain text, not HTML or markdown." }] : [],
       ...this.conversationHistory,
       { role: "user", content: userMessage }
     ];
     if (this.tokenizer && this.tokenizer.getTokenId("<|start_header_id|>") >= 0) {
       let prompt = "<|begin_of_text|>";
-      prompt += "<|start_header_id|>system<|end_header_id|>\n\nYou are a helpful assistant.<|eot_id|>";
       for (const msg of messages) {
         prompt += `<|start_header_id|>${msg.role}<|end_header_id|>
 
