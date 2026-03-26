@@ -77,7 +77,12 @@ else
     }
 
     ModelWeights weights;
-    if (options.UseMmap)
+    if (options.GpuLayers > 0 && backend is CudaBackend cudaBackendForOffload)
+    {
+        weights = CudaLayerOffload.LoadWithOffload(gguf, options.ModelPath,
+            cudaBackendForOffload, config, options.GpuLayers, remapper);
+    }
+    else if (options.UseMmap)
         weights = MmapModelLoader.Load(gguf, options.ModelPath, backend, config, remapper);
     else
         weights = ModelLoader.Load(gguf, stream, backend, config);
@@ -396,6 +401,9 @@ static CliArgs ParseArgs(string[] args)
             case "--kv-quant":
                 result.KvQuant = NextArg(args, ref i);
                 break;
+            case "--gpu-layers":
+                result.GpuLayers = int.Parse(NextArg(args, ref i));
+                break;
             case "--help" or "-h":
                 result.ShowHelp = true;
                 break;
@@ -435,6 +443,7 @@ static void PrintUsage()
           --spec-depth <n>         Speculation depth (default: 5)
           --batched-verify         Use batched verify (faster, higher acceptance, different FP from native)
           --kv-quant <mode>        KV cache compression: turbo, turbo:3, turbo:4, turbo:3+qjl32, turbo:3+noqjl
+          --gpu-layers <n>         Keep first N layers in VRAM, offload rest to pinned RAM (PCIe)
           --help, -h               Show this help
         """);
 }
@@ -463,4 +472,5 @@ class CliArgs
     public int SpecDepth = 5;
     public bool BatchedVerify;
     public string? KvQuant;
+    public int GpuLayers;
 }

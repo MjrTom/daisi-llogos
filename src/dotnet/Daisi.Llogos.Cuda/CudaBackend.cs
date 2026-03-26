@@ -308,6 +308,20 @@ public sealed class CudaBackend : IComputeBackend
         return new CudaTensor(name, type, dimensions, data);
     }
 
+    /// <summary>
+    /// Load a tensor into pinned host memory (GPU-accessible via PCIe).
+    /// Used for layer offloading — pinned tensors have DevicePtr that works
+    /// transparently with all CUDA kernels, just at PCIe bandwidth instead of HBM.
+    /// No alignment repacking (pinned memory is read sequentially, not via dp4a).
+    /// </summary>
+    public ITensor LoadTensorPinned(string name, GgmlType type, ReadOnlySpan<long> dimensions, ReadOnlySpan<byte> data)
+    {
+        EnsureContext();
+        var tensor = new CudaTensor(name, type, dimensions, pinned: true);
+        tensor.CopyFrom(data);
+        return tensor;
+    }
+
     /// <inheritdoc />
     public unsafe void MatMul(ITensor output, ITensor a, ITensor b, int M, int K, int N)
     {
