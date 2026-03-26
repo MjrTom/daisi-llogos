@@ -148,11 +148,11 @@ public sealed class CudaTurboQuantKvCache : IKvCache
         int slot = _strategy.MapPosition(position);
         int idx = GetCacheIndex(layer);
 
-        // Always write to F16 shadow cache (on main stream, inside graph capture)
+        // Write F16 (on main stream, inside graph capture — baseline speed)
         backend.KvCacheWrite(_kF16[idx], _vF16[idx], k, v,
             _nKvHeads, _keyLength, _valueLength, _maxSeqLen, slot);
 
-        // Always write compressed on ASYNC stream (outside graph, doesn't slow main path)
+        // Write compressed on low-priority async stream (minimal contention with main path)
         var kT = (CudaTensor)k;
         var vT = (CudaTensor)v;
 
@@ -212,7 +212,7 @@ public sealed class CudaTurboQuantKvCache : IKvCache
         args[14] = (nint)(&vPackedPH);
         args[15] = (nint)(&qBits);
 
-        // Launch on async stream — doesn't interfere with main graph capture
+        // Launch on async stream to keep turbo_kv_write OUT of the CUDA graph
         uint writeSharedMem = 3072;
         _cudaBackend.LaunchKernelAsync(func, (uint)nKvHeads, 1, 1, 32, 1, 1, writeSharedMem, args);
 
@@ -231,8 +231,7 @@ public sealed class CudaTurboQuantKvCache : IKvCache
         if (seqLen < _compressedThreshold)
             return false;  // ForwardPass uses GetK/VCacheTensor + GatedAttention
 
-        // First time crossing threshold: sync async stream to ensure all compressed
-        // writes have completed before reading from compressed storage
+        // Sync async stream to ensure all compressed writes complete
         _cudaBackend.SyncAsyncStream();
 
         int idx = GetCacheIndex(layer);
