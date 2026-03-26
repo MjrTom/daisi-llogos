@@ -99,6 +99,9 @@ public sealed class CudaTurboQuantKvCache : IKvCache
         // Load CUDA module
         var archOpts = new[] { $"--gpu-architecture=compute_{backend.ComputeCapabilityMajor}{backend.ComputeCapabilityMinor}" };
         _turboModule = CudaModule.FromEmbeddedResource("turbo_quant.cu", archOpts);
+
+        // Note: CUDA graph capture works with turbo kernels — graph updates handle
+        // changing position/seqLen params across decode steps.
     }
 
     private int GetCacheIndex(int layer)
@@ -176,7 +179,10 @@ public sealed class CudaTurboQuantKvCache : IKvCache
         args[14] = (nint)(&vPackedPH);
         args[15] = (nint)(&qBits);
 
-        _cudaBackend.LaunchKernel(func, (uint)nKvHeads, 1, 1, 1, 1, 1, 0, args);
+        // Shared mem: buf[128] + levels[128] = 1024 bytes minimum
+        // Must match or exceed attention kernel's extern __shared__ to avoid NVRTC issues
+        uint writeSharedMem = 3072;  // Same as attention kernel
+        _cudaBackend.LaunchKernel(func, (uint)nKvHeads, 1, 1, 32, 1, 1, writeSharedMem, args);
 
         Length = _strategy.EffectiveSeqLen(position);
     }

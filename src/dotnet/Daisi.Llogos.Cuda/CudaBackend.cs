@@ -30,6 +30,9 @@ public sealed class CudaBackend : IComputeBackend
     private nint _graphExec;          // reusable graph executable (0 = none)
     private bool _graphEnabled = true;
 
+    /// <summary>Disable CUDA graph capture (needed for TurboQuant which uses different kernel topology).</summary>
+    public void DisableGraphCapture() { _graphEnabled = false; }
+
     public CudaBackend(int deviceOrdinal = 0)
     {
         _context = new CudaContext(deviceOrdinal);

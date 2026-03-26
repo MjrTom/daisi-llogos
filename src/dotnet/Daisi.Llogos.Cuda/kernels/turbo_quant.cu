@@ -247,12 +247,14 @@ __global__ void turbo_kv_write(
     int kPackedPerHead, int vPackedPerHead,
     int quantBits)
 {
+    if (threadIdx.x != 0) return;
     int head = blockIdx.x;
     if (head >= nKvHeads) return;
 
-    // Thread-local buffers (dim <= 128 for all current models)
-    float buf[128];
-    int levels[128];
+    // Use extern shared memory for work buffers to avoid local memory driver issues on Blackwell
+    extern __shared__ float writeBuf[];
+    float* buf = writeBuf;           // [128 floats]
+    int* levels = (int*)(buf + 128); // [128 ints]
 
     const float* bounds = get_boundaries(quantBits);
 
@@ -490,36 +492,40 @@ __global__ void turbo_gated_attention(
             outHead[d] *= correction_old;
         __syncthreads();
 
-        // Accumulate weighted V — all threads process positions for their dim.
-        // Threads 0-63 handle dims 0-63. Threads 64-255 are idle (valueLength=64).
+        // Accumulate weighted V — parallel dequant into vShared, scatter-add
         {
             const float* cents = get_centroids(quantBits);
-            for (int d = tid; d < valueLength; d += stride)
+            for (int t = 0; t < tile_len; t++)
             {
-                float accum = 0.0f;
-                for (int t = 0; t < tile_len; t++)
-                {
-                    int p = tile_start + t;
-                    const unsigned char* vData = vPacked + (kvHead * maxSeqLen + p) * vPackedPerHead;
-                    float vScale = vScales[kvHead * maxSeqLen + p];
-                    float centroid;
-                    if (quantBits == 4) {
+                int p = tile_start + t;
+                const unsigned char* vData = vPacked + (kvHead * maxSeqLen + p) * vPackedPerHead;
+                float vScale = vScales[kvHead * maxSeqLen + p];
+
+                // ALL threads cooperatively dequant V into vShared
+                if (quantBits == 4) {
+                    for (int d = tid; d < valueLength; d += stride) {
                         unsigned char b = vData[d >> 1];
-                        centroid = cents[(d & 1) ? ((b >> 4) & 0xF) : (b & 0xF)];
-                    } else if (quantBits == 2) {
-                        centroid = cents[(vData[d >> 2] >> ((d & 3) * 2)) & 3];
-                    } else {
+                        vShared[d] = cents[(d & 1) ? ((b >> 4) & 0xF) : (b & 0xF)] * vScale;
+                    }
+                } else if (quantBits == 2) {
+                    for (int d = tid; d < valueLength; d += stride)
+                        vShared[d] = cents[(vData[d >> 2] >> ((d & 3) * 2)) & 3] * vScale;
+                } else {
+                    for (int d = tid; d < valueLength; d += stride) {
                         int bp = d * 3, bi = bp >> 3, bo = bp & 7;
                         int lv = (vData[bi] >> bo) & 7;
                         if (bo > 5) lv |= (vData[bi+1] << (8 - bo)) & 7;
-                        centroid = cents[lv];
+                        vShared[d] = cents[lv] * vScale;
                     }
-                    accum += scores[t] * centroid * vScale;
                 }
-                outHead[d] += accum * correction_new;
+                __syncthreads();
+
+                float w = scores[t] * correction_new;
+                for (int d = tid; d < valueLength; d += stride)
+                    outHead[d] += w * vShared[d];
+                __syncthreads();
             }
         }
-        __syncthreads();
 
         running_sum = running_sum * correction_old + tile_sum * correction_new;
         running_max = new_max;
