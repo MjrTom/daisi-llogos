@@ -1,7 +1,7 @@
 // SSE endpoint — runs benchmark configurations and streams results
 // Supports cancellation: client aborts fetch → server kills running process
 
-import { CONFIGS } from "@/lib/config";
+import { CONFIGS, CONTEXT_PRESETS } from "@/lib/config";
 import type { Backend } from "@/lib/config";
 import { runBenchmark } from "@/lib/runner";
 
@@ -12,7 +12,10 @@ export async function POST(request: Request) {
     models: string[];
     configs: string[];
     backend: Backend;
+    contextId: string;
   };
+
+  const context = CONTEXT_PRESETS.find((p) => p.id === body.contextId) || CONTEXT_PRESETS[0];
 
   const selectedConfigs = CONFIGS.filter((c) => body.configs.includes(c.id));
   const encoder = new TextEncoder();
@@ -53,7 +56,7 @@ export async function POST(request: Request) {
             progress: completed / total,
           });
 
-          const result = await runBenchmark(modelPath, config, body.backend, signal);
+          const result = await runBenchmark(modelPath, config, body.backend, context, signal);
           completed++;
 
           if (signal.aborted) {

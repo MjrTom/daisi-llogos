@@ -1,8 +1,8 @@
 // LLogos CLI benchmark runner — spawns dotnet process and parses output
 
 import { spawn } from "child_process";
-import { LLOGOS_PROJECT, BENCH_PROMPT, BENCH_TOKENS, BENCH_MAX_CONTEXT } from "./config";
-import type { BenchConfig, Backend } from "./config";
+import { LLOGOS_PROJECT } from "./config";
+import type { BenchConfig, Backend, ContextPreset } from "./config";
 
 export interface BenchResult {
   configId: string;
@@ -25,15 +25,16 @@ export async function runBenchmark(
   modelPath: string,
   config: BenchConfig,
   backend: Backend,
+  context: ContextPreset,
   signal?: AbortSignal,
 ): Promise<BenchResult> {
   const args = [
     "run", "--project", LLOGOS_PROJECT, "-c", "Release", "--",
     "--model", modelPath,
     "--bench",
-    "--prompt", BENCH_PROMPT,
-    "--max-tokens", String(BENCH_TOKENS),
-    "--max-context", String(BENCH_MAX_CONTEXT),
+    "--prompt", context.prompt,
+    "--max-tokens", String(context.maxTokens),
+    "--max-context", String(context.maxContext),
     "--backend", backend,
     ...config.args,
   ];

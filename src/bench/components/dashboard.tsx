@@ -1,7 +1,7 @@
 "use client";
 
 import { useState, useEffect, useCallback, useRef } from "react";
-import { CONFIGS, BACKENDS } from "@/lib/config";
+import { CONFIGS, BACKENDS, CONTEXT_PRESETS } from "@/lib/config";
 import type { BenchConfig, Backend } from "@/lib/config";
 import type { BenchResult } from "@/lib/runner";
 
@@ -41,6 +41,7 @@ export default function Dashboard() {
     new Set(CONFIGS.map((c) => c.id))
   );
   const [backend, setBackend] = useState<Backend>("cuda");
+  const [contextId, setContextId] = useState("short");
   const [cells, setCells] = useState<Map<string, CellData>>(new Map());
   const [running, setRunning] = useState(false);
   const [progress, setProgress] = useState(0);
@@ -53,8 +54,10 @@ export default function Dashboard() {
       .then((r) => r.json())
       .then((data) => {
         setModels(data.models || []);
-        // Auto-select first 3 models
-        const auto = (data.models || []).slice(0, 3).map((m: ModelEntry) => m.path);
+        // Auto-select all Qwen3.5 models
+        const auto = (data.models || [])
+          .filter((m: ModelEntry) => m.shortName.includes("Qwen3.5"))
+          .map((m: ModelEntry) => m.path);
         setSelectedModels(new Set(auto));
       });
     fetch("/api/system")
@@ -102,6 +105,7 @@ export default function Dashboard() {
           models: Array.from(selectedModels),
           configs: Array.from(selectedConfigs),
           backend,
+          contextId,
         }),
         signal: controller.signal,
       });
@@ -163,7 +167,7 @@ export default function Dashboard() {
 
     abortRef.current = null;
     setRunning(false);
-  }, [running, selectedModels, selectedConfigs, backend]);
+  }, [running, selectedModels, selectedConfigs, backend, contextId]);
 
   // Get baseline decode tok/s for a model (for relative comparison)
   const getBaseline = (modelPath: string): number | null => {
@@ -240,7 +244,7 @@ export default function Dashboard() {
         <div className="bg-zinc-900 border border-zinc-800 rounded-lg p-4 flex flex-col justify-between">
           <div>
             <h2 className="text-xs font-semibold text-zinc-500 uppercase tracking-wider mb-2">Backend</h2>
-            <div className="flex gap-2 mb-4">
+            <div className="flex gap-2 mb-3">
               {BACKENDS.map((b) => (
                 <button
                   key={b}
@@ -252,6 +256,22 @@ export default function Dashboard() {
                   }`}
                 >
                   {b.toUpperCase()}
+                </button>
+              ))}
+            </div>
+            <h2 className="text-xs font-semibold text-zinc-500 uppercase tracking-wider mb-2">Context Length</h2>
+            <div className="flex gap-2 mb-4">
+              {CONTEXT_PRESETS.map((p) => (
+                <button
+                  key={p.id}
+                  onClick={() => setContextId(p.id)}
+                  className={`px-4 py-2 rounded text-sm font-medium transition-colors ${
+                    contextId === p.id
+                      ? "bg-blue-600 text-white"
+                      : "bg-zinc-800 text-zinc-400 hover:bg-zinc-700"
+                  }`}
+                >
+                  {p.label}
                 </button>
               ))}
             </div>
