@@ -379,6 +379,27 @@ __global__ void turbo_gated_attention(
     float* temp = shared + TQ_ATTN_TILE_SIZE;
     float* vShared = temp + blockDim.x;  // V broadcast buffer (max 128 dims)
 
+    // ── Pre-rotate Q into the K quantization domain (one WHT per head) ──
+    // Math: q · k_original = scale_k × q_rotated · k_centroids
+    // where q_rotated = (1/√n) · H · (D_k · q)
+    // This eliminates ALL per-position inverse WHTs for K scoring.
+    float qRot[128];
+    if (tid == 0)
+    {
+        for (int d = 0; d < keyLength; d++)
+            qRot[d] = q[d] * kSigns[d];
+        wht_butterfly(qRot, keyLength);
+        float whtNorm = rsqrtf((float)keyLength);
+        for (int d = 0; d < keyLength; d++)
+            qRot[d] *= whtNorm;
+    }
+    // Broadcast qRot to all threads via shared vShared (reuse temporarily)
+    if (tid == 0)
+        for (int d = 0; d < keyLength; d++) vShared[d] = qRot[d];
+    __syncthreads();
+    for (int d = 0; d < keyLength; d++) qRot[d] = vShared[d];
+    __syncthreads();
+
     // Zero output
     float* outHead = output + head * valueLength;
     for (int d = tid; d < valueLength; d += stride)
@@ -388,7 +409,7 @@ __global__ void turbo_gated_attention(
     float running_max = -1e30f;
     float running_sum = 0.0f;
 
-    // Thread-local dequant buffer (one K or V vector at a time)
+    // Thread-local dequant buffer
     float kBuf[128];
     float vBuf[128];
 
@@ -398,32 +419,21 @@ __global__ void turbo_gated_attention(
         if (tile_end > seqLen) tile_end = seqLen;
         int tile_len = tile_end - tile_start;
 
-        // Step 1: Compute attention scores — dequant K inline
+        // Step 1: K scores in rotated domain — NO per-position WHT!
         for (int t = tid; t < tile_len; t += stride)
         {
             int p = tile_start + t;
             const unsigned char* kData = kPacked + (kvHead * maxSeqLen + p) * kPackedPerHead;
             float kScale = kScales[kvHead * maxSeqLen + p];
 
-            // Dequant: unpack → centroids
+            // Just centroid lookup — no WHT, no sign flips
             dequant_vector(kData, kBuf, keyLength, quantBits);
 
-            // Inverse WHT: multiply by 1/sqrt(dim), butterfly, apply signs
-            float whtNorm = rsqrtf((float)keyLength);
-            for (int d = 0; d < keyLength; d++)
-                kBuf[d] *= whtNorm;
-            wht_butterfly(kBuf, keyLength);
-            apply_signs(kBuf, kSigns, keyLength);
-
-            // Rescale
-            for (int d = 0; d < keyLength; d++)
-                kBuf[d] *= kScale;
-
-            // Dot product: Q · K
+            // Dot product in rotated domain: q_rot · k_centroids × scale_k
             float dot = 0.0f;
             for (int d = 0; d < keyLength; d++)
-                dot += q[d] * kBuf[d];
-            scores[t] = dot * scale;
+                dot += qRot[d] * kBuf[d];
+            scores[t] = dot * kScale * scale;
         }
         __syncthreads();
 
@@ -466,24 +476,19 @@ __global__ void turbo_gated_attention(
             outHead[d] *= correction_old;
         __syncthreads();
 
-        // Accumulate weighted V: decompress each V once, scatter-add to output
-        // Thread 0 decompresses each V and broadcasts; all threads scatter-add their dims
+        // Accumulate weighted V centroids in rotated domain — NO per-position WHT!
+        // outHead accumulates: Σ w_t × scale_vt × v_centroids_t
+        // Thread 0 decompresses centroids (just lookup, no WHT), broadcasts via vShared
         for (int t = 0; t < tile_len; t++)
         {
-            // Thread 0 decompresses V into shared memory for all threads to read
             if (tid == 0)
             {
                 int p = tile_start + t;
                 const unsigned char* vData = vPacked + (kvHead * maxSeqLen + p) * vPackedPerHead;
                 float vScale = vScales[kvHead * maxSeqLen + p];
 
+                // Just centroid lookup — no WHT, no signs
                 dequant_vector(vData, vBuf, valueLength, quantBits);
-
-                float whtNorm = rsqrtf((float)valueLength);
-                for (int dd = 0; dd < valueLength; dd++)
-                    vBuf[dd] *= whtNorm;
-                wht_butterfly(vBuf, valueLength);
-                apply_signs(vBuf, vSigns, valueLength);
 
                 for (int dd = 0; dd < valueLength; dd++)
                     vShared[dd] = vBuf[dd] * vScale;
@@ -500,13 +505,33 @@ __global__ void turbo_gated_attention(
         running_max = new_max;
     }
 
-    // Step 5: Normalize and apply sigmoid gating
+    // Step 5: Inverse WHT the accumulated rotated V, normalize, gate
+    // output = D_v · (1/√n) · H · (accumulated_centroids / attention_sum)
     float inv_sum = (running_sum > 0.0f) ? 1.0f / running_sum : 0.0f;
+
+    // Thread 0 applies inverse WHT to accumulated output
+    if (tid == 0)
+    {
+        for (int d = 0; d < valueLength; d++)
+            vBuf[d] = outHead[d] * inv_sum;
+
+        float whtNorm = rsqrtf((float)valueLength);
+        for (int d = 0; d < valueLength; d++)
+            vBuf[d] *= whtNorm;
+        wht_butterfly(vBuf, valueLength);
+        apply_signs(vBuf, vSigns, valueLength);
+
+        for (int d = 0; d < valueLength; d++)
+            vShared[d] = vBuf[d];
+    }
+    __syncthreads();
+
+    // All threads write gated output
     for (int d = tid; d < valueLength; d += stride)
     {
         float g = (d < keyLength) ? qg[d] : 0.0f;
         float sig = 1.0f / (1.0f + expf(-g));
-        outHead[d] = outHead[d] * inv_sum * sig;
+        outHead[d] = vShared[d] * sig;
     }
 }
 

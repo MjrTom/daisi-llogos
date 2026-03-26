@@ -213,9 +213,8 @@ public sealed class CudaTurboQuantKvCache : IKvCache
 
         const int tileSize = 256;
         const int blockSize = 256;
-        // Shared: [256 tile scores] + [blockDim.x temp] + [128 V broadcast]
-        int vBufSize = Math.Max(valueLength, 128);
-        uint sharedMem = (uint)((tileSize + blockSize + vBufSize) * sizeof(float));
+        // Shared: [256 scores] + [256 temp] + [128 qRot] + [128 vAcc]
+        uint sharedMem = (uint)((tileSize + blockSize + 128 + 128) * sizeof(float));
 
         nint* args = stackalloc nint[19];
         args[0] = (nint)(&outPtr);
