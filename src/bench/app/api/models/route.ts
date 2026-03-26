@@ -6,7 +6,7 @@ import { GGUF_DIR } from "@/lib/config";
 export async function GET() {
   try {
     const files = readdirSync(GGUF_DIR)
-      .filter((f) => f.endsWith(".gguf"))
+      .filter((f) => f.endsWith(".gguf") && !f.includes("BF16"))
       .map((f) => {
         const name = f.replace(".gguf", "").replace(/-/g, " ").replace(/_/g, "_");
         const shortName = f.replace(".gguf", "");
