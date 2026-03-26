@@ -376,11 +376,15 @@ public sealed class ForwardPass : IForwardPass
         // seqLen is read AFTER write so it includes the current token
         int seqLen = _kvCache.Length;
 
-        // Compute attention (gating is a no-op when gate=88.0)
-        var kCacheTensor = _kvCache.GetKCacheTensor(layer);
-        var vCacheTensor = _kvCache.GetVCacheTensor(layer);
-        _backend.GatedAttention(_attnOut, _qAttn, _qGate, kCacheTensor, vCacheTensor,
-            numHeads, numKvHeads, keyLen, valLen, _kvCache.MaxSeqLen, seqLen, scale);
+        // Compute attention — try fused compressed path first, fall back to standard
+        if (!_kvCache.ComputeAttention(_attnOut, _qAttn, _qGate,
+                layer, numHeads, numKvHeads, keyLen, valLen, seqLen, scale))
+        {
+            var kCacheTensor = _kvCache.GetKCacheTensor(layer);
+            var vCacheTensor = _kvCache.GetVCacheTensor(layer);
+            _backend.GatedAttention(_attnOut, _qAttn, _qGate, kCacheTensor, vCacheTensor,
+                numHeads, numKvHeads, keyLen, valLen, _kvCache.MaxSeqLen, seqLen, scale);
+        }
 
         // Output projection
         ProjectLinear(_hidden, _attnOut, w.AttnO);
