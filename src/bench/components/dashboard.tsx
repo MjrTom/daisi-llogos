@@ -478,7 +478,7 @@ function ResultCell({ cell, baseline }: { cell?: CellData; baseline: number | nu
         </div>
       )}
       <div className="text-zinc-600 text-[10px]">
-        P: {r.prefillTokPerSec.toFixed(0)} tok/s
+        Prefill: {r.prefillTokPerSec.toFixed(0)} tok/s
       </div>
       {r.compressionRatio && (
         <div className="text-teal-500 text-[10px]">
