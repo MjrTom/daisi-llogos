@@ -426,6 +426,19 @@ export default function Dashboard() {
           Select models and configurations, then click Run Benchmark
         </div>
       )}
+
+      {/* Key */}
+      <div className="mt-6 bg-zinc-900 border border-zinc-800 rounded-lg p-4">
+        <h2 className="text-xs font-semibold text-zinc-500 uppercase tracking-wider mb-2">Key</h2>
+        <div className="grid grid-cols-2 md:grid-cols-4 gap-x-6 gap-y-1 text-xs text-zinc-400">
+          <div><span className="text-zinc-300 font-medium">PV</span> — Partial Vocab (--vocab-limit 32, computes top ~3% of vocab for faster argmax)</div>
+          <div><span className="text-zinc-300 font-medium">FV</span> — Full Vocab (--vocab-limit 1, computes all vocab logits)</div>
+          <div><span className="text-zinc-300 font-medium">T2/T3/T4</span> — LLogos Turbo KV cache compression at 2/3/4 bits per dimension</div>
+          <div><span className="text-zinc-300 font-medium">QJL</span> — Quantized Johnson-Lindenstrauss sign-bit residual correction</div>
+          <div><span className="text-zinc-300 font-medium">F16</span> — Baseline F16 KV cache (no compression)</div>
+          <div><span className="text-zinc-300 font-medium">% baseline</span> — Decode tok/s relative to F16 PV for the same model</div>
+        </div>
+      </div>
     </div>
   );
 }
