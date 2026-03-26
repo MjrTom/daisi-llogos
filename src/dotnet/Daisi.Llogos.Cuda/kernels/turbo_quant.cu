@@ -490,37 +490,38 @@ __global__ void turbo_gated_attention(
             outHead[d] *= correction_old;
         __syncthreads();
 
-        // Accumulate weighted V centroids in rotated domain — NO per-position WHT!
-        // All threads cooperatively dequant V into vShared, then scatter-add
-        for (int t = 0; t < tile_len; t++)
+        // Accumulate weighted V — each thread processes all positions for its dims
+        // No sync barriers per position! Same pattern as baseline attention.
         {
-            int p = tile_start + t;
-            const unsigned char* vData = vPacked + (kvHead * maxSeqLen + p) * vPackedPerHead;
-            float vScale = vScales[kvHead * maxSeqLen + p];
             const float* cents = get_centroids(quantBits);
-
-            // Parallel centroid lookup: each thread handles its dims
-            if (quantBits == 4) {
-                for (int d = tid; d < valueLength; d += stride) {
-                    unsigned char b = vData[d >> 1];
-                    vShared[d] = cents[(d & 1) ? ((b >> 4) & 0xF) : (b & 0xF)] * vScale;
-                }
-            } else if (quantBits == 2) {
-                for (int d = tid; d < valueLength; d += stride)
-                    vShared[d] = cents[(vData[d >> 2] >> ((d & 3) * 2)) & 3] * vScale;
-            } else { // 3-bit: serial unpack (bit-crossing)
-                if (tid == 0) {
-                    dequant_vector(vData, vBuf, valueLength, quantBits);
-                    for (int d = 0; d < valueLength; d++) vShared[d] = vBuf[d] * vScale;
-                }
-            }
-            __syncthreads();
-
-            float w = scores[t] * correction_new;
             for (int d = tid; d < valueLength; d += stride)
-                outHead[d] += w * vShared[d];
-            __syncthreads();
+            {
+                float accum = 0.0f;
+                for (int t = 0; t < tile_len; t++)
+                {
+                    int p = tile_start + t;
+                    const unsigned char* vData = vPacked + (kvHead * maxSeqLen + p) * vPackedPerHead;
+                    float vScale = vScales[kvHead * maxSeqLen + p];
+                    float centroid;
+
+                    // Inline centroid lookup for this dim
+                    if (quantBits == 4) {
+                        unsigned char b = vData[d >> 1];
+                        centroid = cents[(d & 1) ? ((b >> 4) & 0xF) : (b & 0xF)];
+                    } else if (quantBits == 2) {
+                        centroid = cents[(vData[d >> 2] >> ((d & 3) * 2)) & 3];
+                    } else {
+                        int bp = d * 3, bi = bp >> 3, bo = bp & 7;
+                        int lv = (vData[bi] >> bo) & 7;
+                        if (bo > 5) lv |= (vData[bi+1] << (8 - bo)) & 7;
+                        centroid = cents[lv];
+                    }
+                    accum += scores[t] * centroid * vScale;
+                }
+                outHead[d] += accum * correction_new;
+            }
         }
+        __syncthreads();
 
         running_sum = running_sum * correction_old + tile_sum * correction_new;
         running_max = new_max;
