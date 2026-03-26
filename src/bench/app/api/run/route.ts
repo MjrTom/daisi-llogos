@@ -1,4 +1,5 @@
 // SSE endpoint — runs benchmark configurations and streams results
+// Supports cancellation: client aborts fetch → server kills running process
 
 import { CONFIGS } from "@/lib/config";
 import type { Backend } from "@/lib/config";
@@ -16,10 +17,20 @@ export async function POST(request: Request) {
   const selectedConfigs = CONFIGS.filter((c) => body.configs.includes(c.id));
   const encoder = new TextEncoder();
 
+  // Create an AbortController that fires when the client disconnects
+  const abortController = new AbortController();
+  request.signal.addEventListener("abort", () => abortController.abort(), { once: true });
+  const signal = abortController.signal;
+
   const stream = new ReadableStream({
     async start(controller) {
       const send = (data: Record<string, unknown>) => {
-        controller.enqueue(encoder.encode(`data: ${JSON.stringify(data)}\n\n`));
+        try {
+          controller.enqueue(encoder.encode(`data: ${JSON.stringify(data)}\n\n`));
+        } catch {
+          // Stream closed — abort
+          abortController.abort();
+        }
       };
 
       const total = body.models.length * selectedConfigs.length;
@@ -29,6 +40,12 @@ export async function POST(request: Request) {
 
       for (const modelPath of body.models) {
         for (const config of selectedConfigs) {
+          if (signal.aborted) {
+            send({ type: "cancelled", completed });
+            controller.close();
+            return;
+          }
+
           send({
             type: "running",
             modelPath,
@@ -36,8 +53,14 @@ export async function POST(request: Request) {
             progress: completed / total,
           });
 
-          const result = await runBenchmark(modelPath, config, body.backend);
+          const result = await runBenchmark(modelPath, config, body.backend, signal);
           completed++;
+
+          if (signal.aborted) {
+            send({ type: "cancelled", completed });
+            controller.close();
+            return;
+          }
 
           send({
             type: "result",

@@ -1,6 +1,6 @@
 "use client";
 
-import { useState, useEffect, useCallback } from "react";
+import { useState, useEffect, useCallback, useRef } from "react";
 import { CONFIGS, BACKENDS } from "@/lib/config";
 import type { BenchConfig, Backend } from "@/lib/config";
 import type { BenchResult } from "@/lib/runner";
@@ -45,6 +45,7 @@ export default function Dashboard() {
   const [running, setRunning] = useState(false);
   const [progress, setProgress] = useState(0);
   const [system, setSystem] = useState<SystemInfo | null>(null);
+  const abortRef = useRef<AbortController | null>(null);
 
   // Load models + system info on mount
   useEffect(() => {
@@ -77,26 +78,43 @@ export default function Dashboard() {
     });
   };
 
+  const cancelBenchmark = useCallback(() => {
+    abortRef.current?.abort();
+    abortRef.current = null;
+    setRunning(false);
+  }, []);
+
   const runBenchmark = useCallback(async () => {
     if (running || selectedModels.size === 0 || selectedConfigs.size === 0) return;
     setRunning(true);
     setProgress(0);
     setCells(new Map());
 
-    const response = await fetch("/api/run", {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({
-        models: Array.from(selectedModels),
-        configs: Array.from(selectedConfigs),
-        backend,
-      }),
-    });
+    const controller = new AbortController();
+    abortRef.current = controller;
+
+    let response: Response;
+    try {
+      response = await fetch("/api/run", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          models: Array.from(selectedModels),
+          configs: Array.from(selectedConfigs),
+          backend,
+        }),
+        signal: controller.signal,
+      });
+    } catch {
+      setRunning(false);
+      return;
+    }
 
     const reader = response.body?.getReader();
     const decoder = new TextDecoder();
     let buffer = "";
 
+    try {
     while (reader) {
       const { done, value } = await reader.read();
       if (done) break;
@@ -139,7 +157,11 @@ export default function Dashboard() {
         } catch {}
       }
     }
+    } catch {
+      // Aborted — silently stop
+    }
 
+    abortRef.current = null;
     setRunning(false);
   }, [running, selectedModels, selectedConfigs, backend]);
 
@@ -235,17 +257,27 @@ export default function Dashboard() {
             </div>
           </div>
 
-          <button
-            onClick={runBenchmark}
-            disabled={running || selectedModels.size === 0}
-            className={`w-full py-3 rounded-lg font-semibold text-lg transition-colors ${
-              running
-                ? "bg-amber-600 text-amber-100 cursor-wait"
-                : "bg-emerald-600 hover:bg-emerald-500 text-white cursor-pointer"
-            } disabled:opacity-50 disabled:cursor-not-allowed`}
-          >
-            {running ? `Running... ${Math.round(progress * 100)}%` : "Run Benchmark"}
-          </button>
+          {running ? (
+            <div className="flex gap-2">
+              <div className="flex-1 py-3 rounded-lg bg-amber-600 text-amber-100 font-semibold text-lg text-center">
+                Running... {Math.round(progress * 100)}%
+              </div>
+              <button
+                onClick={cancelBenchmark}
+                className="px-6 py-3 rounded-lg bg-red-600 hover:bg-red-500 text-white font-semibold text-lg cursor-pointer transition-colors"
+              >
+                Cancel
+              </button>
+            </div>
+          ) : (
+            <button
+              onClick={runBenchmark}
+              disabled={selectedModels.size === 0}
+              className="w-full py-3 rounded-lg bg-emerald-600 hover:bg-emerald-500 text-white font-semibold text-lg cursor-pointer transition-colors disabled:opacity-50 disabled:cursor-not-allowed"
+            >
+              Run Benchmark
+            </button>
+          )}
         </div>
       </div>
 

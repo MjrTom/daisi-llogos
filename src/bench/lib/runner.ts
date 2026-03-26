@@ -25,6 +25,7 @@ export async function runBenchmark(
   modelPath: string,
   config: BenchConfig,
   backend: Backend,
+  signal?: AbortSignal,
 ): Promise<BenchResult> {
   const args = [
     "run", "--project", LLOGOS_PROJECT, "-c", "Release", "--",
@@ -43,11 +44,16 @@ export async function runBenchmark(
       timeout: 600_000,
     });
 
+    // Kill process if abort signal fires
+    const onAbort = () => { proc.kill("SIGTERM"); };
+    signal?.addEventListener("abort", onAbort, { once: true });
+
     let stderr = "";
     proc.stderr.on("data", (data: Buffer) => { stderr += data.toString(); });
-    proc.stdout.on("data", (data: Buffer) => { stderr += data.toString(); }); // bench outputs to stderr
+    proc.stdout.on("data", (data: Buffer) => { stderr += data.toString(); });
 
     proc.on("close", (code) => {
+      signal?.removeEventListener("abort", onAbort);
       const result: BenchResult = {
         configId: config.id,
         modelPath,
