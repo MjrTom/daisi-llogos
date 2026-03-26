@@ -141,6 +141,7 @@ What works today:
 - BPE tokenizer, KV cache, DeltaNet recurrent state + conv1d buffers
 - Tiled/flash attention with online softmax (no shared memory limit on context length)
 - FP16 KV cache (2x memory savings, default)
+- [**LLogos Turbo**](docs/llogos-turbo.md): Extreme KV cache compression (8-12x) via Walsh-Hadamard rotation + scalar quantization + QJL correction (`--kv-quant turbo:3`)
 - Sliding window + attention sinks for fixed-memory streaming (`--attention sinks:64,4096`)
 - Paged KV cache with dynamic allocation (`--paged`), RAM offloading (`--offload-pages`)
 - Candidate-based sampler with temperature, top-k, top-p, repetition penalty (O(k) not O(N log N))
@@ -223,6 +224,7 @@ flowchart LR
 | [DeltaNet](docs/deltanet.md) | Gated DeltaNet linear attention and hybrid architecture |
 | [Vulkan Backend](docs/vulkan-backend.md) | P/Invoke design, SPIR-V shaders, cross-platform GPU compute |
 | [WebGPU Backend](docs/webgpu-backend.md) | Browser-native GPU inference, WGSL shaders, DeltaNet on GPU |
+| [LLogos Turbo](docs/llogos-turbo.md) | Extreme KV cache compression (8-12x) via TurboQuant — architecture, usage, benchmarks, roadmap |
 | [Long Context](docs/roadmap/phase-11-long-context.md) | Flash attention, paged KV cache, RAM offloading for 200K+ context |
 | [Tested Models](docs/tested-models.md) | Verified models, performance benchmarks, supported quantization formats |
 | [Known Issues](docs/known-issues.md) | Investigation notes on K-quant accumulation errors and DeltaNet architecture |
