@@ -52,6 +52,22 @@ public sealed class CudaBackend : IComputeBackend
     /// <inheritdoc />
     public string Name => $"CUDA ({_context.DeviceName})";
 
+    /// <summary>GPU compute capability major version (e.g. 8 for Ampere, 12 for Blackwell).</summary>
+    public int ComputeCapabilityMajor => _context.ComputeCapabilityMajor;
+
+    /// <summary>GPU compute capability minor version.</summary>
+    public int ComputeCapabilityMinor => _context.ComputeCapabilityMinor;
+
+    /// <summary>
+    /// Launch a CUDA kernel on the backend's stream. Used by CudaTurboQuantKvCache
+    /// to launch TurboQuant kernels without direct stream access.
+    /// </summary>
+    public unsafe void LaunchKernel(nint function, uint gridX, uint gridY, uint gridZ,
+        uint blockX, uint blockY, uint blockZ, uint sharedMem, nint* args)
+    {
+        _stream.Launch(function, gridX, gridY, gridZ, blockX, blockY, blockZ, sharedMem, args);
+    }
+
     /// <summary>Begin recording operations into a CUDA graph (if enabled).</summary>
     public void BeginCommands()
     {
