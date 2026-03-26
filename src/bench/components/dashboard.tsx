@@ -170,9 +170,10 @@ export default function Dashboard() {
     setRunning(false);
   }, [running, selectedModels, selectedConfigs, backend, contextId]);
 
-  // Get baseline decode tok/s for a model (for relative comparison)
-  const getBaseline = (modelPath: string): number | null => {
-    const cell = cells.get(cellKey(modelPath, "baseline"));
+  // Get baseline decode tok/s for a model — matches PV/FV to the right baseline
+  const getBaseline = (modelPath: string, configId: string): number | null => {
+    const baselineId = configId.includes("fullvocab") ? "baseline-fullvocab" : "baseline";
+    const cell = cells.get(cellKey(modelPath, baselineId));
     return cell?.result?.decodeTokPerSec || null;
   };
 
@@ -394,15 +395,14 @@ export default function Dashboard() {
                         {arch}
                       </td>
                     </tr>
-                    {archModels.map((model) => {
-                      const baseline = getBaseline(model.path);
-                      return (
+                    {archModels.map((model) => (
                         <tr key={model.path} className="border-t border-zinc-800 hover:bg-zinc-800/50">
                           <td className="p-3 text-zinc-300 font-medium sticky left-0 bg-zinc-900 z-10 max-w-[200px] truncate">
                             {model.shortName}
                           </td>
                           {activeConfigs.map((config) => {
                             const cell = cells.get(cellKey(model.path, config.id));
+                            const baseline = getBaseline(model.path, config.id);
                             return (
                               <td key={config.id} className="p-2 text-center">
                                 <ResultCell cell={cell} baseline={baseline} />
@@ -410,8 +410,7 @@ export default function Dashboard() {
                             );
                           })}
                         </tr>
-                      );
-                    })}
+                    ))}
                   </Fragment>
                 ));
               })()}
