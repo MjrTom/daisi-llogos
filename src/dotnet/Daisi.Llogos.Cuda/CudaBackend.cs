@@ -70,21 +70,29 @@ public sealed class CudaBackend : IComputeBackend
         _stream.Launch(function, gridX, gridY, gridZ, blockX, blockY, blockZ, sharedMem, args);
     }
 
-    private CudaStream? _asyncStream;
+    private nint _asyncStreamHandle;
 
     /// <summary>
-    /// Launch a kernel on a secondary async stream (outside graph capture).
-    /// Used by TurboQuant for async compressed writes alongside the main forward pass.
+    /// Launch a kernel on a low-priority async stream (outside graph capture).
+    /// Yields SM resources to the main stream for minimal contention.
     /// </summary>
     public unsafe void LaunchKernelAsync(nint function, uint gridX, uint gridY, uint gridZ,
         uint blockX, uint blockY, uint blockZ, uint sharedMem, nint* args)
     {
-        _asyncStream ??= new CudaStream();
-        _asyncStream.Launch(function, gridX, gridY, gridZ, blockX, blockY, blockZ, sharedMem, args);
+        if (_asyncStreamHandle == 0)
+        {
+            CudaApi.Check(CudaApi.StreamCreate(out _asyncStreamHandle, 0), "cuStreamCreate(async)");
+        }
+        CudaApi.LaunchKernel(function, gridX, gridY, gridZ,
+            blockX, blockY, blockZ, sharedMem, _asyncStreamHandle, args, null);
     }
 
     /// <summary>Synchronize the async stream before switching to compressed attention.</summary>
-    public void SyncAsyncStream() => _asyncStream?.Synchronize();
+    public void SyncAsyncStream()
+    {
+        if (_asyncStreamHandle != 0)
+            CudaApi.Check(CudaApi.StreamSynchronize(_asyncStreamHandle), "cuStreamSynchronize(async)");
+    }
 
     /// <summary>Begin recording operations into a CUDA graph (if enabled).</summary>
     public void BeginCommands()
