@@ -62,14 +62,29 @@ public sealed class CudaBackend : IComputeBackend
     public int ComputeCapabilityMinor => _context.ComputeCapabilityMinor;
 
     /// <summary>
-    /// Launch a CUDA kernel on the backend's stream. Used by CudaTurboQuantKvCache
-    /// to launch TurboQuant kernels without direct stream access.
+    /// Launch a CUDA kernel on the backend's main stream (inside graph capture).
     /// </summary>
     public unsafe void LaunchKernel(nint function, uint gridX, uint gridY, uint gridZ,
         uint blockX, uint blockY, uint blockZ, uint sharedMem, nint* args)
     {
         _stream.Launch(function, gridX, gridY, gridZ, blockX, blockY, blockZ, sharedMem, args);
     }
+
+    private CudaStream? _asyncStream;
+
+    /// <summary>
+    /// Launch a kernel on a secondary async stream (outside graph capture).
+    /// Used by TurboQuant for async compressed writes alongside the main forward pass.
+    /// </summary>
+    public unsafe void LaunchKernelAsync(nint function, uint gridX, uint gridY, uint gridZ,
+        uint blockX, uint blockY, uint blockZ, uint sharedMem, nint* args)
+    {
+        _asyncStream ??= new CudaStream();
+        _asyncStream.Launch(function, gridX, gridY, gridZ, blockX, blockY, blockZ, sharedMem, args);
+    }
+
+    /// <summary>Synchronize the async stream before switching to compressed attention.</summary>
+    public void SyncAsyncStream() => _asyncStream?.Synchronize();
 
     /// <summary>Begin recording operations into a CUDA graph (if enabled).</summary>
     public void BeginCommands()
