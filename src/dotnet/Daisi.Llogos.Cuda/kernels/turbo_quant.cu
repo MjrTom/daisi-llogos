@@ -409,8 +409,7 @@ __global__ void turbo_gated_attention(
     float running_max = -1e30f;
     float running_sum = 0.0f;
 
-    // Thread-local dequant buffer
-    float kBuf[128];
+    // Thread-local buffer (only needed for 3-bit V fallback and final WHT)
     float vBuf[128];
 
     for (int tile_start = 0; tile_start < seqLen; tile_start += TQ_ATTN_TILE_SIZE)
@@ -419,20 +418,35 @@ __global__ void turbo_gated_attention(
         if (tile_end > seqLen) tile_end = seqLen;
         int tile_len = tile_end - tile_start;
 
-        // Step 1: K scores in rotated domain — NO per-position WHT!
+        // Step 1: K scores — fused centroid lookup + dot product (zero local arrays)
         for (int t = tid; t < tile_len; t += stride)
         {
             int p = tile_start + t;
             const unsigned char* kData = kPacked + (kvHead * maxSeqLen + p) * kPackedPerHead;
             float kScale = kScales[kvHead * maxSeqLen + p];
+            const float* cents = get_centroids(quantBits);
 
-            // Just centroid lookup — no WHT, no sign flips
-            dequant_vector(kData, kBuf, keyLength, quantBits);
-
-            // Dot product in rotated domain: q_rot · k_centroids × scale_k
+            // Fused dequant + dot: lookup centroid and multiply with qRot in one pass
             float dot = 0.0f;
-            for (int d = 0; d < keyLength; d++)
-                dot += qRot[d] * kBuf[d];
+            if (quantBits == 4) {
+                for (int d = 0; d < keyLength; d += 2) {
+                    unsigned char b = kData[d >> 1];
+                    dot += qRot[d] * cents[b & 0xF];
+                    if (d + 1 < keyLength) dot += qRot[d+1] * cents[(b >> 4) & 0xF];
+                }
+            } else if (quantBits == 2) {
+                for (int d = 0; d < keyLength; d++)
+                    dot += qRot[d] * cents[(kData[d >> 2] >> ((d & 3) * 2)) & 3];
+            } else { // 3-bit fallback
+                int bp = 0;
+                for (int d = 0; d < keyLength; d++) {
+                    int bi = bp >> 3, bo = bp & 7;
+                    int lv = (kData[bi] >> bo) & 7;
+                    if (bo > 5) lv |= (kData[bi+1] << (8 - bo)) & 7;
+                    dot += qRot[d] * cents[lv];
+                    bp += 3;
+                }
+            }
             scores[t] = dot * kScale * scale;
         }
         __syncthreads();
@@ -477,21 +491,28 @@ __global__ void turbo_gated_attention(
         __syncthreads();
 
         // Accumulate weighted V centroids in rotated domain — NO per-position WHT!
-        // outHead accumulates: Σ w_t × scale_vt × v_centroids_t
-        // Thread 0 decompresses centroids (just lookup, no WHT), broadcasts via vShared
+        // All threads cooperatively dequant V into vShared, then scatter-add
         for (int t = 0; t < tile_len; t++)
         {
-            if (tid == 0)
-            {
-                int p = tile_start + t;
-                const unsigned char* vData = vPacked + (kvHead * maxSeqLen + p) * vPackedPerHead;
-                float vScale = vScales[kvHead * maxSeqLen + p];
+            int p = tile_start + t;
+            const unsigned char* vData = vPacked + (kvHead * maxSeqLen + p) * vPackedPerHead;
+            float vScale = vScales[kvHead * maxSeqLen + p];
+            const float* cents = get_centroids(quantBits);
 
-                // Just centroid lookup — no WHT, no signs
-                dequant_vector(vData, vBuf, valueLength, quantBits);
-
-                for (int dd = 0; dd < valueLength; dd++)
-                    vShared[dd] = vBuf[dd] * vScale;
+            // Parallel centroid lookup: each thread handles its dims
+            if (quantBits == 4) {
+                for (int d = tid; d < valueLength; d += stride) {
+                    unsigned char b = vData[d >> 1];
+                    vShared[d] = cents[(d & 1) ? ((b >> 4) & 0xF) : (b & 0xF)] * vScale;
+                }
+            } else if (quantBits == 2) {
+                for (int d = tid; d < valueLength; d += stride)
+                    vShared[d] = cents[(vData[d >> 2] >> ((d & 3) * 2)) & 3] * vScale;
+            } else { // 3-bit: serial unpack (bit-crossing)
+                if (tid == 0) {
+                    dequant_vector(vData, vBuf, valueLength, quantBits);
+                    for (int d = 0; d < valueLength; d++) vShared[d] = vBuf[d] * vScale;
+                }
             }
             __syncthreads();
 
