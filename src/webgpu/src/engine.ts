@@ -304,7 +304,9 @@ export class LlogosEngine {
     const chatTemplate = this.modelInfo?.metadata.get('tokenizer.chat_template') as string | undefined;
 
     // Build messages array for the template
+    const hasSystemMessage = this.conversationHistory.some(m => m.role === 'system');
     const messages: ChatMessage[] = [
+      ...(!hasSystemMessage ? [{ role: 'system', content: 'You are a helpful assistant. Be concise. Answer in plain text, not HTML or markdown.' } as ChatMessage] : []),
       ...this.conversationHistory,
       { role: 'user', content: userMessage },
     ];
@@ -313,8 +315,6 @@ export class LlogosEngine {
     // because the Llama 3 template uses complex Jinja2 features we can't parse)
     if (this.tokenizer && this.tokenizer.getTokenId('<|start_header_id|>') >= 0) {
       let prompt = '<|begin_of_text|>';
-      // System message
-      prompt += '<|start_header_id|>system<|end_header_id|>\n\nYou are a helpful assistant.<|eot_id|>';
       for (const msg of messages) {
         prompt += `<|start_header_id|>${msg.role}<|end_header_id|>\n\n${msg.content.trim()}<|eot_id|>`;
       }

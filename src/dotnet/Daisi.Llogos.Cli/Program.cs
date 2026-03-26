@@ -6,6 +6,7 @@ using Daisi.Llogos.Gguf;
 using Daisi.Llogos.Inference;
 using Daisi.Llogos.Model;
 using Daisi.Llogos;
+using Daisi.Llogos.Inference.DaisiTurbo;
 using Daisi.Llogos.Tokenizer;
 
 // Parse arguments
@@ -85,7 +86,16 @@ else
         ? strategy.CacheCapacity
         : options.MaxContext;
     IKvCache kvCache;
-    if (options.Paged)
+    if (options.KvQuant != null)
+    {
+        var turboConfig = TurboQuantConfig.Parse(options.KvQuant);
+        kvCache = new TurboQuantKvCache(backend, config, maxSeqLen: maxContext,
+            turboConfig: turboConfig, strategy: strategy);
+        Console.Error.WriteLine($"  DaisiTurbo: {turboConfig.EffectiveBitsPerDim(config.KeyLength):F1} bits/dim " +
+            $"(q{turboConfig.QuantBits}" +
+            $"{(turboConfig.QjlProjectionDim is > 0 ? $"+qjl{turboConfig.QjlProjectionDim}" : turboConfig.QjlProjectionDim == 0 ? "+noqjl" : "+qjl")})");
+    }
+    else if (options.Paged)
         kvCache = new PagedKvCache(backend, config, maxSeqLen: maxContext, strategy: strategy,
             vramPageBudget: options.OffloadPages);
     else
@@ -216,6 +226,17 @@ else
         if (firstStableLayer >= 0)
             Console.Error.WriteLine($"\n  → Token stabilizes at layer {firstStableLayer}/{config.NumLayers} ({100 * firstStableLayer / config.NumLayers}% through)");
         Console.Error.WriteLine();
+    }
+
+    // Print DaisiTurbo compression stats
+    if (kvCache is TurboQuantKvCache tqCache && tqCache.Length > 0)
+    {
+        var stats = tqCache.GetStats();
+        Console.Error.WriteLine($"\n[DaisiTurbo KV Cache]");
+        Console.Error.WriteLine($"  Compressed:   {stats.CompressedBytes / 1024.0:F1} KB");
+        Console.Error.WriteLine($"  Uncompressed: {stats.UncompressedBytes / 1024.0:F1} KB");
+        Console.Error.WriteLine($"  Ratio:        {stats.CompressionRatio:F1}x ({stats.EffectiveBitsPerDim:F1} bits/dim)");
+        Console.Error.WriteLine($"  Layers:       {stats.NumLayers}, Seq length: {stats.SeqLength}");
     }
 
     draftForward?.Dispose();
@@ -361,6 +382,9 @@ static CliArgs ParseArgs(string[] args)
             case "--batched-verify":
                 result.BatchedVerify = true;
                 break;
+            case "--kv-quant":
+                result.KvQuant = NextArg(args, ref i);
+                break;
             case "--help" or "-h":
                 result.ShowHelp = true;
                 break;
@@ -399,6 +423,7 @@ static void PrintUsage()
           --draft <path>           Draft model for speculative decoding (smaller, same family)
           --spec-depth <n>         Speculation depth (default: 5)
           --batched-verify         Use batched verify (faster, higher acceptance, different FP from native)
+          --kv-quant <mode>        KV cache compression: turbo, turbo:3, turbo:4, turbo:3+qjl32, turbo:3+noqjl
           --help, -h               Show this help
         """);
 }
@@ -426,4 +451,5 @@ class CliArgs
     public string? DraftModelPath;
     public int SpecDepth = 5;
     public bool BatchedVerify;
+    public string? KvQuant;
 }
