@@ -146,6 +146,26 @@ Daisi.Llogos.Cuda/                           CUDA implementation
 └── kernels/turbo_quant.cu                   CUDA kernels: turbo_kv_write + turbo_gated_attention
 ```
 
+## Benchmark Dashboard
+
+LLogos Bench is a visual benchmark dashboard for comparing configurations side-by-side.
+
+```bash
+cd src/bench
+npm install
+npm run dev
+# Open http://localhost:3000
+```
+
+Features:
+- System specs header (CPU, GPU, VRAM, RAM, OS, .NET version)
+- Model selector grouped by architecture (DeltaNet Hybrid, Standard Attention, BitNet) with select/deselect-all per group
+- Configuration matrix: F16 PV/FV baselines, Turbo 2/3/4-bit, QJL variants
+- Backend toggle (CPU / CUDA) and context length toggle (Short ~150 / Long ~4K tokens)
+- Live SSE streaming with cancel support — results appear cell-by-cell
+- Color-coded cells relative to matched baseline (PV configs vs F16 PV, FV configs vs F16 FV)
+- Compression ratio display for Turbo configurations
+
 ## Usage
 
 ### CLI
@@ -252,7 +272,17 @@ As context length grows, attention becomes a larger fraction of total time. At 4
 | Qwen3.5-27B | 32K | 2.0 GB | 256 MB | 1.8 GB |
 | Qwen3.5-27B | 128K | 8.0 GB | 1.0 GB | 7.0 GB |
 
-On a 16GB GPU with a 27B model (15GB weights), TurboQuant is the difference between running at 128K context and OOMing.
+**VRAM headroom — where TurboQuant is essential:**
+
+The 27B Qwen3.5 Q4_0 model uses ~15GB of the 16GB VRAM on an RTX 5080, leaving only ~1GB for KV cache. With F16 KV, that's ~500 token positions. With Turbo 4-bit, that's ~4K positions — the difference between a single-turn reply and a multi-turn conversation.
+
+| Model on RTX 5080 (16GB) | Weights | F16 KV headroom | Turbo 4-bit headroom |
+|---|---|---|---|
+| Qwen3.5-0.8B Q8_0 | 0.8 GB | 15.2 GB (~millions of tokens) | N/A (plenty of room) |
+| Qwen3.5-9B Q4_0 | 5.2 GB | 10.8 GB (~170K tokens) | 10.8 GB (~1.3M tokens) |
+| Qwen3.5-27B Q4_0 | 15 GB | 1 GB (~500 tokens) | 1 GB (~4K tokens) |
+
+Note: The 27B model is **weight-bandwidth-limited** (~50-60 tok/s max on RTX 5080 due to reading 15GB weights per token). TurboQuant doesn't improve decode speed for weight-bound models — its value is purely enabling longer context within fixed VRAM.
 
 ## Test Coverage
 
@@ -282,6 +312,8 @@ On a 16GB GPU with a 27B model (15GB weights), TurboQuant is the difference betw
 - [x] **Shared Memory Centroid LUT** — 16-float lookup table in shared memory, eliminates constant memory serialization
 - [x] **Adaptive Dual-Path Architecture** — F16 attention at short context (graph-captured), compressed at long context. Async compressed write on secondary CUDA stream.
 - [x] **CUDA Kernel Optimization** — 6 iterations: 45 → 422 tok/s (9.4x speedup). compute-sanitizer debugging for Blackwell shared memory issues.
+- [x] **Async Compressed Write Stream** — Secondary CUDA stream for background compression, keeps turbo_kv_write out of graph capture for 97% baseline throughput.
+- [x] **LLogos Bench Dashboard** — Next.js visual benchmark app with model/config matrix, architecture grouping, short/long context toggle, SSE streaming, cancel support.
 
 ### Next
 
