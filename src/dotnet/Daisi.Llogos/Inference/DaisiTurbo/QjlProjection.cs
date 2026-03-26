@@ -9,14 +9,17 @@ namespace Daisi.Llogos.Inference.DaisiTurbo;
 /// Quantized Johnson-Lindenstrauss (QJL) sign-bit residual correction.
 /// After MSE quantization, the residual (original - reconstructed) is projected
 /// via a random matrix and reduced to sign bits (+1/-1). During attention,
-/// an unbiased estimator combines the quantized dot product with a sign-bit
-/// correction term, eliminating the bias introduced by MSE quantization.
+/// a scale-corrected estimator combines the quantized dot product with a sign-bit
+/// correction term that reduces the bias introduced by MSE quantization.
+///
+/// The estimator uses: correction = (residualNorm / m) × Σ_p sign(R_p · r) × sign(R_p · q) × |R_p · q|
+/// where residualNorm is stored per-vector during compression.
 /// </summary>
 public sealed class QjlProjection
 {
     private readonly int _inputDim;
     private readonly int _projDim;
-    private readonly float[] _projectionMatrix; // [projDim × inputDim], ±1/sqrt(projDim) entries
+    private readonly float[] _projectionMatrix; // [projDim × inputDim], ±1 entries
 
     /// <summary>Input vector dimension (headDim).</summary>
     public int InputDim => _inputDim;
@@ -24,17 +27,15 @@ public sealed class QjlProjection
     /// <summary>Projection dimension (number of sign bits stored per vector).</summary>
     public int ProjectionDim => _projDim;
 
-    /// <summary>Number of bytes needed to store sign bits for one vector.</summary>
+    /// <summary>Bytes for sign bits + 4 bytes for residual norm.</summary>
     public int SignBitBytes => (_projDim + 7) / 8;
+
+    /// <summary>Total bytes stored per vector: sign bits + residual norm float.</summary>
+    public int StorageBytes => SignBitBytes + sizeof(float);
 
     /// <summary>
     /// Create a QJL projection with the given dimensions and seed.
-    /// The projection matrix is a random ±1 Rademacher matrix scaled by 1/sqrt(projDim).
     /// </summary>
-    /// <param name="inputDim">Dimension of input vectors (headDim).</param>
-    /// <param name="projDim">Number of projected dimensions (sign bits to store).
-    /// More bits = less variance in the estimator. Typical: inputDim/2 to inputDim.</param>
-    /// <param name="seed">Random seed for reproducibility.</param>
     public QjlProjection(int inputDim, int projDim, int seed)
     {
         _inputDim = inputDim;
@@ -43,70 +44,109 @@ public sealed class QjlProjection
     }
 
     /// <summary>
-    /// Project the residual vector and store only sign bits.
-    /// residual = original - reconstructed (computed by caller).
+    /// Project the residual vector, store sign bits and the residual L2 norm.
+    /// The norm is needed for the correction estimator's magnitude calibration.
+    /// signBitsAndNorm must have length >= SignBitBytes (norm stored separately via out param).
     /// </summary>
-    public void ProjectAndSign(ReadOnlySpan<float> residual, Span<byte> signBits)
+    public void ProjectAndSign(ReadOnlySpan<float> residual, Span<byte> signBits, out float residualNorm)
     {
         signBits.Slice(0, SignBitBytes).Clear();
 
+        // Compute and store residual L2 norm
+        float normSq = 0;
+        for (int d = 0; d < residual.Length; d++)
+            normSq += residual[d] * residual[d];
+        residualNorm = MathF.Sqrt(normSq);
+
         for (int p = 0; p < _projDim; p++)
         {
-            // Dot product: projectionMatrix[p, :] · residual
             float dot = DotProduct(residual, _projectionMatrix.AsSpan(p * _inputDim, _inputDim));
-
-            // Store sign bit
             if (dot >= 0)
                 signBits[p >> 3] |= (byte)(1 << (p & 7));
         }
     }
 
     /// <summary>
-    /// Compute the unbiased correction term for an attention dot product.
-    /// Given query q and cached sign bits of key residual, returns the correction
-    /// that when added to (q · reconstructed_k) gives an unbiased estimate of (q · original_k).
-    ///
-    /// correction = (1/projDim) * sum_p( sign_p * (R_p · q) )
-    /// where R_p is row p of the projection matrix and sign_p is ±1.
+    /// Backward-compatible overload that discards the residual norm.
     /// </summary>
-    public float ComputeCorrection(ReadOnlySpan<float> query, ReadOnlySpan<byte> signBits)
+    public void ProjectAndSign(ReadOnlySpan<float> residual, Span<byte> signBits)
     {
+        ProjectAndSign(residual, signBits, out _);
+    }
+
+    /// <summary>
+    /// Compute the correction term for an attention dot product score.
+    /// Uses the scale-corrected sign-bit estimator:
+    ///   correction = (residualNorm / (m × queryProjNorm)) × Σ_p sign_r_p × sign_q_p × |R_p · q|
+    /// where sign_r_p = stored sign of R_p · residual, sign_q_p = sign of R_p · query.
+    ///
+    /// This estimates q · residual, correcting the quantization bias in attention scores.
+    /// </summary>
+    public float ComputeCorrection(ReadOnlySpan<float> query, ReadOnlySpan<byte> signBits, float residualNorm)
+    {
+        if (residualNorm < 1e-10f) return 0;
+
         float correction = 0;
+        float queryProjNormSq = 0;
 
         for (int p = 0; p < _projDim; p++)
         {
-            // Dot product: projectionMatrix[p, :] · query
             float projQuery = DotProduct(query, _projectionMatrix.AsSpan(p * _inputDim, _inputDim));
+            float absProjQuery = MathF.Abs(projQuery);
+            queryProjNormSq += projQuery * projQuery;
 
-            // Sign bit: +1 if set, -1 if not
-            bool isPositive = (signBits[p >> 3] & (1 << (p & 7))) != 0;
-            correction += isPositive ? projQuery : -projQuery;
+            bool residualPositive = (signBits[p >> 3] & (1 << (p & 7))) != 0;
+            bool queryPositive = projQuery >= 0;
+
+            // sign agreement → positive contribution, disagreement → negative
+            correction += (residualPositive == queryPositive) ? absProjQuery : -absProjQuery;
         }
 
-        return correction / _projDim;
+        // Scale by residualNorm / queryProjNorm to calibrate magnitude
+        float queryProjNorm = MathF.Sqrt(queryProjNormSq);
+        if (queryProjNorm < 1e-10f) return 0;
+
+        return correction * residualNorm / (queryProjNorm * MathF.Sqrt(_projDim));
+    }
+
+    /// <summary>
+    /// Backward-compatible overload without residual norm (uses unit norm).
+    /// </summary>
+    public float ComputeCorrection(ReadOnlySpan<float> query, ReadOnlySpan<byte> signBits)
+    {
+        return ComputeCorrection(query, signBits, 1.0f);
     }
 
     /// <summary>
     /// Batch-compute corrections for multiple cached positions at once.
-    /// More efficient than calling ComputeCorrection per-position since it
-    /// computes the query projections once and reuses them.
+    /// Pre-computes query projections once and reuses them across all positions.
     /// </summary>
     public void BatchCorrection(ReadOnlySpan<float> query, ReadOnlySpan<byte> allSignBits,
-        int signBitStride, int count, Span<float> corrections)
+        ReadOnlySpan<float> residualNorms, int signBitStride, int count, Span<float> corrections)
     {
-        // Pre-compute R · q for all projection dimensions
+        // Pre-compute R · q and |R · q| for all projection dimensions
         Span<float> projQuery = stackalloc float[_projDim];
-        for (int p = 0; p < _projDim; p++)
-            projQuery[p] = DotProduct(query, _projectionMatrix.AsSpan(p * _inputDim, _inputDim));
+        Span<float> absProjQuery = stackalloc float[_projDim];
+        float queryProjNormSq = 0;
 
-        float invProjDim = 1.0f / _projDim;
+        for (int p = 0; p < _projDim; p++)
+        {
+            projQuery[p] = DotProduct(query, _projectionMatrix.AsSpan(p * _inputDim, _inputDim));
+            absProjQuery[p] = MathF.Abs(projQuery[p]);
+            queryProjNormSq += projQuery[p] * projQuery[p];
+        }
+
+        float queryProjNorm = MathF.Sqrt(queryProjNormSq);
+        float invScale = queryProjNorm > 1e-10f ? 1.0f / (queryProjNorm * MathF.Sqrt(_projDim)) : 0;
 
         for (int pos = 0; pos < count; pos++)
         {
+            float rNorm = residualNorms[pos];
+            if (rNorm < 1e-10f) { corrections[pos] = 0; continue; }
+
             var signBits = allSignBits.Slice(pos * signBitStride, SignBitBytes);
             float corr = 0;
 
-            // Process 8 projection dims at a time using byte-level sign bits
             int fullBytes = _projDim >> 3;
             for (int byteIdx = 0; byteIdx < fullBytes; byteIdx++)
             {
@@ -114,12 +154,13 @@ public sealed class QjlProjection
                 int baseP = byteIdx << 3;
                 for (int b = 0; b < 8; b++)
                 {
-                    bool isPositive = (bits & (1 << b)) != 0;
-                    corr += isPositive ? projQuery[baseP + b] : -projQuery[baseP + b];
+                    bool residualPositive = (bits & (1 << b)) != 0;
+                    bool queryPositive = projQuery[baseP + b] >= 0;
+                    corr += (residualPositive == queryPositive)
+                        ? absProjQuery[baseP + b] : -absProjQuery[baseP + b];
                 }
             }
 
-            // Remaining bits
             int remaining = _projDim & 7;
             if (remaining > 0)
             {
@@ -127,13 +168,86 @@ public sealed class QjlProjection
                 int baseP = fullBytes << 3;
                 for (int b = 0; b < remaining; b++)
                 {
-                    bool isPositive = (bits & (1 << b)) != 0;
-                    corr += isPositive ? projQuery[baseP + b] : -projQuery[baseP + b];
+                    bool residualPositive = (bits & (1 << b)) != 0;
+                    bool queryPositive = projQuery[baseP + b] >= 0;
+                    corr += (residualPositive == queryPositive)
+                        ? absProjQuery[baseP + b] : -absProjQuery[baseP + b];
                 }
             }
 
-            corrections[pos] = corr * invProjDim;
+            corrections[pos] = corr * rNorm * invScale;
         }
+    }
+
+    /// <summary>Backward-compatible batch without residual norms.</summary>
+    public void BatchCorrection(ReadOnlySpan<float> query, ReadOnlySpan<byte> allSignBits,
+        int signBitStride, int count, Span<float> corrections)
+    {
+        Span<float> unitNorms = stackalloc float[count];
+        unitNorms.Fill(1.0f);
+        BatchCorrection(query, allSignBits, unitNorms, signBitStride, count, corrections);
+    }
+
+    // ── Pre-computed query projection for fused attention ──────────────────
+
+    /// <summary>
+    /// Pre-compute R · q and |R · q| for all projection dimensions.
+    /// Call once per attention head, then use ComputeCorrectionPrecomputed per position.
+    /// </summary>
+    public void PrecomputeQueryProjections(ReadOnlySpan<float> query,
+        Span<float> projQuery, Span<float> absProjQuery, out float invScale)
+    {
+        float queryProjNormSq = 0;
+        for (int p = 0; p < _projDim; p++)
+        {
+            float pq = DotProduct(query, _projectionMatrix.AsSpan(p * _inputDim, _inputDim));
+            projQuery[p] = pq;
+            absProjQuery[p] = MathF.Abs(pq);
+            queryProjNormSq += pq * pq;
+        }
+
+        float queryProjNorm = MathF.Sqrt(queryProjNormSq);
+        invScale = queryProjNorm > 1e-10f ? 1.0f / (queryProjNorm * MathF.Sqrt(_projDim)) : 0;
+    }
+
+    /// <summary>
+    /// Compute correction using pre-computed query projections. O(projDim) per position
+    /// instead of O(projDim × inputDim) — avoids redundant query projection dot products.
+    /// </summary>
+    public float ComputeCorrectionPrecomputed(ReadOnlySpan<byte> signBits, float residualNorm,
+        ReadOnlySpan<float> projQuery, ReadOnlySpan<float> absProjQuery, float invScale)
+    {
+        float corr = 0;
+
+        int fullBytes = _projDim >> 3;
+        for (int byteIdx = 0; byteIdx < fullBytes; byteIdx++)
+        {
+            byte bits = signBits[byteIdx];
+            int baseP = byteIdx << 3;
+            for (int b = 0; b < 8; b++)
+            {
+                bool residualPositive = (bits & (1 << b)) != 0;
+                bool queryPositive = projQuery[baseP + b] >= 0;
+                corr += (residualPositive == queryPositive)
+                    ? absProjQuery[baseP + b] : -absProjQuery[baseP + b];
+            }
+        }
+
+        int remaining = _projDim & 7;
+        if (remaining > 0)
+        {
+            byte bits = signBits[fullBytes];
+            int baseP = fullBytes << 3;
+            for (int b = 0; b < remaining; b++)
+            {
+                bool residualPositive = (bits & (1 << b)) != 0;
+                bool queryPositive = projQuery[baseP + b] >= 0;
+                corr += (residualPositive == queryPositive)
+                    ? absProjQuery[baseP + b] : -absProjQuery[baseP + b];
+            }
+        }
+
+        return corr * residualNorm * invScale;
     }
 
     // ── Helpers ──────────────────────────────────────────────────────────────

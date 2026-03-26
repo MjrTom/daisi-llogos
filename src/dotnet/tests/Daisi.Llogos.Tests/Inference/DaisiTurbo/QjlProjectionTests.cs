@@ -122,6 +122,59 @@ public class QjlProjectionTests
         return sumSqErr / trials;
     }
 
+    [Theory]
+    [InlineData(32)]
+    [InlineData(64)]
+    public void NormAwareCorrection_ReducesDotProductError(int dim)
+    {
+        // The norm-aware QJL correction should reduce the error in Q·K estimation
+        // compared to using only the reconstructed (quantized) K.
+        var rng = new Random(42);
+        int projDim = dim;
+        var qjl = new QjlProjection(dim, projDim, seed: 99);
+
+        double totalErrorNoQjl = 0;
+        double totalErrorWithQjl = 0;
+        int trials = 500;
+
+        for (int t = 0; t < trials; t++)
+        {
+            // Simulate: original K, quantized K with some error, query Q
+            var originalK = RandomVector(rng, dim, 1.0f);
+            var quantError = RandomVector(rng, dim, 0.3f); // quantization residual
+            var reconstructedK = new float[dim];
+            for (int d = 0; d < dim; d++)
+                reconstructedK[d] = originalK[d] - quantError[d];
+            var query = RandomVector(rng, dim, 1.0f);
+
+            // True dot product
+            float trueDot = 0;
+            for (int d = 0; d < dim; d++)
+                trueDot += query[d] * originalK[d];
+
+            // Reconstructed dot product (no QJL)
+            float reconDot = 0;
+            for (int d = 0; d < dim; d++)
+                reconDot += query[d] * reconstructedK[d];
+
+            // QJL-corrected dot product
+            var signBits = new byte[qjl.SignBitBytes];
+            qjl.ProjectAndSign(quantError, signBits, out float resNorm);
+            float correction = qjl.ComputeCorrection(query, signBits, resNorm);
+            float correctedDot = reconDot + correction;
+
+            totalErrorNoQjl += (trueDot - reconDot) * (trueDot - reconDot);
+            totalErrorWithQjl += (trueDot - correctedDot) * (trueDot - correctedDot);
+        }
+
+        double mseNoQjl = totalErrorNoQjl / trials;
+        double mseWithQjl = totalErrorWithQjl / trials;
+
+        // QJL correction should reduce MSE
+        Assert.True(mseWithQjl < mseNoQjl,
+            $"QJL should reduce dot product error: without={mseNoQjl:F4}, with={mseWithQjl:F4}");
+    }
+
     private static float[] RandomVector(Random rng, int dim, float scale)
     {
         var v = new float[dim];

@@ -39,6 +39,10 @@ public sealed class TurboQuantKvCache : IKvCache
     private readonly float[][] _kScales; // [layerIdx][nKvHeads × maxSeqLen]
     private readonly float[][] _vScales;
 
+    // Per-head residual norms for QJL correction (stored during compression)
+    private readonly float[][]? _kResidualNorms; // [layerIdx][nKvHeads × maxSeqLen]
+    private readonly float[][]? _vResidualNorms;
+
     // Decompression scratch buffers (reused across layers)
     private readonly float[] _rotatedBuf;
     private readonly float[] _reconstructedBuf;
@@ -108,12 +112,21 @@ public sealed class TurboQuantKvCache : IKvCache
         _kScales = new float[_layerIndices.Length][];
         _vScales = new float[_layerIndices.Length][];
 
+        if (_kQjl != null)
+            _kResidualNorms = new float[_layerIndices.Length][];
+        if (_vQjl != null)
+            _vResidualNorms = new float[_layerIndices.Length][];
+
         for (int i = 0; i < _layerIndices.Length; i++)
         {
             _layers[i] = new CompressedLayer(
                 _nKvHeads, maxSeqLen, kPackedPerHead, vPackedPerHead, kSignPerHead, vSignPerHead);
             _kScales[i] = new float[_nKvHeads * maxSeqLen];
             _vScales[i] = new float[_nKvHeads * maxSeqLen];
+            if (_kResidualNorms != null)
+                _kResidualNorms[i] = new float[_nKvHeads * maxSeqLen];
+            if (_vResidualNorms != null)
+                _vResidualNorms[i] = new float[_nKvHeads * maxSeqLen];
         }
 
         // Scratch buffers
@@ -160,22 +173,30 @@ public sealed class TurboQuantKvCache : IKvCache
             {
                 CompressHead(kSpan.Slice(h * _keyLength, _keyLength), _keyLength,
                     _kSigns, _kQjl, layerStore.GetKPacked(h, slot), layerStore.GetKSignBits(h, slot),
-                    out float kScale);
+                    out float kScale, out float kResNorm);
                 _kScales[idx][h * _maxSeqLen + slot] = kScale;
+                if (_kResidualNorms != null)
+                    _kResidualNorms[idx][h * _maxSeqLen + slot] = kResNorm;
             }
 
-            // ── Compress Value ──────────��───────────────────────────
+            // ── Compress Value ──────────────────────────────────────
             if (compressValues)
             {
                 CompressHead(vSpan.Slice(h * _valueLength, _valueLength), _valueLength,
                     _vSigns, _vQjl, layerStore.GetVPacked(h, slot), layerStore.GetVSignBits(h, slot),
-                    out float vScale);
+                    out float vScale, out float vResNorm);
                 _vScales[idx][h * _maxSeqLen + slot] = vScale;
+                if (_vResidualNorms != null)
+                    _vResidualNorms[idx][h * _maxSeqLen + slot] = vResNorm;
             }
         }
 
-        // Mark that decompressed tensors need refresh
-        _lastDecompressedLength = -1;
+        // Invalidate fallback decompression from this slot onward
+        // For appending (slot == Length), the delta will be caught by DecompressIfNeeded
+        // For overwrites (sliding window), full invalidation is needed
+        if (_kDecompressed != null && slot != Length)
+            _lastDecompressedLength = -1;
+
         Length = _strategy.EffectiveSeqLen(position);
     }
 
@@ -266,11 +287,30 @@ public sealed class TurboQuantKvCache : IKvCache
         Span<float> kBuf = _fusedKBuf;
         Span<float> vBuf = _fusedVBuf;
 
+        // Pre-compute QJL query projections once (reused across all positions for a head)
+        float[]? qjlProjQuery = null;
+        float[]? qjlAbsProjQuery = null;
+        float qjlInvScale = 0;
+        if (_kQjl != null && _kResidualNorms != null)
+        {
+            int projDim = _kQjl.ProjectionDim;
+            qjlProjQuery = new float[projDim];
+            qjlAbsProjQuery = new float[projDim];
+        }
+
         for (int h = 0; h < numHeads; h++)
         {
             int kvHead = h / headsPerGroup;
             int qOff = h * keyLength;
             int outOff = h * valueLength;
+
+            // Pre-compute query projections for QJL (once per head, not per position)
+            if (_kQjl != null && qjlProjQuery != null && qjlAbsProjQuery != null)
+            {
+                _kQjl.PrecomputeQueryProjections(
+                    qAttnSpan.Slice(qOff, keyLength),
+                    qjlProjQuery, qjlAbsProjQuery, out qjlInvScale);
+            }
 
             // Initialize output to zero
             for (int d = 0; d < valueLength; d++)
@@ -285,7 +325,7 @@ public sealed class TurboQuantKvCache : IKvCache
                 int tileEnd = Math.Min(tileStart + tileSize, seqLen);
                 int tileLen = tileEnd - tileStart;
 
-                // Compute attention scores: dequantize K inline, dot with Q
+                // Compute attention scores: dequantize K inline, dot with Q, + QJL correction
                 for (int t = 0; t < tileLen; t++)
                 {
                     int p = tileStart + t;
@@ -294,10 +334,24 @@ public sealed class TurboQuantKvCache : IKvCache
                     DecompressHead(layerStore.GetKPacked(kvHead, p), keyLength, _kSigns,
                         _kScales[idx][kvHead * _maxSeqLen + p], kBuf);
 
-                    // Dot product: Q · K
+                    // Dot product: Q · K_reconstructed
                     float dot = 0;
                     for (int d = 0; d < keyLength; d++)
                         dot += qAttnSpan[qOff + d] * kBuf[d];
+
+                    // QJL correction: estimate Q · (K_original - K_reconstructed)
+                    // Uses pre-computed query projections for speed
+                    if (_kQjl != null && _kResidualNorms != null && qjlAbsProjQuery != null)
+                    {
+                        float resNorm = _kResidualNorms[idx][kvHead * _maxSeqLen + p];
+                        if (resNorm > 1e-10f)
+                        {
+                            var kSignBits = layerStore.GetKSignBits(kvHead, p);
+                            dot += _kQjl.ComputeCorrectionPrecomputed(
+                                kSignBits, resNorm, qjlProjQuery!, qjlAbsProjQuery, qjlInvScale);
+                        }
+                    }
+
                     tileScores[t] = dot * scale;
                 }
 
@@ -358,8 +412,10 @@ public sealed class TurboQuantKvCache : IKvCache
 
     private void CompressHead(ReadOnlySpan<float> input, int dim,
         float[] signs, QjlProjection? qjl, Span<byte> packedOut, Span<byte> signBitsOut,
-        out float scale)
+        out float scale, out float residualNorm)
     {
+        residualNorm = 0;
+
         // Compute scale (L2 norm) for denormalization
         float norm = 0;
         for (int d = 0; d < dim; d++)
@@ -378,42 +434,47 @@ public sealed class TurboQuantKvCache : IKvCache
         var reconstructed = _reconstructedBuf.AsSpan(0, dim);
         _quantizer.QuantizeVector(rotated, packedOut, reconstructed);
 
-        // QJL sign bits on residual
+        // QJL sign bits on residual (with residual norm for unbiased estimator)
         if (qjl != null && signBitsOut.Length > 0)
         {
             var residual = _residualBuf.AsSpan(0, dim);
             for (int d = 0; d < dim; d++)
                 residual[d] = rotated[d] - reconstructed[d];
-            qjl.ProjectAndSign(residual, signBitsOut);
+            qjl.ProjectAndSign(residual, signBitsOut, out residualNorm);
+            // Scale residualNorm back to original space
+            residualNorm *= scale;
         }
     }
 
-    // ── Decompression ────────────────────���──────────────────────────────────
+    // ── Decompression (incremental fallback) ────────────────────────────────
 
     private void DecompressIfNeeded(int idx)
     {
         if (_lastDecompressedLength == Length)
             return;
 
-        // Decompress all layers for current length
+        // Only decompress positions [_lastDecompressedLength .. Length-1]
+        // If _lastDecompressedLength is -1 (reset/invalidated), decompress all
+        int startPos = _lastDecompressedLength >= 0 ? _lastDecompressedLength : 0;
+
         for (int li = 0; li < _layerIndices.Length; li++)
-            DecompressLayer(li);
+            DecompressLayerRange(li, startPos, Length);
 
         _lastDecompressedLength = Length;
     }
 
-    private void DecompressLayer(int idx)
+    private void DecompressLayerRange(int idx, int fromPos, int toPos)
     {
         var layerStore = _layers[idx];
-        var kOut = _kDecompressed[idx].AsFloatSpan();
-        var vOut = _vDecompressed[idx].AsFloatSpan();
+        var kOut = _kDecompressed![idx].AsFloatSpan();
+        var vOut = _vDecompressed![idx].AsFloatSpan();
 
         bool compressKeys = _config.Target != TurboQuantTarget.Values;
         bool compressValues = _config.Target != TurboQuantTarget.Keys;
 
         for (int h = 0; h < _nKvHeads; h++)
         {
-            for (int pos = 0; pos < Length; pos++)
+            for (int pos = fromPos; pos < toPos; pos++)
             {
                 int kCacheOff = h * _maxSeqLen * _keyLength + pos * _keyLength;
                 int vCacheOff = h * _maxSeqLen * _valueLength + pos * _valueLength;
