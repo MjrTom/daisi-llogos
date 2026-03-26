@@ -15,8 +15,8 @@ export interface BenchConfig {
 export const CONFIGS: BenchConfig[] = [
   {
     id: "baseline",
-    label: "Baseline (F16 KV)",
-    shortLabel: "F16",
+    label: "Baseline (Partial Vocab)",
+    shortLabel: "F16 PV",
     args: ["--vocab-limit", "32"],
     color: "bg-slate-700",
   },
@@ -29,8 +29,8 @@ export const CONFIGS: BenchConfig[] = [
   },
   {
     id: "turbo4",
-    label: "Turbo 4-bit",
-    shortLabel: "T4",
+    label: "Turbo 4-bit (Partial Vocab)",
+    shortLabel: "T4 PV",
     args: ["--kv-quant", "turbo:4+noqjl", "--vocab-limit", "32"],
     color: "bg-emerald-700",
   },
