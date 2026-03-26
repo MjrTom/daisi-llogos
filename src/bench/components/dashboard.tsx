@@ -247,7 +247,7 @@ export default function Dashboard() {
                     <span className="text-[10px] font-bold text-zinc-500 uppercase tracking-widest">{arch}</span>
                   </label>
                   {archModels.map((m) => (
-                    <label key={m.path} className="flex items-center gap-2 text-sm cursor-pointer hover:bg-zinc-800 px-2 py-1 rounded">
+                    <label key={m.path} className="flex items-center gap-2 text-sm cursor-pointer hover:bg-zinc-800 px-2 py-1 rounded ml-5">
                       <input
                         type="checkbox"
                         checked={selectedModels.has(m.path)}
