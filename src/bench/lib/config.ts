@@ -49,17 +49,17 @@ export const CONFIGS: BenchConfig[] = [
     color: "bg-teal-700",
   },
   {
-    id: "turbo2",
-    label: "Turbo 2-bit",
-    shortLabel: "T2",
-    args: ["--kv-quant", "turbo:2+noqjl", "--vocab-limit", "32"],
-    color: "bg-teal-600",
-  },
-  {
     id: "turbo3-qjl",
     label: "Turbo 3-bit + QJL",
     shortLabel: "T3+Q",
     args: ["--kv-quant", "turbo:3", "--vocab-limit", "32"],
+    color: "bg-teal-600",
+  },
+  {
+    id: "turbo2",
+    label: "Turbo 2-bit",
+    shortLabel: "T2",
+    args: ["--kv-quant", "turbo:2+noqjl", "--vocab-limit", "32"],
     color: "bg-teal-500",
   },
 ];
