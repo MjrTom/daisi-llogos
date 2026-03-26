@@ -73,6 +73,27 @@ export interface ModelEntry {
 export const BACKENDS = ["cpu", "cuda"] as const;
 export type Backend = typeof BACKENDS[number];
 
-export const BENCH_PROMPT = "Explain the theory of relativity in simple terms. Start from the basics and build up to the key insights that Einstein discovered about space, time, and gravity.";
-export const BENCH_TOKENS = 128;
-export const BENCH_MAX_CONTEXT = 4096;
+export interface ContextPreset {
+  id: string;
+  label: string;
+  prompt: string;
+  maxTokens: number;
+  maxContext: number;
+}
+
+export const CONTEXT_PRESETS: ContextPreset[] = [
+  {
+    id: "short",
+    label: "Short (~150 tokens)",
+    prompt: "Explain the theory of relativity in simple terms. Start from the basics and build up to the key insights that Einstein discovered about space, time, and gravity.",
+    maxTokens: 128,
+    maxContext: 2048,
+  },
+  {
+    id: "long",
+    label: "Long (~4K tokens)",
+    prompt: Array(400).fill("The history of science spans many centuries of human endeavor and discovery with remarkable breakthroughs. ").join(""),
+    maxTokens: 64,
+    maxContext: 8192,
+  },
+];
