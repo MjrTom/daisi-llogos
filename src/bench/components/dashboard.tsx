@@ -220,9 +220,32 @@ export default function Dashboard() {
               const sorted = [...groups.entries()].sort(
                 (a, b) => (order.indexOf(a[0]) === -1 ? 99 : order.indexOf(a[0])) - (order.indexOf(b[0]) === -1 ? 99 : order.indexOf(b[0]))
               );
-              return sorted.map(([arch, archModels]) => (
+              return sorted.map(([arch, archModels]) => {
+                const allSelected = archModels.every((m) => selectedModels.has(m.path));
+                const noneSelected = archModels.every((m) => !selectedModels.has(m.path));
+                const toggleArch = () => {
+                  setSelectedModels((prev) => {
+                    const next = new Set(prev);
+                    if (allSelected) {
+                      archModels.forEach((m) => next.delete(m.path));
+                    } else {
+                      archModels.forEach((m) => next.add(m.path));
+                    }
+                    return next;
+                  });
+                };
+                return (
                 <div key={arch}>
-                  <div className="text-[10px] font-semibold text-zinc-600 uppercase tracking-wider mt-2 mb-1 px-2">{arch}</div>
+                  <label className="flex items-center gap-2 mt-2 mb-1 px-2 cursor-pointer hover:bg-zinc-800 rounded">
+                    <input
+                      type="checkbox"
+                      checked={allSelected}
+                      ref={(el) => { if (el) el.indeterminate = !allSelected && !noneSelected; }}
+                      onChange={toggleArch}
+                      className="accent-emerald-500"
+                    />
+                    <span className="text-[10px] font-bold text-zinc-500 uppercase tracking-widest">{arch}</span>
+                  </label>
                   {archModels.map((m) => (
                     <label key={m.path} className="flex items-center gap-2 text-sm cursor-pointer hover:bg-zinc-800 px-2 py-1 rounded">
                       <input
@@ -235,7 +258,8 @@ export default function Dashboard() {
                     </label>
                   ))}
                 </div>
-              ));
+                );
+              });
             })()}
           </div>
         </div>
