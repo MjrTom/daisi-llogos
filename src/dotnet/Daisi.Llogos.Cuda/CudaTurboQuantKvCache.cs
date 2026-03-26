@@ -213,7 +213,7 @@ public sealed class CudaTurboQuantKvCache : IKvCache
 
         const int tileSize = 256;
         const int blockSize = 256;
-        // Shared: [256 scores] + [256 temp] + [128 qRot] + [128 vAcc]
+        // Shared: [256 scores] + [256 temp] + [128 qRot broadcast] + [128 vShared]
         uint sharedMem = (uint)((tileSize + blockSize + 128 + 128) * sizeof(float));
 
         nint* args = stackalloc nint[19];

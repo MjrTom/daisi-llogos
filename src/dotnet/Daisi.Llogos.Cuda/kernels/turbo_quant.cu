@@ -490,8 +490,8 @@ __global__ void turbo_gated_attention(
             outHead[d] *= correction_old;
         __syncthreads();
 
-        // Accumulate weighted V — each thread processes all positions for its dims
-        // No sync barriers per position! Same pattern as baseline attention.
+        // Accumulate weighted V — all threads process positions for their dim.
+        // Threads 0-63 handle dims 0-63. Threads 64-255 are idle (valueLength=64).
         {
             const float* cents = get_centroids(quantBits);
             for (int d = tid; d < valueLength; d += stride)
@@ -503,8 +503,6 @@ __global__ void turbo_gated_attention(
                     const unsigned char* vData = vPacked + (kvHead * maxSeqLen + p) * vPackedPerHead;
                     float vScale = vScales[kvHead * maxSeqLen + p];
                     float centroid;
-
-                    // Inline centroid lookup for this dim
                     if (quantBits == 4) {
                         unsigned char b = vData[d >> 1];
                         centroid = cents[(d & 1) ? ((b >> 4) & 0xF) : (b & 0xF)];
