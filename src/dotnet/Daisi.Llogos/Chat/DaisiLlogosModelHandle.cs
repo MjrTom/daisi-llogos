@@ -1,5 +1,6 @@
 using Daisi.Llogos.Gguf;
 using Daisi.Llogos.Inference;
+using Daisi.Llogos.Inference.DaisiTurbo;
 using Daisi.Llogos.Model;
 using Daisi.Llogos.Tokenizer;
 
@@ -28,6 +29,12 @@ public sealed class DaisiLlogosModelHandle : IDisposable
 
     /// <summary>The context size this model was loaded with.</summary>
     public int ContextSize => _contextSize;
+
+    /// <summary>
+    /// Optional TurboQuant KV compression config. Set after loading to enable
+    /// compressed KV cache for all new sessions created from this handle.
+    /// </summary>
+    public TurboQuantConfig? TurboConfig { get; set; }
 
     internal DaisiLlogosModelHandle(
         string modelId,
@@ -76,7 +83,15 @@ public sealed class DaisiLlogosModelHandle : IDisposable
         }
         else
         {
-            var kvCache = new KvCache(Backend, Config, contextSize);
+            IKvCache kvCache;
+            if (TurboConfig != null)
+            {
+                kvCache = new TurboQuantKvCache(Backend, Config, contextSize, TurboConfig);
+            }
+            else
+            {
+                kvCache = new KvCache(Backend, Config, contextSize);
+            }
             var deltaState = new DeltaNetState(Backend, Config, Weights);
             var forward = new ForwardPass(Backend, Config, Weights, kvCache, deltaState);
             return (forward, kvCache);
