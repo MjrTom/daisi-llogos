@@ -6,6 +6,7 @@ using Daisi.Llogos.Gguf;
 using Daisi.Llogos.Inference;
 using Daisi.Llogos.Model;
 using Daisi.Llogos;
+using Daisi.Llogos.Cuda;
 using Daisi.Llogos.Inference.DaisiTurbo;
 using Daisi.Llogos.Tokenizer;
 
@@ -89,11 +90,16 @@ else
     if (options.KvQuant != null)
     {
         var turboConfig = TurboQuantConfig.Parse(options.KvQuant);
-        kvCache = new TurboQuantKvCache(backend, config, maxSeqLen: maxContext,
-            turboConfig: turboConfig, strategy: strategy);
-        Console.Error.WriteLine($"  DaisiTurbo: {turboConfig.EffectiveBitsPerDim(config.KeyLength):F1} bits/dim " +
+        if (backend is CudaBackend cudaBackend)
+            kvCache = new CudaTurboQuantKvCache(cudaBackend, config, maxSeqLen: maxContext,
+                turboConfig: turboConfig, strategy: strategy);
+        else
+            kvCache = new TurboQuantKvCache(backend, config, maxSeqLen: maxContext,
+                turboConfig: turboConfig, strategy: strategy);
+        Console.Error.WriteLine($"  LLogos Turbo: {turboConfig.EffectiveBitsPerDim(config.KeyLength):F1} bits/dim " +
             $"(q{turboConfig.QuantBits}" +
-            $"{(turboConfig.QjlProjectionDim is > 0 ? $"+qjl{turboConfig.QjlProjectionDim}" : turboConfig.QjlProjectionDim == 0 ? "+noqjl" : "+qjl")})");
+            $"{(turboConfig.QjlProjectionDim is > 0 ? $"+qjl{turboConfig.QjlProjectionDim}" : turboConfig.QjlProjectionDim == 0 ? "+noqjl" : "+qjl")}" +
+            $", {(backend is CudaBackend ? "CUDA" : "CPU")})");
     }
     else if (options.Paged)
         kvCache = new PagedKvCache(backend, config, maxSeqLen: maxContext, strategy: strategy,
@@ -228,11 +234,16 @@ else
         Console.Error.WriteLine();
     }
 
-    // Print DaisiTurbo compression stats
-    if (kvCache is TurboQuantKvCache tqCache && tqCache.Length > 0)
+    // Print LLogos Turbo compression stats
+    TurboQuantStats? turboStats = kvCache switch
     {
-        var stats = tqCache.GetStats();
-        Console.Error.WriteLine($"\n[DaisiTurbo KV Cache]");
+        TurboQuantKvCache tq when tq.Length > 0 => tq.GetStats(),
+        CudaTurboQuantKvCache ctq when ctq.Length > 0 => ctq.GetStats(),
+        _ => null
+    };
+    if (turboStats is { } stats)
+    {
+        Console.Error.WriteLine($"\n[LLogos Turbo KV Cache]");
         Console.Error.WriteLine($"  Compressed:   {stats.CompressedBytes / 1024.0:F1} KB");
         Console.Error.WriteLine($"  Uncompressed: {stats.UncompressedBytes / 1024.0:F1} KB");
         Console.Error.WriteLine($"  Ratio:        {stats.CompressionRatio:F1}x ({stats.EffectiveBitsPerDim:F1} bits/dim)");
