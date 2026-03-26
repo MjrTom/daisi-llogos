@@ -799,6 +799,118 @@ public sealed class ForwardPass : IForwardPass
         _backend.MatMul(output, input, weight, 1, K, N);
     }
 
+    // ── DaisiChain: Pipeline Parallelism ─────────────────────────────────────
+    // These methods enable splitting the forward pass across multiple hosts.
+    // Each host runs a contiguous slice of layers and passes the hidden state
+    // to the next host. Existing Forward/ForwardHidden/ForwardArgMax paths
+    // are completely unaffected.
+
+    /// <summary>
+    /// Download the current hidden state into a caller-provided buffer.
+    /// Used by DaisiChain to extract the intermediate hidden state after
+    /// ForwardEmbedding or ForwardLayers, for transmission to the next pipeline stage.
+    /// </summary>
+    public void GetHidden(float[] buffer)
+    {
+        _backend.FlushCommands();
+        _hidden.DequantizeTo(buffer);
+    }
+
+    /// <summary>
+    /// Upload a hidden state into the internal buffer.
+    /// Used by DaisiChain to inject a hidden state received from a previous pipeline stage
+    /// before calling ForwardLayers.
+    /// </summary>
+    public void SetHidden(ReadOnlySpan<float> hidden)
+    {
+        var bytes = new byte[hidden.Length * sizeof(float)];
+        System.Runtime.InteropServices.MemoryMarshal.AsBytes(hidden).CopyTo(bytes);
+        _hidden.CopyFrom(bytes);
+    }
+
+    /// <summary>
+    /// Run only the embedding lookup for a single token.
+    /// Leaves the result in the internal hidden buffer — call GetHidden to extract it,
+    /// or follow with ForwardLayers to continue processing.
+    /// </summary>
+    public void ForwardEmbedding(int tokenId)
+    {
+        _backend.BeginCommands();
+        _backend.EmbeddingLookup(_hidden, _weights.TokenEmbedding, tokenId);
+        _backend.FlushCommands();
+    }
+
+    /// <summary>
+    /// Run a contiguous subset of transformer layers [startLayer, endLayer).
+    /// Reads from and writes to the internal hidden buffer.
+    /// The caller must ensure the hidden buffer contains valid input (via ForwardEmbedding
+    /// or SetHidden). KV cache and DeltaNet state are updated for the processed layers.
+    /// </summary>
+    public void ForwardLayers(int startLayer, int endLayer, int position)
+    {
+        _backend.BeginCommands();
+
+        for (int layer = startLayer; layer < endLayer; layer++)
+        {
+            var lw = _weights.Layers[layer];
+
+            if (layer == startLayer)
+                _backend.RmsNormResidual(_normOut, _residual, _hidden, lw.AttnNorm, _config.NormEps);
+            else
+                _backend.AddRmsNormResidual(_normOut, _hidden, _residual, _residual, lw.AttnNorm, _config.NormEps);
+
+            if (lw is StandardAttentionWeights saw)
+                ForwardStandardAttention(saw, position, layer);
+            else if (lw is DeltaNetWeights dnw)
+                ForwardDeltaNet(dnw, layer);
+
+            _backend.AddRmsNorm(_normOut, _hidden, _hidden, _residual, lw.PostAttnNorm, _config.NormEps);
+            _backend.CopyTensor(_residual, _hidden);
+
+            if (lw is StandardAttentionWeights sawFfn && sawFfn.FusedGateUp != null && _fusedGateUpOut != null)
+            {
+                int gateDim = _config.IntermediateDim;
+                ProjectLinear(_fusedGateUpOut, _normOut, sawFfn.FusedGateUp);
+                _backend.SplitSwiGLU(_gate, _fusedGateUpOut, gateDim);
+            }
+            else
+            {
+                ProjectLinear(_gate, _normOut, lw.FfnGate);
+                ProjectLinear(_up, _normOut, lw.FfnUp);
+                _backend.SwiGLU(_gate, _gate, _up);
+            }
+            ProjectLinear(_hidden, _gate, lw.FfnDown);
+
+            if (layer == endLayer - 1)
+                _backend.ElementAdd(_hidden, _hidden, _residual);
+        }
+
+        _backend.FlushCommands();
+    }
+
+    /// <summary>
+    /// Run the output head: RmsNorm + LM head projection → logits.
+    /// Reads from the internal hidden buffer (set via SetHidden or after ForwardLayers).
+    /// Returns logits in the caller-provided buffer (must be VocabSize length).
+    /// </summary>
+    public void ForwardOutputHead(float[] buffer)
+    {
+        _backend.BeginCommands();
+        _backend.RmsNorm(_normOut, _hidden, _weights.OutputNorm, _config.NormEps);
+        ProjectLinear(_logits, _normOut, _weights.OutputWeight);
+        _backend.FlushCommands();
+        _logits.DequantizeTo(buffer);
+    }
+
+    /// <summary>Number of transformer layers in the model.</summary>
+    public int NumLayers => _config.NumLayers;
+
+    /// <summary>Hidden dimension size (for sizing DaisiChain activation buffers).</summary>
+    public int HiddenDim => _config.HiddenDim;
+
+    /// <summary>Vocabulary size (for sizing DaisiChain logit buffers).</summary>
+    public int VocabSize => _config.VocabSize;
+
     private ITensor CreateF32(string name, int size) =>
         _backend.CreateTensor(name, GgmlType.F32, [(long)size]);
 

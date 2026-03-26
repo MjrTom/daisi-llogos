@@ -30,10 +30,14 @@ public sealed class KvCache : IKvCache
     public GgmlType CacheType => _cacheType;
     public AttentionStrategy Strategy => _strategy;
 
+    /// <param name="startLayer">DaisiChain: only allocate for layers >= startLayer. Default 0.</param>
+    /// <param name="endLayer">DaisiChain: only allocate for layers &lt; endLayer. Default NumLayers.</param>
     public KvCache(IComputeBackend backend, ModelConfig config, int maxSeqLen,
-        GgmlType cacheType = GgmlType.F16, AttentionStrategy? strategy = null)
+        GgmlType cacheType = GgmlType.F16, AttentionStrategy? strategy = null,
+        int startLayer = 0, int endLayer = -1)
     {
         _strategy = strategy ?? AttentionStrategy.Full;
+        if (endLayer < 0) endLayer = config.NumLayers;
 
         // For window/sinks strategies, clamp maxSeqLen to the cache capacity
         if (_strategy.Mode != AttentionMode.Full && _strategy.CacheCapacity > 0)
@@ -46,7 +50,7 @@ public sealed class KvCache : IKvCache
         _cacheType = cacheType;
 
         var attnLayers = new List<int>();
-        for (int i = 0; i < config.NumLayers; i++)
+        for (int i = startLayer; i < endLayer; i++)
         {
             if (config.IsStandardAttention(i))
                 attnLayers.Add(i);

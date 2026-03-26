@@ -21,19 +21,23 @@ public sealed class DeltaNetState : IDisposable
     private readonly int _qkvDim;
     private readonly int _convKernel;
 
-    public DeltaNetState(IComputeBackend backend, ModelConfig config, ModelWeights? weights = null)
+    /// <param name="startLayer">DaisiChain: only allocate for layers >= startLayer. Default 0.</param>
+    /// <param name="endLayer">DaisiChain: only allocate for layers &lt; endLayer. Default NumLayers.</param>
+    public DeltaNetState(IComputeBackend backend, ModelConfig config, ModelWeights? weights = null,
+        int startLayer = 0, int endLayer = -1)
     {
         _backend = backend;
         _groupCount = config.SsmGroupCount;
         _headDim = config.SsmHeadDim;
         _convKernel = config.SsmConvKernel;
+        if (endLayer < 0) endLayer = config.NumLayers;
 
         // Derive actual QKV output dim from weight tensors if available.
         // SsmInnerSize * 3 is wrong when Q/K/V have unequal sizes (e.g. 9B: 2048+2048+4096=8192 vs 3*2048=6144).
         _qkvDim = config.SsmInnerSize * 3; // default fallback
         if (weights != null)
         {
-            for (int i = 0; i < config.NumLayers; i++)
+            for (int i = startLayer; i < endLayer; i++)
             {
                 if (!config.IsStandardAttention(i) && weights.Layers[i] is DeltaNetWeights dw)
                 {
@@ -44,7 +48,7 @@ public sealed class DeltaNetState : IDisposable
         }
 
         var deltaLayers = new List<int>();
-        for (int i = 0; i < config.NumLayers; i++)
+        for (int i = startLayer; i < endLayer; i++)
         {
             if (!config.IsStandardAttention(i))
                 deltaLayers.Add(i);
@@ -61,7 +65,7 @@ public sealed class DeltaNetState : IDisposable
             int actualHeadDim = _headDim;
             if (weights != null)
             {
-                for (int i = 0; i < config.NumLayers; i++)
+                for (int i = startLayer; i < endLayer; i++)
                 {
                     if (!config.IsStandardAttention(i) && weights.Layers[i] is DeltaNetWeights dw)
                     {
