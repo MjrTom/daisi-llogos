@@ -1,6 +1,6 @@
 "use client";
 
-import { useState, useEffect, useCallback, useRef } from "react";
+import { useState, useEffect, useCallback, useRef, Fragment } from "react";
 import { CONFIGS, BACKENDS, CONTEXT_PRESETS } from "@/lib/config";
 import type { BenchConfig, Backend } from "@/lib/config";
 import type { BenchResult } from "@/lib/runner";
@@ -10,6 +10,7 @@ interface ModelEntry {
   name: string;
   shortName: string;
   filename: string;
+  arch: string;
 }
 
 interface SystemInfo {
@@ -169,9 +170,10 @@ export default function Dashboard() {
     setRunning(false);
   }, [running, selectedModels, selectedConfigs, backend, contextId]);
 
-  // Get baseline decode tok/s for a model (for relative comparison)
-  const getBaseline = (modelPath: string): number | null => {
-    const cell = cells.get(cellKey(modelPath, "baseline"));
+  // Get baseline decode tok/s for a model — matches PV/FV to the right baseline
+  const getBaseline = (modelPath: string, configId: string): number | null => {
+    const baselineId = configId.includes("fullvocab") ? "baseline-fullvocab" : "baseline";
+    const cell = cells.get(cellKey(modelPath, baselineId));
     return cell?.result?.decodeTokPerSec || null;
   };
 
@@ -206,18 +208,60 @@ export default function Dashboard() {
         {/* Models */}
         <div className="bg-zinc-900 border border-zinc-800 rounded-lg p-4">
           <h2 className="text-xs font-semibold text-zinc-500 uppercase tracking-wider mb-2">Models</h2>
-          <div className="space-y-1 max-h-48 overflow-y-auto">
-            {models.map((m) => (
-              <label key={m.path} className="flex items-center gap-2 text-sm cursor-pointer hover:bg-zinc-800 px-2 py-1 rounded">
-                <input
-                  type="checkbox"
-                  checked={selectedModels.has(m.path)}
-                  onChange={() => toggleModel(m.path)}
-                  className="accent-emerald-500"
-                />
-                <span className="text-zinc-300 truncate">{m.shortName}</span>
-              </label>
-            ))}
+          <div className="space-y-1 max-h-64 overflow-y-auto">
+            {(() => {
+              const groups = new Map<string, ModelEntry[]>();
+              for (const m of models) {
+                const list = groups.get(m.arch) || [];
+                list.push(m);
+                groups.set(m.arch, list);
+              }
+              // Order: DeltaNet first, then Standard, then BitNet
+              const order = ["DeltaNet Hybrid", "Standard Attention (Qwen)", "Standard Attention (LLaMA)", "Standard Attention", "BitNet"];
+              const sorted = [...groups.entries()].sort(
+                (a, b) => (order.indexOf(a[0]) === -1 ? 99 : order.indexOf(a[0])) - (order.indexOf(b[0]) === -1 ? 99 : order.indexOf(b[0]))
+              );
+              return sorted.map(([arch, archModels]) => {
+                const allSelected = archModels.every((m) => selectedModels.has(m.path));
+                const noneSelected = archModels.every((m) => !selectedModels.has(m.path));
+                const toggleArch = () => {
+                  setSelectedModels((prev) => {
+                    const next = new Set(prev);
+                    if (allSelected) {
+                      archModels.forEach((m) => next.delete(m.path));
+                    } else {
+                      archModels.forEach((m) => next.add(m.path));
+                    }
+                    return next;
+                  });
+                };
+                return (
+                <div key={arch}>
+                  <label className="flex items-center gap-2 mt-2 mb-1 px-2 cursor-pointer hover:bg-zinc-800 rounded">
+                    <input
+                      type="checkbox"
+                      checked={allSelected}
+                      ref={(el) => { if (el) el.indeterminate = !allSelected && !noneSelected; }}
+                      onChange={toggleArch}
+                      className="accent-emerald-500"
+                    />
+                    <span className="text-[10px] font-bold text-zinc-500 uppercase tracking-widest">{arch}</span>
+                  </label>
+                  {archModels.map((m) => (
+                    <label key={m.path} className="flex items-center gap-2 text-sm cursor-pointer hover:bg-zinc-800 px-2 py-1 rounded ml-5">
+                      <input
+                        type="checkbox"
+                        checked={selectedModels.has(m.path)}
+                        onChange={() => toggleModel(m.path)}
+                        className="accent-emerald-500"
+                      />
+                      <span className="text-zinc-300 truncate">{m.shortName}</span>
+                    </label>
+                  ))}
+                </div>
+                );
+              });
+            })()}
           </div>
         </div>
 
@@ -329,24 +373,47 @@ export default function Dashboard() {
               </tr>
             </thead>
             <tbody>
-              {activeModels.map((model) => {
-                const baseline = getBaseline(model.path);
-                return (
-                  <tr key={model.path} className="border-t border-zinc-800 hover:bg-zinc-800/50">
-                    <td className="p-3 text-zinc-300 font-medium sticky left-0 bg-zinc-900 z-10 max-w-[200px] truncate">
-                      {model.shortName}
-                    </td>
-                    {activeConfigs.map((config) => {
-                      const cell = cells.get(cellKey(model.path, config.id));
-                      return (
-                        <td key={config.id} className="p-2 text-center">
-                          <ResultCell cell={cell} baseline={baseline} />
-                        </td>
-                      );
-                    })}
-                  </tr>
+              {(() => {
+                // Group active models by architecture
+                const groups = new Map<string, typeof activeModels>();
+                for (const m of activeModels) {
+                  const list = groups.get(m.arch) || [];
+                  list.push(m);
+                  groups.set(m.arch, list);
+                }
+                const order = ["DeltaNet Hybrid", "Standard Attention (Qwen)", "Standard Attention (LLaMA)", "Standard Attention", "BitNet"];
+                const sorted = [...groups.entries()].sort(
+                  (a, b) => (order.indexOf(a[0]) === -1 ? 99 : order.indexOf(a[0])) - (order.indexOf(b[0]) === -1 ? 99 : order.indexOf(b[0]))
                 );
-              })}
+                return sorted.map(([arch, archModels]) => (
+                  <Fragment key={arch}>
+                    <tr>
+                      <td
+                        colSpan={activeConfigs.length + 1}
+                        className="px-3 pt-4 pb-1 text-[10px] font-bold text-zinc-500 uppercase tracking-widest sticky left-0 bg-zinc-900 z-10"
+                      >
+                        {arch}
+                      </td>
+                    </tr>
+                    {archModels.map((model) => (
+                        <tr key={model.path} className="border-t border-zinc-800 hover:bg-zinc-800/50">
+                          <td className="p-3 text-zinc-300 font-medium sticky left-0 bg-zinc-900 z-10 max-w-[200px] truncate">
+                            {model.shortName}
+                          </td>
+                          {activeConfigs.map((config) => {
+                            const cell = cells.get(cellKey(model.path, config.id));
+                            const baseline = getBaseline(model.path, config.id);
+                            return (
+                              <td key={config.id} className="p-2 text-center">
+                                <ResultCell cell={cell} baseline={baseline} />
+                              </td>
+                            );
+                          })}
+                        </tr>
+                    ))}
+                  </Fragment>
+                ));
+              })()}
             </tbody>
           </table>
         </div>
@@ -358,6 +425,19 @@ export default function Dashboard() {
           Select models and configurations, then click Run Benchmark
         </div>
       )}
+
+      {/* Key */}
+      <div className="mt-6 bg-zinc-900 border border-zinc-800 rounded-lg p-4">
+        <h2 className="text-xs font-semibold text-zinc-500 uppercase tracking-wider mb-2">Key</h2>
+        <div className="grid grid-cols-2 md:grid-cols-4 gap-x-6 gap-y-1 text-xs text-zinc-400">
+          <div><span className="text-zinc-300 font-medium">PV</span> — Partial Vocab (--vocab-limit 32, computes top ~3% of vocab for faster argmax)</div>
+          <div><span className="text-zinc-300 font-medium">FV</span> — Full Vocab (--vocab-limit 1, computes all vocab logits)</div>
+          <div><span className="text-zinc-300 font-medium">T2/T3/T4</span> — LLogos Turbo KV cache compression at 2/3/4 bits per dimension</div>
+          <div><span className="text-zinc-300 font-medium">QJL</span> — Quantized Johnson-Lindenstrauss sign-bit residual correction</div>
+          <div><span className="text-zinc-300 font-medium">F16</span> — Baseline F16 KV cache (no compression)</div>
+          <div><span className="text-zinc-300 font-medium">% baseline</span> — Decode tok/s relative to F16 PV for the same model</div>
+        </div>
+      </div>
     </div>
   );
 }
@@ -410,7 +490,7 @@ function ResultCell({ cell, baseline }: { cell?: CellData; baseline: number | nu
         </div>
       )}
       <div className="text-zinc-600 text-[10px]">
-        P: {r.prefillTokPerSec.toFixed(0)} tok/s
+        Prefill: {r.prefillTokPerSec.toFixed(0)} tok/s
       </div>
       {r.compressionRatio && (
         <div className="text-teal-500 text-[10px]">
