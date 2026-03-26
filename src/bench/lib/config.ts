@@ -14,6 +14,20 @@ export interface BenchConfig {
 
 export const CONFIGS: BenchConfig[] = [
   {
+    id: "baseline",
+    label: "Baseline (Partial Vocab)",
+    shortLabel: "F16 PV",
+    args: ["--vocab-limit", "32"],
+    color: "bg-slate-700",
+  },
+  {
+    id: "baseline-fullvocab",
+    label: "Baseline (Full Vocab)",
+    shortLabel: "F16 Full",
+    args: ["--vocab-limit", "1"],
+    color: "bg-slate-600",
+  },
+  {
     id: "turbo2",
     label: "Turbo 2-bit",
     shortLabel: "T2",
@@ -47,20 +61,6 @@ export const CONFIGS: BenchConfig[] = [
     shortLabel: "T4 Full",
     args: ["--kv-quant", "turbo:4+noqjl", "--vocab-limit", "1"],
     color: "bg-emerald-700",
-  },
-  {
-    id: "baseline",
-    label: "Baseline (Partial Vocab)",
-    shortLabel: "F16 PV",
-    args: ["--vocab-limit", "32"],
-    color: "bg-slate-600",
-  },
-  {
-    id: "baseline-fullvocab",
-    label: "Baseline (Full Vocab)",
-    shortLabel: "F16 Full",
-    args: ["--vocab-limit", "1"],
-    color: "bg-slate-700",
   },
 ];
 
