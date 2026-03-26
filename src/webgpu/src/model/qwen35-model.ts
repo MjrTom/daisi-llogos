@@ -408,7 +408,9 @@ export class Qwen35Model {
 
     // Final RMSNorm + LM Head
     compute.rmsNorm(this.hidden, weights.outputNorm, this.normed, E, this.rmsNormEps);
-    compute.matmul(weights.output.buffer, this.normed, this.logits, this.vocabSize, E, weights.output.type);
+    // LM Head — optionally compute only first vocabLimit rows
+    const lmRows = this._vocabLimit > 0 ? Math.min(this._vocabLimit, this.vocabSize) : this.vocabSize;
+    compute.matmul(weights.output.buffer, this.normed, this.logits, lmRows, E, weights.output.type);
 
     this._position++;
     return this.logits;
@@ -437,11 +439,7 @@ export class Qwen35Model {
     if (this.hasGatedQ) {
       compute.deinterleaveQ(this.qBuf, this.qAttnBuf, this.qGateBufAttn, nH, keyLen);
     } else {
-      // Copy Q to qAttn, fill qGate with 88.0 (sigmoid≈1 = ungated)
-      const enc = compute.device.createCommandEncoder();
-      enc.copyBufferToBuffer(this.qBuf, 0, this.qAttnBuf, 0, nH * keyLen * 4);
-      compute.device.queue.submit([enc.finish()]);
-      // qGateBufAttn should be pre-filled with 88.0 — do it once in init
+      compute.copyBuffer(this.qBuf, this.qAttnBuf, nH * keyLen * 4);
     }
 
     // 3. Per-head QK RMSNorm (GPU)
@@ -490,11 +488,9 @@ export class Qwen35Model {
     compute.conv1dSilu(this.qkvBuf, ds.convBuf, lw.ssmConv1d, qkvDim, this.ssmConvKernel);
 
     // 4. Split Q/K/V via GPU copy — layout: [Q: keyDim | K: keyDim | V: valueDim]
-    const enc = compute.device.createCommandEncoder();
-    enc.copyBufferToBuffer(this.qkvBuf, 0, this.qBuf, 0, keyDim * 4);
-    enc.copyBufferToBuffer(this.qkvBuf, keyDim * 4, this.kBuf, 0, keyDim * 4);
-    enc.copyBufferToBuffer(this.qkvBuf, keyDim * 2 * 4, this.vBuf, 0, valueDim * 4);
-    compute.device.queue.submit([enc.finish()]);
+    compute.copyBufferRegion(this.qkvBuf, 0, this.qBuf, 0, keyDim * 4);
+    compute.copyBufferRegion(this.qkvBuf, keyDim * 4, this.kBuf, 0, keyDim * 4);
+    compute.copyBufferRegion(this.qkvBuf, keyDim * 2 * 4, this.vBuf, 0, valueDim * 4);
 
     // 5. L2 normalize Q and K (GPU) — numKHeads groups of groupDim
     compute.l2NormGroups(this.qBuf, numKHeads, groupDim);
@@ -536,8 +532,13 @@ export class Qwen35Model {
     compute.add(this.temp, this.residual, this.hidden, E);
   }
 
-  /** Apply RoPE to first ropeDim dims of each head, leaving rest unchanged. */
+  /** Set vocab limit for partial logit computation. 0 = full vocab. */
+  private _vocabLimit = 0;
+  set vocabLimit(n: number) { this._vocabLimit = n; }
+  get vocabLimit(): number { return this._vocabLimit; }
+
   async readLogits(): Promise<Float32Array> {
-    return new Float32Array(await this.compute.readBuffer(this.logits, this.vocabSize * 4));
+    const size = this._vocabLimit > 0 ? Math.min(this._vocabLimit, this.vocabSize) : this.vocabSize;
+    return new Float32Array(await this.compute.readBuffer(this.logits, size * 4));
   }
 }

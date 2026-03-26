@@ -30,6 +30,9 @@ public sealed class CudaBackend : IComputeBackend
     private nint _graphExec;          // reusable graph executable (0 = none)
     private bool _graphEnabled = true;
 
+    /// <summary>Disable CUDA graph capture (needed for TurboQuant which uses different kernel topology).</summary>
+    public void DisableGraphCapture() { _graphEnabled = false; }
+
     public CudaBackend(int deviceOrdinal = 0)
     {
         _context = new CudaContext(deviceOrdinal);
@@ -51,6 +54,45 @@ public sealed class CudaBackend : IComputeBackend
 
     /// <inheritdoc />
     public string Name => $"CUDA ({_context.DeviceName})";
+
+    /// <summary>GPU compute capability major version (e.g. 8 for Ampere, 12 for Blackwell).</summary>
+    public int ComputeCapabilityMajor => _context.ComputeCapabilityMajor;
+
+    /// <summary>GPU compute capability minor version.</summary>
+    public int ComputeCapabilityMinor => _context.ComputeCapabilityMinor;
+
+    /// <summary>
+    /// Launch a CUDA kernel on the backend's main stream (inside graph capture).
+    /// </summary>
+    public unsafe void LaunchKernel(nint function, uint gridX, uint gridY, uint gridZ,
+        uint blockX, uint blockY, uint blockZ, uint sharedMem, nint* args)
+    {
+        _stream.Launch(function, gridX, gridY, gridZ, blockX, blockY, blockZ, sharedMem, args);
+    }
+
+    private nint _asyncStreamHandle;
+
+    /// <summary>
+    /// Launch a kernel on a low-priority async stream (outside graph capture).
+    /// Yields SM resources to the main stream for minimal contention.
+    /// </summary>
+    public unsafe void LaunchKernelAsync(nint function, uint gridX, uint gridY, uint gridZ,
+        uint blockX, uint blockY, uint blockZ, uint sharedMem, nint* args)
+    {
+        if (_asyncStreamHandle == 0)
+        {
+            CudaApi.Check(CudaApi.StreamCreate(out _asyncStreamHandle, 0), "cuStreamCreate(async)");
+        }
+        CudaApi.LaunchKernel(function, gridX, gridY, gridZ,
+            blockX, blockY, blockZ, sharedMem, _asyncStreamHandle, args, null);
+    }
+
+    /// <summary>Synchronize the async stream before switching to compressed attention.</summary>
+    public void SyncAsyncStream()
+    {
+        if (_asyncStreamHandle != 0)
+            CudaApi.Check(CudaApi.StreamSynchronize(_asyncStreamHandle), "cuStreamSynchronize(async)");
+    }
 
     /// <summary>Begin recording operations into a CUDA graph (if enabled).</summary>
     public void BeginCommands()

@@ -38,6 +38,18 @@ public interface IKvCache : IDisposable
     /// <summary>Get the V cache tensor for an attention layer (contiguous, suitable for GatedAttention).</summary>
     ITensor GetVCacheTensor(int layer);
 
+    /// <summary>
+    /// Compute attention directly from compressed KV data, bypassing GetK/VCacheTensor.
+    /// Returns true if the cache handled attention itself; false to use the standard path.
+    /// Default: false (standard path via GetKCacheTensor + GatedAttention).
+    /// </summary>
+    bool ComputeAttention(ITensor output, ITensor qAttn, ITensor qGate,
+        int layer, int numHeads, int numKvHeads, int keyLength, int valueLength,
+        int seqLen, float scale)
+    {
+        return false;
+    }
+
     /// <summary>Truncate visible length (for speculative decode rejection).</summary>
     void SetLength(int length) { }
 

@@ -34,6 +34,7 @@ export class KvCache {
   }
 
   get seqLen(): number { return this._seqLen; }
+  set seqLen(val: number) { this._seqLen = val; }
 
   /**
    * Write K and V vectors for the current position.

@@ -18,6 +18,7 @@ import { streamTensors } from './storage/streaming-loader.js';
 import { GgmlType } from './gguf/quantization.js';
 import { BpeTokenizer, tokenizerFromGguf } from './tokenizer/bpe-tokenizer.js';
 import { applyTemplate, ChatMessage } from './tokenizer/chat-template.js';
+import { VocabRemapper } from './tokenizer/vocab-remapper.js';
 import { LlamaModel } from './model/llama-model.js';
 import { Qwen35Model } from './model/qwen35-model.js';
 import { Sampler, SamplerOptions } from './model/sampler.js';
@@ -29,6 +30,7 @@ export interface GenerateOptions extends SamplerOptions {
   onToken?: (token: string, tokenId: number) => void;
   signal?: AbortSignal;
   raw?: boolean; // if true, skip chat template wrapping
+  vocabLimit?: number; // if set, only compute first N logits (partial vocab — faster for greedy/low-temp)
 }
 
 export class LlogosEngine {
@@ -36,6 +38,7 @@ export class LlogosEngine {
   private compute: ComputeEngine | null = null;
   private model: LlamaModel | Qwen35Model | null = null;
   private tokenizer: BpeTokenizer | null = null;
+  private vocabRemapper: VocabRemapper | null = null;
   private modelInfo: GgufModelInfo | null = null;
   private _status: EngineStatus = 'uninitialized';
 
@@ -109,6 +112,26 @@ export class LlogosEngine {
       // For models > 2GB, we need initWeights to process incrementally.
       // TODO: For now this works for models < 2GB; streaming prevents
       // the single-ArrayBuffer bottleneck in downloadFile.
+      // Vocab remapping: sort tokens by frequency so partial vocab truncation works
+      const vocabTokens = info.metadata.get('tokenizer.ggml.tokens') as string[];
+      if (vocabTokens) {
+        this.vocabRemapper = new VocabRemapper(vocabTokens);
+        // Permute embedding and output weight rows
+        const embTensor = tensorMap.get('token_embd.weight');
+        if (embTensor) {
+          const bytesPerRow = embTensor.info.byteSize / info.vocabSize;
+          embTensor.buffer = this.vocabRemapper.permuteRows(embTensor.buffer, info.vocabSize, bytesPerRow);
+        }
+        if (tensorMap.has('output.weight')) {
+          const outTensor = tensorMap.get('output.weight')!;
+          const bytesPerRow = outTensor.info.byteSize / info.vocabSize;
+          outTensor.buffer = this.vocabRemapper.permuteRows(outTensor.buffer, info.vocabSize, bytesPerRow);
+        }
+        // Set default vocab limit: vocabSize / 32 (covers 97% of common tokens)
+        const defaultLimit = Math.ceil(info.vocabSize / 32);
+        console.log(`[llogos] Vocab remapped. Default limit: ${defaultLimit}/${info.vocabSize}`);
+      }
+
       // Select model class based on architecture
       options?.onProgress?.({ phase: 'Uploading to GPU', bytesDownloaded: 0, totalBytes: 0 });
       if (info.architecture === 'qwen35') {
@@ -139,9 +162,17 @@ export class LlogosEngine {
       throw new Error('Model not loaded. Call loadModel() first.');
     }
 
+    // Set vocab limit for partial logit computation
+    // Default: vocabSize/32 if remapper is active, 0 (full) otherwise
+    const defaultLimit = this.vocabRemapper ? Math.ceil(this.tokenizer.vocabSize / 32) : 0;
+    if ('vocabLimit' in this.model) {
+      (this.model as any).vocabLimit = options?.vocabLimit ?? defaultLimit;
+    }
+
     this._status = 'generating';
     const maxTokens = options?.maxTokens ?? 512;
     const sampler = new Sampler(options);
+    const remap = this.vocabRemapper;
 
     try {
       // Apply chat template unless raw mode
@@ -150,33 +181,42 @@ export class LlogosEngine {
         finalPrompt = this.applyChatTemplate(prompt);
       }
 
-      // Encode prompt
+      // Encode prompt (then remap to new ID space if remapper active)
       const inputTokens: number[] = [];
       if (this.model.position === 0 && this.tokenizer.bosTokenId >= 0 && options?.raw) {
-        inputTokens.push(this.tokenizer.bosTokenId);
+        inputTokens.push(remap ? remap.remapEncode(this.tokenizer.bosTokenId) : this.tokenizer.bosTokenId);
       }
-      inputTokens.push(...this.tokenizer.encode(finalPrompt));
+      const rawTokens = this.tokenizer.encode(finalPrompt);
+      inputTokens.push(...(remap ? rawTokens.map(t => remap.remapEncode(t)) : rawTokens));
       const allTokens = [...inputTokens];
 
-      // GPU forward pass — prefill
-      for (let i = 0; i < inputTokens.length; i++) {
-        await this.model.forward(inputTokens[i]);
+      // GPU forward pass — use batched prefill for LlamaModel, per-token for Qwen35
+      if (inputTokens.length > 1 && 'forwardPrefill' in this.model) {
+        (this.model as any).forwardPrefill(inputTokens);
+      } else {
+        for (let i = 0; i < inputTokens.length; i++) {
+          await this.model.forward(inputTokens[i]);
+        }
       }
       let logits = await this.model.readLogits();
 
       // Detect <think>/</ think> tokens for thinking models (Qwen 3.5)
-      const thinkStartId = this.tokenizer.getTokenId('<think>');
-      const thinkEndId = this.tokenizer.getTokenId('</think>');
+      // Use remapped IDs for comparison
+      const thinkStartOrig = this.tokenizer.getTokenId('<think>');
+      const thinkEndOrig = this.tokenizer.getTokenId('</think>');
+      const thinkStartId = remap && thinkStartOrig >= 0 ? remap.remapEncode(thinkStartOrig) : thinkStartOrig;
+      const thinkEndId = remap && thinkEndOrig >= 0 ? remap.remapEncode(thinkEndOrig) : thinkEndOrig;
       let inThinking = false;
 
       // Generate tokens autoregressively
       for (let step = 0; step < maxTokens; step++) {
         if (options?.signal?.aborted) break;
 
-        const nextToken = sampler.sample(logits, allTokens);
+        const nextToken = sampler.sample(logits, allTokens); // in remapped space
 
-        // Check EOS
-        if (this.tokenizer.isEos(nextToken)) break;
+        // Check EOS (remap back to original space for tokenizer check)
+        const origToken = remap ? remap.remapDecode(nextToken) : nextToken;
+        if (this.tokenizer.isEos(origToken)) break;
 
         allTokens.push(nextToken);
 
@@ -184,12 +224,12 @@ export class LlogosEngine {
         if (nextToken === thinkStartId) { inThinking = true; }
         else if (nextToken === thinkEndId) { inThinking = false; }
         else if (!inThinking) {
-          const text = this.tokenizer.decode([nextToken]);
-          options?.onToken?.(text, nextToken);
+          const text = this.tokenizer.decode([origToken]);
+          options?.onToken?.(text, origToken);
           yield text;
         }
 
-        await this.model.forward(nextToken);
+        await this.model.forward(nextToken); // forward in remapped space
         logits = await this.model.readLogits();
       }
     } finally {
@@ -264,7 +304,9 @@ export class LlogosEngine {
     const chatTemplate = this.modelInfo?.metadata.get('tokenizer.chat_template') as string | undefined;
 
     // Build messages array for the template
+    const hasSystemMessage = this.conversationHistory.some(m => m.role === 'system');
     const messages: ChatMessage[] = [
+      ...(!hasSystemMessage ? [{ role: 'system', content: 'You are a helpful assistant. Be concise. Answer in plain text, not HTML or markdown.' } as ChatMessage] : []),
       ...this.conversationHistory,
       { role: 'user', content: userMessage },
     ];
@@ -273,8 +315,6 @@ export class LlogosEngine {
     // because the Llama 3 template uses complex Jinja2 features we can't parse)
     if (this.tokenizer && this.tokenizer.getTokenId('<|start_header_id|>') >= 0) {
       let prompt = '<|begin_of_text|>';
-      // System message
-      prompt += '<|start_header_id|>system<|end_header_id|>\n\nYou are a helpful assistant.<|eot_id|>';
       for (const msg of messages) {
         prompt += `<|start_header_id|>${msg.role}<|end_header_id|>\n\n${msg.content.trim()}<|eot_id|>`;
       }
