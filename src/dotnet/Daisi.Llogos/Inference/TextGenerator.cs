@@ -9,11 +9,11 @@ namespace Daisi.Llogos.Inference;
 /// </summary>
 public sealed class TextGenerator
 {
-    private readonly IForwardPass _forward;
+    private readonly ForwardPass _forward;
     private readonly BpeTokenizer _tokenizer;
     private readonly Sampler _sampler;
 
-    public TextGenerator(IForwardPass forward, BpeTokenizer tokenizer, int? seed = null)
+    public TextGenerator(ForwardPass forward, BpeTokenizer tokenizer, int? seed = null)
     {
         _forward = forward;
         _tokenizer = tokenizer;

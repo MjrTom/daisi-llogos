@@ -70,30 +70,6 @@ public sealed class CudaBackend : IComputeBackend
         _stream.Launch(function, gridX, gridY, gridZ, blockX, blockY, blockZ, sharedMem, args);
     }
 
-    private nint _asyncStreamHandle;
-
-    /// <summary>
-    /// Launch a kernel on a low-priority async stream (outside graph capture).
-    /// Yields SM resources to the main stream for minimal contention.
-    /// </summary>
-    public unsafe void LaunchKernelAsync(nint function, uint gridX, uint gridY, uint gridZ,
-        uint blockX, uint blockY, uint blockZ, uint sharedMem, nint* args)
-    {
-        if (_asyncStreamHandle == 0)
-        {
-            CudaApi.Check(CudaApi.StreamCreate(out _asyncStreamHandle, 0), "cuStreamCreate(async)");
-        }
-        CudaApi.LaunchKernel(function, gridX, gridY, gridZ,
-            blockX, blockY, blockZ, sharedMem, _asyncStreamHandle, args, null);
-    }
-
-    /// <summary>Synchronize the async stream before switching to compressed attention.</summary>
-    public void SyncAsyncStream()
-    {
-        if (_asyncStreamHandle != 0)
-            CudaApi.Check(CudaApi.StreamSynchronize(_asyncStreamHandle), "cuStreamSynchronize(async)");
-    }
-
     /// <summary>Begin recording operations into a CUDA graph (if enabled).</summary>
     public void BeginCommands()
     {
@@ -146,6 +122,9 @@ public sealed class CudaBackend : IComputeBackend
     /// this is safe — only one thread calls CUDA at a time.
     /// </summary>
     private void EnsureContext() => _context.MakeCurrent();
+
+    /// <summary>Bind the CUDA context to the calling thread. Required before cuMemFree from non-owner threads.</summary>
+    public void EnsureCudaContext() => _context.MakeCurrent();
 
     /// <summary>
     /// Batch MatMul for M > 1 (prefill, speculative decode verification).
@@ -308,54 +287,6 @@ public sealed class CudaBackend : IComputeBackend
         return new CudaTensor(name, type, dimensions, data);
     }
 
-    /// <summary>
-    /// Load a tensor into pinned host memory (GPU-accessible via PCIe).
-    /// Used for layer offloading — pinned tensors have DevicePtr that works
-    /// transparently with all CUDA kernels, just at PCIe bandwidth instead of HBM.
-    /// Applies the same alignment repacking as VRAM tensors so kernel layouts match.
-    /// </summary>
-    public ITensor LoadTensorPinned(string name, GgmlType type, ReadOnlySpan<long> dimensions, ReadOnlySpan<byte> data)
-    {
-        EnsureContext();
-
-        // Repack Q8_0 to aligned layout (same as LoadTensor)
-        if (type == GgmlType.Q8_0 && dimensions.Length >= 2 && dimensions[0] >= 2048)
-        {
-            int blockCount = data.Length / 34;
-            var aligned = new byte[blockCount * 36];
-            for (int i = 0; i < blockCount; i++)
-            {
-                int srcOff = i * 34, dstOff = i * 36;
-                aligned[dstOff] = data[srcOff];
-                aligned[dstOff + 1] = data[srcOff + 1];
-                data.Slice(srcOff + 2, 32).CopyTo(aligned.AsSpan(dstOff + 4, 32));
-            }
-            var tensor = new CudaTensor(name, type, dimensions, pinned: true, alignedQ8_0: true);
-            tensor.CopyFrom(aligned);
-            return tensor;
-        }
-
-        // Repack Q4_0 to aligned layout (same as LoadTensor)
-        if (type == GgmlType.Q4_0 && dimensions.Length >= 2)
-        {
-            int blockCount = data.Length / 18;
-            var aligned = new byte[blockCount * 20];
-            for (int i = 0; i < blockCount; i++)
-            {
-                int srcOff = i * 18, dstOff = i * 20;
-                aligned[dstOff] = data[srcOff];
-                aligned[dstOff + 1] = data[srcOff + 1];
-                data.Slice(srcOff + 2, 16).CopyTo(aligned.AsSpan(dstOff + 4, 16));
-            }
-            var tensor = new CudaTensor(name, type, dimensions, pinned: true, alignedQ4_0: true);
-            tensor.CopyFrom(aligned);
-            return tensor;
-        }
-
-        var t = new CudaTensor(name, type, dimensions, pinned: true);
-        t.CopyFrom(data);
-        return t;
-    }
 
     /// <inheritdoc />
     public unsafe void MatMul(ITensor output, ITensor a, ITensor b, int M, int K, int N)

@@ -70,19 +70,10 @@ public sealed class CudaTensor : ITensor
 
     /// <summary>
     /// Device pointer for kernel parameters. Works for both device and pinned memory.
-    /// Can be overridden by SetDevicePtr for staging buffer swapping.
     /// </summary>
-    internal ulong DevicePtr => _overrideDevicePtr != 0
-        ? _overrideDevicePtr
-        : (IsPinned ? (_pinnedMemory?.DevicePtr ?? 0) : (_memory?.DevicePtr ?? 0));
-
-    private ulong _overrideDevicePtr;
-
-    /// <summary>Override DevicePtr to point at a staging buffer. Pass 0 to restore original.</summary>
-    internal void SetDevicePtr(ulong ptr) => _overrideDevicePtr = ptr;
-
-    /// <summary>Host pointer for pinned memory (for DMA source). Only valid for pinned tensors.</summary>
-    internal nint PinnedHostPtr => IsPinned ? _pinnedMemory!.HostPtr : 0;
+    internal ulong DevicePtr => IsPinned
+        ? (_pinnedMemory?.DevicePtr ?? 0)
+        : (_memory?.DevicePtr ?? 0);
 
     /// <summary>
     /// The underlying device memory allocation. Only valid for non-pinned tensors.

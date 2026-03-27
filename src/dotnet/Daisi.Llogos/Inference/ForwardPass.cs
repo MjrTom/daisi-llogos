@@ -846,7 +846,16 @@ public sealed class ForwardPass : IForwardPass
     /// The caller must ensure the hidden buffer contains valid input (via ForwardEmbedding
     /// or SetHidden). KV cache and DeltaNet state are updated for the processed layers.
     /// </summary>
-    public void ForwardLayers(int startLayer, int endLayer, int position)
+    /// <summary>
+    /// Run a contiguous subset of transformer layers [startLayer, endLayer).
+    /// When continuation=true, the first layer uses AddRmsNormResidual (preserving
+    /// residual state from a previous ForwardLayers call). When false (default),
+    /// the first layer uses RmsNormResidual (fresh start from embedding or SetHidden).
+    /// </summary>
+    /// <param name="continuation">If true, first layer uses AddRmsNormResidual (continuing from prior segment).</param>
+    /// <param name="isFinal">If true, last layer applies ElementAdd (final residual). If false, defers for next segment.</param>
+    public void ForwardLayers(int startLayer, int endLayer, int position,
+        bool continuation = false, bool isFinal = true)
     {
         _backend.BeginCommands();
 
@@ -854,7 +863,7 @@ public sealed class ForwardPass : IForwardPass
         {
             var lw = _weights.Layers[layer];
 
-            if (layer == startLayer)
+            if (layer == startLayer && !continuation)
                 _backend.RmsNormResidual(_normOut, _residual, _hidden, lw.AttnNorm, _config.NormEps);
             else
                 _backend.AddRmsNormResidual(_normOut, _hidden, _residual, _residual, lw.AttnNorm, _config.NormEps);
@@ -881,7 +890,7 @@ public sealed class ForwardPass : IForwardPass
             }
             ProjectLinear(_hidden, _gate, lw.FfnDown);
 
-            if (layer == endLayer - 1)
+            if (layer == endLayer - 1 && isFinal)
                 _backend.ElementAdd(_hidden, _hidden, _residual);
         }
 
@@ -905,11 +914,6 @@ public sealed class ForwardPass : IForwardPass
     /// <summary>Number of transformer layers in the model.</summary>
     public int NumLayers => _config.NumLayers;
 
-    /// <summary>Get a specific layer's weights (for offload swapper).</summary>
-    public Model.LayerWeights GetLayerWeights(int index) => _weights.Layers[index];
-
-    /// <summary>Get all layer weights (for offload swapper restore).</summary>
-    public Model.LayerWeights[] GetAllLayerWeights() => _weights.Layers;
 
     /// <summary>Hidden dimension size (for sizing DaisiChain activation buffers).</summary>
     public int HiddenDim => _config.HiddenDim;
