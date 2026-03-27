@@ -905,6 +905,19 @@ public sealed class ForwardPass : IForwardPass
     /// <summary>Number of transformer layers in the model.</summary>
     public int NumLayers => _config.NumLayers;
 
+    /// <summary>
+    /// Run only the output head with partial vocab argmax (no embedding/layers).
+    /// Used by OffloadForwardPass after RunLayers has populated the hidden buffer.
+    /// </summary>
+    public int ForwardArgMaxOutputOnly()
+    {
+        _backend.BeginCommands();
+        _backend.RmsNorm(_normOut, _hidden, _weights.OutputNorm, _config.NormEps);
+        ProjectLinearPartial(_logits, _normOut, _weights.OutputWeight, ArgMaxVocabLimit);
+        _backend.FlushCommands();
+        return _backend.ArgMax(_logits, ArgMaxVocabLimit);
+    }
+
     /// <summary>Get a specific layer's weights (for offload swapper).</summary>
     public Model.LayerWeights GetLayerWeights(int index) => _weights.Layers[index];
 

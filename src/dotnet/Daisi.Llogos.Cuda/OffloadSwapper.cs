@@ -21,14 +21,8 @@ public sealed class OffloadSwapper : IDisposable
     private readonly int _totalLayers;
     private readonly nint _dmaStreamHandle;
 
-    // Per offloaded layer: list of (pinned DevicePtr, byte size) for each tensor
+    // Per offloaded layer: list of tensors with pinned data + VRAM mirror
     private readonly LayerTensorMap[] _pinnedMaps;
-
-    // Two VRAM staging buffers for double-buffering
-    private CudaDeviceMemory? _stagingA;
-    private CudaDeviceMemory? _stagingB;
-    private ulong _stagingSize;
-    private bool _useBufferA = true;
 
     public OffloadSwapper(CudaBackend backend, int gpuLayers, int totalLayers)
     {
@@ -43,42 +37,28 @@ public sealed class OffloadSwapper : IDisposable
 
     /// <summary>
     /// Register an offloaded layer's tensors. Called during model loading.
-    /// Records the pinned DevicePtr and size of each tensor for later DMA copy.
+    /// Allocates a per-tensor VRAM mirror for each pinned tensor.
     /// </summary>
     public void RegisterLayer(int layerIndex, LayerWeights layer)
     {
-        if (layerIndex < _gpuLayers) return; // VRAM layer, no registration needed
+        if (layerIndex < _gpuLayers) return;
 
         var tensors = new List<TensorRef>();
         CollectTensors(layer, tensors);
 
-        _pinnedMaps[layerIndex] = new LayerTensorMap { Tensors = tensors.ToArray() };
-
-        // Track max layer size for staging buffer (including 256-byte alignment padding)
-        ulong layerBytes = 0;
+        // Allocate a VRAM mirror for each pinned tensor
         foreach (var t in tensors)
-        {
-            layerBytes += t.ByteSize;
-            layerBytes = (layerBytes + 255) & ~255UL;  // Match PrefetchLayer's alignment
-        }
-        if (layerBytes > _stagingSize) _stagingSize = layerBytes;
+            t.VramMirror = new CudaDeviceMemory(t.ByteSize);
+
+        _pinnedMaps[layerIndex] = new LayerTensorMap { Tensors = tensors.ToArray() };
     }
 
-    /// <summary>
-    /// Allocate staging buffers after all layers are registered.
-    /// Must be called before first PrefetchLayer.
-    /// </summary>
-    public void AllocateStaging()
-    {
-        if (_stagingSize == 0) return;
-        _stagingA = new CudaDeviceMemory(_stagingSize);
-        _stagingB = new CudaDeviceMemory(_stagingSize);
-    }
+    /// <summary>No separate staging allocation needed — mirrors are per-tensor.</summary>
+    public void AllocateStaging() { }
 
     /// <summary>
-    /// Launch async DMA copy of an offloaded layer's weights from pinned RAM to VRAM staging.
-    /// Non-blocking — returns immediately, DMA runs concurrently with GPU compute.
-    /// Call SyncDma before GPU processes this layer.
+    /// Copy an offloaded layer's weights from pinned RAM to per-tensor VRAM mirrors.
+    /// Uses async DMA on the copy stream for overlap with GPU compute.
     /// </summary>
     public unsafe void PrefetchLayer(int layerIndex, LayerWeights layer)
     {
@@ -87,36 +67,14 @@ public sealed class OffloadSwapper : IDisposable
         var map = _pinnedMaps[layerIndex];
         if (map.Tensors == null) return;
 
-        var staging = _useBufferA ? _stagingA! : _stagingB!;
-        ulong offset = 0;
-
-        // Async copy each tensor from pinned → staging, and update DevicePtr
-        var tensorList = new List<TensorRef>();
-        CollectTensors(layer, tensorList);
-
-        for (int i = 0; i < map.Tensors.Length && i < tensorList.Count; i++)
+        for (int i = 0; i < map.Tensors.Length; i++)
         {
-            var src = map.Tensors[i]; // Original pinned pointer
-            var dst = staging.DevicePtr + offset;
-            var size = src.ByteSize;
-
-            // Debug: validate pointers
-            if (src.HostPtr == 0) throw new InvalidOperationException($"Layer {layerIndex} tensor {i}: HostPtr is null");
-            if (dst == 0) throw new InvalidOperationException($"Layer {layerIndex} tensor {i}: staging dst is null");
-            if (size == 0) throw new InvalidOperationException($"Layer {layerIndex} tensor {i}: ByteSize is 0");
-            if (offset + size > _stagingSize) throw new InvalidOperationException($"Layer {layerIndex} tensor {i}: staging overflow ({offset + size} > {_stagingSize})");
-
-            CudaApi.Check(CudaApi.MemcpyHtoD(dst, (void*)src.HostPtr, size), $"cuMemcpyHtoD(layer{layerIndex}.tensor{i}, host={src.HostPtr:X}, dst={dst:X}, size={size})");
-
-            // Update the tensor's device pointer to point at staging
-            tensorList[i].Tensor.SetDevicePtr(dst);
-
-            offset += size;
-            // Align to 256 bytes for GPU memory access
-            offset = (offset + 255) & ~255UL;
+            var t = map.Tensors[i];
+            // Async DMA: pinned host → VRAM mirror
+            CudaApi.MemcpyHtoDAsync(t.VramMirror!.DevicePtr, (void*)t.HostPtr, t.ByteSize, _dmaStreamHandle);
+            // Point tensor at VRAM mirror
+            t.Tensor.SetDevicePtr(t.VramMirror.DevicePtr);
         }
-
-        _useBufferA = !_useBufferA;
     }
 
     /// <summary>
@@ -149,8 +107,13 @@ public sealed class OffloadSwapper : IDisposable
 
     public void Dispose()
     {
-        _stagingA?.Dispose();
-        _stagingB?.Dispose();
+        // Dispose per-tensor VRAM mirrors
+        foreach (var map in _pinnedMaps)
+        {
+            if (map.Tensors == null) continue;
+            foreach (var t in map.Tensors)
+                t.VramMirror?.Dispose();
+        }
         if (_dmaStreamHandle != 0)
             CudaApi.StreamDestroy(_dmaStreamHandle);
     }
@@ -185,12 +148,13 @@ public sealed class OffloadSwapper : IDisposable
         }
     }
 
-    private struct TensorRef
+    private class TensorRef
     {
-        public CudaTensor Tensor;
+        public CudaTensor Tensor = null!;
         public ulong PinnedDevicePtr;  // Original pinned device pointer
         public nint HostPtr;           // Host pointer for DMA source
         public ulong ByteSize;
+        public CudaDeviceMemory? VramMirror;  // Per-tensor VRAM staging buffer
     }
 
     private struct LayerTensorMap

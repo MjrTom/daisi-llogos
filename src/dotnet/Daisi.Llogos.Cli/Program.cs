@@ -67,8 +67,10 @@ else
     // Build vocab remapper if partial vocab is active (vocab-limit > 1)
     // Same-family models (Qwen3.5) have identical vocabularies, so same remapper works for both
     VocabRemapper? remapper = null;
-    // Disable remapper + partial vocab for speculative decoding (both models must share same ID space)
-    int vocabDivisor = options.DraftModelPath != null ? 1 : (options.VocabLimit ?? 32);
+    // Disable remapper for speculative decoding (shared ID space) and layer offloading (not yet supported)
+    int vocabDivisor = options.DraftModelPath != null ? 1
+        : options.GpuLayers > 0 ? 1
+        : (options.VocabLimit ?? 32);
     if (vocabDivisor > 1)
     {
         var tokens = gguf.GetMetadata<string[]>("tokenizer.ggml.tokens")!;
@@ -79,8 +81,11 @@ else
     ModelWeights weights;
     if (options.GpuLayers > 0 && backend is CudaBackend cudaBackendForOffload)
     {
+        // Layer offload doesn't support vocab remapping — load without remapper.
+        // Vocab divisor forced to 1 (full vocab logits).
         weights = CudaLayerOffload.LoadWithOffload(gguf, options.ModelPath,
-            cudaBackendForOffload, config, options.GpuLayers, remapper);
+            cudaBackendForOffload, config, options.GpuLayers);
+        vocabDivisor = 1;
     }
     else if (options.UseMmap)
         weights = MmapModelLoader.Load(gguf, options.ModelPath, backend, config, remapper);
@@ -113,7 +118,9 @@ else
         kvCache = new KvCache(backend, config, maxSeqLen: maxContext, strategy: strategy);
     var deltaState = new DeltaNetState(backend, config, weights);
     var forward = new ForwardPass(backend, config, weights, kvCache, deltaState);
-    forward.ArgMaxVocabLimit = config.VocabSize / vocabDivisor;
+    // For layer offloading: no vocab remapping but still use partial logit computation
+    int effectiveVocabDivisor = options.GpuLayers > 0 ? (options.VocabLimit ?? 32) : vocabDivisor;
+    forward.ArgMaxVocabLimit = config.VocabSize / effectiveVocabDivisor;
 
     // Early exit profiling: measure at which layer the token prediction stabilizes
     if (options.ProfileEarlyExit)
