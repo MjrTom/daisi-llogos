@@ -162,7 +162,14 @@ else
         Console.Error.WriteLine($"done ({draftConfig.Architecture}, {draftConfig.NumLayers}L, {draftConfig.HiddenDim}d)");
     }
 
-    var generator = new TextGenerator(forward, tokenizer, options.Seed);
+    // Hybrid GPU+CPU: replace forward pass with split execution
+    IForwardPass activeForward = forward;
+    if (options.HybridLayers > 0 && backend is CudaBackend cudaForHybrid)
+    {
+        activeForward = HybridForwardPass.Create(gguf, options.ModelPath!, config,
+            cudaForHybrid, options.HybridLayers, strategy);
+    }
+    var generator = new TextGenerator(activeForward, tokenizer, options.Seed);
 
     if (options.Bench)
     {
@@ -396,6 +403,9 @@ static CliArgs ParseArgs(string[] args)
             case "--kv-quant":
                 result.KvQuant = NextArg(args, ref i);
                 break;
+            case "--hybrid-layers":
+                result.HybridLayers = int.Parse(NextArg(args, ref i));
+                break;
             case "--help" or "-h":
                 result.ShowHelp = true;
                 break;
@@ -435,6 +445,7 @@ static void PrintUsage()
           --spec-depth <n>         Speculation depth (default: 5)
           --batched-verify         Use batched verify (faster, higher acceptance, different FP from native)
           --kv-quant <mode>        KV cache compression: turbo, turbo:3, turbo:4, turbo:3+qjl32, turbo:3+noqjl
+          --hybrid-layers <n>      GPU+CPU split: first N layers on GPU, rest on CPU
           --help, -h               Show this help
         """);
 }
@@ -463,4 +474,5 @@ class CliArgs
     public int SpecDepth = 5;
     public bool BatchedVerify;
     public string? KvQuant;
+    public int HybridLayers;
 }

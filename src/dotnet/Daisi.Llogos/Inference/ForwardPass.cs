@@ -816,6 +816,21 @@ public sealed class ForwardPass : IForwardPass
         _hidden.DequantizeTo(buffer);
     }
 
+    /// <summary>Download the residual buffer (for hybrid GPU+CPU transfer).</summary>
+    public void GetResidual(float[] buffer)
+    {
+        _backend.FlushCommands();
+        _residual.DequantizeTo(buffer);
+    }
+
+    /// <summary>Upload a residual state into the internal buffer.</summary>
+    public void SetResidual(ReadOnlySpan<float> residual)
+    {
+        var bytes = new byte[residual.Length * sizeof(float)];
+        System.Runtime.InteropServices.MemoryMarshal.AsBytes(residual).CopyTo(bytes);
+        _residual.CopyFrom(bytes);
+    }
+
     /// <summary>
     /// Upload a hidden state into the internal buffer.
     /// Used by DaisiChain to inject a hidden state received from a previous pipeline stage

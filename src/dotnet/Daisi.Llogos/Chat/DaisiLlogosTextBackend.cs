@@ -293,6 +293,16 @@ internal sealed class DaisiLlogosChatSessionAdapter : IChatSession
         TopP = p.TopP,
         RepetitionPenalty = p.RepeatPenalty,
         Seed = p.Seed > 0 ? (int)p.Seed : null,
+        FrequencyPenalty = p.FrequencyPenalty,
+        PresencePenalty = p.PresencePenalty,
+        MinP = p.MinP,
+        TypicalP = p.TypicalP,
+        PenalizeNewline = p.PenalizeNewline,
+        PenaltyCount = p.PenaltyCount,
+        MinKeep = p.MinKeep,
+        PreventEOS = p.PreventEOS,
+        AntiPrompts = p.AntiPrompts?.Count > 0 ? p.AntiPrompts.ToArray() : null,
+        GrammarText = p.GrammarText,
     };
 
     private static ChatRole MapRole(string role) => role switch

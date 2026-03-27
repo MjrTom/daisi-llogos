@@ -9,11 +9,11 @@ namespace Daisi.Llogos.Inference;
 /// </summary>
 public sealed class TextGenerator
 {
-    private readonly ForwardPass _forward;
+    private readonly IForwardPass _forward;
     private readonly BpeTokenizer _tokenizer;
     private readonly Sampler _sampler;
 
-    public TextGenerator(ForwardPass forward, BpeTokenizer tokenizer, int? seed = null)
+    public TextGenerator(IForwardPass forward, BpeTokenizer tokenizer, int? seed = null)
     {
         _forward = forward;
         _tokenizer = tokenizer;
@@ -29,6 +29,11 @@ public sealed class TextGenerator
             ?? (_tokenizer.Vocabulary.EosTokenId >= 0
                 ? [_tokenizer.Vocabulary.EosTokenId]
                 : []);
+
+        // Grammar constraint
+        GrammarConstraint? grammar = null;
+        if (!string.IsNullOrEmpty(parameters.GrammarText))
+            grammar = new GrammarConstraint(parameters.GrammarText, _tokenizer);
 
         // Tokenize prompt
         var promptIds = _tokenizer.Encode(prompt);
@@ -60,21 +65,49 @@ public sealed class TextGenerator
         var decodeSw = Stopwatch.StartNew();
         int generated = 0;
 
+        // Anti-prompt buffer for string-based stop detection
+        string outputBuffer = "";
+        bool hasAntiPrompts = parameters.AntiPrompts is { Length: > 0 };
+
         // Decode loop
         for (int t = 0; t < parameters.MaxTokens; t++)
         {
-            int tokenId = _sampler.Sample(logits, parameters, history.ToArray());
+            int tokenId = _sampler.Sample(logits, parameters, history.ToArray(), grammar);
 
-            // Check stop condition
+            // Check token-based stop condition
             if (Array.IndexOf(stopTokens, tokenId) >= 0)
                 break;
 
             history.Add(tokenId);
             generated++;
+            grammar?.Accept(tokenId);
 
             // Decode and yield
             string text = _tokenizer.Decode([tokenId]);
             yield return new GenerationToken(tokenId, text);
+
+            // Check anti-prompt (string-based stop sequences)
+            if (hasAntiPrompts)
+            {
+                outputBuffer += text;
+                // Keep buffer to max anti-prompt length + margin
+                int maxLen = 0;
+                foreach (var ap in parameters.AntiPrompts!)
+                    if (ap.Length > maxLen) maxLen = ap.Length;
+                if (outputBuffer.Length > maxLen * 2)
+                    outputBuffer = outputBuffer[(outputBuffer.Length - maxLen * 2)..];
+
+                bool stopped = false;
+                foreach (var ap in parameters.AntiPrompts)
+                {
+                    if (outputBuffer.Contains(ap, StringComparison.Ordinal))
+                    {
+                        stopped = true;
+                        break;
+                    }
+                }
+                if (stopped) break;
+            }
 
             // Next forward pass
             logits = _forward.Forward(tokenId, position);
