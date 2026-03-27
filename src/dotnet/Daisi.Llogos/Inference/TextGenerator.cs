@@ -30,6 +30,11 @@ public sealed class TextGenerator
                 ? [_tokenizer.Vocabulary.EosTokenId]
                 : []);
 
+        // Grammar constraint
+        GrammarConstraint? grammar = null;
+        if (!string.IsNullOrEmpty(parameters.GrammarText))
+            grammar = new GrammarConstraint(parameters.GrammarText, _tokenizer);
+
         // Tokenize prompt
         var promptIds = _tokenizer.Encode(prompt);
         if (promptIds.Length == 0)
@@ -67,7 +72,7 @@ public sealed class TextGenerator
         // Decode loop
         for (int t = 0; t < parameters.MaxTokens; t++)
         {
-            int tokenId = _sampler.Sample(logits, parameters, history.ToArray());
+            int tokenId = _sampler.Sample(logits, parameters, history.ToArray(), grammar);
 
             // Check token-based stop condition
             if (Array.IndexOf(stopTokens, tokenId) >= 0)
@@ -75,6 +80,7 @@ public sealed class TextGenerator
 
             history.Add(tokenId);
             generated++;
+            grammar?.Accept(tokenId);
 
             // Decode and yield
             string text = _tokenizer.Decode([tokenId]);

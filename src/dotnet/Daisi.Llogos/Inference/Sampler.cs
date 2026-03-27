@@ -23,7 +23,8 @@ public sealed class Sampler
     /// <summary>
     /// Sample a token ID from logits using the given parameters.
     /// </summary>
-    public int Sample(ReadOnlySpan<float> logits, GenerationParams p, ReadOnlySpan<int> previousTokens)
+    public int Sample(ReadOnlySpan<float> logits, GenerationParams p, ReadOnlySpan<int> previousTokens,
+        GrammarConstraint? grammarConstraint = null)
     {
         int vocabSize = logits.Length;
 
@@ -40,7 +41,11 @@ public sealed class Sampler
         // 1. Repetition / frequency / presence penalties
         ApplyPenalties(work, previousTokens, p);
 
-        // 2. PreventEOS: set EOS logit to -inf
+        // 2. Grammar constraint: mask invalid tokens
+        if (grammarConstraint != null)
+            grammarConstraint.ApplyToLogits(work);
+
+        // 3. PreventEOS: set EOS logit to -inf
         if (p.PreventEOS && p.StopTokens != null)
         {
             foreach (int eos in p.StopTokens)
