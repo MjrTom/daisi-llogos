@@ -9,13 +9,13 @@ public sealed record GenerationParams
     public int MaxTokens { get; init; } = 256;
 
     /// <summary>Sampling temperature. 0 = greedy (argmax).</summary>
-    public float Temperature { get; init; } = 0.7f;
+    public float Temperature { get; init; } = 0.8f;
 
     /// <summary>Top-k filter. 0 = disabled.</summary>
     public int TopK { get; init; } = 40;
 
     /// <summary>Nucleus sampling threshold. 1.0 = disabled.</summary>
-    public float TopP { get; init; } = 0.9f;
+    public float TopP { get; init; } = 0.95f;
 
     /// <summary>Repetition penalty factor. 1.0 = disabled.</summary>
     public float RepetitionPenalty { get; init; } = 1.1f;
@@ -44,7 +44,7 @@ public sealed record GenerationParams
     public bool PenalizeNewline { get; init; }
 
     /// <summary>Number of recent tokens to consider for repetition/frequency/presence penalty. 0 = all.</summary>
-    public int PenaltyCount { get; init; }
+    public int PenaltyCount { get; init; } = 64;
 
     /// <summary>Minimum candidates to keep after top-p/min-p filtering. Default: 1.</summary>
     public int MinKeep { get; init; } = 1;
