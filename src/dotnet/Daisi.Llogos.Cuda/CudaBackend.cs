@@ -147,6 +147,9 @@ public sealed class CudaBackend : IComputeBackend
     /// </summary>
     private void EnsureContext() => _context.MakeCurrent();
 
+    /// <summary>Bind the CUDA context to the calling thread. Required before cuMemFree from non-owner threads.</summary>
+    public void EnsureCudaContext() => _context.MakeCurrent();
+
     /// <summary>
     /// Batch MatMul for M > 1 (prefill, speculative decode verification).
     /// Dequantizes quantized weights to FP32 temp buffer, then uses cuBLAS SGEMM.

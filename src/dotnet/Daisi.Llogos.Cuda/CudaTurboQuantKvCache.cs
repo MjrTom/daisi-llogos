@@ -297,6 +297,11 @@ public sealed class CudaTurboQuantKvCache : IKvCache
 
     public void Dispose()
     {
+        // Ensure CUDA context is bound to this thread before freeing device memory.
+        // Dispose may be called from a finalizer or different thread than the one
+        // that created the CUDA context, causing segfaults in cuMemFree.
+        _cudaBackend.EnsureCudaContext();
+
         foreach (var m in _kPacked) m.Dispose();
         foreach (var m in _vPacked) m.Dispose();
         foreach (var m in _kScales) m.Dispose();
