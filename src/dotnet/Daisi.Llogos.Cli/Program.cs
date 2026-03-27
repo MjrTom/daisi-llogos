@@ -167,7 +167,13 @@ else
         Console.Error.WriteLine($"done ({draftConfig.Architecture}, {draftConfig.NumLayers}L, {draftConfig.HiddenDim}d)");
     }
 
-    var generator = new TextGenerator(forward, tokenizer, options.Seed);
+    // Use OffloadForwardPass when layer offloading is active
+    IForwardPass activeForward = forward;
+    if (options.GpuLayers > 0 && CudaLayerOffload.Swapper != null)
+    {
+        activeForward = new OffloadForwardPass(forward, CudaLayerOffload.Swapper, options.GpuLayers);
+    }
+    var generator = new TextGenerator(activeForward, tokenizer, options.Seed);
 
     if (options.Bench)
     {

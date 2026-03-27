@@ -18,6 +18,9 @@ namespace Daisi.Llogos.Cuda;
 /// </summary>
 public static class CudaLayerOffload
 {
+    /// <summary>The offload swapper from the last LoadWithOffload call. Used by CLI to create OffloadForwardPass.</summary>
+    public static OffloadSwapper? Swapper { get; private set; }
+
     /// <summary>
     /// Load a model with layer offloading: first N layers in VRAM, rest in pinned host memory.
     /// The returned ModelWeights works with ForwardPass — offloaded layers are transparently
@@ -75,7 +78,15 @@ public static class CudaLayerOffload
                 if (pinned) pinnedCount++;
             }
 
-            Console.Error.WriteLine($"  Layer offload: {gpuLayers} VRAM + {pinnedCount} pinned ({pinnedCount * 100 / totalLayers}% offloaded)");
+            // Create and register offload swapper for DMA prefetching
+            var swapper = new OffloadSwapper(backend, gpuLayers, totalLayers);
+            for (int i = gpuLayers; i < totalLayers; i++)
+                swapper.RegisterLayer(i, layers[i]);
+            swapper.AllocateStaging();
+
+            Console.Error.WriteLine($"  Layer offload: {gpuLayers} VRAM + {pinnedCount} pinned ({pinnedCount * 100 / totalLayers}% offloaded, DMA staging ready)");
+
+            Swapper = swapper;
 
             return new ModelWeights
             {

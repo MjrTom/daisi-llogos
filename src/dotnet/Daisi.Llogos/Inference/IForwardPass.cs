@@ -16,6 +16,20 @@ public interface IForwardPass : IDisposable
 
     IKvCache KvCache { get; }
 
+    /// <summary>
+    /// Forward pass returning only the argmax token ID (skip full logit download).
+    /// Default: falls back to Forward + argmax over the returned logits.
+    /// </summary>
+    int ForwardArgMax(int tokenId, int position)
+    {
+        var logits = Forward(tokenId, position);
+        int best = 0;
+        float bestVal = logits[0];
+        for (int i = 1; i < logits.Length; i++)
+            if (logits[i] > bestVal) { bestVal = logits[i]; best = i; }
+        return best;
+    }
+
     /// <summary>Whether this model supports batched prefill.</summary>
     bool SupportsBatchedPrefill => false;
 
