@@ -54,19 +54,33 @@ public sealed class OffloadForwardPass : IForwardPass
 
     private void RunLayers(int tokenId, int position)
     {
-        // 1. Copy ALL offloaded layers to VRAM mirrors upfront
-        for (int i = _gpuLayers; i < _totalLayers; i++)
-            _swapper.PrefetchLayer(i, _forward.GetLayerWeights(i));
-        _swapper.SyncDma();
-
-        // 2. Run ALL layers in one batch — VRAM layers read from device memory,
-        // offloaded layers read from VRAM mirrors (SetDevicePtr redirects).
-        // Single ForwardLayers call preserves correct residual connections.
         _forward.ForwardEmbedding(tokenId);
-        _forward.ForwardLayers(0, _totalLayers, position);
 
-        // 3. Restore pinned pointers for next token
-        _swapper.RestorePinnedPtrs(_forward.GetAllLayerWeights());
+        // 1. VRAM layers: one fast graph-captured batch
+        // isFinal=false: defer ElementAdd so offloaded layers can continue the residual chain
+        bool hasOffloaded = _gpuLayers < _totalLayers;
+        if (_gpuLayers > 0)
+            _forward.ForwardLayers(0, _gpuLayers, position, isFinal: !hasOffloaded);
+
+        // 2. Offloaded layers: per-layer DMA pipeline with overlap
+        if (hasOffloaded)
+        {
+            _swapper.PrefetchLayer(_gpuLayers, _forward.GetLayerWeights(_gpuLayers));
+
+            for (int i = _gpuLayers; i < _totalLayers; i++)
+            {
+                if (i + 1 < _totalLayers)
+                    _swapper.PrefetchLayer(i + 1, _forward.GetLayerWeights(i + 1));
+
+                _swapper.SyncDma();
+
+                bool isLast = (i == _totalLayers - 1);
+                _forward.ForwardLayers(i, i + 1, position,
+                    continuation: true, isFinal: isLast);
+            }
+
+            _swapper.RestorePinnedPtrs(_forward.GetAllLayerWeights());
+        }
     }
 
     public void Dispose()
