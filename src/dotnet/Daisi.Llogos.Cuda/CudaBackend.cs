@@ -70,30 +70,6 @@ public sealed class CudaBackend : IComputeBackend
         _stream.Launch(function, gridX, gridY, gridZ, blockX, blockY, blockZ, sharedMem, args);
     }
 
-    private nint _asyncStreamHandle;
-
-    /// <summary>
-    /// Launch a kernel on a low-priority async stream (outside graph capture).
-    /// Yields SM resources to the main stream for minimal contention.
-    /// </summary>
-    public unsafe void LaunchKernelAsync(nint function, uint gridX, uint gridY, uint gridZ,
-        uint blockX, uint blockY, uint blockZ, uint sharedMem, nint* args)
-    {
-        if (_asyncStreamHandle == 0)
-        {
-            CudaApi.Check(CudaApi.StreamCreate(out _asyncStreamHandle, 0), "cuStreamCreate(async)");
-        }
-        CudaApi.LaunchKernel(function, gridX, gridY, gridZ,
-            blockX, blockY, blockZ, sharedMem, _asyncStreamHandle, args, null);
-    }
-
-    /// <summary>Synchronize the async stream before switching to compressed attention.</summary>
-    public void SyncAsyncStream()
-    {
-        if (_asyncStreamHandle != 0)
-            CudaApi.Check(CudaApi.StreamSynchronize(_asyncStreamHandle), "cuStreamSynchronize(async)");
-    }
-
     /// <summary>Begin recording operations into a CUDA graph (if enabled).</summary>
     public void BeginCommands()
     {
@@ -146,6 +122,9 @@ public sealed class CudaBackend : IComputeBackend
     /// this is safe — only one thread calls CUDA at a time.
     /// </summary>
     private void EnsureContext() => _context.MakeCurrent();
+
+    /// <summary>Bind the CUDA context to the calling thread. Required before cuMemFree from non-owner threads.</summary>
+    public void EnsureCudaContext() => _context.MakeCurrent();
 
     /// <summary>
     /// Batch MatMul for M > 1 (prefill, speculative decode verification).
@@ -307,6 +286,7 @@ public sealed class CudaBackend : IComputeBackend
 
         return new CudaTensor(name, type, dimensions, data);
     }
+
 
     /// <inheritdoc />
     public unsafe void MatMul(ITensor output, ITensor a, ITensor b, int M, int K, int N)

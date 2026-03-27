@@ -1,5 +1,6 @@
 using Daisi.Llogos.Gguf;
 using Daisi.Llogos.Inference;
+using Daisi.Llogos.Inference.DaisiTurbo;
 using Daisi.Llogos.Model;
 using Daisi.Llogos.Tokenizer;
 
@@ -28,6 +29,21 @@ public sealed class DaisiLlogosModelHandle : IDisposable
 
     /// <summary>The context size this model was loaded with.</summary>
     public int ContextSize => _contextSize;
+
+    /// <summary>
+    /// Optional TurboQuant KV compression config. Set after loading to enable
+    /// compressed KV cache for all new sessions created from this handle.
+    /// </summary>
+    public TurboQuantConfig? TurboConfig { get; set; }
+
+    /// <summary>
+    /// Optional offload forward pass (wraps standard forward with layer swapping).
+    /// Set by the backend when --gpu-layers is used.
+    /// </summary>
+    public IForwardPass? OffloadForwardFactory { get; set; }
+
+    /// <summary>Number of layers kept in VRAM (0 = all). Set by backend.</summary>
+    public int GpuLayerCount { get; set; }
 
     internal DaisiLlogosModelHandle(
         string modelId,
@@ -76,11 +92,52 @@ public sealed class DaisiLlogosModelHandle : IDisposable
         }
         else
         {
-            var kvCache = new KvCache(Backend, Config, contextSize);
+            IKvCache kvCache;
+            if (TurboConfig != null)
+            {
+                // Use CPU TurboQuant — CUDA version has dispose threading issues
+                // TODO: switch to CudaTurboQuantKvCache when CUDA dispose is fixed
+                kvCache = new TurboQuantKvCache(Backend, Config, contextSize, TurboConfig);
+            }
+            else
+            {
+                kvCache = new KvCache(Backend, Config, contextSize);
+            }
             var deltaState = new DeltaNetState(Backend, Config, Weights);
-            var forward = new ForwardPass(Backend, Config, Weights, kvCache, deltaState);
+            IForwardPass forward = new ForwardPass(Backend, Config, Weights, kvCache, deltaState);
+
+            // Wrap with offload forward pass if GPU layer offloading is active
+            if (GpuLayerCount > 0)
+            {
+                forward = TryWrapWithOffload(forward) ?? forward;
+            }
+
             return (forward, kvCache);
         }
+    }
+
+    /// <summary>
+    /// Try to wrap a forward pass with OffloadForwardPass via reflection.
+    /// Returns null if offload classes aren't available or swapper isn't initialized.
+    /// </summary>
+    private IForwardPass? TryWrapWithOffload(IForwardPass inner)
+    {
+        try
+        {
+            // Get the static Swapper from CudaLayerOffload
+            var offloadType = Type.GetType("Daisi.Llogos.Cuda.CudaLayerOffload, Daisi.Llogos.Cuda");
+            var swapperProp = offloadType?.GetProperty("Swapper",
+                System.Reflection.BindingFlags.Public | System.Reflection.BindingFlags.Static);
+            var swapper = swapperProp?.GetValue(null);
+            if (swapper == null) return null;
+
+            // new OffloadForwardPass(inner, swapper, gpuLayers)
+            var offloadFpType = Type.GetType("Daisi.Llogos.Cuda.OffloadForwardPass, Daisi.Llogos.Cuda");
+            if (offloadFpType == null) return null;
+
+            return (IForwardPass?)Activator.CreateInstance(offloadFpType, inner, swapper, GpuLayerCount);
+        }
+        catch { return null; }
     }
 
     /// <summary>

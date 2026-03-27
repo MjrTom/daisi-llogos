@@ -212,9 +212,8 @@ public sealed class CudaTurboQuantKvCache : IKvCache
         args[14] = (nint)(&vPackedPH);
         args[15] = (nint)(&qBits);
 
-        // Launch on async stream to keep turbo_kv_write OUT of the CUDA graph
         uint writeSharedMem = 3072;
-        _cudaBackend.LaunchKernelAsync(func, (uint)nKvHeads, 1, 1, 32, 1, 1, writeSharedMem, args);
+        _cudaBackend.LaunchKernel(func, (uint)nKvHeads, 1, 1, 32, 1, 1, writeSharedMem, args);
 
         Length = _strategy.EffectiveSeqLen(position);
     }
@@ -231,8 +230,7 @@ public sealed class CudaTurboQuantKvCache : IKvCache
         if (seqLen < _compressedThreshold)
             return false;  // ForwardPass uses GetK/VCacheTensor + GatedAttention
 
-        // Sync async stream to ensure all compressed writes complete
-        _cudaBackend.SyncAsyncStream();
+        // Compressed data written on main stream — already ordered.
 
         int idx = GetCacheIndex(layer);
 
@@ -297,6 +295,11 @@ public sealed class CudaTurboQuantKvCache : IKvCache
 
     public void Dispose()
     {
+        // Ensure CUDA context is bound to this thread before freeing device memory.
+        // Dispose may be called from a finalizer or different thread than the one
+        // that created the CUDA context, causing segfaults in cuMemFree.
+        _cudaBackend.EnsureCudaContext();
+
         foreach (var m in _kPacked) m.Dispose();
         foreach (var m in _vPacked) m.Dispose();
         foreach (var m in _kScales) m.Dispose();

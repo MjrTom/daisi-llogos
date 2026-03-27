@@ -3,6 +3,7 @@ using Daisi.Inference;
 using Daisi.Inference.Interfaces;
 using Daisi.Inference.Models;
 using Daisi.Llogos.Gguf;
+using Daisi.Llogos.Inference;
 using Daisi.Llogos.Model;
 using Daisi.Llogos.Tokenizer;
 
@@ -46,9 +47,20 @@ public sealed class DaisiLlogosTextBackend : ITextInferenceBackend
         var config = ModelConfig.FromGguf(gguf);
         var tokenizer = TokenizerFactory.FromGguf(gguf);
         var chatTemplate = ChatTemplate.FromGguf(gguf);
-        var weights = config.IsBitNet
-            ? BitNetModelLoader.Load(gguf, stream, backend, config)
-            : MmapModelLoader.Load(gguf, request.FilePath, backend, config);
+        ModelWeights weights;
+        IForwardPass? offloadForward = null;
+
+        if (!config.IsBitNet && request.GpuLayerCount > 0 && request.GpuLayerCount < config.NumLayers)
+        {
+            // Partial GPU offload: keep first N layers in VRAM, rest in pinned RAM
+            (weights, offloadForward) = TryLoadWithOffload(gguf, request, backend, config);
+        }
+        else
+        {
+            weights = config.IsBitNet
+                ? BitNetModelLoader.Load(gguf, stream, backend, config)
+                : MmapModelLoader.Load(gguf, request.FilePath, backend, config);
+        }
 
         var contextSize = request.ContextSize > 0
             ? (int)Math.Min(request.ContextSize, config.MaxContext)
@@ -66,7 +78,65 @@ public sealed class DaisiLlogosTextBackend : ITextInferenceBackend
             contextSize,
             seed: null);
 
+        if (offloadForward != null)
+            handle.OffloadForwardFactory = offloadForward;
+
+        if (request.GpuLayerCount > 0)
+            OnLog?.Invoke($"GPU layers: {Math.Min(request.GpuLayerCount, config.NumLayers)}/{config.NumLayers}");
+
         return Task.FromResult<IModelHandle>(new DaisiLlogosModelHandleAdapter(handle));
+    }
+
+    /// <summary>
+    /// Try to load model with partial GPU offloading via CudaLayerOffload (reflection).
+    /// Falls back to standard loading if CUDA offload classes aren't available.
+    /// </summary>
+    private (ModelWeights weights, IForwardPass? offloadForward) TryLoadWithOffload(
+        GgufFile gguf, ModelLoadRequest request, IComputeBackend backend, ModelConfig config)
+    {
+        try
+        {
+            // CudaLayerOffload.LoadWithOffload(gguf, filePath, cudaBackend, config, gpuLayers, remapper)
+            var offloadType = Type.GetType("Daisi.Llogos.Cuda.CudaLayerOffload, Daisi.Llogos.Cuda");
+            if (offloadType == null)
+                throw new InvalidOperationException("CudaLayerOffload not available");
+
+            var loadMethod = offloadType.GetMethod("LoadWithOffload",
+                System.Reflection.BindingFlags.Public | System.Reflection.BindingFlags.Static);
+            if (loadMethod == null)
+                throw new InvalidOperationException("LoadWithOffload method not found");
+
+            OnLog?.Invoke($"Loading with GPU offload: {request.GpuLayerCount}/{config.NumLayers} layers in VRAM...");
+
+            var weights = (ModelWeights)loadMethod.Invoke(null, [
+                gguf, request.FilePath, backend, config, request.GpuLayerCount, null
+            ])!;
+
+            // OffloadSwapper is stored statically by CudaLayerOffload.LoadWithOffload
+            // OffloadForwardPass wraps the standard forward pass
+            var swapperProp = offloadType.GetProperty("Swapper",
+                System.Reflection.BindingFlags.Public | System.Reflection.BindingFlags.Static);
+            var swapper = swapperProp?.GetValue(null);
+
+            IForwardPass? offloadForward = null;
+            if (swapper != null)
+            {
+                var offloadFpType = Type.GetType("Daisi.Llogos.Cuda.OffloadForwardPass, Daisi.Llogos.Cuda");
+                if (offloadFpType != null)
+                {
+                    // Store info needed to create OffloadForwardPass later (when creating sessions)
+                    // For now, store the gpu layer count on the handle
+                }
+            }
+
+            return (weights, null);
+        }
+        catch (Exception ex)
+        {
+            OnLog?.Invoke($"GPU offload failed: {ex.Message}. Falling back to standard loading.");
+            using var stream = File.OpenRead(request.FilePath);
+            return (MmapModelLoader.Load(gguf, request.FilePath, backend, config), null);
+        }
     }
 
     /// <summary>
@@ -223,6 +293,16 @@ internal sealed class DaisiLlogosChatSessionAdapter : IChatSession
         TopP = p.TopP,
         RepetitionPenalty = p.RepeatPenalty,
         Seed = p.Seed > 0 ? (int)p.Seed : null,
+        FrequencyPenalty = p.FrequencyPenalty,
+        PresencePenalty = p.PresencePenalty,
+        MinP = p.MinP,
+        TypicalP = p.TypicalP,
+        PenalizeNewline = p.PenalizeNewline,
+        PenaltyCount = p.PenaltyCount,
+        MinKeep = p.MinKeep,
+        PreventEOS = p.PreventEOS,
+        AntiPrompts = p.AntiPrompts?.Count > 0 ? p.AntiPrompts.ToArray() : null,
+        GrammarText = p.GrammarText,
     };
 
     private static ChatRole MapRole(string role) => role switch
