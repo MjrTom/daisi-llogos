@@ -57,7 +57,7 @@ public static class CudaLayerOffload
                 tensorMap[t.Name] = t;
 
             // Embedding and output head always go to VRAM (small, used every token)
-            // Note: vocab remapping not supported with offloaded loading — use standard load
+            // No vocab remapping — offload uses ArgMaxVocabLimit for partial logits instead
             ITensor tokenEmbedding = LoadTensorVram(gguf, basePtr, backend, tensorMap, "token_embd.weight");
             ITensor outputNorm = LoadTensorVram(gguf, basePtr, backend, tensorMap, "output_norm.weight");
             ITensor? output = TryLoadTensorVram(gguf, basePtr, backend, tensorMap, "output.weight");
@@ -83,6 +83,10 @@ public static class CudaLayerOffload
             for (int i = gpuLayers; i < totalLayers; i++)
                 swapper.RegisterLayer(i, layers[i]);
             swapper.AllocateStaging();
+
+            // Disable CUDA graph capture: per-layer ForwardLayers calls with DMA sync
+            // between them prevent graph reuse and add capture overhead per layer.
+            backend.DisableGraphCapture();
 
             Console.Error.WriteLine($"  Layer offload: {gpuLayers} VRAM + {pinnedCount} pinned ({pinnedCount * 100 / totalLayers}% offloaded, DMA staging ready)");
 
@@ -113,6 +117,20 @@ public static class CudaLayerOffload
         var data = new ReadOnlySpan<byte>(basePtr + offset, byteSize);
         var dims = ConvertDims(info);
         return backend.LoadTensor(name, info.Type, dims, data);
+    }
+
+    private static unsafe ITensor LoadTensorRemappedVram(GgufFile gguf, byte* basePtr,
+        CudaBackend backend, Dictionary<string, GgufTensorInfo> map, string name, VocabRemapper remapper)
+    {
+        var info = map[name];
+        long offset = gguf.GetTensorDataOffset(info);
+        int byteSize = (int)info.ByteSize;
+        var data = new ReadOnlySpan<byte>(basePtr + offset, byteSize);
+        var dims = ConvertDims(info);
+        int vocabSize = dims.Length > 1 ? (int)dims[1] : (int)dims[0];
+        int bytesPerRow = byteSize / vocabSize;
+        var permuted = remapper.PermuteRows(data, vocabSize, bytesPerRow);
+        return backend.LoadTensor(name, info.Type, dims, permuted);
     }
 
     private static unsafe ITensor? TryLoadTensorVram(GgufFile gguf, byte* basePtr,

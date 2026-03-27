@@ -36,8 +36,7 @@ public sealed class OffloadSwapper : IDisposable
     }
 
     /// <summary>
-    /// Register an offloaded layer's tensors. Called during model loading.
-    /// Allocates a per-tensor VRAM mirror for each pinned tensor.
+    /// Register an offloaded layer. Computes total layer size for contiguous allocation.
     /// </summary>
     public void RegisterLayer(int layerIndex, LayerWeights layer)
     {
@@ -45,36 +44,72 @@ public sealed class OffloadSwapper : IDisposable
 
         var tensors = new List<TensorRef>();
         CollectTensors(layer, tensors);
-
-        // Allocate a VRAM mirror for each pinned tensor
-        foreach (var t in tensors)
-            t.VramMirror = new CudaDeviceMemory(t.ByteSize);
-
         _pinnedMaps[layerIndex] = new LayerTensorMap { Tensors = tensors.ToArray() };
     }
 
-    /// <summary>No separate staging allocation needed — mirrors are per-tensor.</summary>
-    public void AllocateStaging() { }
+    /// <summary>
+    /// Allocate contiguous VRAM mirrors — ONE allocation per layer for single-DMA copy.
+    /// </summary>
+    public void AllocateStaging()
+    {
+        for (int i = _gpuLayers; i < _totalLayers; i++)
+        {
+            var map = _pinnedMaps[i];
+            if (map.Tensors == null) continue;
+
+            // Total layer size with 256-byte alignment per tensor
+            ulong totalBytes = 0;
+            foreach (var t in map.Tensors)
+            {
+                totalBytes = (totalBytes + 255) & ~255UL;
+                totalBytes += t.ByteSize;
+            }
+
+            // ONE contiguous VRAM buffer per layer
+            map.VramMirror = new CudaDeviceMemory(totalBytes);
+            map.TotalBytes = totalBytes;
+
+            // Compute each tensor's offset within the contiguous buffer
+            ulong offset = 0;
+            foreach (var t in map.Tensors)
+            {
+                offset = (offset + 255) & ~255UL;
+                t.MirrorOffset = offset;
+                offset += t.ByteSize;
+            }
+
+            // Also allocate contiguous pinned host buffer and copy tensors into it
+            map.PinnedBlob = new CudaPinnedMemory(totalBytes);
+            unsafe
+            {
+                foreach (var t in map.Tensors)
+                {
+                    // Copy from individual pinned tensor → contiguous pinned blob
+                    Buffer.MemoryCopy((void*)t.HostPtr, (void*)(map.PinnedBlob.HostPtr + (nint)t.MirrorOffset),
+                        (long)(totalBytes - t.MirrorOffset), (long)t.ByteSize);
+                }
+            }
+        }
+    }
 
     /// <summary>
-    /// Copy an offloaded layer's weights from pinned RAM to per-tensor VRAM mirrors.
-    /// Uses async DMA on the copy stream for overlap with GPU compute.
+    /// Single DMA copy per layer: contiguous pinned blob → contiguous VRAM mirror.
+    /// Then set each tensor's DevicePtr to its offset within the mirror.
     /// </summary>
     public unsafe void PrefetchLayer(int layerIndex, LayerWeights layer)
     {
         if (layerIndex < _gpuLayers) return;
 
         var map = _pinnedMaps[layerIndex];
-        if (map.Tensors == null) return;
+        if (map.Tensors == null || map.VramMirror == null || map.PinnedBlob == null) return;
 
-        for (int i = 0; i < map.Tensors.Length; i++)
-        {
-            var t = map.Tensors[i];
-            // Async DMA: pinned host → VRAM mirror
-            CudaApi.MemcpyHtoDAsync(t.VramMirror!.DevicePtr, (void*)t.HostPtr, t.ByteSize, _dmaStreamHandle);
-            // Point tensor at VRAM mirror
-            t.Tensor.SetDevicePtr(t.VramMirror.DevicePtr);
-        }
+        // ONE async DMA copy for the entire layer
+        CudaApi.MemcpyHtoDAsync(map.VramMirror.DevicePtr, (void*)map.PinnedBlob.HostPtr,
+            map.TotalBytes, _dmaStreamHandle);
+
+        // Set each tensor's DevicePtr to its offset within the VRAM mirror
+        foreach (var t in map.Tensors)
+            t.Tensor.SetDevicePtr(map.VramMirror.DevicePtr + t.MirrorOffset);
     }
 
     /// <summary>
@@ -107,12 +142,11 @@ public sealed class OffloadSwapper : IDisposable
 
     public void Dispose()
     {
-        // Dispose per-tensor VRAM mirrors
         foreach (var map in _pinnedMaps)
         {
-            if (map.Tensors == null) continue;
-            foreach (var t in map.Tensors)
-                t.VramMirror?.Dispose();
+            if (map == null) continue;
+            map.VramMirror?.Dispose();
+            map.PinnedBlob?.Dispose();
         }
         if (_dmaStreamHandle != 0)
             CudaApi.StreamDestroy(_dmaStreamHandle);
@@ -154,11 +188,14 @@ public sealed class OffloadSwapper : IDisposable
         public ulong PinnedDevicePtr;  // Original pinned device pointer
         public nint HostPtr;           // Host pointer for DMA source
         public ulong ByteSize;
-        public CudaDeviceMemory? VramMirror;  // Per-tensor VRAM staging buffer
+        public ulong MirrorOffset;     // Offset within contiguous VRAM mirror
     }
 
-    private struct LayerTensorMap
+    private class LayerTensorMap
     {
         public TensorRef[]? Tensors;
+        public CudaDeviceMemory? VramMirror;  // ONE contiguous VRAM buffer per layer
+        public CudaPinnedMemory? PinnedBlob;  // ONE contiguous pinned buffer per layer
+        public ulong TotalBytes;
     }
 }

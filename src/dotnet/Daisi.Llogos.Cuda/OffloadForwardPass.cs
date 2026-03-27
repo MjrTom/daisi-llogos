@@ -56,29 +56,23 @@ public sealed class OffloadForwardPass : IForwardPass
     {
         _forward.ForwardEmbedding(tokenId);
 
-        // 1. VRAM layers: one fast graph-captured batch
-        // isFinal=false: defer ElementAdd so offloaded layers can continue the residual chain
         bool hasOffloaded = _gpuLayers < _totalLayers;
+
+        // Kick off ALL DMA copies immediately (non-blocking, batched on DMA stream)
+        if (hasOffloaded)
+            for (int i = _gpuLayers; i < _totalLayers; i++)
+                _swapper.PrefetchLayer(i, _forward.GetLayerWeights(i));
+
+        // Run VRAM layers (overlaps with DMA of offloaded layers)
         if (_gpuLayers > 0)
             _forward.ForwardLayers(0, _gpuLayers, position, isFinal: !hasOffloaded);
 
-        // 2. Offloaded layers: per-layer DMA pipeline with overlap
+        // Wait for ALL DMA to complete, then run all offloaded layers in one batch
         if (hasOffloaded)
         {
-            _swapper.PrefetchLayer(_gpuLayers, _forward.GetLayerWeights(_gpuLayers));
-
-            for (int i = _gpuLayers; i < _totalLayers; i++)
-            {
-                if (i + 1 < _totalLayers)
-                    _swapper.PrefetchLayer(i + 1, _forward.GetLayerWeights(i + 1));
-
-                _swapper.SyncDma();
-
-                bool isLast = (i == _totalLayers - 1);
-                _forward.ForwardLayers(i, i + 1, position,
-                    continuation: true, isFinal: isLast);
-            }
-
+            _swapper.SyncDma();
+            _forward.ForwardLayers(_gpuLayers, _totalLayers, position,
+                continuation: true, isFinal: true);
             _swapper.RestorePinnedPtrs(_forward.GetAllLayerWeights());
         }
     }

@@ -67,10 +67,9 @@ else
     // Build vocab remapper if partial vocab is active (vocab-limit > 1)
     // Same-family models (Qwen3.5) have identical vocabularies, so same remapper works for both
     VocabRemapper? remapper = null;
-    // Disable remapper for speculative decoding (shared ID space) and layer offloading (not yet supported)
-    int vocabDivisor = options.DraftModelPath != null ? 1
-        : options.GpuLayers > 0 ? 1
-        : (options.VocabLimit ?? 32);
+    // Disable remapper for speculative decoding (shared ID space) and layer offloading
+    // (offload uses ArgMaxVocabLimit for partial logits without weight remapping)
+    int vocabDivisor = (options.DraftModelPath != null || options.GpuLayers > 0) ? 1 : (options.VocabLimit ?? 32);
     if (vocabDivisor > 1)
     {
         var tokens = gguf.GetMetadata<string[]>("tokenizer.ggml.tokens")!;
@@ -118,9 +117,10 @@ else
         kvCache = new KvCache(backend, config, maxSeqLen: maxContext, strategy: strategy);
     var deltaState = new DeltaNetState(backend, config, weights);
     var forward = new ForwardPass(backend, config, weights, kvCache, deltaState);
-    // For layer offloading: no vocab remapping but still use partial logit computation
-    int effectiveVocabDivisor = options.GpuLayers > 0 ? (options.VocabLimit ?? 32) : vocabDivisor;
-    forward.ArgMaxVocabLimit = config.VocabSize / effectiveVocabDivisor;
+    // For offloading: use partial vocab logits without remapping (ArgMaxVocabLimit
+    // just computes fewer columns of LM head — doesn't need remapped weights)
+    int argMaxDivisor = options.GpuLayers > 0 ? (options.VocabLimit ?? 32) : vocabDivisor;
+    forward.ArgMaxVocabLimit = config.VocabSize / argMaxDivisor;
 
     // Early exit profiling: measure at which layer the token prediction stabilizes
     if (options.ProfileEarlyExit)
