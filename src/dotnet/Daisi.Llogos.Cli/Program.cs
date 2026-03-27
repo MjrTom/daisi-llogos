@@ -67,9 +67,8 @@ else
     // Build vocab remapper if partial vocab is active (vocab-limit > 1)
     // Same-family models (Qwen3.5) have identical vocabularies, so same remapper works for both
     VocabRemapper? remapper = null;
-    // Disable remapper for speculative decoding (shared ID space) and layer offloading
-    // (offload uses ArgMaxVocabLimit for partial logits without weight remapping)
-    int vocabDivisor = (options.DraftModelPath != null || options.GpuLayers > 0) ? 1 : (options.VocabLimit ?? 32);
+    // Disable remapper + partial vocab for speculative decoding (both models must share same ID space)
+    int vocabDivisor = options.DraftModelPath != null ? 1 : (options.VocabLimit ?? 32);
     if (vocabDivisor > 1)
     {
         var tokens = gguf.GetMetadata<string[]>("tokenizer.ggml.tokens")!;
@@ -78,15 +77,7 @@ else
     }
 
     ModelWeights weights;
-    if (options.GpuLayers > 0 && backend is CudaBackend cudaBackendForOffload)
-    {
-        // Layer offload doesn't support vocab remapping — load without remapper.
-        // Vocab divisor forced to 1 (full vocab logits).
-        weights = CudaLayerOffload.LoadWithOffload(gguf, options.ModelPath,
-            cudaBackendForOffload, config, options.GpuLayers);
-        vocabDivisor = 1;
-    }
-    else if (options.UseMmap)
+    if (options.UseMmap)
         weights = MmapModelLoader.Load(gguf, options.ModelPath, backend, config, remapper);
     else
         weights = ModelLoader.Load(gguf, stream, backend, config);
@@ -117,10 +108,7 @@ else
         kvCache = new KvCache(backend, config, maxSeqLen: maxContext, strategy: strategy);
     var deltaState = new DeltaNetState(backend, config, weights);
     var forward = new ForwardPass(backend, config, weights, kvCache, deltaState);
-    // For offloading: use partial vocab logits without remapping (ArgMaxVocabLimit
-    // just computes fewer columns of LM head — doesn't need remapped weights)
-    int argMaxDivisor = options.GpuLayers > 0 ? (options.VocabLimit ?? 32) : vocabDivisor;
-    forward.ArgMaxVocabLimit = config.VocabSize / argMaxDivisor;
+    forward.ArgMaxVocabLimit = config.VocabSize / vocabDivisor;
 
     // Early exit profiling: measure at which layer the token prediction stabilizes
     if (options.ProfileEarlyExit)
@@ -174,15 +162,7 @@ else
         Console.Error.WriteLine($"done ({draftConfig.Architecture}, {draftConfig.NumLayers}L, {draftConfig.HiddenDim}d)");
     }
 
-    // Use OffloadForwardPass when layer offloading is active.
-    // REQUIRED: pinned memory DevicePtr doesn't work with fused matmul kernels.
-    // OffloadForwardPass DMA-copies each offloaded layer to VRAM staging before execution.
-    IForwardPass activeForward = forward;
-    if (options.GpuLayers > 0 && CudaLayerOffload.Swapper != null)
-    {
-        activeForward = new OffloadForwardPass(forward, CudaLayerOffload.Swapper, options.GpuLayers);
-    }
-    var generator = new TextGenerator(activeForward, tokenizer, options.Seed);
+    var generator = new TextGenerator(forward, tokenizer, options.Seed);
 
     if (options.Bench)
     {
@@ -416,9 +396,6 @@ static CliArgs ParseArgs(string[] args)
             case "--kv-quant":
                 result.KvQuant = NextArg(args, ref i);
                 break;
-            case "--gpu-layers":
-                result.GpuLayers = int.Parse(NextArg(args, ref i));
-                break;
             case "--help" or "-h":
                 result.ShowHelp = true;
                 break;
@@ -458,7 +435,6 @@ static void PrintUsage()
           --spec-depth <n>         Speculation depth (default: 5)
           --batched-verify         Use batched verify (faster, higher acceptance, different FP from native)
           --kv-quant <mode>        KV cache compression: turbo, turbo:3, turbo:4, turbo:3+qjl32, turbo:3+noqjl
-          --gpu-layers <n>         Keep first N layers in VRAM, offload rest to pinned RAM (PCIe)
           --help, -h               Show this help
         """);
 }
@@ -487,5 +463,4 @@ class CliArgs
     public int SpecDepth = 5;
     public bool BatchedVerify;
     public string? KvQuant;
-    public int GpuLayers;
 }

@@ -93,12 +93,6 @@ internal static partial class CudaApi
     [LibraryImport(Lib, EntryPoint = "cuStreamCreate")]
     internal static partial CuResult StreamCreate(out nint stream, uint flags);
 
-    [LibraryImport(Lib, EntryPoint = "cuStreamCreateWithPriority")]
-    internal static partial CuResult StreamCreateWithPriority(out nint stream, uint flags, int priority);
-
-    [LibraryImport(Lib, EntryPoint = "cuCtxGetStreamPriorityRange")]
-    internal static partial CuResult CtxGetStreamPriorityRange(out int leastPriority, out int greatestPriority);
-
     [LibraryImport(Lib, EntryPoint = "cuStreamDestroy_v2")]
     internal static partial CuResult StreamDestroy(nint stream);
 
