@@ -36,6 +36,15 @@ public sealed class DaisiLlogosModelHandle : IDisposable
     /// </summary>
     public TurboQuantConfig? TurboConfig { get; set; }
 
+    /// <summary>
+    /// Optional offload forward pass (wraps standard forward with layer swapping).
+    /// Set by the backend when --gpu-layers is used.
+    /// </summary>
+    public IForwardPass? OffloadForwardFactory { get; set; }
+
+    /// <summary>Number of layers kept in VRAM (0 = all). Set by backend.</summary>
+    public int GpuLayerCount { get; set; }
+
     internal DaisiLlogosModelHandle(
         string modelId,
         string filePath,
@@ -95,9 +104,40 @@ public sealed class DaisiLlogosModelHandle : IDisposable
                 kvCache = new KvCache(Backend, Config, contextSize);
             }
             var deltaState = new DeltaNetState(Backend, Config, Weights);
-            var forward = new ForwardPass(Backend, Config, Weights, kvCache, deltaState);
+            IForwardPass forward = new ForwardPass(Backend, Config, Weights, kvCache, deltaState);
+
+            // Wrap with offload forward pass if GPU layer offloading is active
+            if (GpuLayerCount > 0)
+            {
+                forward = TryWrapWithOffload(forward) ?? forward;
+            }
+
             return (forward, kvCache);
         }
+    }
+
+    /// <summary>
+    /// Try to wrap a forward pass with OffloadForwardPass via reflection.
+    /// Returns null if offload classes aren't available or swapper isn't initialized.
+    /// </summary>
+    private IForwardPass? TryWrapWithOffload(IForwardPass inner)
+    {
+        try
+        {
+            // Get the static Swapper from CudaLayerOffload
+            var offloadType = Type.GetType("Daisi.Llogos.Cuda.CudaLayerOffload, Daisi.Llogos.Cuda");
+            var swapperProp = offloadType?.GetProperty("Swapper",
+                System.Reflection.BindingFlags.Public | System.Reflection.BindingFlags.Static);
+            var swapper = swapperProp?.GetValue(null);
+            if (swapper == null) return null;
+
+            // new OffloadForwardPass(inner, swapper, gpuLayers)
+            var offloadFpType = Type.GetType("Daisi.Llogos.Cuda.OffloadForwardPass, Daisi.Llogos.Cuda");
+            if (offloadFpType == null) return null;
+
+            return (IForwardPass?)Activator.CreateInstance(offloadFpType, inner, swapper, GpuLayerCount);
+        }
+        catch { return null; }
     }
 
     /// <summary>
