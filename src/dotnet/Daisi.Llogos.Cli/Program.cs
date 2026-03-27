@@ -167,7 +167,9 @@ else
         Console.Error.WriteLine($"done ({draftConfig.Architecture}, {draftConfig.NumLayers}L, {draftConfig.HiddenDim}d)");
     }
 
-    // Use OffloadForwardPass when layer offloading is active
+    // Use OffloadForwardPass when layer offloading is active.
+    // REQUIRED: pinned memory DevicePtr doesn't work with fused matmul kernels.
+    // OffloadForwardPass DMA-copies each offloaded layer to VRAM staging before execution.
     IForwardPass activeForward = forward;
     if (options.GpuLayers > 0 && CudaLayerOffload.Swapper != null)
     {

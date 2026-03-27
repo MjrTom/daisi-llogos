@@ -54,9 +54,13 @@ public sealed class OffloadSwapper : IDisposable
 
         _pinnedMaps[layerIndex] = new LayerTensorMap { Tensors = tensors.ToArray() };
 
-        // Track max layer size for staging buffer allocation
+        // Track max layer size for staging buffer (including 256-byte alignment padding)
         ulong layerBytes = 0;
-        foreach (var t in tensors) layerBytes += t.ByteSize;
+        foreach (var t in tensors)
+        {
+            layerBytes += t.ByteSize;
+            layerBytes = (layerBytes + 255) & ~255UL;  // Match PrefetchLayer's alignment
+        }
         if (layerBytes > _stagingSize) _stagingSize = layerBytes;
     }
 
@@ -96,8 +100,13 @@ public sealed class OffloadSwapper : IDisposable
             var dst = staging.DevicePtr + offset;
             var size = src.ByteSize;
 
-            // Async H2D copy on DMA stream
-            CudaApi.MemcpyHtoDAsync(dst, (void*)src.HostPtr, size, _dmaStreamHandle);
+            // Debug: validate pointers
+            if (src.HostPtr == 0) throw new InvalidOperationException($"Layer {layerIndex} tensor {i}: HostPtr is null");
+            if (dst == 0) throw new InvalidOperationException($"Layer {layerIndex} tensor {i}: staging dst is null");
+            if (size == 0) throw new InvalidOperationException($"Layer {layerIndex} tensor {i}: ByteSize is 0");
+            if (offset + size > _stagingSize) throw new InvalidOperationException($"Layer {layerIndex} tensor {i}: staging overflow ({offset + size} > {_stagingSize})");
+
+            CudaApi.Check(CudaApi.MemcpyHtoD(dst, (void*)src.HostPtr, size), $"cuMemcpyHtoD(layer{layerIndex}.tensor{i}, host={src.HostPtr:X}, dst={dst:X}, size={size})");
 
             // Update the tensor's device pointer to point at staging
             tensorList[i].Tensor.SetDevicePtr(dst);
