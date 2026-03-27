@@ -86,6 +86,8 @@ public sealed class DaisiLlogosModelHandle : IDisposable
             IKvCache kvCache;
             if (TurboConfig != null)
             {
+                // Use CPU TurboQuant — CUDA version has dispose threading issues
+                // TODO: switch to CudaTurboQuantKvCache when CUDA dispose is fixed
                 kvCache = new TurboQuantKvCache(Backend, Config, contextSize, TurboConfig);
             }
             else
