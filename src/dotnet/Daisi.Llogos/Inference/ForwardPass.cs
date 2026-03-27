@@ -905,6 +905,12 @@ public sealed class ForwardPass : IForwardPass
     /// <summary>Number of transformer layers in the model.</summary>
     public int NumLayers => _config.NumLayers;
 
+    /// <summary>Get a specific layer's weights (for offload swapper).</summary>
+    public Model.LayerWeights GetLayerWeights(int index) => _weights.Layers[index];
+
+    /// <summary>Get all layer weights (for offload swapper restore).</summary>
+    public Model.LayerWeights[] GetAllLayerWeights() => _weights.Layers;
+
     /// <summary>Hidden dimension size (for sizing DaisiChain activation buffers).</summary>
     public int HiddenDim => _config.HiddenDim;
 

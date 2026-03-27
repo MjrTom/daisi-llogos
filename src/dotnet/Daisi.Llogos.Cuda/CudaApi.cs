@@ -73,6 +73,9 @@ internal static partial class CudaApi
     [LibraryImport(Lib, EntryPoint = "cuMemcpyDtoDAsync_v2")]
     internal static partial CuResult MemcpyDtoDAsync(ulong dstDevice, ulong srcDevice, ulong byteCount, nint stream);
 
+    [LibraryImport(Lib, EntryPoint = "cuMemcpyHtoDAsync_v2")]
+    internal static unsafe partial CuResult MemcpyHtoDAsync(ulong dstDevice, void* srcHost, ulong byteCount, nint stream);
+
     [LibraryImport(Lib, EntryPoint = "cuMemsetD8_v2")]
     internal static partial CuResult MemsetD8(ulong dstDevice, byte value, ulong count);
 
