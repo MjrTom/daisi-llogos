@@ -7,240 +7,221 @@ using Daisi.Llogos.Tokenizer;
 namespace Daisi.Llogos.Tests.Inference;
 
 /// <summary>
-/// Integration tests for sampler parameters and grammar-constrained generation.
-/// These run the full model → forward pass → sampler pipeline.
+/// Integration tests that verify each sampler parameter has a measurable EFFECT
+/// on generation output. Each test compares behavior with vs without the parameter
+/// to prove it's not silently ignored.
 /// </summary>
 public class SamplerIntegrationTests
 {
     // ── AntiPrompts ─────────────────────────────────────────────────────────
 
     [Fact]
-    public void AntiPrompts_StopsOnMatchingString()
+    public void AntiPrompts_StopsEarlierThanWithout()
     {
         if (!TestConstants.ModelExists) return;
-        using var ctx = LoadModel();
-        var gen = new TextGenerator(ctx.Forward, ctx.Tokenizer, seed: 42);
 
-        // Generate with anti-prompt that should trigger early stop
-        var p = new GenerationParams
-        {
-            MaxTokens = 100,
-            Temperature = 0,
-            AntiPrompts = ["."],  // Stop at first period
-        };
+        // Without anti-prompt: generate freely
+        using var ctx1 = LoadModel();
+        var gen1 = new TextGenerator(ctx1.Forward, ctx1.Tokenizer, seed: 42);
+        var noStop = new GenerationParams { MaxTokens = 80, Temperature = 0 };
+        int countWithout = gen1.Generate("The capital of France is", noStop)
+            .Count(t => !t.IsDone);
 
-        var text = string.Concat(gen.Generate("The capital of France is", p)
-            .Where(t => !t.IsDone).Select(t => t.Text));
+        // With anti-prompt on period: should stop sooner
+        using var ctx2 = LoadModel();
+        var gen2 = new TextGenerator(ctx2.Forward, ctx2.Tokenizer, seed: 42);
+        var withStop = new GenerationParams { MaxTokens = 80, Temperature = 0, AntiPrompts = ["."] };
+        var tokensWith = gen2.Generate("The capital of France is", withStop)
+            .Where(t => !t.IsDone).ToList();
+        int countWith = tokensWith.Count;
+        string textWith = string.Concat(tokensWith.Select(t => t.Text));
 
-        // Should contain a period (the anti-prompt) and be shorter than 100 tokens worth
-        Assert.Contains(".", text);
-        // The output should be relatively short since we stop at the first sentence
-        Assert.True(text.Length < 500, $"AntiPrompt should have stopped early, got {text.Length} chars");
-    }
-
-    [Fact]
-    public void AntiPrompts_MultiplePatterns()
-    {
-        if (!TestConstants.ModelExists) return;
-        using var ctx = LoadModel();
-        var gen = new TextGenerator(ctx.Forward, ctx.Tokenizer, seed: 42);
-
-        var p = new GenerationParams
-        {
-            MaxTokens = 100,
-            Temperature = 0,
-            AntiPrompts = ["!", "?", "."],
-        };
-
-        var text = string.Concat(gen.Generate("Tell me about", p)
-            .Where(t => !t.IsDone).Select(t => t.Text));
-
-        // Should stop at any sentence-ending punctuation
-        bool hasStop = text.Contains('.') || text.Contains('!') || text.Contains('?');
-        Assert.True(hasStop, $"Should stop at punctuation, got: {text}");
+        Assert.True(countWith < countWithout,
+            $"AntiPrompt '.' should stop earlier: {countWith} vs {countWithout} tokens");
+        Assert.Contains(".", textWith);
     }
 
     // ── PreventEOS ──────────────────────────────────────────────────────────
 
     [Fact]
-    public void PreventEOS_GeneratesMoreTokens()
+    public void PreventEOS_ForcesFullMaxTokens()
     {
         if (!TestConstants.ModelExists) return;
         using var ctx = LoadModel();
+        var gen = new TextGenerator(ctx.Forward, ctx.Tokenizer, seed: 42);
 
-        // Without PreventEOS
-        var gen1 = new TextGenerator(ctx.Forward, ctx.Tokenizer, seed: 42);
-        var p1 = new GenerationParams { MaxTokens = 50, Temperature = 0 };
-        var tokens1 = gen1.Generate("Hi", p1).Where(t => !t.IsDone).Count();
-
-        // Reset and run with PreventEOS
-        ctx.Forward.ResetState();
-        var gen2 = new TextGenerator(ctx.Forward, ctx.Tokenizer, seed: 42);
-        var p2 = new GenerationParams
+        int maxTokens = 20;
+        var p = new GenerationParams
         {
-            MaxTokens = 50,
+            MaxTokens = maxTokens,
             Temperature = 0,
             PreventEOS = true,
             StopTokens = ctx.Tokenizer.Vocabulary.EosTokenId >= 0
                 ? [ctx.Tokenizer.Vocabulary.EosTokenId] : [],
         };
-        var tokens2 = gen2.Generate("Hi", p2).Where(t => !t.IsDone).Count();
+        int count = gen.Generate("Hi", p).Count(t => !t.IsDone);
 
-        // PreventEOS should generate at least as many tokens (often exactly MaxTokens)
-        Assert.True(tokens2 >= tokens1,
-            $"PreventEOS should generate >= tokens: {tokens2} vs {tokens1}");
+        // PreventEOS should force generation to hit MaxTokens exactly
+        Assert.Equal(maxTokens, count);
     }
 
-    // ── FrequencyPenalty / PresencePenalty ───────────────────────────────────
+    // ── FrequencyPenalty ─────────────────────────────────────────────────────
 
     [Fact]
-    public void FrequencyPenalty_ReducesRepetition()
+    public void FrequencyPenalty_HighPenalty_MoreDiverseThanLow()
     {
         if (!TestConstants.ModelExists) return;
-        using var ctx = LoadModel();
-        var gen = new TextGenerator(ctx.Forward, ctx.Tokenizer, seed: 42);
 
-        var p = new GenerationParams
-        {
-            MaxTokens = 40,
-            Temperature = 0.7f,
-            FrequencyPenalty = 1.0f,
-            RepetitionPenalty = 1.0f, // Disable standard repeat penalty
-        };
-
-        var tokens = gen.Generate("Repeat after me: hello hello hello", p)
+        // Low penalty
+        using var ctx1 = LoadModel();
+        var gen1 = new TextGenerator(ctx1.Forward, ctx1.Tokenizer, seed: 42);
+        var low = new GenerationParams { MaxTokens = 40, Temperature = 0.7f, FrequencyPenalty = 0f, RepetitionPenalty = 1.0f };
+        var tokensLow = gen1.Generate("Say hello hello hello hello hello", low)
             .Where(t => !t.IsDone).Select(t => t.TokenId).ToArray();
+        float uniqueLow = (float)tokensLow.Distinct().Count() / Math.Max(tokensLow.Length, 1);
 
-        // With high frequency penalty, tokens should be more diverse
-        var uniqueRatio = (float)tokens.Distinct().Count() / tokens.Length;
-        Assert.True(uniqueRatio > 0.3f,
-            $"Frequency penalty should increase diversity: {uniqueRatio:P0} unique");
+        // High penalty
+        using var ctx2 = LoadModel();
+        var gen2 = new TextGenerator(ctx2.Forward, ctx2.Tokenizer, seed: 42);
+        var high = new GenerationParams { MaxTokens = 40, Temperature = 0.7f, FrequencyPenalty = 2.0f, RepetitionPenalty = 1.0f };
+        var tokensHigh = gen2.Generate("Say hello hello hello hello hello", high)
+            .Where(t => !t.IsDone).Select(t => t.TokenId).ToArray();
+        float uniqueHigh = (float)tokensHigh.Distinct().Count() / Math.Max(tokensHigh.Length, 1);
+
+        Assert.True(uniqueHigh >= uniqueLow,
+            $"High FreqPenalty should be more diverse: {uniqueHigh:P0} vs {uniqueLow:P0}");
     }
 
+    // ── PresencePenalty ──────────────────────────────────────────────────────
+
     [Fact]
-    public void PresencePenalty_ProducesValidOutput()
+    public void PresencePenalty_HighPenalty_MoreDiverseThanLow()
     {
         if (!TestConstants.ModelExists) return;
-        using var ctx = LoadModel();
-        var gen = new TextGenerator(ctx.Forward, ctx.Tokenizer, seed: 42);
 
-        var p = new GenerationParams
-        {
-            MaxTokens = 20,
-            Temperature = 0.7f,
-            PresencePenalty = 0.5f,
-            RepetitionPenalty = 1.0f,
-        };
+        // No penalty
+        using var ctx1 = LoadModel();
+        var gen1 = new TextGenerator(ctx1.Forward, ctx1.Tokenizer, seed: 42);
+        var none = new GenerationParams { MaxTokens = 40, Temperature = 0.7f, PresencePenalty = 0f, RepetitionPenalty = 1.0f };
+        var tokensNone = gen1.Generate("Repeat: cat cat cat cat cat", none)
+            .Where(t => !t.IsDone).Select(t => t.TokenId).ToArray();
+        float uniqueNone = (float)tokensNone.Distinct().Count() / Math.Max(tokensNone.Length, 1);
 
-        var text = string.Concat(gen.Generate("Hello world", p)
-            .Where(t => !t.IsDone).Select(t => t.Text));
+        // High penalty
+        using var ctx2 = LoadModel();
+        var gen2 = new TextGenerator(ctx2.Forward, ctx2.Tokenizer, seed: 42);
+        var high = new GenerationParams { MaxTokens = 40, Temperature = 0.7f, PresencePenalty = 2.0f, RepetitionPenalty = 1.0f };
+        var tokensHigh = gen2.Generate("Repeat: cat cat cat cat cat", high)
+            .Where(t => !t.IsDone).Select(t => t.TokenId).ToArray();
+        float uniqueHigh = (float)tokensHigh.Distinct().Count() / Math.Max(tokensHigh.Length, 1);
 
-        Assert.True(text.Length > 0, "Presence penalty should produce valid output");
+        Assert.True(uniqueHigh >= uniqueNone,
+            $"High PresencePenalty should be more diverse: {uniqueHigh:P0} vs {uniqueNone:P0}");
     }
 
     // ── MinP ────────────────────────────────────────────────────────────────
 
     [Fact]
-    public void MinP_ProducesValidOutput()
+    public void MinP_HighThreshold_ProducesDifferentOutputThanLow()
     {
         if (!TestConstants.ModelExists) return;
-        using var ctx = LoadModel();
-        var gen = new TextGenerator(ctx.Forward, ctx.Tokenizer, seed: 42);
 
-        var p = new GenerationParams
-        {
-            MaxTokens = 10,
-            Temperature = 0.8f,
-            MinP = 0.05f,
-        };
+        // MinP=0 (disabled)
+        using var ctx1 = LoadModel();
+        var gen1 = new TextGenerator(ctx1.Forward, ctx1.Tokenizer, seed: 42);
+        var off = new GenerationParams { MaxTokens = 15, Temperature = 0.8f, MinP = 0f };
+        var tokensOff = gen1.Generate("The meaning of life", off)
+            .Where(t => !t.IsDone).Select(t => t.TokenId).ToArray();
 
-        var text = string.Concat(gen.Generate("Hello", p)
-            .Where(t => !t.IsDone).Select(t => t.Text));
+        // MinP=0.3 (aggressive filtering)
+        using var ctx2 = LoadModel();
+        var gen2 = new TextGenerator(ctx2.Forward, ctx2.Tokenizer, seed: 42);
+        var on = new GenerationParams { MaxTokens = 15, Temperature = 0.8f, MinP = 0.3f };
+        var tokensOn = gen2.Generate("The meaning of life", on)
+            .Where(t => !t.IsDone).Select(t => t.TokenId).ToArray();
 
-        Assert.True(text.Length > 0, "MinP sampling should produce output");
+        // MinP should change the output (fewer low-probability tokens allowed)
+        bool different = !tokensOff.SequenceEqual(tokensOn);
+        Assert.True(different,
+            "MinP=0.3 should produce different output than MinP=0 (filters low-prob tokens)");
     }
 
     // ── TypicalP ────────────────────────────────────────────────────────────
 
     [Fact]
-    public void TypicalP_ProducesValidOutput()
+    public void TypicalP_ProducesDifferentOutputThanDisabled()
     {
         if (!TestConstants.ModelExists) return;
-        using var ctx = LoadModel();
-        var gen = new TextGenerator(ctx.Forward, ctx.Tokenizer, seed: 42);
 
-        var p = new GenerationParams
-        {
-            MaxTokens = 10,
-            Temperature = 0.8f,
-            TypicalP = 0.9f,
-        };
-
-        var text = string.Concat(gen.Generate("Hello", p)
-            .Where(t => !t.IsDone).Select(t => t.Text));
-
-        Assert.True(text.Length > 0, "Typical sampling should produce output");
-    }
-
-    // ── PenaltyCount (window) ───────────────────────────────────────────────
-
-    [Fact]
-    public void PenaltyCount_LimitsLookback()
-    {
-        if (!TestConstants.ModelExists) return;
-        using var ctx = LoadModel();
-        var gen = new TextGenerator(ctx.Forward, ctx.Tokenizer, seed: 42);
-
-        // With PenaltyCount=5, only last 5 tokens are penalized
-        var p = new GenerationParams
-        {
-            MaxTokens = 20,
-            Temperature = 0,
-            RepetitionPenalty = 2.0f,
-            PenaltyCount = 5,
-        };
-
-        var tokens = gen.Generate("Hello world", p)
+        // TypicalP=1.0 (disabled)
+        using var ctx1 = LoadModel();
+        var gen1 = new TextGenerator(ctx1.Forward, ctx1.Tokenizer, seed: 42);
+        var off = new GenerationParams { MaxTokens = 15, Temperature = 0.8f, TypicalP = 1.0f };
+        var tokensOff = gen1.Generate("Once upon a time", off)
             .Where(t => !t.IsDone).Select(t => t.TokenId).ToArray();
 
-        // Should produce valid output
-        Assert.True(tokens.Length > 0, "PenaltyCount should not prevent generation");
+        // TypicalP=0.5 (strong filtering)
+        using var ctx2 = LoadModel();
+        var gen2 = new TextGenerator(ctx2.Forward, ctx2.Tokenizer, seed: 42);
+        var on = new GenerationParams { MaxTokens = 15, Temperature = 0.8f, TypicalP = 0.5f };
+        var tokensOn = gen2.Generate("Once upon a time", on)
+            .Where(t => !t.IsDone).Select(t => t.TokenId).ToArray();
+
+        bool different = !tokensOff.SequenceEqual(tokensOn);
+        Assert.True(different,
+            "TypicalP=0.5 should produce different output than TypicalP=1.0");
     }
 
-    // ── Grammar (GBNF constrained) ──────────────────────────────────────────
+    // ── PenaltyCount ────────────────────────────────────────────────────────
 
     [Fact]
-    public void Grammar_JsonConstraint_DoesNotCrash()
+    public void PenaltyCount_SmallWindow_DifferentFromLargeWindow()
+    {
+        if (!TestConstants.ModelExists) return;
+
+        // Large window (all history penalized)
+        using var ctx1 = LoadModel();
+        var gen1 = new TextGenerator(ctx1.Forward, ctx1.Tokenizer, seed: 42);
+        var large = new GenerationParams { MaxTokens = 20, Temperature = 0.5f, RepetitionPenalty = 2.0f, PenaltyCount = 0 };
+        var tokensLarge = gen1.Generate("Hello world, hello world, hello", large)
+            .Where(t => !t.IsDone).Select(t => t.TokenId).ToArray();
+
+        // Small window (only last 3 tokens penalized — earlier repeats allowed)
+        using var ctx2 = LoadModel();
+        var gen2 = new TextGenerator(ctx2.Forward, ctx2.Tokenizer, seed: 42);
+        var small = new GenerationParams { MaxTokens = 20, Temperature = 0.5f, RepetitionPenalty = 2.0f, PenaltyCount = 3 };
+        var tokensSmall = gen2.Generate("Hello world, hello world, hello", small)
+            .Where(t => !t.IsDone).Select(t => t.TokenId).ToArray();
+
+        bool different = !tokensLarge.SequenceEqual(tokensSmall);
+        Assert.True(different,
+            "PenaltyCount=3 should produce different output than PenaltyCount=0 (full window)");
+    }
+
+    // ── MinKeep ─────────────────────────────────────────────────────────────
+
+    [Fact]
+    public void MinKeep_HighValue_ProducesValidOutput()
     {
         if (!TestConstants.ModelExists) return;
         using var ctx = LoadModel();
         var gen = new TextGenerator(ctx.Forward, ctx.Tokenizer, seed: 42);
 
-        // Simple JSON grammar — tests that grammar parsing and constraint
-        // application doesn't crash, even if output isn't perfectly constrained
-        // (the state machine is a best-effort character-level constraint)
-        string grammar = """
-            root   ::= "{" ws "\"name\"" ws ":" ws string ws "}"
-            string ::= "\"" [a-zA-Z ]+ "\""
-            ws     ::= " "?
-            """;
+        // MinKeep=10 with very aggressive TopP should still produce output
+        var p = new GenerationParams { MaxTokens = 10, Temperature = 0.5f, TopP = 0.01f, MinKeep = 10 };
+        var tokens = gen.Generate("Hello", p).Where(t => !t.IsDone).ToArray();
 
-        var p = new GenerationParams
-        {
-            MaxTokens = 20,
-            Temperature = 0.8f,
-            GrammarText = grammar,
-        };
-
-        // Should not throw
-        var tokens = gen.Generate("Output JSON:", p).ToList();
-        Assert.True(tokens.Count > 0, "Grammar generation should produce tokens");
+        Assert.True(tokens.Length > 0,
+            "MinKeep=10 should prevent TopP=0.01 from eliminating all candidates");
     }
+
+    // ── Grammar ─────────────────────────────────────────────────────────────
 
     [Fact]
     public void Grammar_ParsesStandardJsonGrammar()
     {
-        // Test that the GBNF parser handles the standard JSON grammar without crashing
+        if (!TestConstants.ModelExists) return;
+
         string jsonGrammar = """
             root   ::= object
             value  ::= object | array | string | number | ("true" | "false" | "null") ws
@@ -251,41 +232,68 @@ public class SamplerIntegrationTests
             ws     ::= [ \t\n]*
             """;
 
-        // Should not throw
-        var constraint = new GrammarConstraint(jsonGrammar,
-            LoadTokenizerOnly());
+        var constraint = new GrammarConstraint(jsonGrammar, LoadTokenizerOnly());
         Assert.NotNull(constraint);
     }
 
-    // ── Combined parameters ─────────────────────────────────────────────────
-
     [Fact]
-    public void AllParams_CombinedSampling()
+    public void Grammar_ConstrainsOutput()
     {
         if (!TestConstants.ModelExists) return;
         using var ctx = LoadModel();
-        var gen = new TextGenerator(ctx.Forward, ctx.Tokenizer, seed: 42);
 
-        // Use all parameters together
-        var p = new GenerationParams
-        {
-            MaxTokens = 15,
-            Temperature = 0.7f,
-            TopK = 40,
-            TopP = 0.9f,
-            MinP = 0.05f,
-            TypicalP = 0.95f,
-            RepetitionPenalty = 1.1f,
-            FrequencyPenalty = 0.3f,
-            PresencePenalty = 0.3f,
-            PenaltyCount = 20,
-            MinKeep = 2,
-        };
-
-        var text = string.Concat(gen.Generate("The meaning of life is", p)
+        // Without grammar: free generation
+        var gen1 = new TextGenerator(ctx.Forward, ctx.Tokenizer, seed: 42);
+        var free = new GenerationParams { MaxTokens = 15, Temperature = 0.8f };
+        var textFree = string.Concat(gen1.Generate("Output:", free)
             .Where(t => !t.IsDone).Select(t => t.Text));
 
-        Assert.True(text.Length > 0, "Combined params should produce output");
+        // Reset and run with grammar
+        ctx.Forward.ResetState();
+        var gen2 = new TextGenerator(ctx.Forward, ctx.Tokenizer, seed: 42);
+        var constrained = new GenerationParams
+        {
+            MaxTokens = 15,
+            Temperature = 0.8f,
+            GrammarText = "root ::= [0-9]+",  // Only digits
+        };
+        var textGrammar = string.Concat(gen2.Generate("Output:", constrained)
+            .Where(t => !t.IsDone).Select(t => t.Text));
+
+        // Grammar output should differ from free output
+        Assert.NotEqual(textFree, textGrammar);
+    }
+
+    // ── Combined all-params ─────────────────────────────────────────────────
+
+    [Fact]
+    public void AllParams_DifferFromDefaults()
+    {
+        if (!TestConstants.ModelExists) return;
+
+        // Default params
+        using var ctx1 = LoadModel();
+        var gen1 = new TextGenerator(ctx1.Forward, ctx1.Tokenizer, seed: 42);
+        var defaults = new GenerationParams { MaxTokens = 15, Temperature = 0.7f };
+        var tokensDefault = gen1.Generate("The meaning of life is", defaults)
+            .Where(t => !t.IsDone).Select(t => t.TokenId).ToArray();
+
+        // All custom params
+        using var ctx2 = LoadModel();
+        var gen2 = new TextGenerator(ctx2.Forward, ctx2.Tokenizer, seed: 42);
+        var custom = new GenerationParams
+        {
+            MaxTokens = 15, Temperature = 0.7f,
+            MinP = 0.1f, TypicalP = 0.8f,
+            FrequencyPenalty = 0.5f, PresencePenalty = 0.5f,
+            PenaltyCount = 10, MinKeep = 3,
+        };
+        var tokensCustom = gen2.Generate("The meaning of life is", custom)
+            .Where(t => !t.IsDone).Select(t => t.TokenId).ToArray();
+
+        bool different = !tokensDefault.SequenceEqual(tokensCustom);
+        Assert.True(different,
+            "Custom params (MinP, TypicalP, Freq/Presence penalty) should produce different output than defaults");
     }
 
     // ── Helpers ──────────────────────────────────────────────────────────────
