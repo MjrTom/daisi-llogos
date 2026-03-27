@@ -60,12 +60,16 @@ public sealed class TextGenerator
         var decodeSw = Stopwatch.StartNew();
         int generated = 0;
 
+        // Anti-prompt buffer for string-based stop detection
+        string outputBuffer = "";
+        bool hasAntiPrompts = parameters.AntiPrompts is { Length: > 0 };
+
         // Decode loop
         for (int t = 0; t < parameters.MaxTokens; t++)
         {
             int tokenId = _sampler.Sample(logits, parameters, history.ToArray());
 
-            // Check stop condition
+            // Check token-based stop condition
             if (Array.IndexOf(stopTokens, tokenId) >= 0)
                 break;
 
@@ -75,6 +79,29 @@ public sealed class TextGenerator
             // Decode and yield
             string text = _tokenizer.Decode([tokenId]);
             yield return new GenerationToken(tokenId, text);
+
+            // Check anti-prompt (string-based stop sequences)
+            if (hasAntiPrompts)
+            {
+                outputBuffer += text;
+                // Keep buffer to max anti-prompt length + margin
+                int maxLen = 0;
+                foreach (var ap in parameters.AntiPrompts!)
+                    if (ap.Length > maxLen) maxLen = ap.Length;
+                if (outputBuffer.Length > maxLen * 2)
+                    outputBuffer = outputBuffer[(outputBuffer.Length - maxLen * 2)..];
+
+                bool stopped = false;
+                foreach (var ap in parameters.AntiPrompts)
+                {
+                    if (outputBuffer.Contains(ap, StringComparison.Ordinal))
+                    {
+                        stopped = true;
+                        break;
+                    }
+                }
+                if (stopped) break;
+            }
 
             // Next forward pass
             logits = _forward.Forward(tokenId, position);

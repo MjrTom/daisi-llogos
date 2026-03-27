@@ -2,7 +2,7 @@ namespace Daisi.Llogos.Inference;
 
 /// <summary>
 /// Transforms raw logits into a selected token ID through a configurable pipeline:
-/// repetition penalty → temperature → top-k → top-p → softmax → sample/argmax.
+/// repetition/frequency/presence penalty → temperature → top-k → min-p → softmax → typical-p → top-p → sample.
 /// </summary>
 public sealed class Sampler
 {
@@ -28,7 +28,8 @@ public sealed class Sampler
         int vocabSize = logits.Length;
 
         // Greedy shortcut: no copy needed, just find argmax
-        if (p.Temperature == 0 && p.RepetitionPenalty == 1.0f)
+        if (p.Temperature == 0 && p.RepetitionPenalty == 1.0f
+            && p.FrequencyPenalty == 0 && p.PresencePenalty == 0)
             return ArgMax(logits);
 
         // Copy logits so we can mutate (reuse buffer to avoid GC pressure)
@@ -36,47 +37,194 @@ public sealed class Sampler
         logits.CopyTo(_workBuffer);
         var work = _workBuffer.AsSpan(0, vocabSize);
 
-        // 1. Repetition penalty
-        if (p.RepetitionPenalty != 1.0f)
-            ApplyRepetitionPenalty(work, previousTokens, p.RepetitionPenalty);
+        // 1. Repetition / frequency / presence penalties
+        ApplyPenalties(work, previousTokens, p);
 
-        // 2. Greedy shortcut (after penalty)
+        // 2. PreventEOS: set EOS logit to -inf
+        if (p.PreventEOS && p.StopTokens != null)
+        {
+            foreach (int eos in p.StopTokens)
+                if ((uint)eos < (uint)vocabSize) work[eos] = float.NegativeInfinity;
+        }
+
+        // 3. Greedy shortcut (after penalties)
         if (p.Temperature == 0)
             return ArgMax(work);
 
-        // 3. Temperature
+        // 4. Temperature
         float invTemp = 1.0f / p.Temperature;
         for (int i = 0; i < vocabSize; i++)
             work[i] *= invTemp;
 
-        // 4. Top-k: collect indices of top-k candidates
+        // 5. Top-k: collect indices of top-k candidates
         int effectiveK = (p.TopK > 0 && p.TopK < vocabSize) ? p.TopK : vocabSize;
         var candidates = CollectTopK(work, effectiveK);
 
-        // 5. Softmax over candidates only (not full vocab)
+        // 6. Min-p: remove tokens below min_p × max_prob (before softmax, on logits)
+        if (p.MinP > 0 && p.MinP < 1.0f)
+            candidates = ApplyMinP(work, candidates, p.MinP, Math.Max(p.MinKeep, 1));
+
+        // 7. Softmax over candidates only
         SoftmaxCandidates(work, candidates);
 
-        // 6. Top-p (nucleus) over candidates
-        if (p.TopP > 0 && p.TopP < 1.0f)
-            ApplyTopPCandidates(work, candidates, p.TopP);
+        // 8. Typical-p: filter by typical probability
+        if (p.TypicalP > 0 && p.TypicalP < 1.0f)
+            candidates = ApplyTypicalP(work, candidates, p.TypicalP, Math.Max(p.MinKeep, 1));
 
-        // 7. Weighted random sample from candidates
+        // 9. Top-p (nucleus) over candidates
+        if (p.TopP > 0 && p.TopP < 1.0f)
+            candidates = ApplyTopP(work, candidates, p.TopP, Math.Max(p.MinKeep, 1));
+
+        // 10. Weighted random sample from candidates
         return SampleFromCandidates(work, candidates);
     }
 
-    private static void ApplyRepetitionPenalty(Span<float> logits, ReadOnlySpan<int> previousTokens, float penalty)
-    {
-        for (int i = 0; i < previousTokens.Length; i++)
-        {
-            int tokenId = previousTokens[i];
-            if ((uint)tokenId >= (uint)logits.Length) continue;
+    // ── Penalties ────────────────────────────────────────────────────────────
 
-            if (logits[tokenId] > 0)
-                logits[tokenId] /= penalty;
-            else
-                logits[tokenId] *= penalty;
+    private static void ApplyPenalties(Span<float> logits, ReadOnlySpan<int> previousTokens, GenerationParams p)
+    {
+        if (p.RepetitionPenalty == 1.0f && p.FrequencyPenalty == 0 && p.PresencePenalty == 0)
+            return;
+
+        // Determine penalty window
+        int windowStart = 0;
+        if (p.PenaltyCount > 0 && p.PenaltyCount < previousTokens.Length)
+            windowStart = previousTokens.Length - p.PenaltyCount;
+
+        var window = previousTokens[windowStart..];
+
+        // Count token frequencies in window (for frequency penalty)
+        Dictionary<int, int>? freqMap = null;
+        if (p.FrequencyPenalty != 0 || p.PresencePenalty != 0)
+        {
+            freqMap = new Dictionary<int, int>();
+            for (int i = 0; i < window.Length; i++)
+            {
+                int t = window[i];
+                freqMap[t] = freqMap.GetValueOrDefault(t) + 1;
+            }
+        }
+
+        // Apply repetition penalty (multiplicative)
+        if (p.RepetitionPenalty != 1.0f)
+        {
+            for (int i = 0; i < window.Length; i++)
+            {
+                int tokenId = window[i];
+                if ((uint)tokenId >= (uint)logits.Length) continue;
+                if (!p.PenalizeNewline && IsNewlineToken(tokenId)) continue;
+
+                if (logits[tokenId] > 0)
+                    logits[tokenId] /= p.RepetitionPenalty;
+                else
+                    logits[tokenId] *= p.RepetitionPenalty;
+            }
+        }
+
+        // Apply frequency + presence penalties (additive)
+        if (freqMap != null)
+        {
+            foreach (var (tokenId, count) in freqMap)
+            {
+                if ((uint)tokenId >= (uint)logits.Length) continue;
+                if (!p.PenalizeNewline && IsNewlineToken(tokenId)) continue;
+
+                // Frequency: proportional to count
+                logits[tokenId] -= p.FrequencyPenalty * count;
+                // Presence: flat penalty if token appeared at all
+                logits[tokenId] -= p.PresencePenalty;
+            }
         }
     }
+
+    private static bool IsNewlineToken(int tokenId)
+    {
+        // Common newline token IDs across models (10 = '\n' in most BPE vocabularies)
+        return tokenId == 10 || tokenId == 13;
+    }
+
+    // ── Min-P ────────────────────────────────────────────────────────────────
+
+    /// <summary>
+    /// Remove candidates whose logit is below min_p × max_logit.
+    /// Applied before softmax, so works on raw (temperature-scaled) logits.
+    /// </summary>
+    private static int[] ApplyMinP(Span<float> logits, int[] candidates, float minP, int minKeep)
+    {
+        if (candidates.Length <= minKeep) return candidates;
+
+        float maxLogit = float.NegativeInfinity;
+        foreach (int c in candidates)
+            if (logits[c] > maxLogit) maxLogit = logits[c];
+
+        float threshold = maxLogit + MathF.Log(minP); // log-domain: log(p) > log(min_p) + log(max_p)
+
+        var kept = new List<int>(candidates.Length);
+        foreach (int c in candidates)
+        {
+            if (logits[c] >= threshold || kept.Count < minKeep)
+                kept.Add(c);
+        }
+        return kept.ToArray();
+    }
+
+    // ── Typical-P ────────────────────────────────────────────────────────────
+
+    /// <summary>
+    /// Typical sampling: keep tokens whose probability is close to the expected information content.
+    /// Filters by |log(p) - entropy| sorted ascending, keeping cumulative up to typicalP.
+    /// </summary>
+    private static int[] ApplyTypicalP(Span<float> probs, int[] candidates, float typicalP, int minKeep)
+    {
+        if (candidates.Length <= minKeep) return candidates;
+
+        // Compute entropy over candidates
+        float entropy = 0;
+        foreach (int c in candidates)
+        {
+            float prob = probs[c];
+            if (prob > 0) entropy -= prob * MathF.Log(prob);
+        }
+
+        // Score each candidate by |log(p) - entropy|
+        var scored = new (int idx, float deviation)[candidates.Length];
+        for (int i = 0; i < candidates.Length; i++)
+        {
+            float prob = probs[candidates[i]];
+            float logP = prob > 0 ? -MathF.Log(prob) : float.MaxValue;
+            scored[i] = (candidates[i], MathF.Abs(logP - entropy));
+        }
+
+        // Sort by deviation ascending (most typical first)
+        Array.Sort(scored, (a, b) => a.deviation.CompareTo(b.deviation));
+
+        // Keep cumulative probability up to typicalP
+        float cumulative = 0;
+        var kept = new List<int>(candidates.Length);
+        for (int i = 0; i < scored.Length; i++)
+        {
+            kept.Add(scored[i].idx);
+            cumulative += probs[scored[i].idx];
+            if (cumulative >= typicalP && kept.Count >= minKeep)
+                break;
+        }
+
+        // Renormalize
+        float sum = 0;
+        foreach (int c in kept) sum += probs[c];
+        if (sum > 0)
+        {
+            // Zero out non-kept
+            foreach (int c in candidates)
+                if (!kept.Contains(c)) probs[c] = 0;
+            float invSum = 1.0f / sum;
+            foreach (int c in kept) probs[c] *= invSum;
+        }
+
+        return kept.ToArray();
+    }
+
+    // ── Core sampling methods (unchanged) ────────────────────────────────────
 
     private static int ArgMax(ReadOnlySpan<float> values)
     {
@@ -93,10 +241,6 @@ public sealed class Sampler
         return best;
     }
 
-    /// <summary>
-    /// Collect indices of top-k logit values. O(N*k) but k is small (typically 40).
-    /// Returns the actual number of candidates (may be less than k if vocab is small).
-    /// </summary>
     private static int[] CollectTopK(ReadOnlySpan<float> logits, int k)
     {
         int n = logits.Length;
@@ -112,7 +256,6 @@ public sealed class Sampler
             {
                 topVal[k - 1] = v;
                 topIdx[k - 1] = i;
-                // Bubble up
                 for (int j = k - 2; j >= 0; j--)
                 {
                     if (topVal[j + 1] > topVal[j])
@@ -127,9 +270,6 @@ public sealed class Sampler
         return topIdx;
     }
 
-    /// <summary>
-    /// Softmax over only the candidate indices. Much faster than full-vocab softmax.
-    /// </summary>
     private static void SoftmaxCandidates(Span<float> logits, int[] candidates)
     {
         float max = float.NegativeInfinity;
@@ -149,17 +289,13 @@ public sealed class Sampler
             logits[candidates[i]] *= invSum;
     }
 
-    /// <summary>
-    /// Apply top-p filtering over candidates only. O(k log k) sort instead of O(N log N).
-    /// </summary>
-    private static void ApplyTopPCandidates(Span<float> probs, int[] candidates, float p)
+    private static int[] ApplyTopP(Span<float> probs, int[] candidates, float p, int minKeep)
     {
         // Sort candidates by probability descending
-        // Extract probs into a small array to avoid Span capture issue
         var cp = new float[candidates.Length];
         for (int i = 0; i < candidates.Length; i++) cp[i] = probs[candidates[i]];
         Array.Sort(cp, candidates);
-        Array.Reverse(candidates); // descending
+        Array.Reverse(candidates);
         Array.Reverse(cp);
 
         float cumulative = 0;
@@ -167,18 +303,16 @@ public sealed class Sampler
         for (int i = 0; i < candidates.Length; i++)
         {
             cumulative += probs[candidates[i]];
-            if (cumulative > p)
+            if (cumulative > p && i + 1 >= minKeep)
             {
                 cutoff = i + 1;
                 break;
             }
         }
 
-        // Zero out tokens beyond cutoff
         for (int i = cutoff; i < candidates.Length; i++)
             probs[candidates[i]] = 0;
 
-        // Renormalize
         float sum = 0;
         for (int i = 0; i < cutoff; i++)
             sum += probs[candidates[i]];
@@ -188,6 +322,8 @@ public sealed class Sampler
             for (int i = 0; i < cutoff; i++)
                 probs[candidates[i]] *= invSum;
         }
+
+        return candidates[..cutoff];
     }
 
     private int SampleFromCandidates(ReadOnlySpan<float> probs, int[] candidates)
