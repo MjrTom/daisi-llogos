@@ -1489,7 +1489,27 @@ public sealed class CudaBackend : IComputeBackend
         kArgs[1] = (nint)(&gPtr);
         kArgs[2] = (nint)(&uPtr);
         kArgs[3] = (nint)(&n);
-        _stream.Launch(func, grid, 1, 1, (uint)BlockSize, 1, 1, 0, kArgs);
+
+        // Fused path: SwiGLU + Q8_1 quantization for dp4a matmul
+        if ((_hasQ4_0Weights || _hasQ8_0Weights) && _q8_1Scratch != null)
+        {
+            ulong q8Ptr = _q8_1Scratch.DevicePtr;
+            var qFunc = _elementwiseModule.GetFunction("swiglu_q8_1");
+            nint* qArgs = stackalloc nint[5];
+            qArgs[0] = (nint)(&outPtr);
+            qArgs[1] = (nint)(&q8Ptr);
+            qArgs[2] = (nint)(&gPtr);
+            qArgs[3] = (nint)(&uPtr);
+            qArgs[4] = (nint)(&n);
+            _stream.Launch(qFunc, grid, 1, 1, (uint)BlockSize, 1, 1, 0, qArgs);
+            _q8_1CachedInputPtr = outPtr;
+            _q8_1CachedGeneration = _q8_1CacheGeneration;
+            _q8_1FusedReady = true;
+        }
+        else
+        {
+            _stream.Launch(func, grid, 1, 1, (uint)BlockSize, 1, 1, 0, kArgs);
+        }
     }
 
     /// <inheritdoc />

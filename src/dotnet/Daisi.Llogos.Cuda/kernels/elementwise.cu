@@ -870,6 +870,62 @@ __global__ void swiglu(float* output, const float* gate, const float* up, int n)
     }
 }
 
+// ── Fused: SwiGLU + Q8_1 quantization ───────────────────────────────────────
+// Computes SwiGLU and quantizes output to Q8_1 in one pass.
+// Grid: ceil(n/256) blocks, 256 threads per block.
+// Each thread computes one SwiGLU element and contributes to Q8_1 block stats.
+
+__global__ void swiglu_q8_1(float* output, void* __restrict__ q8_1_dst,
+                             const float* gate, const float* up, int n)
+{
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+
+    // Step 1: Compute SwiGLU and write to output
+    float v = 0.0f;
+    if (idx < n)
+    {
+        float g = gate[idx];
+        v = (g / (1.0f + expf(-g))) * up[idx];
+        output[idx] = v;
+    }
+
+    // Step 2: Quantize to Q8_1 blocks.
+    // Each Q8_1 block has 32 elements. Thread lane within a warp maps to block element.
+    int lane = threadIdx.x & 31;
+    int blk_id = idx / 32;
+    int num_blocks = n / 32;
+
+    if (blk_id < num_blocks)
+    {
+        // Warp-level reduction for amax and sum (all 32 lanes have their element)
+        float av = fabsf(v);
+        float warp_max = av;
+        float warp_sum = v;
+        for (int offset = 16; offset > 0; offset >>= 1) {
+            warp_max = fmaxf(warp_max, __shfl_down_sync(0xffffffff, warp_max, offset));
+            warp_sum += __shfl_down_sync(0xffffffff, warp_sum, offset);
+        }
+
+        // Broadcast amax back to all lanes
+        float amax = __shfl_sync(0xffffffff, warp_max, 0);
+        float d = amax / 127.0f;
+
+        // Each lane quantizes its own element
+        signed char q = (amax == 0.0f) ? 0 : (signed char)__float2int_rn(v / d);
+
+        // Lane 0 writes the header, all lanes write their quant
+        unsigned char* dp = (unsigned char*)q8_1_dst + blk_id * 36;
+        if (lane == 0) {
+            unsigned short d_fp16 = fp32_to_fp16(d);
+            float sum = __shfl_sync(0xffffffff, warp_sum, 0);
+            unsigned short s_fp16 = fp32_to_fp16(sum);
+            dp[0] = d_fp16 & 0xFF; dp[1] = d_fp16 >> 8;
+            dp[2] = s_fp16 & 0xFF; dp[3] = s_fp16 >> 8;
+        }
+        ((signed char*)(dp + 4))[lane] = q;
+    }
+}
+
 // ── Fused: Element add + RMSNorm (residual add then norm) ────────────────────
 // hidden[i] = a[i] + b[i]; output[i] = (hidden[i] / rms) * weight[i]
 
