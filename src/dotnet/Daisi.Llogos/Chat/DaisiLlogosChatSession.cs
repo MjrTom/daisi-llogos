@@ -114,12 +114,31 @@ public sealed class DaisiLlogosChatSession : IDisposable
         }
         _cachedTokenCount = allTokenIds.Length;
 
-        // Set up stop sequence detection
-        var stopDetector = new StopSequenceDetector(_stopSequences);
+        // Set up stop sequence detection — merge template stops with AntiPrompts
+        var allStopStrings = _stopSequences;
+        if (parameters.AntiPrompts is { Length: > 0 })
+        {
+            allStopStrings = [.. _stopSequences, .. parameters.AntiPrompts];
+        }
+        var stopDetector = new StopSequenceDetector(allStopStrings);
         var stopTokens = parameters.StopTokens
             ?? (_tokenizer.Vocabulary.EosTokenId >= 0
                 ? [_tokenizer.Vocabulary.EosTokenId]
                 : []);
+
+        // Set up grammar constraint if provided
+        GrammarConstraint? grammar = null;
+        if (!string.IsNullOrEmpty(parameters.GrammarText))
+        {
+            grammar = new GrammarConstraint(parameters.GrammarText, _tokenizer);
+            try { File.AppendAllText(@"C:\repos\daisinet-qwen-integration-crm\host-debug.log",
+                $"\n[LLOGOS] Grammar constraint CREATED. Length={parameters.GrammarText.Length}, IsComplete={grammar.IsComplete}\n"); } catch { }
+        }
+        else
+        {
+            try { File.AppendAllText(@"C:\repos\daisinet-qwen-integration-crm\host-debug.log",
+                $"\n[LLOGOS] NO grammar. GrammarText='{parameters.GrammarText ?? "NULL"}'\n"); } catch { }
+        }
 
         // Decode loop
         var generatedTokens = new List<int>();
@@ -134,7 +153,19 @@ public sealed class DaisiLlogosChatSession : IDisposable
             allTokenIds.CopyTo(allHistory, 0);
             generatedTokens.CopyTo(allHistory, allTokenIds.Length);
 
-            int tokenId = _sampler.Sample(_logitsBuffer, parameters, allHistory);
+            int tokenId = _sampler.Sample(_logitsBuffer, parameters, allHistory, grammar);
+
+            // Check grammar completion — if the grammar has fully matched, stop generation
+            if (grammar is { IsComplete: true })
+            {
+                var flushed = stopDetector.Flush();
+                if (flushed.Length > 0)
+                {
+                    responseText.Append(flushed);
+                    yield return flushed;
+                }
+                break;
+            }
 
             // Check token-level stop
             if (Array.IndexOf(stopTokens, tokenId) >= 0)
@@ -149,6 +180,7 @@ public sealed class DaisiLlogosChatSession : IDisposable
             }
 
             generatedTokens.Add(tokenId);
+            grammar?.Accept(tokenId);
             string tokenText = _tokenizer.Decode([tokenId]);
 
             // Check string-level stop sequences

@@ -3,49 +3,112 @@ using Daisi.Llogos.Tokenizer;
 namespace Daisi.Llogos.Inference;
 
 /// <summary>
-/// GBNF grammar-constrained sampling. Parses GBNF text into rules, tracks
-/// generation state, and masks invalid tokens at each sampling step.
+/// GBNF grammar-constrained sampling, following the llama.cpp approach:
 ///
-/// The approach: maintain a set of valid "grammar stacks" (positions within
-/// rules). For each candidate token, check if its text can advance any
-/// valid stack. Tokens that can't are masked to -inf.
+/// 1. Parse grammar into flat rules where each rule is a sequence of terminal elements
+///    (char ranges, literals) and rule references, with alternates as separate sub-sequences.
+///    Optional, Repeat, and Group constructs are desugared into helper rules at parse time.
 ///
-/// This is a character-level constraint: each character of a token's text
-/// must match the grammar. Multi-character tokens are validated by stepping
-/// through each character.
+/// 2. Grammar state = set of stacks. Each stack is a list of positions within rules.
+///    Stacks are always pre-resolved: the top always points at a terminal element.
+///    advance_stack() expands rule refs using a worklist with dedup.
+///
+/// 3. Token validation: for each candidate token, test character-by-character against
+///    each stack. A token is rejected only if ALL stacks reject it.
+///
+/// 4. Performance: pre-resolving stacks means validation is just char matching,
+///    no complex expansion during the hot path.
 /// </summary>
 public sealed class GrammarConstraint
 {
     private readonly GbnfGrammar _grammar;
     private readonly BpeTokenizer _tokenizer;
     private List<GrammarStack> _stacks;
+    private readonly string?[] _tokenTextCache; // Cache token ID → decoded text
 
     public GrammarConstraint(string grammarText, BpeTokenizer tokenizer, string rootRule = "root")
     {
         _grammar = new GbnfGrammar(grammarText);
         _tokenizer = tokenizer;
-        // Initialize with the root rule's starting positions
         _stacks = _grammar.GetInitialStacks(rootRule);
+
+        // Pre-cache all token texts (avoids repeated decode calls in ApplyToLogits)
+        _tokenTextCache = new string?[tokenizer.Vocabulary.Count];
+        for (int i = 0; i < _tokenTextCache.Length; i++)
+            _tokenTextCache[i] = tokenizer.Decode([i]);
     }
 
     /// <summary>
     /// Apply grammar constraints to logits: set invalid tokens to -inf.
-    /// Call before sampling each token.
+    ///
+    /// Optimization: pre-resolve stacks to get valid first chars, then only check
+    /// tokens whose first char can advance the grammar. This eliminates ~99% of
+    /// candidates before the expensive per-stack character-by-character check.
     /// </summary>
     public void ApplyToLogits(Span<float> logits)
     {
-        if (_stacks.Count == 0) return; // Grammar complete or failed
+        if (_stacks.Count == 0) return;
 
-        for (int tokenId = 0; tokenId < logits.Length; tokenId++)
+        // Step 1: Resolve all stacks to terminals and collect valid first chars
+        var resolvedStacks = new List<GrammarStack>();
+        var allowedFirstChars = new HashSet<char>();
+        foreach (var stack in _stacks)
         {
-            if (logits[tokenId] == float.NegativeInfinity) continue;
+            var terminals = _grammar.AdvanceStackPublic(stack);
+            resolvedStacks.AddRange(terminals);
+            foreach (var t in terminals)
+            {
+                if (t.Count == 0) continue;
+                var (ruleIdx, elemIdx) = t[^1];
+                var elem = _grammar.GetRules()[ruleIdx].Elements[elemIdx];
+                CollectFirstChars(elem, allowedFirstChars);
+            }
+        }
 
-            string tokenText = _tokenizer.Decode([tokenId]);
-            if (string.IsNullOrEmpty(tokenText)) continue;
+        // Step 2: Build candidate list using first-char filter
+        var candidates = new List<GrammarCandidate>();
+        int cacheLen = Math.Min(logits.Length, _tokenTextCache.Length);
+        for (int i = 0; i < cacheLen; i++)
+        {
+            if (logits[i] == float.NegativeInfinity) continue;
+            var text = _tokenTextCache[i];
+            if (string.IsNullOrEmpty(text)) { logits[i] = float.NegativeInfinity; continue; }
 
-            // Check if this token's text can advance any valid stack
-            if (!CanAccept(tokenText))
-                logits[tokenId] = float.NegativeInfinity;
+            // First-char rejection: skip tokens whose first char can't match any terminal
+            if (!allowedFirstChars.Contains(text[0]))
+            {
+                logits[i] = float.NegativeInfinity;
+                continue;
+            }
+
+            candidates.Add(new GrammarCandidate(i, text));
+        }
+        // Handle any tokens beyond cache
+        for (int i = cacheLen; i < logits.Length; i++)
+            logits[i] = float.NegativeInfinity;
+
+        // Step 3: Reject candidates that fail ALL resolved stacks
+        var rejected = _grammar.RejectCandidates(resolvedStacks, candidates);
+        foreach (var r in rejected)
+            logits[r.TokenIndex] = float.NegativeInfinity;
+    }
+
+    private static void CollectFirstChars(GrammarElem elem, HashSet<char> chars)
+    {
+        if (elem.Ranges == null) return;
+        if (elem.Type == GrammarElemType.CharNot)
+        {
+            // Negated: add all printable chars except excluded
+            for (int c = 32; c < 127; c++)
+                if (elem.MatchesChar((char)c)) chars.Add((char)c);
+            for (int c = 128; c < 256; c++)
+                if (elem.MatchesChar((char)c)) chars.Add((char)c);
+        }
+        else
+        {
+            foreach (var (from, to) in elem.Ranges)
+                for (char c = from; c <= to && c < 256; c++)
+                    chars.Add(c);
         }
     }
 
@@ -60,222 +123,281 @@ public sealed class GrammarConstraint
         var newStacks = new List<GrammarStack>();
         foreach (var stack in _stacks)
         {
-            var advanced = _grammar.AdvanceStack(stack, tokenText);
+            var advanced = _grammar.AcceptChars(stack, tokenText);
             newStacks.AddRange(advanced);
         }
-        _stacks = Deduplicate(newStacks);
+        _stacks = GbnfGrammar.Deduplicate(newStacks);
     }
 
-    /// <summary>Whether the grammar has been fully matched (generation can stop).</summary>
-    public bool IsComplete => _stacks.Any(s => s.IsComplete);
+    public bool IsComplete => _stacks.Any(s => s.Count == 0);
+}
 
-    private bool CanAccept(string text)
-    {
-        foreach (var stack in _stacks)
-        {
-            var advanced = _grammar.AdvanceStack(stack, text);
-            if (advanced.Count > 0) return true;
-        }
-        return false;
-    }
+internal readonly record struct GrammarCandidate(int TokenIndex, string Text);
 
-    private static List<GrammarStack> Deduplicate(List<GrammarStack> stacks)
-    {
-        // Simple dedup by string key
-        var seen = new HashSet<string>();
-        var result = new List<GrammarStack>();
-        foreach (var s in stacks)
-        {
-            var key = s.GetKey();
-            if (seen.Add(key))
-                result.Add(s);
-        }
-        return result;
-    }
+/// <summary>
+/// A grammar stack: list of positions (ruleIndex, elementIndex) within the grammar.
+/// Top of stack = last element. An empty stack means the grammar has completed.
+/// </summary>
+internal sealed class GrammarStack : List<(int ruleIdx, int elemIdx)>
+{
+    internal GrammarStack() { }
+    internal GrammarStack(IEnumerable<(int, int)> items) : base(items) { }
+    internal GrammarStack Clone() => new(this);
 }
 
 /// <summary>
-/// A position within the grammar's rule tree. Tracks which rule elements
-/// have been matched and what comes next.
+/// GBNF grammar engine. Parses GBNF text, desugars Optional/Repeat/Group into flat rules,
+/// and provides stack-based NFA simulation for grammar-constrained generation.
 /// </summary>
-internal sealed class GrammarStack
-{
-    /// <summary>Stack of (rule elements, position within elements) from outer to inner.</summary>
-    internal readonly List<(GbnfElement[] elements, int pos)> Frames;
-
-    internal GrammarStack() { Frames = new(); }
-    internal GrammarStack(List<(GbnfElement[], int)> frames) { Frames = frames; }
-
-    internal bool IsComplete => Frames.Count == 0 ||
-        Frames.All(f => f.pos >= f.elements.Length);
-
-    internal GrammarStack Clone()
-    {
-        return new GrammarStack(Frames.Select(f => (f.elements, f.pos)).ToList());
-    }
-
-    internal string GetKey()
-    {
-        return string.Join("|", Frames.Select(f => $"{f.elements.GetHashCode()}:{f.pos}"));
-    }
-}
-
-/// <summary>Simple GBNF parser producing element arrays per rule.</summary>
 internal sealed class GbnfGrammar
 {
-    private readonly Dictionary<string, GbnfElement[]> _rules = new();
+    // Each rule is a list of elements. Alternates are separate rules sharing the same name.
+    // Element types: Char (match one char), CharNot (negative match), Literal (multi-char),
+    //                RuleRef (push rule), Alt (marks alternate boundary), End (marks rule end).
+    private readonly List<GrammarRule> _rules = [];
+    private int _nextSyntheticId;
 
-    internal GbnfGrammar(string grammarText) => Parse(grammarText);
+    internal IReadOnlyList<GrammarRule> GetRules() => _rules;
+
+    internal GbnfGrammar(string grammarText)
+    {
+        Parse(grammarText);
+    }
 
     internal List<GrammarStack> GetInitialStacks(string rootRule)
     {
-        if (!_rules.TryGetValue(rootRule, out var elements))
-            return new();
-        var stack = new GrammarStack();
-        stack.Frames.Add((elements, 0));
-        return ExpandAlternations([stack]);
+        var alts = GetRuleAlternatesByName(rootRule);
+        if (alts.Count == 0) return [];
+
+        var result = new List<GrammarStack>();
+        foreach (int altIdx in alts)
+        {
+            var stack = new GrammarStack();
+            if (_rules[altIdx].Elements.Length > 0)
+                stack.Add((altIdx, 0));
+            result.AddRange(AdvanceStack(stack));
+        }
+        return Deduplicate(result);
     }
 
     /// <summary>
-    /// Try to advance a grammar stack by consuming the given text.
-    /// Returns all valid successor stacks (may be multiple due to alternations).
+    /// Reject candidates that are invalid in ALL stacks. Returns the rejected subset.
+    /// A token is valid if ANY stack accepts it.
     /// </summary>
-    internal List<GrammarStack> AdvanceStack(GrammarStack stack, string text)
+    internal List<GrammarCandidate> RejectCandidates(List<GrammarStack> stacks, List<GrammarCandidate> candidates)
     {
-        var current = new List<GrammarStack> { stack.Clone() };
+        // Start with all candidates as "rejected by every stack so far"
+        var rejects = candidates;
+
+        foreach (var stack in stacks)
+        {
+            if (rejects.Count == 0) break;
+            rejects = RejectCandidatesForStack(stack, rejects, 0);
+        }
+
+        return rejects;
+    }
+
+    /// <summary>
+    /// From the candidate list, return those rejected by this specific stack.
+    /// Processes character-by-character through each candidate's text.
+    /// </summary>
+    private List<GrammarCandidate> RejectCandidatesForStack(
+        GrammarStack stack, List<GrammarCandidate> candidates, int charOffset)
+    {
+        if (stack.Count == 0)
+        {
+            // Empty stack = grammar complete. Only accept empty remaining text.
+            return candidates.Where(c => charOffset < c.Text.Length).ToList();
+        }
+
+        var (ruleIdx, elemIdx) = stack[^1];
+        var rule = _rules[ruleIdx];
+        var elem = rule.Elements[elemIdx];
+
+        var accepted = new List<GrammarCandidate>();
+        var rejected = new List<GrammarCandidate>();
+
+        foreach (var cand in candidates)
+        {
+            if (charOffset >= cand.Text.Length)
+            {
+                // Token fully consumed — accepted by this stack (partial match is OK)
+                accepted.Add(cand);
+                continue;
+            }
+
+            char c = cand.Text[charOffset];
+
+            if (elem.MatchesChar(c))
+                accepted.Add(cand);
+            else
+                rejected.Add(cand);
+        }
+
+        if (accepted.Count == 0) return candidates; // All rejected
+
+        // Advance stack past the matched char element and recurse for next char
+        var advancedStack = stack.Clone();
+        advancedStack.RemoveAt(advancedStack.Count - 1);
+
+        // Push the next element in the same rule (if any)
+        if (elemIdx + 1 < rule.Elements.Length)
+            advancedStack.Add((ruleIdx, elemIdx + 1));
+
+        // Expand any rule refs at the new top
+        var newStacks = AdvanceStack(advancedStack);
+
+        // Recursively check remaining characters against all new stacks
+        var stillRejected = accepted; // Start assuming all accepted tokens might be rejected at next char
+        foreach (var ns in newStacks)
+        {
+            if (stillRejected.Count == 0) break;
+            stillRejected = RejectCandidatesForStack(ns, stillRejected, charOffset + 1);
+        }
+
+        // Combine: tokens rejected at this char + tokens accepted at this char but rejected at later chars
+        rejected.AddRange(stillRejected);
+        return rejected;
+    }
+
+    /// <summary>
+    /// Accept a string of characters through a stack, returning all valid resulting stacks.
+    /// Used by GrammarConstraint.Accept after a token is sampled.
+    /// </summary>
+    internal List<GrammarStack> AcceptChars(GrammarStack stack, string text)
+    {
+        // Ensure initial stack is resolved to terminals
+        var current = AdvanceStack(stack);
 
         foreach (char c in text)
         {
             var next = new List<GrammarStack>();
             foreach (var s in current)
             {
-                var advanced = AdvanceByChar(s, c);
-                next.AddRange(advanced);
+                if (s.Count == 0) continue;
+                var (ruleIdx, elemIdx) = s[^1];
+                var elem = _rules[ruleIdx].Elements[elemIdx];
+
+                if (!elem.MatchesChar(c)) continue;
+
+                var advanced = s.Clone();
+                advanced.RemoveAt(advanced.Count - 1);
+                if (elemIdx + 1 < _rules[ruleIdx].Elements.Length)
+                    advanced.Add((ruleIdx, elemIdx + 1));
+
+                // Resolve the advanced stack so all tops are terminals for the next iteration
+                next.AddRange(AdvanceStack(advanced));
             }
-            if (next.Count == 0) return new(); // Dead end
-            current = next;
+            if (next.Count == 0) return [];
+            current = Deduplicate(next);
         }
         return current;
     }
 
-    private List<GrammarStack> AdvanceByChar(GrammarStack stack, char c)
-    {
-        // Expand to get current expected elements
-        var expanded = ExpandAlternations([stack]);
-        var results = new List<GrammarStack>();
+    /// <summary>
+    /// Expand rule references at the top of a stack until all resulting stacks
+    /// point at terminal elements (char matchers) or are empty (complete).
+    /// Uses worklist with dedup to handle recursive rules.
+    /// </summary>
+    internal List<GrammarStack> AdvanceStackPublic(GrammarStack stack) => AdvanceStack(stack);
 
-        foreach (var s in expanded)
+    private List<GrammarStack> AdvanceStack(GrammarStack stack)
+    {
+        var result = new List<GrammarStack>();
+        var todo = new List<GrammarStack> { stack };
+        var seen = new HashSet<string>();
+
+        while (todo.Count > 0)
         {
-            var elem = GetCurrentElement(s);
-            if (elem == null)
+            var cur = todo[^1];
+            todo.RemoveAt(todo.Count - 1);
+
+            // Dedup by stack signature
+            var key = StackKey(cur);
+            if (!seen.Add(key)) continue;
+
+            if (cur.Count == 0)
             {
-                // Stack complete — can't accept more chars unless it's optional
+                // Empty stack = complete parse path
+                result.Add(cur);
                 continue;
             }
 
-            if (elem is GbnfLiteralElement lit)
+            var (ruleIdx, elemIdx) = cur[^1];
+            var rule = _rules[ruleIdx];
+
+            // Skip past any end-of-sequence markers
+            if (elemIdx >= rule.Elements.Length)
             {
-                if (lit.CharIndex < lit.Text.Length && lit.Text[lit.CharIndex] == c)
-                {
-                    var ns = s.Clone();
-                    if (lit.CharIndex + 1 >= lit.Text.Length)
-                        AdvancePosition(ns); // Literal fully matched
-                    else
-                        SetCurrentLiteralPos(ns, lit.CharIndex + 1);
-                    results.Add(ns);
-                }
+                // Rule exhausted — pop frame and continue
+                var popped = cur.Clone();
+                popped.RemoveAt(popped.Count - 1);
+                todo.Add(popped);
+                continue;
             }
-            else if (elem is GbnfCharClassElement cc)
+
+            var elem = rule.Elements[elemIdx];
+
+            if (elem.Type == GrammarElemType.RuleRef)
             {
-                if (cc.Matches(c))
+                // Expand: pop the rule ref, push continuation, then push each alternate of the referenced rule
+                var alts = GetRuleAlternatesByName(elem.RuleName!);
+
+                foreach (int altRuleIdx in alts)
                 {
-                    var ns = s.Clone();
-                    AdvancePosition(ns);
-                    results.Add(ns);
-                }
-            }
-            else if (elem is GbnfRuleRefElement rref)
-            {
-                // Push the referenced rule onto the stack
-                if (_rules.TryGetValue(rref.Name, out var ruleElements))
-                {
-                    var ns = s.Clone();
-                    ns.Frames.Add((ruleElements, 0));
-                    var sub = AdvanceByChar(ns, c);
-                    results.AddRange(sub);
-                }
-            }
-        }
-
-        return results;
-    }
-
-    private static GbnfElement? GetCurrentElement(GrammarStack stack)
-    {
-        for (int i = stack.Frames.Count - 1; i >= 0; i--)
-        {
-            var (elements, pos) = stack.Frames[i];
-            if (pos < elements.Length) return elements[pos];
-        }
-        return null;
-    }
-
-    private static void AdvancePosition(GrammarStack stack)
-    {
-        // Move to next element in innermost frame; pop completed frames
-        for (int i = stack.Frames.Count - 1; i >= 0; i--)
-        {
-            var (elements, pos) = stack.Frames[i];
-            stack.Frames[i] = (elements, pos + 1);
-            if (pos + 1 < elements.Length) return; // More elements in this frame
-            stack.Frames.RemoveAt(i); // Frame complete, pop
-        }
-    }
-
-    private static void SetCurrentLiteralPos(GrammarStack stack, int charIdx)
-    {
-        // Update the literal's char position in the current element
-        for (int i = stack.Frames.Count - 1; i >= 0; i--)
-        {
-            var (elements, pos) = stack.Frames[i];
-            if (pos < elements.Length && elements[pos] is GbnfLiteralElement lit)
-            {
-                // Create a new literal with advanced position
-                var newElements = (GbnfElement[])elements.Clone();
-                newElements[pos] = new GbnfLiteralElement(lit.Text, charIdx);
-                stack.Frames[i] = (newElements, pos);
-                return;
-            }
-        }
-    }
-
-    private List<GrammarStack> ExpandAlternations(List<GrammarStack> stacks)
-    {
-        // Expand any alternation elements at the current position
-        var result = new List<GrammarStack>();
-        foreach (var s in stacks)
-        {
-            var elem = GetCurrentElement(s);
-            if (elem is GbnfAlternationElement alt)
-            {
-                foreach (var branch in alt.Branches)
-                {
-                    var ns = s.Clone();
-                    // Replace current frame's element with the branch
-                    var frame = ns.Frames[^1];
-                    var newElements = new GbnfElement[frame.elements.Length - 1 + branch.Length];
-                    Array.Copy(frame.elements, 0, newElements, 0, frame.pos);
-                    Array.Copy(branch, 0, newElements, frame.pos, branch.Length);
-                    Array.Copy(frame.elements, frame.pos + 1, newElements, frame.pos + branch.Length,
-                        frame.elements.Length - frame.pos - 1);
-                    ns.Frames[^1] = (newElements, frame.pos);
-                    result.AddRange(ExpandAlternations([ns]));
+                    var ns = cur.Clone();
+                    ns.RemoveAt(ns.Count - 1);
+                    // Push continuation (next element after the rule ref)
+                    if (elemIdx + 1 < rule.Elements.Length)
+                        ns.Add((ruleIdx, elemIdx + 1));
+                    // Push the alternate rule
+                    if (_rules[altRuleIdx].Elements.Length > 0)
+                        ns.Add((altRuleIdx, 0));
+                    todo.Add(ns);
                 }
             }
             else
             {
-                result.Add(s);
+                // Terminal element — stack is ready
+                result.Add(cur);
             }
+        }
+
+        return Deduplicate(result);
+    }
+
+    /// <summary>Get all alternate rule indices for a rule name.</summary>
+    private List<int> GetRuleAlternatesByName(string name)
+    {
+        var alts = new List<int>();
+        for (int i = 0; i < _rules.Count; i++)
+            if (_rules[i].Name == name) alts.Add(i);
+        return alts;
+    }
+
+    private static string StackKey(GrammarStack stack)
+    {
+        if (stack.Count == 0) return "[]";
+        var sb = new System.Text.StringBuilder(stack.Count * 8);
+        for (int i = 0; i < stack.Count; i++)
+        {
+            if (i > 0) sb.Append('|');
+            sb.Append(stack[i].ruleIdx);
+            sb.Append(':');
+            sb.Append(stack[i].elemIdx);
+        }
+        return sb.ToString();
+    }
+
+    internal static List<GrammarStack> Deduplicate(List<GrammarStack> stacks)
+    {
+        var seen = new HashSet<string>();
+        var result = new List<GrammarStack>();
+        foreach (var s in stacks)
+        {
+            var key = StackKey(s);
+            if (seen.Add(key)) result.Add(s);
         }
         return result;
     }
@@ -284,6 +406,8 @@ internal sealed class GbnfGrammar
 
     private void Parse(string text)
     {
+        // First pass: parse into intermediate AST
+        var rawRules = new Dictionary<string, GbnfElement[]>();
         var lines = text.Split('\n');
         string? currentName = null;
         string currentExpr = "";
@@ -291,7 +415,6 @@ internal sealed class GbnfGrammar
         foreach (var rawLine in lines)
         {
             var line = rawLine.Trim();
-            // Strip inline comments (not inside quotes)
             int commentIdx = FindComment(line);
             if (commentIdx >= 0) line = line[..commentIdx].TrimEnd();
             if (line.Length == 0) continue;
@@ -300,7 +423,7 @@ internal sealed class GbnfGrammar
             if (defIdx >= 0)
             {
                 if (currentName != null)
-                    _rules[currentName] = ParseElements(currentExpr.Trim());
+                    rawRules[currentName] = ParseElements(currentExpr.Trim());
                 currentName = line[..defIdx].Trim();
                 currentExpr = line[(defIdx + 3)..];
             }
@@ -308,8 +431,133 @@ internal sealed class GbnfGrammar
                 currentExpr += " " + line;
         }
         if (currentName != null)
-            _rules[currentName] = ParseElements(currentExpr.Trim());
+            rawRules[currentName] = ParseElements(currentExpr.Trim());
+
+        // Second pass: desugar AST into flat rules
+        foreach (var (name, elements) in rawRules)
+            DesugarRule(name, elements);
     }
+
+    /// <summary>
+    /// Convert an AST element array into one or more flat GrammarRules.
+    /// Desugars Optional, Repeat, Group into synthetic rules with alternates.
+    /// </summary>
+    private void DesugarRule(string name, GbnfElement[] elements)
+    {
+        if (elements.Length == 1 && elements[0] is GbnfAlternationElement alt)
+        {
+            // Top-level alternation: create one rule per branch
+            foreach (var branch in alt.Branches)
+            {
+                var flatElems = new List<GrammarElem>();
+                FlattenElements(branch, flatElems);
+                AddRule(name, flatElems);
+            }
+        }
+        else
+        {
+            var flatElems = new List<GrammarElem>();
+            FlattenElements(elements, flatElems);
+            AddRule(name, flatElems);
+        }
+    }
+
+    /// <summary>
+    /// Flatten AST elements into a flat list of GrammarElems, creating synthetic rules
+    /// for Optional, Repeat, and Group constructs.
+    /// </summary>
+    private void FlattenElements(GbnfElement[] elements, List<GrammarElem> output)
+    {
+        foreach (var elem in elements)
+        {
+            switch (elem)
+            {
+                case GbnfLiteralElement lit:
+                    // Expand multi-char literal into individual char matchers
+                    foreach (char c in lit.Text)
+                        output.Add(GrammarElem.Char(c));
+                    break;
+
+                case GbnfCharClassElement cc:
+                    output.Add(GrammarElem.CharClass(cc));
+                    break;
+
+                case GbnfRuleRefElement rref:
+                    output.Add(GrammarElem.RuleRef(rref.Name));
+                    break;
+
+                case GbnfAlternationElement altElem:
+                    // Create synthetic rule for inline alternation
+                    var synName = NextSyntheticName();
+                    foreach (var branch in altElem.Branches)
+                    {
+                        var branchElems = new List<GrammarElem>();
+                        FlattenElements(branch, branchElems);
+                        AddRule(synName, branchElems);
+                    }
+                    output.Add(GrammarElem.RuleRef(synName));
+                    break;
+
+                case GbnfOptionalElement opt:
+                    // x? → synthetic rule: x | ε
+                    var optName = NextSyntheticName();
+                    var optInner = opt.Inner is GbnfGroupElement og ? og.Elements : [opt.Inner];
+                    var innerElems = new List<GrammarElem>();
+                    FlattenElements(optInner, innerElems);
+                    AddRule(optName, innerElems); // x branch
+                    AddRule(optName, []); // ε branch (empty)
+                    output.Add(GrammarElem.RuleRef(optName));
+                    break;
+
+                case GbnfRepeatElement rep:
+                    // x* → synthetic rule: _rep ::= x _rep | ε
+                    // x+ → synthetic rule: _rep ::= x _rep | x
+                    var repName = NextSyntheticName();
+                    GbnfElement[] repInner;
+                    if (rep.Inner is GbnfGroupElement rg)
+                        repInner = rg.Elements;
+                    else if (rep.Inner is GbnfAlternationElement)
+                        repInner = [rep.Inner]; // Keep alternation as single element for FlattenElements to desugar
+                    else
+                        repInner = [rep.Inner];
+
+                    // Recursive branch: inner + self-ref
+                    var recElems = new List<GrammarElem>();
+                    FlattenElements(repInner, recElems);
+                    recElems.Add(GrammarElem.RuleRef(repName));
+                    AddRule(repName, recElems);
+
+                    if (rep.MinCount == 0)
+                    {
+                        // ε branch (zero occurrences)
+                        AddRule(repName, []);
+                    }
+                    else
+                    {
+                        // Base branch: just inner (one occurrence)
+                        var baseElems = new List<GrammarElem>();
+                        FlattenElements(repInner, baseElems);
+                        AddRule(repName, baseElems);
+                    }
+                    output.Add(GrammarElem.RuleRef(repName));
+                    break;
+
+                case GbnfGroupElement grp:
+                    // Inline group: just flatten its elements
+                    FlattenElements(grp.Elements, output);
+                    break;
+            }
+        }
+    }
+
+    private void AddRule(string name, List<GrammarElem> elements)
+    {
+        _rules.Add(new GrammarRule(name, elements.ToArray()));
+    }
+
+    private string NextSyntheticName() => $"_s{_nextSyntheticId++}";
+
+    // ── Expression parser (produces AST) ────────────────────────────────────
 
     private static int FindComment(string line)
     {
@@ -324,7 +572,6 @@ internal sealed class GbnfGrammar
 
     private GbnfElement[] ParseElements(string expr)
     {
-        // Check for top-level alternation
         var alts = SplitTopLevel(expr, '|');
         if (alts.Count > 1)
             return [new GbnfAlternationElement(alts.Select(a => ParseElements(a.Trim())).ToArray())];
@@ -338,19 +585,13 @@ internal sealed class GbnfGrammar
 
             GbnfElement? elem = null;
 
-            if (expr[i] == '"')
-            {
-                elem = ParseLiteral(expr, ref i);
-            }
-            else if (expr[i] == '[')
-            {
-                elem = ParseCharClass(expr, ref i);
-            }
+            if (expr[i] == '"') elem = ParseLiteral(expr, ref i);
+            else if (expr[i] == '[') elem = ParseCharClass(expr, ref i);
             else if (expr[i] == '(')
             {
                 int depth = 1, start = ++i;
-                while (i < expr.Length && depth > 0) { if (expr[i]=='(') depth++; else if (expr[i]==')') depth--; i++; }
-                var inner = ParseElements(expr[start..(i-1)]);
+                while (i < expr.Length && depth > 0) { if (expr[i] == '(') depth++; else if (expr[i] == ')') depth--; i++; }
+                var inner = ParseElements(expr[start..(i - 1)]);
                 elem = inner.Length == 1 ? inner[0] : new GbnfGroupElement(inner);
             }
             else if (char.IsLetterOrDigit(expr[i]) || expr[i] == '_' || expr[i] == '-')
@@ -363,7 +604,6 @@ internal sealed class GbnfGrammar
 
             if (elem == null) continue;
 
-            // Repetition
             if (i < expr.Length && expr[i] == '*') { elem = new GbnfRepeatElement(elem, 0); i++; }
             else if (i < expr.Length && expr[i] == '+') { elem = new GbnfRepeatElement(elem, 1); i++; }
             else if (i < expr.Length && expr[i] == '?') { elem = new GbnfOptionalElement(elem); i++; }
@@ -371,7 +611,6 @@ internal sealed class GbnfGrammar
             {
                 i++; int s = i; while (i < expr.Length && expr[i] != '}') i++;
                 var parts = expr[s..i].Split(',');
-                // For simplicity treat {n} and {n,m} as repeat
                 elem = new GbnfRepeatElement(elem, int.Parse(parts[0].Trim()));
                 i++;
             }
@@ -390,7 +629,7 @@ internal sealed class GbnfGrammar
             if (expr[i] == '\\' && i + 1 < expr.Length)
             {
                 i++;
-                sb.Append(expr[i] switch { 'n'=>'\n', 't'=>'\t', 'r'=>'\r', '"'=>'"', '\\'=>'\\', _=>expr[i] });
+                sb.Append(expr[i] switch { 'n' => '\n', 't' => '\t', 'r' => '\r', '"' => '"', '\\' => '\\', _ => expr[i] });
             }
             else sb.Append(expr[i]);
             i++;
@@ -407,39 +646,117 @@ internal sealed class GbnfGrammar
         var ranges = new List<(char, char)>();
         while (i < expr.Length && expr[i] != ']')
         {
-            char from = expr[i]; i++;
-            if (i + 1 < expr.Length && expr[i] == '-' && expr[i+1] != ']') { i++; ranges.Add((from, expr[i])); i++; }
-            else ranges.Add((from, from));
+            char from = ReadCharClassChar(expr, ref i);
+            if (i + 1 < expr.Length && expr[i] == '-' && expr[i + 1] != ']')
+            {
+                i++; // skip '-'
+                char to = ReadCharClassChar(expr, ref i);
+                ranges.Add((from, to));
+            }
+            else
+            {
+                ranges.Add((from, from));
+            }
         }
         if (i < expr.Length) i++;
         return new GbnfCharClassElement(ranges.ToArray(), neg);
     }
 
+    /// <summary>Read a single character from a char class, handling \x hex and \n \t \r \\ escapes.</summary>
+    private static char ReadCharClassChar(string expr, ref int i)
+    {
+        if (i < expr.Length && expr[i] == '\\' && i + 1 < expr.Length)
+        {
+            i++; // skip backslash
+            char esc = expr[i];
+            if (esc == 'x' && i + 2 < expr.Length)
+            {
+                // \xHH hex escape
+                var hex = expr.Substring(i + 1, 2);
+                if (int.TryParse(hex, System.Globalization.NumberStyles.HexNumber, null, out int val))
+                {
+                    i += 3; // skip 'x' + 2 hex digits
+                    return (char)val;
+                }
+            }
+            i++; // skip escape char
+            return esc switch { 'n' => '\n', 't' => '\t', 'r' => '\r', _ => esc };
+        }
+        return expr[i++];
+    }
+
     private static List<string> SplitTopLevel(string expr, char sep)
     {
         var result = new List<string>();
-        int depth = 0; bool inQ = false; int start = 0;
+        int parenDepth = 0; int bracketDepth = 0; bool inQ = false; int start = 0;
         for (int i = 0; i < expr.Length; i++)
         {
-            if (expr[i] == '"' && (i == 0 || expr[i-1] != '\\')) inQ = !inQ;
-            if (!inQ) { if (expr[i]=='('||expr[i]=='[') depth++; else if (expr[i]==')'||expr[i]==']') depth--; }
-            if (!inQ && depth == 0 && expr[i] == sep) { result.Add(expr[start..i]); start = i + 1; }
+            // Only toggle quote state outside brackets (quotes inside [...] are literal chars, not string delimiters)
+            if (bracketDepth == 0 && expr[i] == '"' && (i == 0 || expr[i - 1] != '\\')) inQ = !inQ;
+            if (!inQ)
+            {
+                if (expr[i] == '(') parenDepth++;
+                else if (expr[i] == ')') parenDepth--;
+                else if (expr[i] == '[') bracketDepth++;
+                else if (expr[i] == ']') bracketDepth--;
+            }
+            if (!inQ && parenDepth == 0 && bracketDepth == 0 && expr[i] == sep) { result.Add(expr[start..i]); start = i + 1; }
         }
         result.Add(expr[start..]);
         return result;
     }
 }
 
-// ── Element types ──
+// ── Flat grammar elements (runtime) ──────────────────────────────────────
+
+internal enum GrammarElemType { Char, CharNot, RuleRef }
+
+internal readonly struct GrammarElem
+{
+    public GrammarElemType Type { get; init; }
+    public (char from, char to)[]? Ranges { get; init; }    // For Char/CharNot: char ranges
+    public string? RuleName { get; init; }                   // For RuleRef: rule name (resolved lazily)
+
+    public static GrammarElem Char(char c) => new() { Type = GrammarElemType.Char, Ranges = [(c, c)] };
+    public static GrammarElem CharClass(GbnfCharClassElement cc) => new()
+    {
+        Type = cc.IsNegated ? GrammarElemType.CharNot : GrammarElemType.Char,
+        Ranges = cc.Ranges
+    };
+    public static GrammarElem RuleRef(string name) => new()
+    {
+        Type = GrammarElemType.RuleRef,
+        RuleName = name
+    };
+
+    public bool MatchesChar(char c)
+    {
+        if (Ranges == null) return false;
+        bool inRange = false;
+        foreach (var (f, t) in Ranges)
+            if (c >= f && c <= t) { inRange = true; break; }
+        return Type == GrammarElemType.CharNot ? !inRange : inRange;
+    }
+}
+
+internal sealed class GrammarRule(string name, GrammarElem[] elements)
+{
+    public string Name => name;
+    public GrammarElem[] Elements => elements;
+}
+
+// ── AST element types (parse-time only) ──────────────────────────────────
+
 internal abstract class GbnfElement { }
 internal sealed class GbnfLiteralElement(string text, int charIndex = 0) : GbnfElement
 {
     public string Text => text;
     public int CharIndex => charIndex;
-    public bool Matches(char c) => charIndex < text.Length && text[charIndex] == c;
 }
 internal sealed class GbnfCharClassElement((char from, char to)[] ranges, bool negated) : GbnfElement
 {
+    public (char from, char to)[] Ranges => ranges;
+    public bool IsNegated => negated;
     public bool Matches(char c)
     {
         bool inRange = false;

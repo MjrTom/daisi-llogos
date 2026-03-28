@@ -284,7 +284,7 @@ __global__ void gated_attention(float* output,
             float dot = 0.0f;
             int kOffset = kBaseOffset + (tile_start + t) * keyLength;
             for (int d = 0; d < keyLength; d++)
-                dot += q[d] * load_cache_val(kCache, kOffset + d, cacheIsFp16);
+                dot = __fmaf_rn(q[d], load_cache_val(kCache, kOffset + d, cacheIsFp16), dot);
             scores[t] = dot * scale;
         }
         __syncthreads();
@@ -409,7 +409,7 @@ __global__ void batched_gated_attention(float* output,
             float dot = 0.0f;
             int kOffset = kBaseOffset + (tile_start + t) * keyLength;
             for (int d = 0; d < keyLength; d++)
-                dot += q[d] * load_cache_val(kCache, kOffset + d, cacheIsFp16);
+                dot = __fmaf_rn(q[d], load_cache_val(kCache, kOffset + d, cacheIsFp16), dot);
             scores[t] = dot * scale;
         }
         __syncthreads();
@@ -612,17 +612,20 @@ __global__ void deltanet_step(float* output, const float* q, const float* k,
     float* S = state + group * headDim * headDim;
     float* oh = output + group * headDim;
 
-    // For each row i of the state matrix (parallelized across threads):
-    // sk[i] = sum_j(S[i][j] * k[j])
-    // error[i] = (v[i] - d * sk[i]) * b
-    // S[i][j] = d * S[i][j] + k[j] * error[i]
-    // o[i] = sum_j(S[i][j] * q[j]) * scale
+    // DeltaNet state update — row-major layout for coalesced GPU access.
+    // State S is stored as S^T compared to the math notation:
+    //   S_stored[i][j] = S_math[j][i]
+    // This means:
+    //   sk_i = S_stored[i,:] . k = sum_j(S_stored[i][j] * k[j])  (row i dotted with k)
+    //   error_i = (v[i] - d * sk_i) * beta
+    //   S_stored[i][j] = d * S_stored[i][j] + k[j] * error_i
+    //   o_i = S_stored[i,:] . q = sum_j(S_stored[i][j] * q[j]) * scale
 
     for (int i = tid; i < headDim; i += stride)
     {
         float* Si = S + i * headDim;
 
-        // sk = S[i,:] . k
+        // sk = S_stored[i,:] . k  (row-major, coalesced read)
         float sk = 0.0f;
         for (int j = 0; j < headDim; j++)
             sk += Si[j] * kh[j];
