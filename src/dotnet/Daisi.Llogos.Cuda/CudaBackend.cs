@@ -21,6 +21,7 @@ public sealed class CudaBackend : IComputeBackend
     private int _q8_1CachedGeneration; // generation when cache was last written
     private bool _q8_1FusedReady; // true when Q8_1 was pre-computed by fused RmsNorm
     private bool _hasQ4_0Weights; // true when model contains Q4_0 weight tensors
+    private bool _hasQ8_0Weights; // true when model contains Q8_0 weight tensors (enables dp4a path)
     private bool _disposed;
 
     private const int BlockSize = 256;
@@ -240,11 +241,11 @@ public sealed class CudaBackend : IComputeBackend
         // New: [scale(2b) | pad(2b) | quants(32b)] = 36 bytes, quants 4-byte aligned
         if (type == GgmlType.Q8_0 && dimensions.Length >= 2 && dimensions[0] >= 2048)
         {
+            _hasQ8_0Weights = true;
             // Pre-allocate Q8_1 scratch for dp4a matmul (must happen outside stream capture)
             EnsureQ8_1Scratch((int)dimensions[0]);
 
-            // dp4a Q8_0 matmul quantizes activations at runtime — not compatible with graph capture
-            _graphEnabled = false;
+            // dp4a Q8_0 matmul uses pre-allocated Q8_1 scratch (no runtime alloc needed for graph capture)
             // Only repack weight matrices with K >= 2048 (not small embeddings or 1D tensors)
             int blockCount = data.Length / 34;
             var aligned = new byte[blockCount * 36];
@@ -342,14 +343,14 @@ public sealed class CudaBackend : IComputeBackend
             // Use dp4a (integer dot product) for precision matching llama.cpp.
             // Step 1: Quantize FP32 activation to Q8_1 (if not already cached)
             ulong q8_1Ptr;
-            if (_q8_1FusedReady && _q8_1CachedInputPtr == aPtr && _q8_1CachedGeneration == _q8_1CacheGeneration)
+            if (_q8_1CachedInputPtr == aPtr && _q8_1CachedGeneration == _q8_1CacheGeneration)
             {
+                // Cache hit: same activation, already quantized
                 q8_1Ptr = _q8_1Scratch!.DevicePtr;
             }
             else
             {
-                // Scratch was pre-allocated during model loading (EnsureQ8_1Scratch in CreateTensor).
-                // No allocation here — would crash during graph capture.
+                // Quantize activation to Q8_1 and cache for subsequent matmuls with same input
                 q8_1Ptr = _q8_1Scratch!.DevicePtr;
                 var qFunc = _matmulModule.GetFunction("quantize_f32_q8_1");
                 int numBlocksQ = K / 32;
@@ -1440,7 +1441,7 @@ public sealed class CudaBackend : IComputeBackend
             return;
         }
 
-        if (_hasQ4_0Weights && _q8_1Scratch != null)
+        if ((_hasQ4_0Weights || _hasQ8_0Weights) && _q8_1Scratch != null)
         {
             ulong q8Ptr = _q8_1Scratch.DevicePtr;
             var func = _elementwiseModule.GetFunction("rms_norm_residual_q8_1");
@@ -1520,7 +1521,7 @@ public sealed class CudaBackend : IComputeBackend
             return;
         }
 
-        if (_hasQ4_0Weights && _q8_1Scratch != null)
+        if ((_hasQ4_0Weights || _hasQ8_0Weights) && _q8_1Scratch != null)
         {
             ulong q8Ptr = _q8_1Scratch.DevicePtr;
             var func = _elementwiseModule.GetFunction("add_rms_norm_residual_q8_1");
@@ -1583,7 +1584,7 @@ public sealed class CudaBackend : IComputeBackend
             return;
         }
 
-        if (_hasQ4_0Weights && _q8_1Scratch != null)
+        if ((_hasQ4_0Weights || _hasQ8_0Weights) && _q8_1Scratch != null)
         {
             ulong q8Ptr = _q8_1Scratch.DevicePtr;
             var func = _elementwiseModule.GetFunction("add_rms_norm_q8_1");
