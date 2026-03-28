@@ -2,6 +2,14 @@
 
 A suite of inference engines for GGUF models — from native C# backends (CPU, CUDA, Vulkan, Metal) to a browser-native TypeScript/WebGPU engine. Native performance through direct hardware access across every platform: SIMD intrinsics on CPU, P/Invoke to CUDA/Vulkan/Metal on GPU, and WGSL compute shaders in the browser. No managed wrapper libraries, no ONNX, no Python.
 
+**Dependencies**
+There are no external, 3rd-party dependencies for the Daisi.LLogos assembly by itself, but you will need to also clone the Daisi.SDK repo so that the IInferenceBackend is accessible for the Daisi Host backend. 
+
+- /daisinet
+  - /daisi-dotnet-sdk
+  - /daisi-llogos
+
+
 ## Platform Support
 
 | Platform | Backend | Language | Status |
