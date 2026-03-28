@@ -9,6 +9,7 @@ There are no external, 3rd-party dependencies for the Daisi.LLogos assembly by i
   - /daisi-dotnet-sdk
   - /daisi-llogos
 
+In addition to the SDK, you will need to reference one of the LLogos backends in your project: CPU (fallback most of the time), CUDA, or Vulkan. The system will automatically detect if you have CUDA, then look for Vulkan, then go to CPU when the others fail (very slow). 
 
 ## Platform Support
 
