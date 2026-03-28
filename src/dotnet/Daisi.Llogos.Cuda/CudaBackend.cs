@@ -366,10 +366,9 @@ public sealed class CudaBackend : IComputeBackend
             }
 
             // Step 2: dp4a matmul (Q8_0 weights × Q8_1 activation → int32 → float)
-            // One thread block per output neuron, 256 threads per block.
             var func = _matmulModule.GetFunction("dequant_matmul_q8_0_q8_1_aligned");
             int nVal = N;
-            uint dp4aSmem = (uint)((256 / 32) * sizeof(float)); // warp reduction
+            uint dp4aSmem = (uint)((256 / 32) * sizeof(float));
             nint* kArgs = stackalloc nint[6];
             kArgs[0] = (nint)(&outPtr);
             kArgs[1] = (nint)(&q8_1Ptr);

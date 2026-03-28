@@ -106,7 +106,7 @@ __global__ void dequant_matmul_q8_0_q8_1_aligned(float* __restrict__ output,
     if (n >= N) return;
 
     int blocks_per_row = K / 32;
-    long bytes_per_row = (long)blocks_per_row * 36;  // 36-byte aligned blocks
+    long bytes_per_row = (long)blocks_per_row * 36;
     const unsigned char* b_row = b + (long)n * bytes_per_row;
     const unsigned char* a_q8_1 = (const unsigned char*)vq8_1;
 
@@ -114,29 +114,27 @@ __global__ void dequant_matmul_q8_0_q8_1_aligned(float* __restrict__ output,
 
     for (int blk = tid; blk < blocks_per_row; blk += blockSize)
     {
-        // Aligned Q8_0: scale at +0, quants at +4 (4-byte aligned!)
         const unsigned char* wblk = b_row + blk * 36;
-        float w_scale = fp16_to_fp32(*reinterpret_cast<const unsigned short*>(wblk));
-        const int* w_qs = reinterpret_cast<const int*>(wblk + 4); // ALIGNED
+        float w_scale = fp16_to_fp32(__ldg(reinterpret_cast<const unsigned short*>(wblk)));
+        const int* w_qs = reinterpret_cast<const int*>(wblk + 4);
 
         const unsigned char* ablk = a_q8_1 + blk * 36;
-        float a_scale = fp16_to_fp32(*reinterpret_cast<const unsigned short*>(ablk));
-        const int* a_qs = reinterpret_cast<const int*>(ablk + 4); // ALIGNED
+        float a_scale = fp16_to_fp32(__ldg(reinterpret_cast<const unsigned short*>(ablk)));
+        const int* a_qs = reinterpret_cast<const int*>(ablk + 4);
 
         int sumi = 0;
-        sumi = __dp4a(a_qs[0], w_qs[0], sumi);
-        sumi = __dp4a(a_qs[1], w_qs[1], sumi);
-        sumi = __dp4a(a_qs[2], w_qs[2], sumi);
-        sumi = __dp4a(a_qs[3], w_qs[3], sumi);
-        sumi = __dp4a(a_qs[4], w_qs[4], sumi);
-        sumi = __dp4a(a_qs[5], w_qs[5], sumi);
-        sumi = __dp4a(a_qs[6], w_qs[6], sumi);
-        sumi = __dp4a(a_qs[7], w_qs[7], sumi);
+        sumi = __dp4a(__ldg(&a_qs[0]), __ldg(&w_qs[0]), sumi);
+        sumi = __dp4a(__ldg(&a_qs[1]), __ldg(&w_qs[1]), sumi);
+        sumi = __dp4a(__ldg(&a_qs[2]), __ldg(&w_qs[2]), sumi);
+        sumi = __dp4a(__ldg(&a_qs[3]), __ldg(&w_qs[3]), sumi);
+        sumi = __dp4a(__ldg(&a_qs[4]), __ldg(&w_qs[4]), sumi);
+        sumi = __dp4a(__ldg(&a_qs[5]), __ldg(&w_qs[5]), sumi);
+        sumi = __dp4a(__ldg(&a_qs[6]), __ldg(&w_qs[6]), sumi);
+        sumi = __dp4a(__ldg(&a_qs[7]), __ldg(&w_qs[7]), sumi);
 
         sum += a_scale * w_scale * (float)sumi;
     }
 
-    // Warp reduction
     sum = warp_reduce_sum(sum);
     int lane = tid & 31;
     int warp = tid >> 5;
