@@ -227,10 +227,10 @@ __global__ void matmul_f32(float* output, const float* a, const float* b,
 
     const float* b_row = b + (long)n * K;
 
-    // Each thread computes partial sum
+    // Each thread computes partial sum using FMA for precision
     float sum = 0.0f;
     for (int k = tid; k < K; k += blockSize)
-        sum += a[k] * b_row[k];
+        sum = __fmaf_rn(a[k], b_row[k], sum);
 
     // Warp reduction
     sum = warp_reduce_sum(sum);
@@ -292,17 +292,24 @@ __global__ void dequant_matmul_q8_0_aligned(float* __restrict__ output,
             const unsigned char* block_ptr = b + (long)n * bytes_per_row + blk * 36;
             float scale = fp16_to_fp32(__ldg(reinterpret_cast<const unsigned short*>(block_ptr)));
             const unsigned int* q32 = reinterpret_cast<const unsigned int*>(block_ptr + 4);
+            // Accumulate quant*activation products per block.
+            // llama.cpp uses dp4a (int8×int8→int32) for exact integer accumulation.
+            // We can't use dp4a directly (activations are FP32 not int8), but we
+            // minimize float rounding by accumulating the int-weighted sums separately
+            // then multiplying by scale once (matching llama.cpp's pattern).
             float bs = 0.0f;
             #pragma unroll
             for (int i = 0; i < 8; i++) {
                 float4 ai = a_cache[i];
                 unsigned int packed = __ldg(&q32[i]);
-                bs += ai.x*(float)(int)((signed char)(packed))
-                    + ai.y*(float)(int)((signed char)(packed >> 8))
-                    + ai.z*(float)(int)((signed char)(packed >> 16))
-                    + ai.w*(float)(int)((signed char)(packed >> 24));
+                // Each multiply is exact (int8 fits in float mantissa), only the
+                // addition rounds. FMA minimizes this.
+                bs = __fmaf_rn(ai.x, (float)((signed char)(packed)),      bs);
+                bs = __fmaf_rn(ai.y, (float)((signed char)(packed >> 8)),  bs);
+                bs = __fmaf_rn(ai.z, (float)((signed char)(packed >> 16)), bs);
+                bs = __fmaf_rn(ai.w, (float)((signed char)(packed >> 24)), bs);
             }
-            sums[r] += scale * bs;
+            sums[r] = __fmaf_rn(scale, bs, sums[r]);
         }
     }
 
@@ -339,7 +346,6 @@ __global__ void dequant_matmul_q8_0(float* __restrict__ output,
     int blocks_per_row = K / 32;
     long bytes_per_row = (long)blocks_per_row * 34;
 
-    // Accumulate all rows in registers (no sync between rows)
     float sums[Q8_ROWS_PER_BLOCK] = {0};
 
     for (int blk = tid; blk < blocks_per_row; blk += blockSize)
@@ -366,10 +372,12 @@ __global__ void dequant_matmul_q8_0(float* __restrict__ output,
             {
                 float4 ai = a_cache[i];
                 int base = i * 4;
-                bs += ai.x * (float)quants[base]     + ai.y * (float)quants[base + 1]
-                    + ai.z * (float)quants[base + 2] + ai.w * (float)quants[base + 3];
+                bs = __fmaf_rn(ai.x, (float)quants[base],     bs);
+                bs = __fmaf_rn(ai.y, (float)quants[base + 1], bs);
+                bs = __fmaf_rn(ai.z, (float)quants[base + 2], bs);
+                bs = __fmaf_rn(ai.w, (float)quants[base + 3], bs);
             }
-            sums[r] += scale * bs;
+            sums[r] = __fmaf_rn(scale, bs, sums[r]);
         }
     }
 

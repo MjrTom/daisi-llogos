@@ -7,6 +7,12 @@ namespace Daisi.Llogos.Cpu;
 /// </summary>
 internal static class Rope
 {
+    // Precomputed inverse frequencies per (ropeDim, theta) pair.
+    // llama.cpp precomputes these in double precision — critical for matching its output.
+    private static double[]? _cachedFreqs;
+    private static int _cachedRopeDim;
+    private static float _cachedTheta;
+
     /// <summary>
     /// Apply RoPE in-place to q and k tensors.
     /// q is [nHeads × headDim], k is [nKvHeads × headDim], both stored flat.
@@ -17,28 +23,46 @@ internal static class Rope
         int nQHeads = q.Length / headDim;
         int nKvHeads = k.Length / headDim;
 
+        // Precompute frequencies in double precision (matches llama.cpp)
+        var freqs = GetFreqs(ropeDim, ropeTheta);
+
         for (int h = 0; h < nQHeads; h++)
-            RotateHead(q.Slice(h * headDim, headDim), ropeDim, positionOffset, ropeTheta);
+            RotateHead(q.Slice(h * headDim, headDim), ropeDim, positionOffset, freqs);
 
         for (int h = 0; h < nKvHeads; h++)
-            RotateHead(k.Slice(h * headDim, headDim), ropeDim, positionOffset, ropeTheta);
+            RotateHead(k.Slice(h * headDim, headDim), ropeDim, positionOffset, freqs);
     }
 
-    private static void RotateHead(Span<float> head, int ropeDim, int position, float theta)
+    private static double[] GetFreqs(int ropeDim, float theta)
+    {
+        if (_cachedFreqs != null && _cachedRopeDim == ropeDim && _cachedTheta == theta)
+            return _cachedFreqs;
+
+        int halfDim = ropeDim / 2;
+        var freqs = new double[halfDim];
+        for (int i = 0; i < halfDim; i++)
+            freqs[i] = 1.0 / Math.Pow((double)theta, 2.0 * i / ropeDim);
+
+        _cachedFreqs = freqs;
+        _cachedRopeDim = ropeDim;
+        _cachedTheta = theta;
+        return freqs;
+    }
+
+    private static void RotateHead(Span<float> head, int ropeDim, int position, double[] freqs)
     {
         int halfDim = ropeDim / 2;
         for (int i = 0; i < halfDim; i++)
         {
-            float freq = 1.0f / MathF.Pow(theta, 2.0f * i / ropeDim);
-            float angle = position * freq;
-            float cos = MathF.Cos(angle);
-            float sin = MathF.Sin(angle);
+            // Compute angle in double precision (matches llama.cpp)
+            double angle = position * freqs[i];
+            float cos = (float)Math.Cos(angle);
+            float sin = (float)Math.Sin(angle);
 
             float x0 = head[2 * i];
             float x1 = head[2 * i + 1];
             head[2 * i] = x0 * cos - x1 * sin;
             head[2 * i + 1] = x0 * sin + x1 * cos;
         }
-        // Dimensions beyond ropeDim are left unchanged (NoPE)
     }
 }

@@ -33,12 +33,67 @@ public sealed partial class BpeTokenizer
     /// <summary>
     /// Encode text into a sequence of token IDs.
     /// </summary>
+    /// <summary>Cached list of special tokens that should be matched as whole units.</summary>
+    private string[]? _specialTokens;
+
     public int[] Encode(string text)
     {
         if (string.IsNullOrEmpty(text))
             return [];
 
+        // Build special token list lazily (tokens containing | that are in the vocabulary)
+        _specialTokens ??= BuildSpecialTokenList();
+
         var result = new List<int>();
+
+        // Split text around special tokens, then BPE-encode each non-special segment
+        int pos = 0;
+        while (pos < text.Length)
+        {
+            // Try to match a special token at the current position
+            string? matched = null;
+            foreach (var special in _specialTokens)
+            {
+                if (pos + special.Length <= text.Length &&
+                    text.AsSpan(pos, special.Length).SequenceEqual(special))
+                {
+                    matched = special;
+                    break;
+                }
+            }
+
+            if (matched != null)
+            {
+                // Emit the special token as a single ID
+                int id = _vocab.TokenToId(matched);
+                if (id >= 0) result.Add(id);
+                pos += matched.Length;
+            }
+            else
+            {
+                // Find the next special token (or end of string)
+                int nextSpecial = text.Length;
+                foreach (var special in _specialTokens)
+                {
+                    int idx = text.IndexOf(special, pos, StringComparison.Ordinal);
+                    if (idx >= 0 && idx < nextSpecial)
+                        nextSpecial = idx;
+                }
+
+                // BPE-encode the segment before the next special token
+                var segment = text[pos..nextSpecial];
+                if (segment.Length > 0)
+                    EncodeSegment(segment, result);
+                pos = nextSpecial;
+            }
+        }
+
+        return result.ToArray();
+    }
+
+    /// <summary>BPE-encode a text segment (no special tokens).</summary>
+    private void EncodeSegment(string text, List<int> result)
+    {
         var matches = _preTokenizePattern.Matches(text);
 
         foreach (Match match in matches)
@@ -56,8 +111,29 @@ public sealed partial class BpeTokenizer
                     result.Add(id);
             }
         }
+    }
 
-        return result.ToArray();
+    /// <summary>
+    /// Build a list of special tokens from the vocabulary.
+    /// Special tokens are those containing "|" (like &lt;|im_start|&gt;, &lt;|im_end|&gt;, &lt;|endoftext|&gt;)
+    /// sorted longest-first to ensure greedy matching.
+    /// </summary>
+    private string[] BuildSpecialTokenList()
+    {
+        var specials = new List<string>();
+        for (int i = 0; i < _vocab.Count; i++)
+        {
+            var token = _vocab.IdToToken(i);
+            // Qwen special tokens have the pattern <|...|> or <｜...｜>
+            if (token.Length > 3 && token.StartsWith('<') && token.EndsWith('>') &&
+                (token.Contains('|') || token.Contains('｜')))
+            {
+                specials.Add(token);
+            }
+        }
+        // Sort longest first for greedy matching
+        specials.Sort((a, b) => b.Length.CompareTo(a.Length));
+        return specials.ToArray();
     }
 
     /// <summary>

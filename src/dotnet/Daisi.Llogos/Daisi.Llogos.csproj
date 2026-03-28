@@ -4,6 +4,9 @@
     <AssemblyName>Daisi.Llogos</AssemblyName>
   </PropertyGroup>
   <ItemGroup>
+    <InternalsVisibleTo Include="Daisi.Llogos.Tests" />
+  </ItemGroup>
+  <ItemGroup>
     <ProjectReference Include="..\..\..\..\daisi-sdk-dotnet\Daisi.Inference\Daisi.Inference.csproj" />
   </ItemGroup>
 </Project>

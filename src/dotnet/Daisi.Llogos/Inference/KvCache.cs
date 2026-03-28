@@ -33,7 +33,7 @@ public sealed class KvCache : IKvCache
     /// <param name="startLayer">DaisiChain: only allocate for layers >= startLayer. Default 0.</param>
     /// <param name="endLayer">DaisiChain: only allocate for layers &lt; endLayer. Default NumLayers.</param>
     public KvCache(IComputeBackend backend, ModelConfig config, int maxSeqLen,
-        GgmlType cacheType = GgmlType.F16, AttentionStrategy? strategy = null,
+        GgmlType cacheType = GgmlType.F32, AttentionStrategy? strategy = null,
         int startLayer = 0, int endLayer = -1)
     {
         _strategy = strategy ?? AttentionStrategy.Full;

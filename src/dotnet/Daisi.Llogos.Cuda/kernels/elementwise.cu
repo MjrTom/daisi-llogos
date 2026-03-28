@@ -23,12 +23,12 @@ __global__ void rms_norm(float* output, const float* input, const float* weight,
     int tid = threadIdx.x;
     int stride = blockDim.x;
 
-    // Pass 1: compute sum of squares
-    float sum = 0.0f;
+    // Pass 1: compute sum of squares (double precision accumulation for precision)
+    double sum = 0.0;
     for (int i = tid; i < n; i += stride)
-        sum += input[i] * input[i];
+        sum += (double)input[i] * (double)input[i];
 
-    sdata[tid] = sum;
+    sdata[tid] = (float)sum;
     __syncthreads();
 
     // Block reduction
@@ -255,10 +255,10 @@ __global__ void rope(float* q, float* k,
         int pair = idx % (head_dim / 2);
         if (pair < half_rope)
         {
-            float freq = 1.0f / powf(theta, (float)(2 * pair) / (float)rope_dim);
-            float angle = (float)position * freq;
-            float cos_a = cosf(angle);
-            float sin_a = sinf(angle);
+            double freq = 1.0 / pow((double)theta, (double)(2 * pair) / (double)rope_dim);
+            double angle = (double)position * freq;
+            float cos_a = (float)cos(angle);
+            float sin_a = (float)sin(angle);
 
             int base_idx = head * head_dim + pair * 2;
             float v0 = q[base_idx];
@@ -275,10 +275,10 @@ __global__ void rope(float* q, float* k,
         int pair = idx % (head_dim / 2);
         if (pair < half_rope)
         {
-            float freq = 1.0f / powf(theta, (float)(2 * pair) / (float)rope_dim);
-            float angle = (float)position * freq;
-            float cos_a = cosf(angle);
-            float sin_a = sinf(angle);
+            double freq = 1.0 / pow((double)theta, (double)(2 * pair) / (double)rope_dim);
+            double angle = (double)position * freq;
+            float cos_a = (float)cos(angle);
+            float sin_a = (float)sin(angle);
 
             int base_idx = head * head_dim + pair * 2;
             float v0 = k[base_idx];
@@ -312,10 +312,10 @@ __global__ void batched_rope(float* q, float* k,
         {
             int token = head / q_heads_per_token;
             int position = start_position + token;
-            float freq = 1.0f / powf(theta, (float)(2 * pair) / (float)rope_dim);
-            float angle = (float)position * freq;
-            float cos_a = cosf(angle);
-            float sin_a = sinf(angle);
+            double freq = 1.0 / pow((double)theta, (double)(2 * pair) / (double)rope_dim);
+            double angle = (double)position * freq;
+            float cos_a = (float)cos(angle);
+            float sin_a = (float)sin(angle);
 
             int base_idx = head * head_dim + pair * 2;
             float v0 = q[base_idx];
@@ -334,10 +334,10 @@ __global__ void batched_rope(float* q, float* k,
         {
             int token = head / k_heads_per_token;
             int position = start_position + token;
-            float freq = 1.0f / powf(theta, (float)(2 * pair) / (float)rope_dim);
-            float angle = (float)position * freq;
-            float cos_a = cosf(angle);
-            float sin_a = sinf(angle);
+            double freq = 1.0 / pow((double)theta, (double)(2 * pair) / (double)rope_dim);
+            double angle = (double)position * freq;
+            float cos_a = (float)cos(angle);
+            float sin_a = (float)sin(angle);
 
             int base_idx = head * head_dim + pair * 2;
             float v0 = k[base_idx];

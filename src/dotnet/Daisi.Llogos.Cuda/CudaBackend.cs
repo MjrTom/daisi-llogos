@@ -242,6 +242,9 @@ public sealed class CudaBackend : IComputeBackend
         {
             // Pre-allocate Q8_1 scratch for dp4a matmul (must happen outside stream capture)
             EnsureQ8_1Scratch((int)dimensions[0]);
+
+            // dp4a Q8_0 matmul quantizes activations at runtime — not compatible with graph capture
+            _graphEnabled = false;
             // Only repack weight matrices with K >= 2048 (not small embeddings or 1D tensors)
             int blockCount = data.Length / 34;
             var aligned = new byte[blockCount * 36];
@@ -336,15 +339,44 @@ public sealed class CudaBackend : IComputeBackend
         }
         else if (b.Type == GgmlType.Q8_0)
         {
-            var (grid, threads, smem) = AdaptiveLaunch(N, 2, K / 32); // Q8_ROWS_PER_BLOCK=2
-            bool isAligned = bT is CudaTensor ct2 && ct2.IsAlignedQ8_0;
-            var func = _matmulModule.GetFunction(isAligned
-                ? "dequant_matmul_q8_0_aligned" : "dequant_matmul_q8_0");
+            // Use dp4a (integer dot product) for precision matching llama.cpp.
+            // Step 1: Quantize FP32 activation to Q8_1 (if not already cached)
+            ulong q8_1Ptr;
+            if (_q8_1FusedReady && _q8_1CachedInputPtr == aPtr && _q8_1CachedGeneration == _q8_1CacheGeneration)
+            {
+                q8_1Ptr = _q8_1Scratch!.DevicePtr;
+            }
+            else
+            {
+                // Scratch was pre-allocated during model loading (EnsureQ8_1Scratch in CreateTensor).
+                // No allocation here — would crash during graph capture.
+                q8_1Ptr = _q8_1Scratch!.DevicePtr;
+                var qFunc = _matmulModule.GetFunction("quantize_f32_q8_1");
+                int numBlocksQ = K / 32;
+                uint qGrid = (uint)((numBlocksQ + BlockSize - 1) / BlockSize);
+                int kVal = K;
+                nint* qArgs = stackalloc nint[3];
+                qArgs[0] = (nint)(&q8_1Ptr);
+                qArgs[1] = (nint)(&aPtr);
+                qArgs[2] = (nint)(&kVal);
+                _stream.Launch(qFunc, qGrid, 1, 1, (uint)BlockSize, 1, 1, 0, qArgs);
+                _q8_1CachedInputPtr = aPtr;
+                _q8_1CachedGeneration = _q8_1CacheGeneration;
+            }
+
+            // Step 2: dp4a matmul (Q8_0 weights × Q8_1 activation → int32 → float)
+            // One thread block per output neuron, 256 threads per block.
+            var func = _matmulModule.GetFunction("dequant_matmul_q8_0_q8_1_aligned");
             int nVal = N;
+            uint dp4aSmem = (uint)((256 / 32) * sizeof(float)); // warp reduction
             nint* kArgs = stackalloc nint[6];
-            kArgs[0] = (nint)(&outPtr); kArgs[1] = (nint)(&aPtr); kArgs[2] = (nint)(&bPtr);
-            kArgs[3] = (nint)(&M); kArgs[4] = (nint)(&K); kArgs[5] = (nint)(&nVal);
-            _stream.Launch(func, grid, 1, 1, threads, 1, 1, smem, kArgs);
+            kArgs[0] = (nint)(&outPtr);
+            kArgs[1] = (nint)(&q8_1Ptr);
+            kArgs[2] = (nint)(&bPtr);
+            kArgs[3] = (nint)(&M);
+            kArgs[4] = (nint)(&K);
+            kArgs[5] = (nint)(&nVal);
+            _stream.Launch(func, (uint)N, 1, 1, 256, 1, 1, dp4aSmem, kArgs);
         }
         else if (b.Type == GgmlType.Q4_0 && _q8_1FusedReady
                  && _q8_1CachedInputPtr == aPtr && _q8_1CachedGeneration == _q8_1CacheGeneration)
