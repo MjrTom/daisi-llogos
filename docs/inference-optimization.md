@@ -14,7 +14,7 @@ RTX 5080, CUDA 13, greedy sampling (temperature=0). llama.cpp b8461 CUDA.
 | TinyLlama 1.1B Q8_0 | LLaMA | 444 | 448 | 0.99x |
 | Qwen3.5-4B Q8_0 | DeltaNet hybrid | **142** | 134 | **1.05x** |
 | Qwen3-8B Q8_0 | Standard attention | 89 | 91 | 0.98x |
-| Qwen3-8B Q4_K_M | Standard attention | 122 | 138 | 0.88x |
+| Qwen3-8B Q4_K_M | Standard attention | **127** | 138 | **0.92x** |
 | Qwen3.5-9B Q8_0 | DeltaNet hybrid | **86** | 84 | **1.02x** |
 | Qwen3.5-9B Q4_0 | DeltaNet hybrid | 99 | 126 | 0.79x |
 
@@ -30,7 +30,7 @@ RTX 5080, CUDA 13, greedy sampling (temperature=0). llama.cpp b8461 CUDA.
 | Qwen3.5-9B Q8_0 | DeltaNet hybrid | **165** | 4,714 | 0.04x | Hybrid (1.8x vs sequential) |
 | Qwen3.5-9B Q4_0 | DeltaNet hybrid | **155** | 4,954 | 0.03x | Hybrid (1.5x vs sequential) |
 
-We exceed llama.cpp on decode for 3 of 7 models, across DeltaNet and standard attention architectures. The remaining decode gap on 4-bit quants is from our Q4_0 float kernel being compute-bound on nibble extraction.
+We exceed llama.cpp on decode for 3 of 7 models, across DeltaNet and standard attention architectures. The Q4_K_M gap has been reduced from 12% to 8% via fused SwiGLU matmul, Q6_K kernel optimization, and cooperative dp4a kernels. The remaining 4-bit gaps are from pipeline overhead and mixed-quant layer efficiency.
 
 Prefill is a large gap: llama.cpp uses fused quantized GEMM via cuBLASLt with tensor cores, while our batched path dequantizes to FP32 then calls cuBLAS SGEMM. Pure attention models achieve 5-9x speedup over sequential prefill; DeltaNet hybrids achieve 1.5-1.8x (only RmsNorm, FFN, and attention layers are batched; DeltaNet state updates remain sequential). llama.cpp's fused approach is 8-30x faster on prefill overall.
 
@@ -79,7 +79,7 @@ The optimal row count varies per quant type because each has different register 
 | Q8_0 | 2 | Simple byte extraction, low ALU — register pressure dominates |
 | Q4_0 | 2 | Same as Q8_0 (float path with nibble extraction) |
 | Q4_K | 3 | Complex scale unpacking, moderate register use |
-| Q6_K | 10 | Very complex inner loop but small data per super-block |
+| Q6_K | 3 | Branch-free split loops, factored scale multiply, float4 activation loads |
 | Q4_1 | 8 | Simple with min offset, similar to Q4_0 |
 | Q5_K | 1 | Extremely complex (5-bit with high-bit array), any multi-row spills |
 
@@ -134,6 +134,49 @@ An early optimization attempt used global `sed` commands to tune kernel paramete
 
 The fix: each quant type's dispatch computes its own grid size, thread count, and shared memory via a self-contained `AdaptiveLaunch()` helper. No shared variables between quant types = no cross-contamination from editing one type's parameters.
 
+## 8. Fused MatMulSwiGLU for Q4_K FFN Layers
+
+The FFN block in transformer models computes `output = SiLU(gate_proj(x)) * up_proj(x)`. The standard pipeline executes this as three separate operations: gate matmul → up matmul → SwiGLU activation. Each operation writes to global memory and requires a separate kernel launch.
+
+We fuse all three into a single CUDA kernel: `dequant_matmul_swiGLU_q4_k`. For each output element `i`, the kernel computes both `dot(activation, gate_weights[i])` and `dot(activation, up_weights[i])` in the same thread block, then applies `SiLU(gate) * up` and writes the final result. The Q8_1 activation data is loaded once and shared across both weight row reads.
+
+**Architecture:** Uses the same cooperative dp4a design as the Q4_K v2 kernel (128 threads, 16 per super-block). Two sets of partial sums (gate and up) are accumulated in parallel with negligible extra register pressure (~30 registers vs ~15 for single matmul).
+
+**Savings per FFN layer:**
+- 2 fewer kernel launches (up_proj matmul + SwiGLU eliminated)
+- Intermediate tensor writes eliminated (gate and up outputs never touch global memory)
+- Activation Q8_1 loaded once instead of twice
+
+**Impact:** Over 36 layers, this eliminates 72 kernel launches and ~8 MB of intermediate memory traffic per token. Measured improvement: 125.4 → 127.4 tok/s on Qwen3 8B Q4_K_M (+1.6%).
+
+## 9. Q6_K Kernel Optimization
+
+Q4_K_M models use mixed quantization — approximately 39% of weight data per layer is Q6_K (attention V projections, FFN down projections). The original Q6_K kernel had several inefficiencies:
+
+- **10 rows per block** — extreme register pressure (42+ registers per thread) limiting SM occupancy
+- **Per-element branch** — `(l < 16) ? sc0 : sc1` in the hot inner loop caused warp divergence
+- **Scalar activation loads** — 32 individual float reads instead of vectorized loads
+- **Scale multiply per element** — `a * (sc * q)` computed 32 scale multiplications per chunk
+
+The optimized kernel reduces to **3 rows per block**, eliminates the branch by splitting into two 16-element loops, uses **float4 vectorized activation loads** (8 × 128-bit reads), and **factors the scale multiply** outside the inner loop (`sc * Σ(a*q)` = 1 multiply instead of 16).
+
+**Impact:** Measured improvement on Qwen3 8B Q4_K_M: 124 → 125.4 tok/s (+1.1%). The improvement is proportional to Q6_K's share of the model's weight data.
+
+## 10. Cooperative Q4_K dp4a Kernel (v2)
+
+The original Q4_K float kernel uses 64 threads with 3 rows per block, where each thread independently processes a 64-element chunk (loading 64 floats of activation + 32 bytes of nibbles). This gives ~70 registers per thread and only 2 warps for memory latency hiding.
+
+Inspired by llama.cpp's `mul_mat_vec_q` architecture, the v2 kernel (`dequant_matmul_q4_k_v2`) uses a cooperative design:
+
+- **128 threads** (4 warps), **1 row per block** — all threads cooperate on the same output row
+- **16 threads per super-block** — 4 threads per chunk, each handling 16 elements via dp4a
+- **~15 registers per thread** — 4x lower than the multi-row kernel
+- **16-thread warp reduction** via `__shfl_xor_sync` + 8-entry shared memory cross-group sum
+
+This architecture enables much higher SM occupancy (up to 27 blocks vs 14 for the old kernel) and 4 warps for latency hiding. The activation Q8_1 data is shared across all threads via L2 cache, and the dp4a(0x01010101, ...) trick correctly distributes activation sums for the Q4_K min-correction term.
+
+On Blackwell, the v2 kernel matches the multi-row float kernel's performance (both achieve ~125 tok/s). On pre-Blackwell GPUs with lower FP32 throughput, dp4a's 4x integer throughput advantage should yield a measurable speedup.
+
 ## Lessons Learned
 
 1. **The lm_head is a bottleneck hiding in plain sight.** For Qwen3.5's 152K vocab, the output projection reads 1.6GB per token — 17% of total weight data for the 9B model. Partial vocab computation eliminates most of this for free.
@@ -143,6 +186,14 @@ The fix: each quant type's dispatch computes its own grid size, thread count, an
 3. **dp4a precision issues were a cache bug, not a math bug.** We spent significant time investigating FP16 truncation, Q8_1 sum compensation, and quantization rounding before discovering the real cause: stale cached data from tensor pointer reuse.
 
 4. **Beating llama.cpp from managed C# is possible.** The GPU kernel code is identical (CUDA C compiled via NVRTC, GLSL compiled to SPIR-V). The managed overhead is negligible — the bottleneck is always the GPU kernels and memory bandwidth. C#'s `unsafe` context and P/Invoke provide zero-overhead access to the CUDA/Vulkan driver APIs.
+
+5. **Mixed-quant models need all kernels fast.** Q4_K_M uses ~39% Q6_K weights per layer. A slow Q6_K kernel drags the entire model's performance. Optimizing the Q6_K kernel from 10→3 rows with branch elimination yielded a measurable 1.1% improvement on Q4_K_M models.
+
+6. **Kernel fusion saves more than you'd expect.** The fused SwiGLU matmul saves ~0.15 ms per token — mostly from eliminated kernel launches, not memory traffic. With CUDA graph replay overhead at ~2 μs per kernel, eliminating 72 launches per token adds up.
+
+7. **On-demand Q8_1 quantization needs activation tracking, not just fused-ready flags.** The dp4a fallback path's stale-cache condition (`!_q8_1FusedReady && ...`) silently served wrong Q8_1 data when the fused flag was stale from a previous RmsNorm but the activation had changed. Always check activation pointer + generation, regardless of fused state.
+
+8. **FP16 scale pre-computation overflows.** Attempting to pre-compute `d * sc` as FP16 at load time for Q4_K flat scales caused overflow (d up to 65504 × sc up to 63 = 4.1M >> FP16 max 65504). The original runtime FP32 computation is correct; there is no lossless FP16 shortcut.
 
 ## 8. Early Layer Exit (Investigated, Not Viable)
 

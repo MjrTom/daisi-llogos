@@ -31,7 +31,7 @@ The `__dp4a` integer dot product approach (CUDA) produced garbage output. Initia
 ### Fix
 Generation-based cache invalidation: a counter is incremented by every operation that writes to a tensor (RmsNorm, AddRmsNorm, etc.). The cache checks both pointer AND generation. Additionally, three fused RmsNorm+Q8_1 kernels pre-compute the Q8_1 data inside the normalization pass, eliminating the separate quantization kernel entirely.
 
-dp4a is now the default Q4_0 path on pre-Blackwell GPUs, with architecture-adaptive dispatch selecting the float path on Blackwell (SM 12.x).
+dp4a is now the default Q4_0 path on all GPUs. Q4_K also has a cooperative dp4a kernel (v2) with 128 threads and 16 threads per super-block, used alongside a fused MatMulSwiGLU kernel for Q4_K FFN layers.
 
 ---
 
@@ -48,13 +48,18 @@ dp4a is now the default Q4_0 path on pre-Blackwell GPUs, with architecture-adapt
 | 4B Q8_0 | **144** | 135 | **107%** |
 | 8B Q8_0 | 91 | 92 | 99% |
 | DeepSeek R1 8B Q8_0 | 94 | 95 | 99% |
-| 8B Q4_K_M | 124 | 138 | 90% |
+| 8B Q4_K_M | **127** | 138 | **92%** |
 | 9B Q8_0 | **88** | 84 | **105%** |
 | 9B Q4_0 | 101 | 123 | 82% |
 
 ### Remaining Gaps
-- **CUDA 4-bit quants** (81-88%): Q4_0 float kernel is compute-bound on nibble extraction; dp4a matches float on Blackwell but doesn't exceed it. Q4_K needs dp4a implementation.
+- **CUDA Q4_K_M** (92%): Closed from 90% via fused SwiGLU matmul, Q6_K kernel optimization (10→3 rows), and cooperative dp4a kernels. Remaining ~8% gap is from pipeline overhead and mixed-quant layer efficiency.
+- **CUDA Q4_0** (82%): dp4a kernel limited by DeltaNet overhead in Qwen3.5 hybrid models. Pure attention Q4_0 models would be closer.
 - **Vulkan** (33-58%): matmul bandwidth utilization gap, no dp4a equivalent in GLSL. Needs further shader optimization.
+
+### Resolved: Q4_0 dp4a Stale Activation Bug
+
+The on-demand Q8_1 quantization condition was `!_q8_1FusedReady && (ptr/gen mismatch)`. When `_q8_1FusedReady` was stale from a previous RmsNorm but the current activation was different (o_proj, down_proj matmuls), the condition evaluated false and quantization was skipped — the dp4a kernel ran on stale Q8_1 data, producing garbled output. This was a latent bug masked by the Blackwell float fallback path for Q4_0. Fixed by removing the `!_q8_1FusedReady` guard: always re-quantize when the activation pointer or generation changes.
 
 ### Key Optimizations
 See [Inference Optimization White Paper](inference-optimization.md) for full details on partial vocab logits, per-quant row tuning, fused RmsNorm+Q8_1, and other techniques.
