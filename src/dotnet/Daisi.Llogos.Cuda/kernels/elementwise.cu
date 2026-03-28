@@ -479,9 +479,9 @@ __device__ float fp16_to_fp32_emb(unsigned short h)
     return result;
 }
 
-// ── Q4_K embedding lookup ─────────────────────────────────────────────────────
+// ── Q4_K embedding lookup (original 144-byte layout) ─────────────────────────
 // Q4_K super block: 256 elements, 144 bytes.
-// Layout: 2b d (fp16) + 2b dmin (fp16) + 12b packed scales/mins + 128b nibbles.
+// Layout: 2b d(f16) + 2b dmin(f16) + 12b packed scales/mins + 128b nibbles.
 
 __global__ void embedding_lookup_q4_k(float* output, const unsigned char* table,
                                        int hidden_dim, int token_id)
@@ -497,19 +497,19 @@ __global__ void embedding_lookup_q4_k(float* output, const unsigned char* table,
     int elem_in_sb = idx % 256;
     const unsigned char* sb = row + sb_idx * 144;
 
-    unsigned short d_bits = ((unsigned short)sb[1] << 8) | sb[0];
-    unsigned short dmin_bits = ((unsigned short)sb[3] << 8) | sb[2];
-    float d = fp16_to_fp32_emb(d_bits);
-    float dmin = fp16_to_fp32_emb(dmin_bits);
+    float d = fp16_to_fp32_emb(((unsigned short)sb[1] << 8) | sb[0]);
+    float dmin = fp16_to_fp32_emb(((unsigned short)sb[3] << 8) | sb[2]);
 
     // Chunk layout: 4 chunks of 64 elements, 32 qs bytes each.
-    // lo nibble → first 32 elems, hi nibble → second 32 elems.
+    // lo nibble -> first 32 elems, hi nibble -> second 32 elems.
     int chunk = elem_in_sb / 64;
     int pos_in_chunk = elem_in_sb % 64;
     int l = pos_in_chunk % 32;
-    int is_hi = pos_in_chunk / 32; // 0 for first sub-block, 1 for second
+    int is_hi = pos_in_chunk / 32;
 
-    int j = chunk * 2 + is_hi; // sub-block index for scales
+    int j = chunk * 2 + is_hi;
+
+    // Unpack scales from packed 12-byte format
     int sc, m;
     if (j < 4) {
         sc = sb[4 + j] & 63;
@@ -518,11 +518,14 @@ __global__ void embedding_lookup_q4_k(float* output, const unsigned char* table,
         sc = (sb[4 + j + 4] & 0xF) | ((sb[4 + j - 4] >> 6) << 4);
         m  = (sb[4 + j + 4] >> 4)  | ((sb[4 + j]     >> 6) << 4);
     }
+    float ss = d * (float)sc;
+    float sm = dmin * (float)m;
 
+    // Nibbles at offset 16 within the 144-byte super-block
     unsigned char packed = sb[16 + chunk * 32 + l];
     int nibble = is_hi ? (packed >> 4) : (packed & 0xF);
 
-    output[idx] = d * (float)sc * (float)nibble - dmin * (float)m;
+    output[idx] = ss * (float)nibble - sm;
 }
 
 // ── Q4_0 embedding lookup ─────────────────────────────────────────────────────

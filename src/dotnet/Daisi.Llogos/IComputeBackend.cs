@@ -410,6 +410,20 @@ public interface IComputeBackend : IDisposable
     }
 
     /// <summary>
+    /// Fused gate+up matmul with SwiGLU: output[i] = SiLU(dot(a, gate[i])) * dot(a, up[i]).
+    /// Eliminates intermediate tensor writes and extra kernel launches vs separate gate/up/SwiGLU.
+    /// </summary>
+    void MatMulSwiGLU(ITensor output, ITensor a, ITensor gateWeights, ITensor upWeights, int M, int K, int N)
+    {
+        // Default: separate operations (overridden by CudaBackend with fused kernel)
+        MatMul(output, a, gateWeights, M, K, N);      // output = gate projection
+        var temp = CreateTensor("_swiGLU_temp", output.Type, output.Dimensions);
+        MatMul(temp, a, upWeights, M, K, N);           // temp = up projection
+        SwiGLU(output, output, temp);                   // output = SiLU(gate) * up
+        temp.Dispose();
+    }
+
+    /// <summary>
     /// Fused: hidden[i] = a[i] + b[i], output[i] = RmsNorm(hidden, weight).
     /// Saves kernel launches vs ElementAdd + CopyTensor + RmsNorm.
     /// </summary>

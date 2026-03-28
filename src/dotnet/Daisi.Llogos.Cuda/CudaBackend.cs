@@ -288,6 +288,11 @@ public sealed class CudaBackend : IComputeBackend
             return tensor;
         }
 
+        if (type == GgmlType.Q4_K && dimensions.Length >= 2)
+        {
+            EnsureQ8_1Scratch((int)dimensions[0]);
+        }
+
         return new CudaTensor(name, type, dimensions, data);
     }
 
@@ -396,24 +401,16 @@ public sealed class CudaBackend : IComputeBackend
             kArgs[5] = (nint)(&nVal);
             _stream.Launch(func, dp4aGrid, 1, 1, 256, 1, 1, dp4aSmem, kArgs);
         }
-        else if (b.Type == GgmlType.Q4_0 && _context.ComputeCapabilityMajor >= 12)
-        {
-            var (grid, threads, smem) = AdaptiveLaunch(N, 4, K / 32); // Q4_0_ROWS_PER_BLOCK=4
-            var func = _matmulModule.GetFunction("dequant_matmul_q4_0");
-            int nVal = N;
-            nint* kArgs = stackalloc nint[6];
-            kArgs[0] = (nint)(&outPtr); kArgs[1] = (nint)(&aPtr); kArgs[2] = (nint)(&bPtr);
-            kArgs[3] = (nint)(&M); kArgs[4] = (nint)(&K); kArgs[5] = (nint)(&nVal);
-            _stream.Launch(func, grid, 1, 1, threads, 1, 1, smem, kArgs);
-        }
         else if (b.Type == GgmlType.Q4_0)
         {
             // dp4a path: use fused Q8_1 from RmsNorm, or quantize on demand
             ulong q8_1Ptr = EnsureQ8_1Scratch(K);
 
-            if (!_q8_1FusedReady &&
-                (_q8_1CachedInputPtr != aPtr || _q8_1CachedGeneration != _q8_1CacheGeneration))
+            if (_q8_1CachedInputPtr != aPtr || _q8_1CachedGeneration != _q8_1CacheGeneration)
             {
+                // Activation changed since last Q8_1 quantize — must re-quantize.
+                // This catches cases where _q8_1FusedReady is stale from a previous RmsNorm
+                // but the current activation (e.g. attn output, SiLU output) is different.
                 _q8_1CachedInputPtr = aPtr;
                 _q8_1CachedGeneration = _q8_1CacheGeneration;
                 var quantFunc = _matmulModule.GetFunction("quantize_f32_q8_1");
@@ -460,10 +457,106 @@ public sealed class CudaBackend : IComputeBackend
             var (grid, threads, smem) = AdaptiveLaunch(N, 1, K / 8);
             LaunchMatMul("dequant_matmul_f16", outPtr, aPtr, bPtr, M, K, N, grid, threads, smem);
         }
+        else if (b.Type == GgmlType.Q4_K && _q8_1FusedReady
+                 && _q8_1CachedInputPtr == aPtr && _q8_1CachedGeneration == _q8_1CacheGeneration)
+        {
+            // Cooperative v2 kernel: 128 threads, 16 per super-block, dp4a
+            // Q8_1 pre-computed by fused RmsNorm — zero quantization overhead
+            ulong q8_1Ptr = _q8_1Scratch!.DevicePtr;
+            var func = _matmulModule.GetFunction("dequant_matmul_q4_k_v2");
+            int nVal = N;
+            uint v2Smem = 8 * sizeof(float); // shared_sums[8]
+            nint* kArgs = stackalloc nint[6];
+            kArgs[0] = (nint)(&outPtr);
+            kArgs[1] = (nint)(&q8_1Ptr);
+            kArgs[2] = (nint)(&bPtr);
+            kArgs[3] = (nint)(&M);
+            kArgs[4] = (nint)(&K);
+            kArgs[5] = (nint)(&nVal);
+            _stream.Launch(func, (uint)N, 1, 1, 128, 1, 1, v2Smem, kArgs);
+        }
+        else if (b.Type == GgmlType.Q4_K && _q8_1Scratch != null)
+        {
+            // Cooperative v2 kernel with on-demand Q8_1 quantization
+            ulong q8_1Ptr = EnsureQ8_1Scratch(K);
+
+            if (_q8_1CachedInputPtr != aPtr || _q8_1CachedGeneration != _q8_1CacheGeneration)
+            {
+                _q8_1CachedInputPtr = aPtr;
+                _q8_1CachedGeneration = _q8_1CacheGeneration;
+                var quantFunc = _matmulModule.GetFunction("quantize_f32_q8_1");
+                int numBlocks = K / 32;
+                uint quantGrid = (uint)((numBlocks + BlockSize - 1) / BlockSize);
+                int kVal = K;
+                nint* qArgs = stackalloc nint[3];
+                qArgs[0] = (nint)(&q8_1Ptr);
+                qArgs[1] = (nint)(&aPtr);
+                qArgs[2] = (nint)(&kVal);
+                _stream.Launch(quantFunc, quantGrid, 1, 1, (uint)BlockSize, 1, 1, 0, qArgs);
+            }
+
+            var func = _matmulModule.GetFunction("dequant_matmul_q4_k_v2");
+            int nVal = N;
+            uint v2Smem = 8 * sizeof(float);
+            nint* kArgs = stackalloc nint[6];
+            kArgs[0] = (nint)(&outPtr);
+            kArgs[1] = (nint)(&q8_1Ptr);
+            kArgs[2] = (nint)(&bPtr);
+            kArgs[3] = (nint)(&M);
+            kArgs[4] = (nint)(&K);
+            kArgs[5] = (nint)(&nVal);
+            _stream.Launch(func, (uint)N, 1, 1, 128, 1, 1, v2Smem, kArgs);
+        }
+        else if (b.Type == GgmlType.Q4_K && _q8_1FusedReady
+                 && _q8_1CachedInputPtr == aPtr && _q8_1CachedGeneration == _q8_1CacheGeneration)
+        {
+            // Pre-Blackwell: Q8_1 pre-computed by fused RmsNorm — use dp4a
+            ulong q8_1Ptr = _q8_1Scratch!.DevicePtr;
+            var func = _matmulModule.GetFunction("dequant_matmul_q4_k_q8_1");
+            int nVal = N;
+            uint dp4aGrid = ((uint)N + 3) / 4; // Q4K_DP4A_ROWS = 4
+            uint dp4aSmem = (256 / 32) * 4 * sizeof(float); // smem[nwarps][Q4K_DP4A_ROWS]
+            nint* kArgs = stackalloc nint[6];
+            kArgs[0] = (nint)(&outPtr);
+            kArgs[1] = (nint)(&q8_1Ptr);
+            kArgs[2] = (nint)(&bPtr);
+            kArgs[3] = (nint)(&M);
+            kArgs[4] = (nint)(&K);
+            kArgs[5] = (nint)(&nVal);
+            _stream.Launch(func, dp4aGrid, 1, 1, 256, 1, 1, dp4aSmem, kArgs);
+        }
         else if (b.Type == GgmlType.Q4_K)
         {
-            var (grid, threads, smem) = AdaptiveLaunch(N, 3, K / 256 * 4); // Q4K_ROWS_PER_BLOCK=3
-            LaunchMatMul("dequant_matmul_q4_k", outPtr, aPtr, bPtr, M, K, N, grid, threads, smem);
+            // Pre-Blackwell fallback: quantize activation on demand, then use dp4a
+            ulong q8_1Ptr = EnsureQ8_1Scratch(K);
+
+            if (_q8_1CachedInputPtr != aPtr || _q8_1CachedGeneration != _q8_1CacheGeneration)
+            {
+                _q8_1CachedInputPtr = aPtr;
+                _q8_1CachedGeneration = _q8_1CacheGeneration;
+                var quantFunc = _matmulModule.GetFunction("quantize_f32_q8_1");
+                int numBlocks = K / 32;
+                uint quantGrid = (uint)((numBlocks + BlockSize - 1) / BlockSize);
+                int kVal = K;
+                nint* qArgs = stackalloc nint[3];
+                qArgs[0] = (nint)(&q8_1Ptr);
+                qArgs[1] = (nint)(&aPtr);
+                qArgs[2] = (nint)(&kVal);
+                _stream.Launch(quantFunc, quantGrid, 1, 1, (uint)BlockSize, 1, 1, 0, qArgs);
+            }
+
+            var func = _matmulModule.GetFunction("dequant_matmul_q4_k_q8_1");
+            int nVal = N;
+            uint dp4aGrid = ((uint)N + 3) / 4; // Q4K_DP4A_ROWS = 4
+            uint dp4aSmem = (256 / 32) * 4 * sizeof(float); // smem[nwarps][Q4K_DP4A_ROWS]
+            nint* kArgs = stackalloc nint[6];
+            kArgs[0] = (nint)(&outPtr);
+            kArgs[1] = (nint)(&q8_1Ptr);
+            kArgs[2] = (nint)(&bPtr);
+            kArgs[3] = (nint)(&M);
+            kArgs[4] = (nint)(&K);
+            kArgs[5] = (nint)(&nVal);
+            _stream.Launch(func, dp4aGrid, 1, 1, 256, 1, 1, dp4aSmem, kArgs);
         }
         else if (b.Type == GgmlType.Q5_K)
         {
@@ -472,7 +565,7 @@ public sealed class CudaBackend : IComputeBackend
         }
         else if (b.Type == GgmlType.Q6_K)
         {
-            var (grid, threads, smem) = AdaptiveLaunch(N, 10, K / 256 * 8); // Q6K_ROWS_PER_BLOCK=10
+            var (grid, threads, smem) = AdaptiveLaunch(N, 3, K / 256 * 8); // Q6K_ROWS_PER_BLOCK=3
             LaunchMatMul("dequant_matmul_q6_k", outPtr, aPtr, bPtr, M, K, N, grid, threads, smem);
         }
         else
@@ -482,6 +575,63 @@ public sealed class CudaBackend : IComputeBackend
         }
 
 
+    }
+
+    /// <inheritdoc />
+    public unsafe void MatMulSwiGLU(ITensor output, ITensor a, ITensor gateWeights, ITensor upWeights, int M, int K, int N)
+    {
+        // Fused path only supports Q4_K single-token with Q8_1 scratch available
+        if (M != 1 || gateWeights.Type != GgmlType.Q4_K || _q8_1Scratch == null)
+            throw new InvalidOperationException(
+                $"MatMulSwiGLU fused kernel requires M=1, Q4_K weights, and Q8_1 scratch. " +
+                $"Got M={M}, type={gateWeights.Type}. Use separate MatMul+SwiGLU for other types.");
+
+        var outT = (CudaTensor)output;
+        var aT = (CudaTensor)a;
+        var gateT = (CudaTensor)gateWeights;
+        var upT = (CudaTensor)upWeights;
+        ulong outPtr = outT.DevicePtr;
+        ulong aPtr = aT.DevicePtr;
+        ulong gatePtr = gateT.DevicePtr;
+        ulong upPtr = upT.DevicePtr;
+
+        // Ensure Q8_1 activation is available (fused or on-demand)
+        ulong q8_1Ptr;
+        if (_q8_1FusedReady && _q8_1CachedInputPtr == aPtr && _q8_1CachedGeneration == _q8_1CacheGeneration)
+        {
+            q8_1Ptr = _q8_1Scratch!.DevicePtr;
+        }
+        else
+        {
+            q8_1Ptr = EnsureQ8_1Scratch(K);
+            if (_q8_1CachedInputPtr != aPtr || _q8_1CachedGeneration != _q8_1CacheGeneration)
+            {
+                _q8_1CachedInputPtr = aPtr;
+                _q8_1CachedGeneration = _q8_1CacheGeneration;
+                var quantFunc = _matmulModule.GetFunction("quantize_f32_q8_1");
+                int numBlocks = K / 32;
+                uint quantGrid = (uint)((numBlocks + BlockSize - 1) / BlockSize);
+                int kVal = K;
+                nint* qArgs = stackalloc nint[3];
+                qArgs[0] = (nint)(&q8_1Ptr);
+                qArgs[1] = (nint)(&aPtr);
+                qArgs[2] = (nint)(&kVal);
+                _stream.Launch(quantFunc, quantGrid, 1, 1, (uint)BlockSize, 1, 1, 0, qArgs);
+            }
+        }
+
+        var func = _matmulModule.GetFunction("dequant_matmul_swiGLU_q4_k");
+        int nVal = N;
+        uint smem = 2 * 8 * sizeof(float); // shared_gate[8] + shared_up[8]
+        nint* kArgs = stackalloc nint[7];
+        kArgs[0] = (nint)(&outPtr);
+        kArgs[1] = (nint)(&q8_1Ptr);
+        kArgs[2] = (nint)(&gatePtr);
+        kArgs[3] = (nint)(&upPtr);
+        kArgs[4] = (nint)(&M);
+        kArgs[5] = (nint)(&K);
+        kArgs[6] = (nint)(&nVal);
+        _stream.Launch(func, (uint)N, 1, 1, 128, 1, 1, smem, kArgs);
     }
 
     /// <inheritdoc />

@@ -229,6 +229,13 @@ public sealed class ForwardPass : IForwardPass
                 ProjectLinear(_fusedGateUpOut, _normOut, sawFfn.FusedGateUp);
                 _backend.SplitSwiGLU(_gate, _fusedGateUpOut, gateDim);
             }
+            else if (lw.FfnGate.Type == Gguf.GgmlType.Q4_K)
+            {
+                // Fused gate+up+SwiGLU: single kernel for Q4_K weights
+                int ffnK = (int)lw.FfnGate.Dimensions[0];
+                int ffnN = (int)lw.FfnGate.Dimensions[1];
+                _backend.MatMulSwiGLU(_gate, _normOut, lw.FfnGate, lw.FfnUp, 1, ffnK, ffnN);
+            }
             else
             {
                 ProjectLinear(_gate, _normOut, lw.FfnGate);
