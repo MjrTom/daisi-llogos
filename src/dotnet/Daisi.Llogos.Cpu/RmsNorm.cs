@@ -15,8 +15,8 @@ internal static class RmsNorm
     {
         int n = input.Length;
 
-        // Pass 1: compute sum of squares
-        float sumSq = 0;
+        // Pass 1: compute sum of squares in double precision (matches llama.cpp)
+        double sumSq = 0;
         if (Avx2.IsSupported && n >= 8)
         {
             ref float inRef = ref MemoryMarshal.GetReference(input);
@@ -29,16 +29,16 @@ internal static class RmsNorm
             }
             sumSq = Vector256.Sum(vSum);
             for (; i < n; i++)
-                sumSq += input[i] * input[i];
+                sumSq += (double)input[i] * input[i];
         }
         else
         {
             for (int i = 0; i < n; i++)
-                sumSq += input[i] * input[i];
+                sumSq += (double)input[i] * input[i];
         }
 
         // Pass 2: normalize and scale
-        float rmsInv = 1.0f / MathF.Sqrt(sumSq / n + eps);
+        float rmsInv = (float)(1.0 / Math.Sqrt(sumSq / n + eps));
 
         if (Avx2.IsSupported && n >= 8)
         {

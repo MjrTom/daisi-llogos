@@ -533,8 +533,6 @@ public sealed class CpuBackend : IComputeBackend
         var bSpan = beta.AsFloatSpan();
         var normW = normWeight.AsFloatSpan();
 
-        var error = new float[headDim];
-
         for (int g = 0; g < groupCount; g++)
         {
             int baseOff = g * headDim;
@@ -542,32 +540,33 @@ public sealed class CpuBackend : IComputeBackend
             float d = dSpan[g];
             float b = bSpan[g];
 
-            // 1. sk = S^T * k (from OLD state)
-            // 2. error = (v - d*sk) * beta
-            for (int j = 0; j < headDim; j++)
-            {
-                float sk = 0;
-                for (int i = 0; i < headDim; i++)
-                    sk += stateSpan[stateOff + i * headDim + j] * kSpan[baseOff + i];
-                error[j] = (vSpan[baseOff + j] - d * sk) * b;
-            }
+            // State is stored in transposed layout: S_stored[i][j] = S_math[j][i]
+            // This matches the CUDA kernel's row-major access pattern.
+            //
+            // 1. sk_i = S_stored[i,:] . k  (row dot product)
+            // 2. error_i = (v[i] - d * sk_i) * beta
+            // 3. S_stored[i][j] = d * S_stored[i][j] + k[j] * error_i
+            // 4. o_i = S_stored[i,:] . q * scale  (row dot product)
 
-            // 3. S_new = d * S_old + k * error^T
             for (int i = 0; i < headDim; i++)
             {
-                float ki = kSpan[baseOff + i];
                 int rowOff = stateOff + i * headDim;
-                for (int j = 0; j < headDim; j++)
-                    stateSpan[rowOff + j] = d * stateSpan[rowOff + j] + ki * error[j];
-            }
 
-            // 4. o = S_new^T * q * scale
-            for (int j = 0; j < headDim; j++)
-            {
-                float sum = 0;
-                for (int i = 0; i < headDim; i++)
-                    sum += stateSpan[stateOff + i * headDim + j] * qSpan[baseOff + i];
-                outSpan[baseOff + j] = sum * scale;
+                // sk = S_stored[i,:] . k
+                float sk = 0;
+                for (int j = 0; j < headDim; j++)
+                    sk += stateSpan[rowOff + j] * kSpan[baseOff + j];
+
+                float error = (vSpan[baseOff + i] - d * sk) * b;
+
+                // Update state row and compute output
+                float oi = 0;
+                for (int j = 0; j < headDim; j++)
+                {
+                    stateSpan[rowOff + j] = d * stateSpan[rowOff + j] + kSpan[baseOff + j] * error;
+                    oi += stateSpan[rowOff + j] * qSpan[baseOff + j];
+                }
+                outSpan[baseOff + i] = oi * scale;
             }
 
             // Per-head RMSNorm

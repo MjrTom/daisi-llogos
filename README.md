@@ -112,11 +112,11 @@ Measured on AMD Ryzen 9 9900X + NVIDIA RTX 5080, 128 decode tokens, FP16 KV cach
 | Qwen3.5-4B Q8_0 | **144** | 135 | **107%** | 73 |
 | Qwen3-8B Q8_0 | 91 | 92 | 99% | 56 |
 | DeepSeek R1 8B Q8_0 | 94 | 95 | 99% | — |
-| Qwen3-8B Q4_K_M | 124 | 138 | 90% | 54 |
+| Qwen3-8B Q4_K_M | **127** | 138 | **92%** | 54 |
 | Qwen3.5-9B Q8_0 | **88** | 84 | **105%** | 53 |
 | Qwen3.5-9B Q4_0 | 101 | 123 | 82% | 45 |
 
-**Exceeding llama.cpp** on 4 of 8 models across three architectures (DeltaNet, LLaMA, standard attention). See [Inference Optimization White Paper](docs/inference-optimization.md) for technical details.
+**Exceeding llama.cpp** on 4 of 8 models across three architectures (DeltaNet, LLaMA, standard attention). Q4_K_M gap reduced from 10% to 8% via fused SwiGLU matmul, Q6_K kernel optimization, and cooperative dp4a kernels. See [Inference Optimization White Paper](docs/inference-optimization.md) for technical details.
 
 ### WebGPU Benchmarks
 
@@ -133,7 +133,7 @@ DeltaNet (Qwen 3.5) runs entirely on GPU with zero CPU readbacks — 6 custom WG
 
 ### Key Optimizations
 
-**CUDA:** CUDA graph capture, dp4a integer dot product for 4-bit quants, fused RmsNorm+Q8_1 quantization (zero-overhead dp4a activation prep), partial vocab logit computation (lm_head computes top ~5K tokens instead of full 152K vocab), architecture-adaptive dispatch (Blackwell float vs pre-Blackwell dp4a), per-quant row count tuning, aligned block repacking (Q8_0 34→36, Q4_0 18→20), multi-row activation reuse, cuBLAS F32 GEMV, GPU-side argmax, NVRTC with PTX disk cache.
+**CUDA:** CUDA graph capture, dp4a integer dot product for 4-bit quants, fused RmsNorm+Q8_1 quantization (zero-overhead dp4a activation prep), **fused MatMulSwiGLU** (single kernel for gate+up projection + SiLU activation in Q4_K FFN layers), cooperative Q4_K dp4a kernel (128 threads, 16 per super-block), partial vocab logit computation (lm_head computes top ~5K tokens instead of full 152K vocab), architecture-adaptive dispatch (Blackwell float vs pre-Blackwell dp4a), per-quant row count tuning, aligned block repacking (Q8_0 34→36, Q4_0 18→20), multi-row activation reuse, cuBLAS F32 GEMV, GPU-side argmax, NVRTC with PTX disk cache.
 
 **Vulkan:** uint32 buffer views, aligned Q8_0 repacking, subgroup arithmetic reduction, multi-row workgroups, fused composite ops (RmsNormResidual, AddRmsNormResidual, AddRmsNorm, SplitSwiGLU, RepeatTile, ArgMax), Q4_0/Q4_1/Q5_K matmul + embedding shaders, Vulkan 1.2 with SPIR-V 1.3.
 

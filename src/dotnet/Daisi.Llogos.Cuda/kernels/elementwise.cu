@@ -23,12 +23,12 @@ __global__ void rms_norm(float* output, const float* input, const float* weight,
     int tid = threadIdx.x;
     int stride = blockDim.x;
 
-    // Pass 1: compute sum of squares
-    float sum = 0.0f;
+    // Pass 1: compute sum of squares (double precision accumulation for precision)
+    double sum = 0.0;
     for (int i = tid; i < n; i += stride)
-        sum += input[i] * input[i];
+        sum += (double)input[i] * (double)input[i];
 
-    sdata[tid] = sum;
+    sdata[tid] = (float)sum;
     __syncthreads();
 
     // Block reduction
@@ -255,10 +255,10 @@ __global__ void rope(float* q, float* k,
         int pair = idx % (head_dim / 2);
         if (pair < half_rope)
         {
-            float freq = 1.0f / powf(theta, (float)(2 * pair) / (float)rope_dim);
-            float angle = (float)position * freq;
-            float cos_a = cosf(angle);
-            float sin_a = sinf(angle);
+            double freq = 1.0 / pow((double)theta, (double)(2 * pair) / (double)rope_dim);
+            double angle = (double)position * freq;
+            float cos_a = (float)cos(angle);
+            float sin_a = (float)sin(angle);
 
             int base_idx = head * head_dim + pair * 2;
             float v0 = q[base_idx];
@@ -275,10 +275,10 @@ __global__ void rope(float* q, float* k,
         int pair = idx % (head_dim / 2);
         if (pair < half_rope)
         {
-            float freq = 1.0f / powf(theta, (float)(2 * pair) / (float)rope_dim);
-            float angle = (float)position * freq;
-            float cos_a = cosf(angle);
-            float sin_a = sinf(angle);
+            double freq = 1.0 / pow((double)theta, (double)(2 * pair) / (double)rope_dim);
+            double angle = (double)position * freq;
+            float cos_a = (float)cos(angle);
+            float sin_a = (float)sin(angle);
 
             int base_idx = head * head_dim + pair * 2;
             float v0 = k[base_idx];
@@ -312,10 +312,10 @@ __global__ void batched_rope(float* q, float* k,
         {
             int token = head / q_heads_per_token;
             int position = start_position + token;
-            float freq = 1.0f / powf(theta, (float)(2 * pair) / (float)rope_dim);
-            float angle = (float)position * freq;
-            float cos_a = cosf(angle);
-            float sin_a = sinf(angle);
+            double freq = 1.0 / pow((double)theta, (double)(2 * pair) / (double)rope_dim);
+            double angle = (double)position * freq;
+            float cos_a = (float)cos(angle);
+            float sin_a = (float)sin(angle);
 
             int base_idx = head * head_dim + pair * 2;
             float v0 = q[base_idx];
@@ -334,10 +334,10 @@ __global__ void batched_rope(float* q, float* k,
         {
             int token = head / k_heads_per_token;
             int position = start_position + token;
-            float freq = 1.0f / powf(theta, (float)(2 * pair) / (float)rope_dim);
-            float angle = (float)position * freq;
-            float cos_a = cosf(angle);
-            float sin_a = sinf(angle);
+            double freq = 1.0 / pow((double)theta, (double)(2 * pair) / (double)rope_dim);
+            double angle = (double)position * freq;
+            float cos_a = (float)cos(angle);
+            float sin_a = (float)sin(angle);
 
             int base_idx = head * head_dim + pair * 2;
             float v0 = k[base_idx];
@@ -479,9 +479,9 @@ __device__ float fp16_to_fp32_emb(unsigned short h)
     return result;
 }
 
-// ── Q4_K embedding lookup ─────────────────────────────────────────────────────
+// ── Q4_K embedding lookup (original 144-byte layout) ─────────────────────────
 // Q4_K super block: 256 elements, 144 bytes.
-// Layout: 2b d (fp16) + 2b dmin (fp16) + 12b packed scales/mins + 128b nibbles.
+// Layout: 2b d(f16) + 2b dmin(f16) + 12b packed scales/mins + 128b nibbles.
 
 __global__ void embedding_lookup_q4_k(float* output, const unsigned char* table,
                                        int hidden_dim, int token_id)
@@ -497,19 +497,19 @@ __global__ void embedding_lookup_q4_k(float* output, const unsigned char* table,
     int elem_in_sb = idx % 256;
     const unsigned char* sb = row + sb_idx * 144;
 
-    unsigned short d_bits = ((unsigned short)sb[1] << 8) | sb[0];
-    unsigned short dmin_bits = ((unsigned short)sb[3] << 8) | sb[2];
-    float d = fp16_to_fp32_emb(d_bits);
-    float dmin = fp16_to_fp32_emb(dmin_bits);
+    float d = fp16_to_fp32_emb(((unsigned short)sb[1] << 8) | sb[0]);
+    float dmin = fp16_to_fp32_emb(((unsigned short)sb[3] << 8) | sb[2]);
 
     // Chunk layout: 4 chunks of 64 elements, 32 qs bytes each.
-    // lo nibble → first 32 elems, hi nibble → second 32 elems.
+    // lo nibble -> first 32 elems, hi nibble -> second 32 elems.
     int chunk = elem_in_sb / 64;
     int pos_in_chunk = elem_in_sb % 64;
     int l = pos_in_chunk % 32;
-    int is_hi = pos_in_chunk / 32; // 0 for first sub-block, 1 for second
+    int is_hi = pos_in_chunk / 32;
 
-    int j = chunk * 2 + is_hi; // sub-block index for scales
+    int j = chunk * 2 + is_hi;
+
+    // Unpack scales from packed 12-byte format
     int sc, m;
     if (j < 4) {
         sc = sb[4 + j] & 63;
@@ -518,11 +518,14 @@ __global__ void embedding_lookup_q4_k(float* output, const unsigned char* table,
         sc = (sb[4 + j + 4] & 0xF) | ((sb[4 + j - 4] >> 6) << 4);
         m  = (sb[4 + j + 4] >> 4)  | ((sb[4 + j]     >> 6) << 4);
     }
+    float ss = d * (float)sc;
+    float sm = dmin * (float)m;
 
+    // Nibbles at offset 16 within the 144-byte super-block
     unsigned char packed = sb[16 + chunk * 32 + l];
     int nibble = is_hi ? (packed >> 4) : (packed & 0xF);
 
-    output[idx] = d * (float)sc * (float)nibble - dmin * (float)m;
+    output[idx] = ss * (float)nibble - sm;
 }
 
 // ── Q4_0 embedding lookup ─────────────────────────────────────────────────────
@@ -867,6 +870,62 @@ __global__ void swiglu(float* output, const float* gate, const float* up, int n)
     {
         float g = gate[idx];
         output[idx] = (g / (1.0f + expf(-g))) * up[idx];
+    }
+}
+
+// ── Fused: SwiGLU + Q8_1 quantization ───────────────────────────────────────
+// Computes SwiGLU and quantizes output to Q8_1 in one pass.
+// Grid: ceil(n/256) blocks, 256 threads per block.
+// Each thread computes one SwiGLU element and contributes to Q8_1 block stats.
+
+__global__ void swiglu_q8_1(float* output, void* __restrict__ q8_1_dst,
+                             const float* gate, const float* up, int n)
+{
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+
+    // Step 1: Compute SwiGLU and write to output
+    float v = 0.0f;
+    if (idx < n)
+    {
+        float g = gate[idx];
+        v = (g / (1.0f + expf(-g))) * up[idx];
+        output[idx] = v;
+    }
+
+    // Step 2: Quantize to Q8_1 blocks.
+    // Each Q8_1 block has 32 elements. Thread lane within a warp maps to block element.
+    int lane = threadIdx.x & 31;
+    int blk_id = idx / 32;
+    int num_blocks = n / 32;
+
+    if (blk_id < num_blocks)
+    {
+        // Warp-level reduction for amax and sum (all 32 lanes have their element)
+        float av = fabsf(v);
+        float warp_max = av;
+        float warp_sum = v;
+        for (int offset = 16; offset > 0; offset >>= 1) {
+            warp_max = fmaxf(warp_max, __shfl_down_sync(0xffffffff, warp_max, offset));
+            warp_sum += __shfl_down_sync(0xffffffff, warp_sum, offset);
+        }
+
+        // Broadcast amax back to all lanes
+        float amax = __shfl_sync(0xffffffff, warp_max, 0);
+        float d = amax / 127.0f;
+
+        // Each lane quantizes its own element
+        signed char q = (amax == 0.0f) ? 0 : (signed char)__float2int_rn(v / d);
+
+        // Lane 0 writes the header, all lanes write their quant
+        unsigned char* dp = (unsigned char*)q8_1_dst + blk_id * 36;
+        if (lane == 0) {
+            unsigned short d_fp16 = fp32_to_fp16(d);
+            float sum = __shfl_sync(0xffffffff, warp_sum, 0);
+            unsigned short s_fp16 = fp32_to_fp16(sum);
+            dp[0] = d_fp16 & 0xFF; dp[1] = d_fp16 >> 8;
+            dp[2] = s_fp16 & 0xFF; dp[3] = s_fp16 >> 8;
+        }
+        ((signed char*)(dp + 4))[lane] = q;
     }
 }
 
