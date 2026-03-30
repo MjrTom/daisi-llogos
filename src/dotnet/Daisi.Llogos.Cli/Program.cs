@@ -9,6 +9,14 @@ using Daisi.Llogos;
 using Daisi.Llogos.Cuda;
 using Daisi.Llogos.Inference.DaisiTurbo;
 using Daisi.Llogos.Tokenizer;
+using Daisi.Llogos.Training;
+using Daisi.Llogos.Training.Lora;
+
+// ── Training subcommand ──────────────────────────────────────────────────────
+if (args.Length > 0 && args[0] == "train")
+{
+    return RunTraining(args[1..]);
+}
 
 // Parse arguments
 var options = ParseArgs(args);
@@ -81,6 +89,15 @@ else
         weights = MmapModelLoader.Load(gguf, options.ModelPath, backend, config, remapper);
     else
         weights = ModelLoader.Load(gguf, stream, backend, config);
+
+    // Merge LoRA adapter if provided
+    LoraAdapter? loraAdapter = null;
+    if (options.LoraPath != null)
+    {
+        Console.Error.Write($"Loading LoRA adapter: {options.LoraPath}... ");
+        loraAdapter = LoraInference.LoadAndMerge(options.LoraPath, weights, backend, config);
+        Console.Error.WriteLine($"done ({loraAdapter.ParameterCount:N0} params, rank={loraAdapter.Config.Rank})");
+    }
 
     var strategy = AttentionStrategy.Parse(options.Attention);
     int maxContext = strategy.Mode != AttentionMode.Full && strategy.CacheCapacity > 0
@@ -406,6 +423,9 @@ static CliArgs ParseArgs(string[] args)
             case "--hybrid-layers":
                 result.HybridLayers = int.Parse(NextArg(args, ref i));
                 break;
+            case "--lora":
+                result.LoraPath = NextArg(args, ref i);
+                break;
             case "--help" or "-h":
                 result.ShowHelp = true;
                 break;
@@ -446,8 +466,176 @@ static void PrintUsage()
           --batched-verify         Use batched verify (faster, higher acceptance, different FP from native)
           --kv-quant <mode>        KV cache compression: turbo, turbo:3, turbo:4, turbo:3+qjl32, turbo:3+noqjl
           --hybrid-layers <n>      GPU+CPU split: first N layers on GPU, rest on CPU
+          --lora <path>            LoRA adapter file (.llra) to merge into model weights
           --help, -h               Show this help
+
+        Training:
+          daisi-llogos train --model <path> --data <path> [options]
+          Run 'daisi-llogos train --help' for training options.
         """);
+}
+
+// ── Training Subcommand ──────────────────────────────────────────────────────
+
+static int RunTraining(string[] args)
+{
+    string? modelPath = null;
+    string? dataPath = null;
+    string? outputPath = null;
+    int rank = 8;
+    float alpha = 16;
+    float lr = 1e-4f;
+    int epochs = 3;
+    int seqLen = 512;
+    int warmup = 50;
+    int saveEvery = 100;
+    int logEvery = 10;
+    float weightDecay = 0.01f;
+    float maxGradNorm = 1.0f;
+    int gradAccum = 1;
+    int seed = 42;
+    string targets = "qkvo";
+    string trainBackend = "cpu";
+    bool showHelp = false;
+
+    for (int i = 0; i < args.Length; i++)
+    {
+        switch (args[i])
+        {
+            case "--model" or "-m":
+                modelPath = NextArg(args, ref i);
+                break;
+            case "--data" or "-d":
+                dataPath = NextArg(args, ref i);
+                break;
+            case "--output" or "-o":
+                outputPath = NextArg(args, ref i);
+                break;
+            case "--rank" or "-r":
+                rank = int.Parse(NextArg(args, ref i));
+                break;
+            case "--alpha":
+                alpha = float.Parse(NextArg(args, ref i));
+                break;
+            case "--lr":
+                lr = float.Parse(NextArg(args, ref i));
+                break;
+            case "--epochs":
+                epochs = int.Parse(NextArg(args, ref i));
+                break;
+            case "--seq-len":
+                seqLen = int.Parse(NextArg(args, ref i));
+                break;
+            case "--warmup":
+                warmup = int.Parse(NextArg(args, ref i));
+                break;
+            case "--save-every":
+                saveEvery = int.Parse(NextArg(args, ref i));
+                break;
+            case "--log-every":
+                logEvery = int.Parse(NextArg(args, ref i));
+                break;
+            case "--weight-decay":
+                weightDecay = float.Parse(NextArg(args, ref i));
+                break;
+            case "--max-grad-norm":
+                maxGradNorm = float.Parse(NextArg(args, ref i));
+                break;
+            case "--grad-accum":
+                gradAccum = int.Parse(NextArg(args, ref i));
+                break;
+            case "--seed":
+                seed = int.Parse(NextArg(args, ref i));
+                break;
+            case "--targets":
+                targets = NextArg(args, ref i).ToLowerInvariant();
+                break;
+            case "--backend" or "-b":
+                trainBackend = NextArg(args, ref i).ToLowerInvariant();
+                break;
+            case "--help" or "-h":
+                showHelp = true;
+                break;
+        }
+    }
+
+    if (showHelp || modelPath == null || dataPath == null)
+    {
+        Console.Error.WriteLine("""
+            daisi-llogos train - LoRA fine-tuning
+
+            Usage: daisi-llogos train --model <path> --data <path> [options]
+
+            Required:
+              --model, -m <path>       Path to GGUF model file
+              --data, -d <path>        Training data (text, .jsonl with "text" field, or .jsonl with "prompt"+"completion")
+              --output, -o <path>      Output path for trained adapter (default: <model>.lora)
+
+            LoRA:
+              --rank, -r <n>           LoRA rank (default: 8)
+              --alpha <f>              LoRA alpha scaling (default: 16)
+              --targets <str>          Target projections: qkvo (default), qkvod (+ DeltaNet), all
+              --backend, -b <name>     Compute backend: cpu (default), cuda
+
+            Training:
+              --lr <f>                 Learning rate (default: 1e-4)
+              --epochs <n>             Number of epochs (default: 3)
+              --seq-len <n>            Sequence length (default: 512)
+              --warmup <n>             Warmup steps (default: 50)
+              --weight-decay <f>       Weight decay (default: 0.01)
+              --max-grad-norm <f>      Gradient clipping norm (default: 1.0)
+              --grad-accum <n>         Gradient accumulation steps (default: 1)
+              --seed <n>               Random seed (default: 42)
+              --save-every <n>         Save checkpoint every N steps (default: 100)
+              --log-every <n>          Log every N steps (default: 10)
+              --help, -h               Show this help
+            """);
+        return showHelp ? 0 : 1;
+    }
+
+    outputPath ??= Path.ChangeExtension(modelPath, ".llra");
+
+    var loraTargets = LoraTarget.None;
+    if (targets == "all")
+    {
+        loraTargets = LoraTarget.AllLayers;
+    }
+    else
+    {
+        if (targets.Contains('q')) loraTargets |= LoraTarget.Q;
+        if (targets.Contains('k')) loraTargets |= LoraTarget.K;
+        if (targets.Contains('v')) loraTargets |= LoraTarget.V;
+        if (targets.Contains('o')) loraTargets |= LoraTarget.O;
+        if (targets.Contains('d')) loraTargets |= LoraTarget.DeltaQkv | LoraTarget.DeltaOut;
+    }
+
+    var config = new TrainingConfig
+    {
+        ModelPath = modelPath,
+        DataPath = dataPath,
+        OutputPath = outputPath,
+        Lora = new LoraConfig { Rank = rank, Alpha = alpha, Targets = loraTargets },
+        Epochs = epochs,
+        LearningRate = lr,
+        SeqLen = seqLen,
+        WarmupSteps = warmup,
+        WeightDecay = weightDecay,
+        MaxGradNorm = maxGradNorm,
+        GradientAccumulationSteps = gradAccum,
+        Seed = seed,
+        SaveEverySteps = saveEvery,
+        LogEverySteps = logEvery,
+    };
+
+    IComputeBackend trainingBackend = trainBackend switch
+    {
+        "cuda" => new CudaBackend(),
+        _ => new CpuBackend(),
+    };
+
+    using var session = new TrainingSession(config, trainingBackend);
+    session.Run();
+    return 0;
 }
 
 class CliArgs
@@ -475,4 +663,5 @@ class CliArgs
     public bool BatchedVerify;
     public string? KvQuant;
     public int HybridLayers;
+    public string? LoraPath;
 }

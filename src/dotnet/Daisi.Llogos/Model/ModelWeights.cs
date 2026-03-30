@@ -52,10 +52,10 @@ public abstract class LayerWeights : IDisposable
 /// </summary>
 public sealed class StandardAttentionWeights : LayerWeights
 {
-    public required ITensor AttnQ { get; init; }
-    public required ITensor AttnK { get; init; }
-    public required ITensor AttnV { get; init; }
-    public required ITensor AttnO { get; init; }
+    public required ITensor AttnQ { get; set; }
+    public required ITensor AttnK { get; set; }
+    public required ITensor AttnV { get; set; }
+    public required ITensor AttnO { get; set; }
     public ITensor? AttnQNorm { get; init; }
     public ITensor? AttnKNorm { get; init; }
 
@@ -103,15 +103,15 @@ public sealed class StandardAttentionWeights : LayerWeights
 /// </summary>
 public sealed class DeltaNetWeights : LayerWeights
 {
-    public required ITensor AttnQkv { get; init; }
-    public required ITensor AttnGate { get; init; }
+    public required ITensor AttnQkv { get; set; }
+    public required ITensor AttnGate { get; set; }
     public required ITensor SsmA { get; init; }
     public required ITensor SsmAlpha { get; init; }
     public required ITensor SsmBeta { get; init; }
     public required ITensor SsmConv1d { get; init; }
     public required ITensor SsmDtBias { get; init; }
     public required ITensor SsmNorm { get; init; }
-    public required ITensor SsmOut { get; init; }
+    public required ITensor SsmOut { get; set; }
 
     public override void Dispose()
     {

@@ -1584,6 +1584,287 @@ public sealed class CudaBackend : IComputeBackend
         }
     }
 
+    // ── Training Operations (backward pass) ────────────────────────────────────
+    // These methods are used by GpuTrainingForwardPass. They do NOT modify any
+    // existing inference code paths.
+
+    private CudaModule? _backwardModule;
+
+    private CudaModule BackwardModule
+    {
+        get
+        {
+            if (_backwardModule == null)
+            {
+                var archOpts = new[] { $"--gpu-architecture=compute_{_context.ComputeCapabilityMajor}{_context.ComputeCapabilityMinor}" };
+                _backwardModule = CudaModule.FromEmbeddedResource("backward_ops.cu", archOpts);
+            }
+            return _backwardModule;
+        }
+    }
+
+    /// <summary>C[M×N] = A[M×K] × B[K×N], both F32.</summary>
+    public unsafe void SgemmF32(ITensor c, ITensor a, ITensor b, int M, int K, int N)
+    {
+        ulong aPtr = ((CudaTensor)a).DevicePtr;
+        ulong bPtr = ((CudaTensor)b).DevicePtr;
+        ulong cPtr = ((CudaTensor)c).DevicePtr;
+        float alpha = 1.0f, beta = 0.0f;
+        CublasApi.Check(CublasApi.Sgemm(_cublasHandle,
+            CublasApi.CUBLAS_OP_N, CublasApi.CUBLAS_OP_N,
+            N, M, K, &alpha, bPtr, N, aPtr, K, &beta, cPtr, N), "SgemmF32");
+    }
+
+    /// <summary>C[M×N] = A[M×K] × B^T[K×N], B stored as [N×K], both F32.</summary>
+    public unsafe void SgemmTransB(ITensor c, ITensor a, ITensor b, int M, int K, int N)
+    {
+        ulong aPtr = ((CudaTensor)a).DevicePtr;
+        ulong bPtr = ((CudaTensor)b).DevicePtr;
+        ulong cPtr = ((CudaTensor)c).DevicePtr;
+        float alpha = 1.0f, beta = 0.0f;
+        CublasApi.Check(CublasApi.Sgemm(_cublasHandle,
+            CublasApi.CUBLAS_OP_T, CublasApi.CUBLAS_OP_N,
+            N, M, K, &alpha, bPtr, K, aPtr, K, &beta, cPtr, N), "SgemmTransB");
+    }
+
+    /// <summary>C[M×N] = A^T[M×K] × B[K×N], A stored as [K×M], both F32.</summary>
+    public unsafe void SgemmTransA(ITensor c, ITensor a, ITensor b, int M, int K, int N)
+    {
+        ulong aPtr = ((CudaTensor)a).DevicePtr;
+        ulong bPtr = ((CudaTensor)b).DevicePtr;
+        ulong cPtr = ((CudaTensor)c).DevicePtr;
+        float alpha = 1.0f, beta = 0.0f;
+        CublasApi.Check(CublasApi.Sgemm(_cublasHandle,
+            CublasApi.CUBLAS_OP_N, CublasApi.CUBLAS_OP_T,
+            N, M, K, &alpha, bPtr, N, aPtr, M, &beta, cPtr, N), "SgemmTransA");
+    }
+
+    /// <summary>C[M×N] += A[M×K] × B[K×N], both F32 (accumulate, beta=1).</summary>
+    public unsafe void SgemmF32Accumulate(ITensor c, ITensor a, ITensor b, int M, int K, int N)
+    {
+        ulong aPtr = ((CudaTensor)a).DevicePtr;
+        ulong bPtr = ((CudaTensor)b).DevicePtr;
+        ulong cPtr = ((CudaTensor)c).DevicePtr;
+        float alpha = 1.0f, beta = 1.0f;
+        CublasApi.Check(CublasApi.Sgemm(_cublasHandle,
+            CublasApi.CUBLAS_OP_N, CublasApi.CUBLAS_OP_N,
+            N, M, K, &alpha, bPtr, N, aPtr, K, &beta, cPtr, N), "SgemmF32Acc");
+    }
+
+    /// <summary>C[M×N] += A^T[M×K] × B[K×N], A stored as [K×M] (accumulate).</summary>
+    public unsafe void SgemmTransAAccumulate(ITensor c, ITensor a, ITensor b, int M, int K, int N)
+    {
+        ulong aPtr = ((CudaTensor)a).DevicePtr;
+        ulong bPtr = ((CudaTensor)b).DevicePtr;
+        ulong cPtr = ((CudaTensor)c).DevicePtr;
+        float alpha = 1.0f, beta = 1.0f;
+        CublasApi.Check(CublasApi.Sgemm(_cublasHandle,
+            CublasApi.CUBLAS_OP_N, CublasApi.CUBLAS_OP_T,
+            N, M, K, &alpha, bPtr, N, aPtr, M, &beta, cPtr, N), "SgemmTransAAcc");
+    }
+
+    // ── Backward kernel launchers ───────────────────────────────────────────
+
+    public unsafe void SiLUBackward(ITensor dInput, ITensor dOutput, ITensor input)
+    {
+        ulong diPtr = ((CudaTensor)dInput).DevicePtr;
+        ulong doPtr = ((CudaTensor)dOutput).DevicePtr;
+        ulong iPtr = ((CudaTensor)input).DevicePtr;
+        int n = (int)input.ElementCount;
+        var func = BackwardModule.GetFunction("silu_backward");
+        uint grid = (uint)((n + BlockSize - 1) / BlockSize);
+        nint* k = stackalloc nint[4];
+        k[0] = (nint)(&diPtr); k[1] = (nint)(&doPtr); k[2] = (nint)(&iPtr); k[3] = (nint)(&n);
+        _stream.Launch(func, grid, 1, 1, (uint)BlockSize, 1, 1, 0, k);
+    }
+
+    public unsafe void SwiGLUBackward(ITensor dGate, ITensor dUp, ITensor dOutput,
+        ITensor gate, ITensor up)
+    {
+        ulong dgPtr = ((CudaTensor)dGate).DevicePtr;
+        ulong duPtr = ((CudaTensor)dUp).DevicePtr;
+        ulong doPtr = ((CudaTensor)dOutput).DevicePtr;
+        ulong gPtr = ((CudaTensor)gate).DevicePtr;
+        ulong uPtr = ((CudaTensor)up).DevicePtr;
+        int n = (int)gate.ElementCount;
+        var func = BackwardModule.GetFunction("swiglu_backward");
+        uint grid = (uint)((n + BlockSize - 1) / BlockSize);
+        nint* k = stackalloc nint[6];
+        k[0] = (nint)(&dgPtr); k[1] = (nint)(&duPtr); k[2] = (nint)(&doPtr);
+        k[3] = (nint)(&gPtr); k[4] = (nint)(&uPtr); k[5] = (nint)(&n);
+        _stream.Launch(func, grid, 1, 1, (uint)BlockSize, 1, 1, 0, k);
+    }
+
+    public unsafe void BatchedRmsNormBackward(ITensor dInput, ITensor dOutput,
+        ITensor input, ITensor weight, float eps, int dim, int M)
+    {
+        ulong diPtr = ((CudaTensor)dInput).DevicePtr;
+        ulong doPtr = ((CudaTensor)dOutput).DevicePtr;
+        ulong iPtr = ((CudaTensor)input).DevicePtr;
+        ulong wPtr = ((CudaTensor)weight).DevicePtr;
+        var func = BackwardModule.GetFunction("batched_rms_norm_backward");
+        uint sharedMem = (uint)(BlockSize * sizeof(float));
+        nint* k = stackalloc nint[7];
+        k[0] = (nint)(&diPtr); k[1] = (nint)(&doPtr); k[2] = (nint)(&iPtr);
+        k[3] = (nint)(&wPtr); k[4] = (nint)(&eps); k[5] = (nint)(&dim); k[6] = (nint)(&M);
+        _stream.Launch(func, (uint)M, 1, 1, (uint)BlockSize, 1, 1, sharedMem, k);
+    }
+
+    public unsafe void BatchedRoPEBackward(ITensor dData, int T, int numHeads, int headDim,
+        int ropeDim, int startPos, float theta)
+    {
+        ulong ptr = ((CudaTensor)dData).DevicePtr;
+        int totalPairs = T * numHeads * (ropeDim / 2);
+        uint grid = (uint)((totalPairs + BlockSize - 1) / BlockSize);
+        var func = BackwardModule.GetFunction("batched_rope_backward");
+        nint* k = stackalloc nint[7];
+        k[0] = (nint)(&ptr); k[1] = (nint)(&T); k[2] = (nint)(&numHeads);
+        k[3] = (nint)(&headDim); k[4] = (nint)(&ropeDim); k[5] = (nint)(&startPos);
+        k[6] = (nint)(&theta);
+        _stream.Launch(func, grid, 1, 1, (uint)BlockSize, 1, 1, 0, k);
+    }
+
+    public unsafe float CrossEntropyLoss(ITensor dLogits, ITensor logits, ITensor targets,
+        int T, int V)
+    {
+        ulong dlPtr = ((CudaTensor)dLogits).DevicePtr;
+        ulong lPtr = ((CudaTensor)logits).DevicePtr;
+        ulong tPtr = ((CudaTensor)targets).DevicePtr;
+        // Allocate scalar for loss result
+        using var lossMem = new CudaDeviceMemory(sizeof(float));
+        CudaApi.MemsetD8(lossMem.DevicePtr, 0, sizeof(float));
+        ulong lossPtr = lossMem.DevicePtr;
+        var func = BackwardModule.GetFunction("cross_entropy_loss");
+        uint sharedMem = (uint)(BlockSize * sizeof(float));
+        nint* k = stackalloc nint[6];
+        k[0] = (nint)(&dlPtr); k[1] = (nint)(&lossPtr); k[2] = (nint)(&lPtr);
+        k[3] = (nint)(&tPtr); k[4] = (nint)(&T); k[5] = (nint)(&V);
+        _stream.Launch(func, (uint)T, 1, 1, (uint)BlockSize, 1, 1, sharedMem, k);
+        // Download scalar loss
+        float loss = 0;
+        _stream.Synchronize();
+        lossMem.CopyToHost(new Span<float>(ref loss));
+        return loss;
+    }
+
+    public unsafe void CausalGatedAttentionBackward(
+        ITensor dQAttn, ITensor dQGate, ITensor dK, ITensor dV,
+        ITensor dOutput, ITensor qAttn, ITensor qGate,
+        ITensor kData, ITensor vData, ITensor savedProbs, ITensor attnOutput,
+        int T, int numHeads, int numKvHeads, int keyDim, int valDim, float scale)
+    {
+        ulong dqPtr = ((CudaTensor)dQAttn).DevicePtr;
+        ulong dgPtr = ((CudaTensor)dQGate).DevicePtr;
+        ulong dkPtr = ((CudaTensor)dK).DevicePtr;
+        ulong dvPtr = ((CudaTensor)dV).DevicePtr;
+        ulong doPtr = ((CudaTensor)dOutput).DevicePtr;
+        ulong qaPtr = ((CudaTensor)qAttn).DevicePtr;
+        ulong qgPtr = ((CudaTensor)qGate).DevicePtr;
+        ulong kdPtr = ((CudaTensor)kData).DevicePtr;
+        ulong vdPtr = ((CudaTensor)vData).DevicePtr;
+        ulong spPtr = ((CudaTensor)savedProbs).DevicePtr;
+        ulong aoPtr = ((CudaTensor)attnOutput).DevicePtr;
+        var func = BackwardModule.GetFunction("causal_gated_attention_backward");
+        int blocks = numHeads * T;
+        uint threads = (uint)Math.Min(T, BlockSize);
+        nint* k = stackalloc nint[16];
+        k[0] = (nint)(&dqPtr); k[1] = (nint)(&dgPtr); k[2] = (nint)(&dkPtr); k[3] = (nint)(&dvPtr);
+        k[4] = (nint)(&doPtr); k[5] = (nint)(&qaPtr); k[6] = (nint)(&qgPtr);
+        k[7] = (nint)(&kdPtr); k[8] = (nint)(&vdPtr); k[9] = (nint)(&spPtr); k[10] = (nint)(&aoPtr);
+        k[11] = (nint)(&T); k[12] = (nint)(&numHeads); k[13] = (nint)(&numKvHeads);
+        k[14] = (nint)(&keyDim); k[15] = (nint)(&valDim);
+        // scale passed via shared memory trick? No — add as kernel arg
+        // Actually the kernel signature has scale as last param, need 17 args
+        // Let's use a larger array
+        nint* k2 = stackalloc nint[17];
+        for (int i = 0; i < 16; i++) k2[i] = k[i];
+        k2[16] = (nint)(&scale);
+        _stream.Launch(func, (uint)blocks, 1, 1, threads, 1, 1, 0, k2);
+    }
+
+    public unsafe void ElementMulBackward(ITensor dA, ITensor dB, ITensor dC,
+        ITensor a, ITensor b)
+    {
+        ulong daPtr = ((CudaTensor)dA).DevicePtr;
+        ulong dbPtr = ((CudaTensor)dB).DevicePtr;
+        ulong dcPtr = ((CudaTensor)dC).DevicePtr;
+        ulong aPtr = ((CudaTensor)a).DevicePtr;
+        ulong bPtr = ((CudaTensor)b).DevicePtr;
+        int n = (int)a.ElementCount;
+        var func = BackwardModule.GetFunction("element_mul_backward");
+        uint grid = (uint)((n + BlockSize - 1) / BlockSize);
+        nint* k = stackalloc nint[6];
+        k[0] = (nint)(&daPtr); k[1] = (nint)(&dbPtr); k[2] = (nint)(&dcPtr);
+        k[3] = (nint)(&aPtr); k[4] = (nint)(&bPtr); k[5] = (nint)(&n);
+        _stream.Launch(func, grid, 1, 1, (uint)BlockSize, 1, 1, 0, k);
+    }
+
+    public unsafe void AddInPlace(ITensor dst, ITensor src)
+    {
+        ulong dPtr = ((CudaTensor)dst).DevicePtr;
+        ulong sPtr = ((CudaTensor)src).DevicePtr;
+        int n = (int)dst.ElementCount;
+        var func = BackwardModule.GetFunction("add_inplace");
+        uint grid = (uint)((n + BlockSize - 1) / BlockSize);
+        nint* k = stackalloc nint[3];
+        k[0] = (nint)(&dPtr); k[1] = (nint)(&sPtr); k[2] = (nint)(&n);
+        _stream.Launch(func, grid, 1, 1, (uint)BlockSize, 1, 1, 0, k);
+    }
+
+    public unsafe void ScaleInPlace(ITensor data, float scale)
+    {
+        ulong ptr = ((CudaTensor)data).DevicePtr;
+        int n = (int)data.ElementCount;
+        var func = BackwardModule.GetFunction("scale_inplace");
+        uint grid = (uint)((n + BlockSize - 1) / BlockSize);
+        nint* k = stackalloc nint[3];
+        k[0] = (nint)(&ptr); k[1] = (nint)(&scale); k[2] = (nint)(&n);
+        _stream.Launch(func, grid, 1, 1, (uint)BlockSize, 1, 1, 0, k);
+    }
+
+    public unsafe void AdamWStep(ITensor param, ITensor grad, ITensor m, ITensor v,
+        float lr, float beta1, float beta2, float eps, float weightDecay, float bc1, float bc2)
+    {
+        ulong pPtr = ((CudaTensor)param).DevicePtr;
+        ulong gPtr = ((CudaTensor)grad).DevicePtr;
+        ulong mPtr = ((CudaTensor)m).DevicePtr;
+        ulong vPtr = ((CudaTensor)v).DevicePtr;
+        int n = (int)param.ElementCount;
+        var func = BackwardModule.GetFunction("adamw_step");
+        uint grid = (uint)((n + BlockSize - 1) / BlockSize);
+        nint* k = stackalloc nint[11];
+        k[0] = (nint)(&pPtr); k[1] = (nint)(&gPtr); k[2] = (nint)(&mPtr); k[3] = (nint)(&vPtr);
+        k[4] = (nint)(&lr); k[5] = (nint)(&beta1); k[6] = (nint)(&beta2); k[7] = (nint)(&eps);
+        k[8] = (nint)(&weightDecay); k[9] = (nint)(&bc1); k[10] = (nint)(&bc2);
+        // n is the 12th arg
+        nint* k2 = stackalloc nint[12];
+        for (int i = 0; i < 11; i++) k2[i] = k[i];
+        k2[11] = (nint)(&n);
+        _stream.Launch(func, grid, 1, 1, (uint)BlockSize, 1, 1, 0, k2);
+    }
+
+    public unsafe float GradNormSq(ITensor grad)
+    {
+        ulong gPtr = ((CudaTensor)grad).DevicePtr;
+        int n = (int)grad.ElementCount;
+        using var result = new CudaDeviceMemory(sizeof(float));
+        CudaApi.MemsetD8(result.DevicePtr, 0, sizeof(float));
+        ulong rPtr = result.DevicePtr;
+        var func = BackwardModule.GetFunction("grad_norm_sq");
+        uint sharedMem = (uint)(BlockSize * sizeof(float));
+        uint grid = (uint)((n + BlockSize - 1) / BlockSize);
+        nint* k = stackalloc nint[3];
+        k[0] = (nint)(&rPtr); k[1] = (nint)(&gPtr); k[2] = (nint)(&n);
+        _stream.Launch(func, grid, 1, 1, (uint)BlockSize, 1, 1, sharedMem, k);
+        float normSq = 0;
+        _stream.Synchronize();
+        result.CopyToHost(new Span<float>(ref normSq));
+        return normSq;
+    }
+
+    /// <summary>Synchronize the CUDA stream (wait for all queued operations to complete).</summary>
+    public void Synchronize() => _stream.Synchronize();
+
     /// <inheritdoc />
     public void Dispose()
     {
@@ -1593,6 +1874,7 @@ public sealed class CudaBackend : IComputeBackend
             if (_graphExec != 0) CudaApi.GraphExecDestroy(_graphExec);
             _argmaxResult?.Dispose();
             _q8_1Scratch?.Dispose();
+            _backwardModule?.Dispose();
             if (_cublasHandle != 0) CublasApi.Destroy(_cublasHandle);
             _stream.Dispose();
             _matmulModule.Dispose();
