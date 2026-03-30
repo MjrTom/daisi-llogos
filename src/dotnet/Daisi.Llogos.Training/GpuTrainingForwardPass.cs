@@ -439,44 +439,42 @@ public sealed class GpuTrainingForwardPass : ITrainingForwardPass
         var dAttnOutFromO = _gpu.CreateTensor($"d_l{layer}.attn_out", GgmlType.F32, [T * oDim]);
         _gpu.SgemmF32(dAttnOutFromO, dOOut, oF32, T, H, oDim);
 
-        // Attention backward — CPU (complex O(T²) per head)
-        var dQAttnCpu = new float[T * qAttnDim];
-        var dQGateCpu = new float[T * qAttnDim];
-        var dKCpu = new float[T * kOutDim];
-        var dVCpu = new float[T * vOutDim];
-        var dAttnCpu = DownloadF32(dAttnOutFromO, T * oDim);
-        var qAttnCpu = DownloadF32(saved.QAttn!, T * qAttnDim);
-        var qGateCpu = DownloadF32(saved.QGate!, T * qAttnDim);
-        var kRawCpu = DownloadF32(saved.KRaw!, T * kOutDim);
-        var vRawCpu = DownloadF32(saved.VRaw!, T * vOutDim);
-        var probsCpu = DownloadF32(saved.SavedProbs!, numHeads * T * T);
-        var attnOutCpu = DownloadF32(saved.AttnOut!, T * oDim);
-        F32Ops.CausalGatedAttentionBackward(dQAttnCpu, dQGateCpu, dKCpu, dVCpu,
-            dAttnCpu, qAttnCpu, qGateCpu, kRawCpu, vRawCpu, probsCpu, attnOutCpu,
+        // Attention backward — GPU kernel
+        var dQAttn = _gpu.CreateTensor($"d_l{layer}.dqattn", GgmlType.F32, [T * qAttnDim]);
+        var dQGate = _gpu.CreateTensor($"d_l{layer}.dqgate", GgmlType.F32, [T * qAttnDim]);
+        var dK = _gpu.CreateTensor($"d_l{layer}.dk", GgmlType.F32, [T * kOutDim]);
+        var dV = _gpu.CreateTensor($"d_l{layer}.dv", GgmlType.F32, [T * vOutDim]);
+        _gpu.ZeroTensor(dQAttn); _gpu.ZeroTensor(dQGate);
+        _gpu.ZeroTensor(dK); _gpu.ZeroTensor(dV);
+        _gpu.CausalGatedAttentionBackward(dQAttn, dQGate, dK, dV,
+            dAttnOutFromO, saved.QAttn!, saved.QGate!,
+            saved.KRaw!, saved.VRaw!, saved.SavedProbs!, saved.AttnOut!,
             T, numHeads, numKvHeads, keyDim, valDim, scale);
         dAttnOutFromO.Dispose();
 
-        // RoPE backward (on CPU arrays)
-        F32Ops.BatchedRoPEBackward(dQAttnCpu, T, numHeads, keyDim, ropeDim, 0, _config.RopeTheta);
-        F32Ops.BatchedRoPEBackward(dKCpu, T, numKvHeads, keyDim, ropeDim, 0, _config.RopeTheta);
+        // RoPE backward — GPU kernel
+        _gpu.BatchedRoPEBackward(dQAttn, T, numHeads, keyDim, ropeDim, 0, _config.RopeTheta);
+        _gpu.BatchedRoPEBackward(dK, T, numKvHeads, keyDim, ropeDim, 0, _config.RopeTheta);
 
-        // Q/K/V projection backward (GPU matmuls)
+        // De-interleave Q backward (CPU fallback for gated Q, GPU for non-gated)
         int qRawDim = saved.HasGatedQ ? numHeads * keyDim * 2 : qAttnDim;
-        float[] dQRawCpu;
+        ITensor dQRaw;
         if (saved.HasGatedQ)
         {
-            dQRawCpu = new float[T * qRawDim];
+            var dQAttnCpu = DownloadF32(dQAttn, T * qAttnDim);
+            var dQGateCpu = DownloadF32(dQGate, T * qAttnDim);
+            var dQRawCpu = new float[T * qRawDim];
             for (int t = 0; t < T; t++)
                 F32Ops.DeInterleaveQBackward(dQRawCpu.AsSpan(t * qRawDim, qRawDim),
                     dQAttnCpu.AsSpan(t * qAttnDim, qAttnDim),
                     dQGateCpu.AsSpan(t * qAttnDim, qAttnDim), numHeads, keyDim);
+            dQRaw = CreateF32Tensor($"d_l{layer}.dq", dQRawCpu);
         }
         else
-            dQRawCpu = dQAttnCpu;
-
-        var dQRaw = CreateF32Tensor($"d_l{layer}.dq", dQRawCpu);
-        var dK = CreateF32Tensor($"d_l{layer}.dk", dKCpu);
-        var dV = CreateF32Tensor($"d_l{layer}.dv", dVCpu);
+        {
+            dQRaw = dQAttn; // same tensor, no gate
+        }
+        dQGate.Dispose();
 
         var dNormOut = _gpu.CreateTensor($"d_l{layer}.dnorm", GgmlType.F32, [T * H]);
         _gpu.ZeroTensor(dNormOut);
