@@ -90,13 +90,12 @@ else
     else
         weights = ModelLoader.Load(gguf, stream, backend, config);
 
-    // Merge LoRA adapter if provided
-    LoraAdapter? loraAdapter = null;
-    if (options.LoraPath != null)
+    // Merge LoRA adapters if provided (multiple --lora flags stack additively)
+    foreach (var loraPath in options.LoraPaths)
     {
-        Console.Error.Write($"Loading LoRA adapter: {options.LoraPath}... ");
-        loraAdapter = LoraInference.LoadAndMerge(options.LoraPath, weights, backend, config);
-        Console.Error.WriteLine($"done ({loraAdapter.ParameterCount:N0} params, rank={loraAdapter.Config.Rank})");
+        Console.Error.Write($"Loading LoRA adapter: {loraPath}... ");
+        var adapter = LoraInference.LoadAndMerge(loraPath, weights, backend, config);
+        Console.Error.WriteLine($"done ({adapter.ParameterCount:N0} params, rank={adapter.Config.Rank})");
     }
 
     var strategy = AttentionStrategy.Parse(options.Attention);
@@ -424,7 +423,7 @@ static CliArgs ParseArgs(string[] args)
                 result.HybridLayers = int.Parse(NextArg(args, ref i));
                 break;
             case "--lora":
-                result.LoraPath = NextArg(args, ref i);
+                result.LoraPaths.Add(NextArg(args, ref i));
                 break;
             case "--help" or "-h":
                 result.ShowHelp = true;
@@ -663,5 +662,5 @@ class CliArgs
     public bool BatchedVerify;
     public string? KvQuant;
     public int HybridLayers;
-    public string? LoraPath;
+    public List<string> LoraPaths = new();
 }
