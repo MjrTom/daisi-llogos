@@ -122,4 +122,72 @@ public static class LoraInference
         MergeAdapter(weights, adapter, backend, config);
         return adapter;
     }
+
+    /// <summary>
+    /// Re-upload all weight tensors from CPU to a different backend (e.g., CUDA).
+    /// Used after LoRA merge: weights are merged on CPU, then uploaded to GPU for inference.
+    /// </summary>
+    public static void UploadWeights(ModelWeights weights, IComputeBackend target, ModelConfig config)
+    {
+        // Re-load the entire model on the target backend from the same GGUF file.
+        // This is cleaner than re-uploading individual tensors.
+        // Instead, we re-upload every tensor.
+        weights.TokenEmbedding = ReUpload(weights.TokenEmbedding, target);
+        weights.OutputNorm = ReUpload(weights.OutputNorm, target);
+        if (weights.Output != null)
+            weights.Output = ReUpload(weights.Output, target);
+
+        for (int layer = 0; layer < config.NumLayers; layer++)
+        {
+            var lw = weights.Layers[layer];
+            lw.AttnNorm = ReUpload(lw.AttnNorm, target);
+            lw.PostAttnNorm = ReUpload(lw.PostAttnNorm, target);
+            lw.FfnGate = ReUpload(lw.FfnGate, target);
+            lw.FfnUp = ReUpload(lw.FfnUp, target);
+            lw.FfnDown = ReUpload(lw.FfnDown, target);
+
+            if (lw is StandardAttentionWeights saw)
+            {
+                saw.AttnQ = ReUpload(saw.AttnQ, target);
+                saw.AttnK = ReUpload(saw.AttnK, target);
+                saw.AttnV = ReUpload(saw.AttnV, target);
+                saw.AttnO = ReUpload(saw.AttnO, target);
+                if (saw.AttnQNorm != null) saw.AttnQNorm = ReUpload(saw.AttnQNorm, target);
+                if (saw.AttnKNorm != null) saw.AttnKNorm = ReUpload(saw.AttnKNorm, target);
+                // Clear fused tensors — they reference old CPU memory
+                saw.FusedQKV?.Dispose(); saw.FusedQKV = null;
+                saw.FusedGateUp?.Dispose(); saw.FusedGateUp = null;
+            }
+            else if (lw is DeltaNetWeights dnw)
+            {
+                dnw.AttnQkv = ReUpload(dnw.AttnQkv, target);
+                dnw.AttnGate = ReUpload(dnw.AttnGate, target);
+                dnw.SsmOut = ReUpload(dnw.SsmOut, target);
+                // DeltaNet-specific non-merged weights
+                ReUploadField(ref dnw, "SsmA", target);
+                ReUploadField(ref dnw, "SsmAlpha", target);
+                ReUploadField(ref dnw, "SsmBeta", target);
+                ReUploadField(ref dnw, "SsmConv1d", target);
+                ReUploadField(ref dnw, "SsmDtBias", target);
+                ReUploadField(ref dnw, "SsmNorm", target);
+            }
+        }
+    }
+
+    private static void ReUploadField(ref DeltaNetWeights dnw, string field, IComputeBackend target)
+    {
+        // Use reflection-free approach: get tensor by name
+        var prop = typeof(DeltaNetWeights).GetProperty(field)!;
+        var tensor = (ITensor)prop.GetValue(dnw)!;
+        prop.SetValue(dnw, ReUpload(tensor, target));
+    }
+
+    private static ITensor ReUpload(ITensor cpu, IComputeBackend target)
+    {
+        var rawBytes = new byte[cpu.ByteSize];
+        cpu.CopyRawTo(rawBytes);
+        var gpu = target.LoadTensor(cpu.Name, cpu.Type, cpu.Dimensions, rawBytes);
+        cpu.Dispose();
+        return gpu;
+    }
 }
