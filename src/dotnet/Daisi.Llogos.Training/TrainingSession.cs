@@ -64,7 +64,9 @@ public sealed class TrainingSession : IDisposable
         // 5. Training loop
         Train(sequences);
 
-        // 6. Save final adapter
+        // 6. Download final weights from GPU and save adapter
+        if (_forwardPass is GpuTrainingForwardPass gpuFwdSave)
+            gpuFwdSave.DownloadLoraWeights();
         var outputPath = _config.OutputPath;
         Directory.CreateDirectory(Path.GetDirectoryName(outputPath) ?? outputPath);
         LoraFile.Save(outputPath, _adapter);
@@ -211,8 +213,9 @@ public sealed class TrainingSession : IDisposable
                 var targets = seq[1..(seqLen + 1)];
 
                 // Zero gradients at start of accumulation window
-                if (seqIdx % _config.GradientAccumulationSteps == 0)
-                    _adapter!.ZeroGrad();
+                if (seqIdx % _config.GradientAccumulationSteps == 0 &&
+                    _forwardPass is not GpuTrainingForwardPass)
+                    _adapter!.ZeroGrad(); // GPU path zeros grads in GpuOptimizerStep
 
                 // Forward + backward
                 _forwardPass!.Forward(input, out float loss, targets);
@@ -226,17 +229,20 @@ public sealed class TrainingSession : IDisposable
                 if ((seqIdx + 1) % _config.GradientAccumulationSteps == 0)
                 {
                     step++;
-
-                    // Gradient clipping
-                    ClipGradNorm(_config.MaxGradNorm);
-
-                    // LR schedule
                     float lrMult = AdamW.CosineSchedule(step, warmupSteps, totalSteps);
-                    _optimizer!.Step(_adapter!.Parameters(), lrMult);
 
-                    // Re-upload LoRA weights to GPU after optimizer step
                     if (_forwardPass is GpuTrainingForwardPass gpuFwd)
-                        gpuFwd.SyncLoraWeights();
+                    {
+                        // Entire optimizer step on GPU — no CPU round-trip
+                        gpuFwd.GpuOptimizerStep(_config.LearningRate,
+                            0.9f, 0.999f, 1e-8f, _config.WeightDecay,
+                            _config.MaxGradNorm, lrMult);
+                    }
+                    else
+                    {
+                        ClipGradNorm(_config.MaxGradNorm);
+                        _optimizer!.Step(_adapter!.Parameters(), lrMult);
+                    }
 
                     // Logging
                     if (step % _config.LogEverySteps == 0)
@@ -246,7 +252,7 @@ public sealed class TrainingSession : IDisposable
                         float seqPerSec = epochSteps / elapsed;
                         Console.Error.WriteLine(
                             $"  epoch {epoch + 1}/{_config.Epochs} | step {step}/{totalSteps} | " +
-                            $"loss {avgLoss:F4} | lr {_optimizer.CurrentLr:E2} | " +
+                            $"loss {avgLoss:F4} | lr {_config.LearningRate * lrMult:E2} | " +
                             $"{seqPerSec:F1} seq/s");
                         runningLoss = 0;
                         lossCount = 0;

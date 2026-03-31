@@ -37,6 +37,9 @@ public sealed class GpuTrainingForwardPass : ITrainingForwardPass
     private readonly Dictionary<string, (ITensor dA, ITensor dB)> _gpuLoraGrad = new();
     // LoRA intermediates per layer (reused)
     private readonly Dictionary<string, ITensor> _gpuLoraIntermediate = new();
+    // GPU optimizer state (AdamW m and v for each LoRA param)
+    private readonly Dictionary<string, (ITensor mA, ITensor vA, ITensor mB, ITensor vB)> _gpuOptState = new();
+    private int _optimStep;
 
     public GpuTrainingForwardPass(ModelConfig config, ModelWeights weights,
         LoraAdapter adapter, CudaBackend gpu)
@@ -59,6 +62,15 @@ public sealed class GpuTrainingForwardPass : ITrainingForwardPass
             // Intermediate buffer for LoRA forward
             var inter = _gpu.CreateTensor($"lora.{name}.inter", GgmlType.F32, [1]); // resized later
             _gpuLoraIntermediate[name] = inter;
+
+            // Optimizer state (m and v for AdamW, initialized to zero)
+            var mA = _gpu.CreateTensor($"opt.{name}.mA", GgmlType.F32, [layer.A.Size]);
+            var vA = _gpu.CreateTensor($"opt.{name}.vA", GgmlType.F32, [layer.A.Size]);
+            var mB = _gpu.CreateTensor($"opt.{name}.mB", GgmlType.F32, [layer.B.Size]);
+            var vB = _gpu.CreateTensor($"opt.{name}.vB", GgmlType.F32, [layer.B.Size]);
+            _gpu.ZeroTensor(mA); _gpu.ZeroTensor(vA);
+            _gpu.ZeroTensor(mB); _gpu.ZeroTensor(vB);
+            _gpuOptState[name] = (mA, vA, mB, vB);
         }
     }
 
@@ -167,8 +179,7 @@ public sealed class GpuTrainingForwardPass : ITrainingForwardPass
         dLogits.Dispose();
         finalNormOut.Dispose();
 
-        // 6. Download LoRA gradients to CPU
-        DownloadLoraGradients();
+        // Note: LoRA gradients stay on GPU — GpuOptimizerStep uses them directly
 
         return null; // logits not downloaded
     }
@@ -609,7 +620,7 @@ public sealed class GpuTrainingForwardPass : ITrainingForwardPass
         }
     }
 
-    /// <summary>Re-upload LoRA weights after optimizer step.</summary>
+    /// <summary>Re-upload LoRA weights after CPU optimizer step.</summary>
     public void SyncLoraWeights()
     {
         foreach (var (name, layer) in _adapter.Layers)
@@ -617,10 +628,70 @@ public sealed class GpuTrainingForwardPass : ITrainingForwardPass
             var lora = _gpuLora[name];
             UploadF32(lora.a, layer.A.Data);
             UploadF32(lora.b, layer.B.Data);
-            // Zero gradients on GPU for next step
             var grad = _gpuLoraGrad[name];
             _gpu.ZeroTensor(grad.dA);
             _gpu.ZeroTensor(grad.dB);
+        }
+    }
+
+    /// <summary>
+    /// Run AdamW optimizer step entirely on GPU. No CPU round-trip.
+    /// Clips gradients, updates LoRA params, zeros gradients — all on device.
+    /// </summary>
+    public void GpuOptimizerStep(float lr, float beta1, float beta2, float eps,
+        float weightDecay, float maxGradNorm, float lrMultiplier)
+    {
+        _optimStep++;
+        float effectiveLr = lr * lrMultiplier;
+        float bc1 = 1.0f - MathF.Pow(beta1, _optimStep);
+        float bc2 = 1.0f - MathF.Pow(beta2, _optimStep);
+
+        // Gradient clipping: compute total norm across all LoRA params
+        float totalNormSq = 0;
+        foreach (var (name, _) in _adapter.Layers)
+        {
+            var grad = _gpuLoraGrad[name];
+            totalNormSq += _gpu.GradNormSq(grad.dA);
+            totalNormSq += _gpu.GradNormSq(grad.dB);
+        }
+        float totalNorm = MathF.Sqrt(totalNormSq);
+        if (totalNorm > maxGradNorm)
+        {
+            float scale = maxGradNorm / totalNorm;
+            foreach (var (name, _) in _adapter.Layers)
+            {
+                var grad = _gpuLoraGrad[name];
+                _gpu.ScaleInPlace(grad.dA, scale);
+                _gpu.ScaleInPlace(grad.dB, scale);
+            }
+        }
+
+        // AdamW step on GPU for each LoRA parameter
+        foreach (var (name, _) in _adapter.Layers)
+        {
+            var lora = _gpuLora[name];
+            var grad = _gpuLoraGrad[name];
+            var opt = _gpuOptState[name];
+
+            _gpu.AdamWStep(lora.a, grad.dA, opt.mA, opt.vA,
+                effectiveLr, beta1, beta2, eps, weightDecay, bc1, bc2);
+            _gpu.AdamWStep(lora.b, grad.dB, opt.mB, opt.vB,
+                effectiveLr, beta1, beta2, eps, weightDecay, bc1, bc2);
+
+            // Zero gradients for next step
+            _gpu.ZeroTensor(grad.dA);
+            _gpu.ZeroTensor(grad.dB);
+        }
+    }
+
+    /// <summary>Download final LoRA weights from GPU to CPU adapter (for saving).</summary>
+    public void DownloadLoraWeights()
+    {
+        foreach (var (name, layer) in _adapter.Layers)
+        {
+            var lora = _gpuLora[name];
+            DownloadF32To(lora.a, layer.A.Data);
+            DownloadF32To(lora.b, layer.B.Data);
         }
     }
 
@@ -738,6 +809,8 @@ public sealed class GpuTrainingForwardPass : ITrainingForwardPass
         foreach (var t in _gpuLoraIntermediate.Values) t.Dispose();
         foreach (var t in _dequantCache.Values) t.Dispose();
         foreach (var t in _gpuWeightCache.Values) t.Dispose();
+        foreach (var (mA, vA, mB, vB) in _gpuOptState.Values)
+            { mA.Dispose(); vA.Dispose(); mB.Dispose(); vB.Dispose(); }
     }
 }
 
