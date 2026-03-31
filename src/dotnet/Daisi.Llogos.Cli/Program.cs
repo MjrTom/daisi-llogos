@@ -612,6 +612,7 @@ static int RunTraining(string[] args)
         if (targets.Contains('k')) loraTargets |= LoraTarget.K;
         if (targets.Contains('v')) loraTargets |= LoraTarget.V;
         if (targets.Contains('o')) loraTargets |= LoraTarget.O;
+        if (targets.Contains('f')) loraTargets |= LoraTarget.AllFfn;
         if (targets.Contains('d')) loraTargets |= LoraTarget.DeltaQkv | LoraTarget.DeltaOut;
     }
 

@@ -186,20 +186,45 @@ public sealed class TrainingForwardPass : ITrainingForwardPass
             var upOut = new float[T * I];
             var ffnGated = new float[T * I];
 
-            // gate = ffnNormOut × gateWeight^T
+            // gate = ffnNormOut × gateWeight^T + LoRA
             WeightMatMul(gateOut, ffnNormOut, lw.FfnGate, T, H, I);
-            // up = ffnNormOut × upWeight^T
+            string ffnPrefix = $"blk.{layer}";
+            var loraGate = _adapter.GetLayer($"{ffnPrefix}.ffn_gate");
+            float[]? loraGateInter = null;
+            if (loraGate != null)
+            {
+                loraGateInter = new float[T * loraGate.Rank];
+                loraGate.Forward(gateOut, ffnNormOut, loraGateInter, T);
+            }
+            // up = ffnNormOut × upWeight^T + LoRA
             WeightMatMul(upOut, ffnNormOut, lw.FfnUp, T, H, I);
+            var loraUp = _adapter.GetLayer($"{ffnPrefix}.ffn_up");
+            float[]? loraUpInter = null;
+            if (loraUp != null)
+            {
+                loraUpInter = new float[T * loraUp.Rank];
+                loraUp.Forward(upOut, ffnNormOut, loraUpInter, T);
+            }
             // ffnGated = SwiGLU(gate, up)
             F32Ops.SwiGLU(ffnGated, gateOut, upOut, T * I);
 
-            // hidden = ffnGated × downWeight^T
+            // hidden = ffnGated × downWeight^T + LoRA
             var ffnOut = new float[T * H];
             WeightMatMul(ffnOut, ffnGated, lw.FfnDown, T, I, H);
+            var loraDown = _adapter.GetLayer($"{ffnPrefix}.ffn_down");
+            float[]? loraDownInter = null;
+            if (loraDown != null)
+            {
+                loraDownInter = new float[T * loraDown.Rank];
+                loraDown.Forward(ffnOut, ffnGated, loraDownInter, T);
+            }
 
             saved.GateInput = gateOut;
             saved.UpInput = upOut;
             saved.FfnGated = ffnGated;
+            saved.LoraFfnGateInter = loraGateInter;
+            saved.LoraFfnUpInter = loraUpInter;
+            saved.LoraFfnDownInter = loraDownInter;
 
             // Add residual
             for (int i = 0; i < T * H; i++)
@@ -481,8 +506,12 @@ public sealed class TrainingForwardPass : ITrainingForwardPass
             var dFfnOut = dHidden.ToArray();
             var dFfnResidual = dHidden.ToArray();
 
-            // Backward through FFN down projection: dFfnGated = dFfnOut × downWeight
-            // Re-dequantize on demand (not cached from forward) to reduce peak memory
+            // Backward through FFN down LoRA + projection
+            string ffnPrefix = $"blk.{layer}";
+            var loraDown = _adapter.GetLayer($"{ffnPrefix}.ffn_down");
+            if (loraDown != null)
+                loraDown.Backward(new float[T * I], dFfnOut, saved.FfnGated!, saved.LoraFfnDownInter!, T);
+
             var downWeight = F32Ops.Dequantize(lw.FfnDown);
             var dFfnGated = new float[T * I];
             F32Ops.MatMul(dFfnGated, dFfnOut, downWeight, T, H, I);
@@ -492,14 +521,22 @@ public sealed class TrainingForwardPass : ITrainingForwardPass
             var dUp = new float[T * I];
             F32Ops.SwiGLUBackward(dGate, dUp, dFfnGated, saved.GateInput!, saved.UpInput!, T * I);
 
+            // Backward through gate/up LoRA
+            var loraGate = _adapter.GetLayer($"{ffnPrefix}.ffn_gate");
+            var loraUp = _adapter.GetLayer($"{ffnPrefix}.ffn_up");
+
             // Backward through gate/up projections → dFfnNormOut
             var dFfnNormOut = new float[T * H];
-            // dFfnNormOut += dGate × gateWeight
+            // dFfnNormOut += dGate × gateWeight + LoRA backward
+            if (loraGate != null)
+                loraGate.Backward(dFfnNormOut, dGate, saved.FfnNormOut!, saved.LoraFfnGateInter!, T);
             var gateWeight = F32Ops.Dequantize(lw.FfnGate);
             var dFromGate = new float[T * H];
             F32Ops.MatMul(dFromGate, dGate, gateWeight, T, I, H);
             F32Ops.AddInPlace(dFfnNormOut, dFromGate, T * H);
-            // dFfnNormOut += dUp × upWeight
+            // dFfnNormOut += dUp × upWeight + LoRA backward
+            if (loraUp != null)
+                loraUp.Backward(dFfnNormOut, dUp, saved.FfnNormOut!, saved.LoraFfnUpInter!, T);
             var upWeight = F32Ops.Dequantize(lw.FfnUp);
             var dFromUp = new float[T * H];
             F32Ops.MatMul(dFromUp, dUp, upWeight, T, I, H);
@@ -804,6 +841,7 @@ internal sealed class LayerActivations
 
     // FFN saved values (weights re-dequantized on demand in backward)
     public float[]? GateInput, UpInput, FfnGated;
+    public float[]? LoraFfnGateInter, LoraFfnUpInter, LoraFfnDownInter;
 
     // Backward output
     public float[]? DNormOut;

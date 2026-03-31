@@ -36,6 +36,12 @@ public static class LoraInference
                 MergeDeltaNetWeight(dnw, "AttnQkv", adapter.GetLayer($"{prefix}.delta_qkv"), backend);
                 MergeDeltaNetWeight(dnw, "SsmOut", adapter.GetLayer($"{prefix}.delta_out"), backend);
             }
+
+            // FFN projections (every layer has FFN)
+            var lw = weights.Layers[layer];
+            MergeFfnWeight(lw, "FfnGate", adapter.GetLayer($"{prefix}.ffn_gate"), backend);
+            MergeFfnWeight(lw, "FfnUp", adapter.GetLayer($"{prefix}.ffn_up"), backend);
+            MergeFfnWeight(lw, "FfnDown", adapter.GetLayer($"{prefix}.ffn_down"), backend);
         }
     }
 
@@ -85,6 +91,30 @@ public static class LoraInference
         {
             case "AttnQkv": dnw.AttnQkv = merged; break;
             case "SsmOut": dnw.SsmOut = merged; break;
+        }
+        original.Dispose();
+    }
+
+    private static void MergeFfnWeight(LayerWeights lw, string weightName,
+        LoraLayer? lora, IComputeBackend backend)
+    {
+        if (lora == null) return;
+
+        ITensor original = weightName switch
+        {
+            "FfnGate" => lw.FfnGate,
+            "FfnUp" => lw.FfnUp,
+            "FfnDown" => lw.FfnDown,
+            _ => throw new ArgumentException($"Unknown FFN weight: {weightName}")
+        };
+
+        var merged = MergeWeight(original, lora, backend);
+
+        switch (weightName)
+        {
+            case "FfnGate": lw.FfnGate = merged; break;
+            case "FfnUp": lw.FfnUp = merged; break;
+            case "FfnDown": lw.FfnDown = merged; break;
         }
         original.Dispose();
     }

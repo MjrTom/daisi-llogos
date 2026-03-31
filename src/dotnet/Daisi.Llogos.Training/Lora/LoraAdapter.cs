@@ -75,6 +75,27 @@ public sealed class LoraAdapter : IDisposable
                         $"{prefix}.delta_out", inDim, outDim, rank, scaling, rng);
                 }
             }
+
+            // FFN projections — every layer has FFN (both attention and DeltaNet)
+            var lw = weights.Layers[layer];
+            int intermediateDim = modelConfig.IntermediateDim;
+
+            if (config.Targets.HasFlag(LoraTarget.FfnGate))
+            {
+                Layers[$"{prefix}.ffn_gate"] = new LoraLayer(
+                    $"{prefix}.ffn_gate", hiddenDim, intermediateDim, rank, scaling, rng);
+            }
+            if (config.Targets.HasFlag(LoraTarget.FfnUp))
+            {
+                Layers[$"{prefix}.ffn_up"] = new LoraLayer(
+                    $"{prefix}.ffn_up", hiddenDim, intermediateDim, rank, scaling, rng);
+            }
+            if (config.Targets.HasFlag(LoraTarget.FfnDown))
+            {
+                int ffnInDim = (int)lw.FfnDown.Dimensions[0];
+                Layers[$"{prefix}.ffn_down"] = new LoraLayer(
+                    $"{prefix}.ffn_down", ffnInDim, hiddenDim, rank, scaling, rng);
+            }
         }
     }
 
