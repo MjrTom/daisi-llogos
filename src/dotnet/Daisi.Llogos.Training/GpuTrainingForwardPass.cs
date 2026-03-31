@@ -85,14 +85,10 @@ public sealed class GpuTrainingForwardPass : ITrainingForwardPass
         // Allocate activation storage
         _saved = new GpuLayerActivations[_config.NumLayers];
 
-        // 1. Embedding lookup → hidden [T × H]
-        // Upload token IDs, do embedding on CPU, upload result
-        var hiddenCpu = new float[T * H];
-        var embTable = new float[_embeddingTable.ElementCount];
-        _embeddingTable.DequantizeTo(embTable);
-        for (int t = 0; t < T; t++)
-            F32Ops.EmbeddingLookup(hiddenCpu.AsSpan(t * H, H), embTable, tokenIds[t], H);
-        UploadF32(_hidden!, hiddenCpu);
+        // 1. Embedding lookup → hidden [T × H] (GPU kernel)
+        var gpuTokenIds = CreateIntTensor("token_ids", tokenIds);
+        _gpu.BatchedEmbeddingLookup(_hidden!, _embeddingTable, gpuTokenIds, T, H);
+        gpuTokenIds.Dispose();
 
         // 2. Transformer layers
         for (int layer = 0; layer < _config.NumLayers; layer++)
@@ -214,7 +210,15 @@ public sealed class GpuTrainingForwardPass : ITrainingForwardPass
         {
             qAttn = _gpu.CreateTensor($"l{layer}.qattn", GgmlType.F32, [T * qAttnDim]);
             qGate = _gpu.CreateTensor($"l{layer}.qgate", GgmlType.F32, [T * qAttnDim]);
-            // Download, de-interleave on CPU, upload (TODO: GPU kernel for this)
+            // DeInterleaveQ exists on GPU backend — call per token row
+            for (int t = 0; t < T; t++)
+            {
+                // Use backend's existing DeInterleaveQ (works on GPU tensors per-row)
+                // For batched: offset into the tensor. Use CopyTensorSlice to extract rows.
+                // Simpler: batch the whole thing on CPU (small T, fast)
+                // TODO: add batched GPU DeInterleaveQ kernel
+            }
+            // CPU fallback for gated Q (only 6 layers, T is small)
             var qRawCpu = DownloadF32(qRaw, T * qOutDim);
             var qAttnCpu = new float[T * qAttnDim];
             var qGateCpu = new float[T * qAttnDim];
@@ -235,21 +239,12 @@ public sealed class GpuTrainingForwardPass : ITrainingForwardPass
         // RoPE (batched)
         _gpu.BatchedRoPE(qAttn, kRaw, keyDim, ropeDim, 0, _config.RopeTheta, numHeads, numKvHeads);
 
-        // Causal attention — download to CPU, compute, upload
-        // (The existing GPU GatedAttention uses KV cache which doesn't fit training.
-        //  For training we need the full T×T attention matrix. Do on CPU for now.)
+        // Causal gated attention — GPU kernel (saves probs for backward)
         int attnOutDim = numHeads * valDim;
-        var attnOutCpu = new float[T * attnOutDim];
-        var savedProbsCpu = new float[numHeads * T * T];
-        var qAttnCpu2 = DownloadF32(qAttn, T * qAttnDim);
-        var qGateCpu2 = DownloadF32(qGate, T * qAttnDim);
-        var kRawCpu = DownloadF32(kRaw, T * kOutDim);
-        var vRawCpu = DownloadF32(vRaw, T * vOutDim);
-        F32Ops.CausalGatedAttention(attnOutCpu, qAttnCpu2, qGateCpu2,
-            kRawCpu, vRawCpu, T, numHeads, numKvHeads, keyDim, valDim, scale, savedProbsCpu);
-
-        var attnOut = CreateF32Tensor($"l{layer}.attn_out", attnOutCpu);
-        var savedProbs = CreateF32Tensor($"l{layer}.probs", savedProbsCpu);
+        var attnOut = _gpu.CreateTensor($"l{layer}.attn_out", GgmlType.F32, [T * attnOutDim]);
+        var savedProbs = _gpu.CreateTensor($"l{layer}.probs", GgmlType.F32, [numHeads * T * T]);
+        _gpu.TrainingCausalGatedAttention(attnOut, savedProbs, qAttn, qGate, kRaw, vRaw,
+            T, numHeads, numKvHeads, keyDim, valDim, scale);
 
         // O projection
         int oDim = (int)saw.AttnO.Dimensions[0];
@@ -294,18 +289,8 @@ public sealed class GpuTrainingForwardPass : ITrainingForwardPass
 
         // SSM approximation: ssmApprox = qkvPostSilu * gatePostSilu (truncated to outInDim)
         int outInDim = (int)dnw.SsmOut.Dimensions[0];
-        // Element-wise on min(qkvDim, gateDim, outInDim) — do on CPU for dimension mismatch
-        var qkvCpu = DownloadF32(qkvOut, T * qkvDim);
-        var gateCpu = DownloadF32(gateOut, T * gateDim);
-        var ssmCpu = new float[T * outInDim];
-        for (int t = 0; t < T; t++)
-            for (int i = 0; i < outInDim; i++)
-            {
-                float q = i < qkvDim ? qkvCpu[t * qkvDim + i] : 0;
-                float g = i < gateDim ? gateCpu[t * gateDim + i] : 0;
-                ssmCpu[t * outInDim + i] = q * g;
-            }
-        var ssmApprox = CreateF32Tensor($"l{layer}.ssm", ssmCpu);
+        var ssmApprox = _gpu.CreateTensor($"l{layer}.ssm", GgmlType.F32, [T * outInDim]);
+        _gpu.TruncatedElementMul(ssmApprox, qkvOut, gateOut, T, outInDim, qkvDim, gateDim);
         saved.DeltaSsmApprox = ssmApprox;
 
         var layerOut = _gpu.CreateTensor($"l{layer}.delta_out", GgmlType.F32, [T * H]);
@@ -521,35 +506,25 @@ public sealed class GpuTrainingForwardPass : ITrainingForwardPass
         var dSsmApprox = _gpu.CreateTensor($"d_l{layer}.dssm", GgmlType.F32, [T * outInDim]);
         _gpu.SgemmF32(dSsmApprox, dLayerOut, outF32, T, H, outInDim);
 
-        // Element-wise product backward (CPU for dimension mismatch)
-        var dSsmCpu = DownloadF32(dSsmApprox, T * outInDim);
-        var qkvPostCpu = DownloadF32(saved.DeltaQkvPostSilu!, T * qkvDim);
-        var gatePostCpu = DownloadF32(saved.DeltaGatePostSilu!, T * gateDim);
-        var dQkvPostCpu = new float[T * qkvDim];
-        var dGatePostCpu = new float[T * gateDim];
-        for (int t = 0; t < T; t++)
-            for (int i = 0; i < outInDim; i++)
-            {
-                float dS = dSsmCpu[t * outInDim + i];
-                if (i < qkvDim)
-                    dQkvPostCpu[t * qkvDim + i] = dS * (i < gateDim ? gatePostCpu[t * gateDim + i] : 0);
-                if (i < gateDim)
-                    dGatePostCpu[t * gateDim + i] = dS * (i < qkvDim ? qkvPostCpu[t * qkvDim + i] : 0);
-            }
+        // Element-wise product backward (GPU kernel handles dimension mismatch)
+        var dQkvPost = _gpu.CreateTensor($"d_l{layer}.dqkv_post", GgmlType.F32, [T * qkvDim]);
+        var dGatePost = _gpu.CreateTensor($"d_l{layer}.dgate_post", GgmlType.F32, [T * gateDim]);
+        _gpu.ZeroTensor(dQkvPost);
+        _gpu.ZeroTensor(dGatePost);
+        _gpu.TruncatedElementMulBackward(dQkvPost, dGatePost, dSsmApprox,
+            saved.DeltaQkvPostSilu!, saved.DeltaGatePostSilu!, T, outInDim, qkvDim, gateDim);
         dSsmApprox.Dispose();
 
-        // SiLU backward (CPU)
-        var qkvPreCpu = DownloadF32(saved.DeltaQkvPreSilu!, T * qkvDim);
-        var dQkvPreCpu = new float[T * qkvDim];
-        F32Ops.SiLUBackward(dQkvPreCpu, dQkvPostCpu, qkvPreCpu, T * qkvDim);
+        // SiLU backward (GPU)
+        var dQkvPre = _gpu.CreateTensor($"d_l{layer}.dqkv", GgmlType.F32, [T * qkvDim]);
+        _gpu.ZeroTensor(dQkvPre);
+        _gpu.SiLUBackward(dQkvPre, dQkvPost, saved.DeltaQkvPreSilu!);
+        dQkvPost.Dispose();
 
-        var gatePreCpu = DownloadF32(saved.DeltaGatePreSilu!, T * gateDim);
-        var dGatePreCpu = new float[T * gateDim];
-        F32Ops.SiLUBackward(dGatePreCpu, dGatePostCpu, gatePreCpu, T * gateDim);
-
-        // Upload gradients for projection backward
-        var dQkvPre = CreateF32Tensor($"d_l{layer}.dqkv", dQkvPreCpu);
-        var dGatePre = CreateF32Tensor($"d_l{layer}.dgate", dGatePreCpu);
+        var dGatePre = _gpu.CreateTensor($"d_l{layer}.dgate", GgmlType.F32, [T * gateDim]);
+        _gpu.ZeroTensor(dGatePre);
+        _gpu.SiLUBackward(dGatePre, dGatePost, saved.DeltaGatePreSilu!);
+        dGatePost.Dispose();
 
         // LoRA backward for AttnQkv
         ApplyLoraBackward($"{prefix}.delta_qkv", saved.NormOut!, dQkvPre, T);
@@ -731,17 +706,9 @@ public sealed class GpuTrainingForwardPass : ITrainingForwardPass
 
     private ITensor DequantToGpu(string name, ITensor quantized)
     {
+        // Cache permanently — base model weights never change during training
         if (_dequantCache.TryGetValue(name, out var cached))
-        {
-            // Check if same size
-            if (cached.ElementCount == quantized.ElementCount)
-            {
-                var f32 = F32Ops.Dequantize(quantized);
-                UploadF32(cached, f32);
-                return cached;
-            }
-            cached.Dispose();
-        }
+            return cached;
         var data = F32Ops.Dequantize(quantized);
         var t = CreateF32Tensor(name, data);
         _dequantCache[name] = t;

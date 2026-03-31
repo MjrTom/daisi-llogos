@@ -417,4 +417,143 @@ __global__ void grad_norm_sq(float* output, const float* grad, int n)
         atomicAdd(output, sdata[0]);
 }
 
+// ── Training Causal Gated Attention (forward) ──────────────────────────────
+// Full T×T causal attention for training. Saves probability matrix for backward.
+// One block per (head, query_position). Grid: numHeads * T.
+__global__ void training_causal_gated_attention(
+    float* output, float* savedProbs,
+    const float* qAttn, const float* qGate,
+    const float* k, const float* v,
+    int T, int numHeads, int numKvHeads, int keyDim, int valDim, float scale)
+{
+    int blockId = blockIdx.x;
+    int h = blockId / T;
+    int t = blockId % T;
+    if (h >= numHeads) return;
+
+    int tid = threadIdx.x;
+    int kvH = h / (numHeads / numKvHeads);
+    int seqLen = t + 1;
+
+    int qOff = t * numHeads * keyDim + h * keyDim;
+
+    // Compute attention scores
+    for (int s = tid; s < seqLen; s += blockDim.x)
+    {
+        int kOff = s * numKvHeads * keyDim + kvH * keyDim;
+        float score = 0;
+        for (int d = 0; d < keyDim; d++)
+            score += qAttn[qOff + d] * k[kOff + d];
+        score *= scale;
+        savedProbs[h * T * T + t * T + s] = score;
+    }
+    // Zero non-causal
+    for (int s = seqLen + tid; s < T; s += blockDim.x)
+        savedProbs[h * T * T + t * T + s] = 0;
+    __syncthreads();
+
+    // Softmax over [0..seqLen-1]
+    extern __shared__ float sdata[];
+
+    // Find max
+    float localMax = -1e30f;
+    for (int s = tid; s < seqLen; s += blockDim.x)
+        localMax = fmaxf(localMax, savedProbs[h * T * T + t * T + s]);
+    sdata[tid] = localMax;
+    __syncthreads();
+    for (int s = blockDim.x / 2; s > 0; s >>= 1)
+    {
+        if (tid < s) sdata[tid] = fmaxf(sdata[tid], sdata[tid + s]);
+        __syncthreads();
+    }
+    float maxVal = sdata[0];
+    __syncthreads();
+
+    // Exp + sum
+    float localSum = 0;
+    for (int s = tid; s < seqLen; s += blockDim.x)
+    {
+        float p = expf(savedProbs[h * T * T + t * T + s] - maxVal);
+        savedProbs[h * T * T + t * T + s] = p;
+        localSum += p;
+    }
+    sdata[tid] = localSum;
+    __syncthreads();
+    for (int s = blockDim.x / 2; s > 0; s >>= 1)
+    {
+        if (tid < s) sdata[tid] += sdata[tid + s];
+        __syncthreads();
+    }
+    float invSum = 1.0f / sdata[0];
+    __syncthreads();
+
+    for (int s = tid; s < seqLen; s += blockDim.x)
+        savedProbs[h * T * T + t * T + s] *= invSum;
+    __syncthreads();
+
+    // Weighted sum of V + sigmoid gating
+    int outOff = t * numHeads * valDim + h * valDim;
+    int gateOff = t * numHeads * keyDim + h * keyDim;
+    for (int d = tid; d < valDim; d += blockDim.x)
+    {
+        float sum = 0;
+        for (int s = 0; s < seqLen; s++)
+        {
+            float p = savedProbs[h * T * T + t * T + s];
+            int vOff = s * numKvHeads * valDim + kvH * valDim;
+            sum += p * v[vOff + d];
+        }
+        // Sigmoid gating
+        float gateVal = (d < keyDim) ? qGate[gateOff + d] : 0.0f;
+        float sig = 1.0f / (1.0f + expf(-gateVal));
+        output[outOff + d] = sum * sig;
+    }
+}
+
+// ── Truncated element-wise product ─────────────────────────────────────────
+// c[t*cDim + i] = a[t*aDim + i] * b[t*bDim + i] for i < min(cDim, aDim, bDim)
+// Handles dimension mismatch for DeltaNet SSM approximation
+__global__ void truncated_element_mul(float* c, const float* a, const float* b,
+                                       int T, int cDim, int aDim, int bDim)
+{
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    int total = T * cDim;
+    if (idx >= total) return;
+    int t = idx / cDim;
+    int i = idx % cDim;
+    float aVal = (i < aDim) ? a[t * aDim + i] : 0.0f;
+    float bVal = (i < bDim) ? b[t * bDim + i] : 0.0f;
+    c[idx] = aVal * bVal;
+}
+
+// ── Truncated element-wise product backward ────────────────────────────────
+__global__ void truncated_element_mul_backward(float* dA, float* dB, const float* dC,
+                                                const float* a, const float* b,
+                                                int T, int cDim, int aDim, int bDim)
+{
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    int total = T * cDim;
+    if (idx >= total) return;
+    int t = idx / cDim;
+    int i = idx % cDim;
+    float dCval = dC[idx];
+    if (i < aDim)
+        atomicAdd(&dA[t * aDim + i], dCval * ((i < bDim) ? b[t * bDim + i] : 0.0f));
+    if (i < bDim)
+        atomicAdd(&dB[t * bDim + i], dCval * ((i < aDim) ? a[t * aDim + i] : 0.0f));
+}
+
+// ── Batched embedding lookup ───────────────────────────────────────────────
+// output[t*dim .. (t+1)*dim] = table[tokenIds[t]*dim .. ]
+__global__ void batched_embedding_lookup(float* output, const float* table,
+                                          const int* tokenIds, int T, int dim)
+{
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    int total = T * dim;
+    if (idx >= total) return;
+    int t = idx / dim;
+    int d = idx % dim;
+    output[idx] = table[tokenIds[t] * dim + d];
+}
+
 } // extern "C"

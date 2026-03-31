@@ -1862,6 +1862,79 @@ public sealed class CudaBackend : IComputeBackend
         return normSq;
     }
 
+    public unsafe void TrainingCausalGatedAttention(
+        ITensor output, ITensor savedProbs,
+        ITensor qAttn, ITensor qGate, ITensor k, ITensor v,
+        int T, int numHeads, int numKvHeads, int keyDim, int valDim, float scale)
+    {
+        ulong oPtr = ((CudaTensor)output).DevicePtr;
+        ulong spPtr = ((CudaTensor)savedProbs).DevicePtr;
+        ulong qaPtr = ((CudaTensor)qAttn).DevicePtr;
+        ulong qgPtr = ((CudaTensor)qGate).DevicePtr;
+        ulong kPtr = ((CudaTensor)k).DevicePtr;
+        ulong vPtr = ((CudaTensor)v).DevicePtr;
+        var func = BackwardModule.GetFunction("training_causal_gated_attention");
+        int blocks = numHeads * T;
+        uint threads = (uint)Math.Min(Math.Max(T, 32), BlockSize);
+        uint sharedMem = (uint)(threads * sizeof(float));
+        nint* args = stackalloc nint[12];
+        args[0] = (nint)(&oPtr); args[1] = (nint)(&spPtr);
+        args[2] = (nint)(&qaPtr); args[3] = (nint)(&qgPtr);
+        args[4] = (nint)(&kPtr); args[5] = (nint)(&vPtr);
+        args[6] = (nint)(&T); args[7] = (nint)(&numHeads);
+        args[8] = (nint)(&numKvHeads); args[9] = (nint)(&keyDim);
+        args[10] = (nint)(&valDim); args[11] = (nint)(&scale);
+        _stream.Launch(func, (uint)blocks, 1, 1, threads, 1, 1, sharedMem, args);
+    }
+
+    public unsafe void TruncatedElementMul(ITensor c, ITensor a, ITensor b,
+        int T, int cDim, int aDim, int bDim)
+    {
+        ulong cPtr = ((CudaTensor)c).DevicePtr;
+        ulong aPtr = ((CudaTensor)a).DevicePtr;
+        ulong bPtr = ((CudaTensor)b).DevicePtr;
+        int total = T * cDim;
+        var func = BackwardModule.GetFunction("truncated_element_mul");
+        uint grid = (uint)((total + BlockSize - 1) / BlockSize);
+        nint* k = stackalloc nint[7];
+        k[0] = (nint)(&cPtr); k[1] = (nint)(&aPtr); k[2] = (nint)(&bPtr);
+        k[3] = (nint)(&T); k[4] = (nint)(&cDim); k[5] = (nint)(&aDim); k[6] = (nint)(&bDim);
+        _stream.Launch(func, grid, 1, 1, (uint)BlockSize, 1, 1, 0, k);
+    }
+
+    public unsafe void TruncatedElementMulBackward(ITensor dA, ITensor dB, ITensor dC,
+        ITensor a, ITensor b, int T, int cDim, int aDim, int bDim)
+    {
+        ulong daPtr = ((CudaTensor)dA).DevicePtr;
+        ulong dbPtr = ((CudaTensor)dB).DevicePtr;
+        ulong dcPtr = ((CudaTensor)dC).DevicePtr;
+        ulong aPtr = ((CudaTensor)a).DevicePtr;
+        ulong bPtr = ((CudaTensor)b).DevicePtr;
+        int total = T * cDim;
+        var func = BackwardModule.GetFunction("truncated_element_mul_backward");
+        uint grid = (uint)((total + BlockSize - 1) / BlockSize);
+        nint* k = stackalloc nint[9];
+        k[0] = (nint)(&daPtr); k[1] = (nint)(&dbPtr); k[2] = (nint)(&dcPtr);
+        k[3] = (nint)(&aPtr); k[4] = (nint)(&bPtr);
+        k[5] = (nint)(&T); k[6] = (nint)(&cDim); k[7] = (nint)(&aDim); k[8] = (nint)(&bDim);
+        _stream.Launch(func, grid, 1, 1, (uint)BlockSize, 1, 1, 0, k);
+    }
+
+    public unsafe void BatchedEmbeddingLookup(ITensor output, ITensor table, ITensor tokenIds,
+        int T, int dim)
+    {
+        ulong oPtr = ((CudaTensor)output).DevicePtr;
+        ulong tPtr = ((CudaTensor)table).DevicePtr;
+        ulong idPtr = ((CudaTensor)tokenIds).DevicePtr;
+        int total = T * dim;
+        var func = BackwardModule.GetFunction("batched_embedding_lookup");
+        uint grid = (uint)((total + BlockSize - 1) / BlockSize);
+        nint* k = stackalloc nint[5];
+        k[0] = (nint)(&oPtr); k[1] = (nint)(&tPtr); k[2] = (nint)(&idPtr);
+        k[3] = (nint)(&T); k[4] = (nint)(&dim);
+        _stream.Launch(func, grid, 1, 1, (uint)BlockSize, 1, 1, 0, k);
+    }
+
     /// <summary>Synchronize the CUDA stream (wait for all queued operations to complete).</summary>
     public void Synchronize() => _stream.Synchronize();
 
