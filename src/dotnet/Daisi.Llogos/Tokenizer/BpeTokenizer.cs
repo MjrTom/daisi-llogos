@@ -19,12 +19,31 @@ public sealed partial class BpeTokenizer
     private static readonly string[] ByteToUnicodeTable = BuildByteToUnicode();
     private static readonly Dictionary<char, byte> UnicodeToByte = BuildUnicodeToByte();
 
+    // Special tokens that should be matched as whole strings (e.g. <|im_start|>, <|endoftext|>)
+    private readonly List<(string token, int id)> _specialTokens = new();
+
     public BpeTokenizer(Vocabulary vocab, MergeTable merges, bool useByteEncoding = false)
     {
         _vocab = vocab;
         _merges = merges;
         _useByteEncoding = useByteEncoding;
         _preTokenizePattern = PreTokenizeRegex();
+
+        // Build special token list from vocabulary (tokens matching <|...|> or <...> patterns)
+        for (int i = 0; i < vocab.Count; i++)
+        {
+            var token = vocab.IdToToken(i);
+            if (token != null && token.StartsWith("<|") && token.EndsWith("|>") && token.Length > 4)
+                _specialTokens.Add((token, i));
+            // Also handle fullwidth pipe variants (Qwen uses ｜ in GGUF)
+            else if (token != null && token.Contains('\uFF5C') && token.StartsWith("<"))
+            {
+                var normalized = token.Replace('\uFF5C', '|');
+                _specialTokens.Add((normalized, i));
+            }
+        }
+        // Sort by length descending so longer tokens match first
+        _specialTokens.Sort((a, b) => b.token.Length.CompareTo(a.token.Length));
     }
 
     /// <summary>The vocabulary used by this tokenizer.</summary>
@@ -33,107 +52,94 @@ public sealed partial class BpeTokenizer
     /// <summary>
     /// Encode text into a sequence of token IDs.
     /// </summary>
-    /// <summary>Cached list of special tokens that should be matched as whole units.</summary>
-    private string[]? _specialTokens;
-
     public int[] Encode(string text)
     {
         if (string.IsNullOrEmpty(text))
             return [];
 
-        // Build special token list lazily (tokens containing | that are in the vocabulary)
-        _specialTokens ??= BuildSpecialTokenList();
-
         var result = new List<int>();
 
-        // Split text around special tokens, then BPE-encode each non-special segment
-        int pos = 0;
-        while (pos < text.Length)
+        // Split on special tokens first, then BPE-encode the segments between them
+        var segments = SplitOnSpecialTokens(text);
+        foreach (var (segment, specialId) in segments)
         {
-            // Try to match a special token at the current position
-            string? matched = null;
-            foreach (var special in _specialTokens)
+            if (specialId >= 0)
             {
-                if (pos + special.Length <= text.Length &&
-                    text.AsSpan(pos, special.Length).SequenceEqual(special))
-                {
-                    matched = special;
-                    break;
-                }
+                result.Add(specialId);
+                continue;
             }
 
-            if (matched != null)
+            // Regular BPE encoding for non-special text
+            var matches = _preTokenizePattern.Matches(segment);
+            foreach (Match match in matches)
             {
-                // Emit the special token as a single ID
-                int id = _vocab.TokenToId(matched);
-                if (id >= 0) result.Add(id);
-                pos += matched.Length;
-            }
-            else
-            {
-                // Find the next special token (or end of string)
-                int nextSpecial = text.Length;
-                foreach (var special in _specialTokens)
-                {
-                    int idx = text.IndexOf(special, pos, StringComparison.Ordinal);
-                    if (idx >= 0 && idx < nextSpecial)
-                        nextSpecial = idx;
-                }
+                var chunk = match.Value;
+                var symbols = _useByteEncoding ? ByteEncodeChunk(chunk) : DirectEncodeChunk(chunk);
+                if (symbols.Count == 0) continue;
 
-                // BPE-encode the segment before the next special token
-                var segment = text[pos..nextSpecial];
-                if (segment.Length > 0)
-                    EncodeSegment(segment, result);
-                pos = nextSpecial;
+                ApplyMerges(symbols);
+
+                foreach (var symbol in symbols)
+                {
+                    int id = _vocab.TokenToId(symbol);
+                    if (id >= 0)
+                        result.Add(id);
+                }
             }
         }
 
         return result.ToArray();
     }
 
-    /// <summary>BPE-encode a text segment (no special tokens).</summary>
-    private void EncodeSegment(string text, List<int> result)
-    {
-        var matches = _preTokenizePattern.Matches(text);
-
-        foreach (Match match in matches)
-        {
-            var chunk = match.Value;
-            var symbols = _useByteEncoding ? ByteEncodeChunk(chunk) : DirectEncodeChunk(chunk);
-            if (symbols.Count == 0) continue;
-
-            ApplyMerges(symbols);
-
-            foreach (var symbol in symbols)
-            {
-                int id = _vocab.TokenToId(symbol);
-                if (id >= 0)
-                    result.Add(id);
-            }
-        }
-    }
-
     /// <summary>
-    /// Build a list of special tokens from the vocabulary.
-    /// Special tokens are those containing "|" (like &lt;|im_start|&gt;, &lt;|im_end|&gt;, &lt;|endoftext|&gt;)
-    /// sorted longest-first to ensure greedy matching.
+    /// Split text into segments, identifying special tokens as whole units.
+    /// Returns (text_segment, -1) for regular text, (token_text, token_id) for special tokens.
     /// </summary>
-    private string[] BuildSpecialTokenList()
+    private List<(string text, int id)> SplitOnSpecialTokens(string text)
     {
-        var specials = new List<string>();
-        for (int i = 0; i < _vocab.Count; i++)
+        if (_specialTokens.Count == 0)
+            return [(text, -1)];
+
+        var segments = new List<(string text, int id)>();
+        int pos = 0;
+
+        while (pos < text.Length)
         {
-            var token = _vocab.IdToToken(i);
-            // Qwen special tokens have the pattern <|...|> or <｜...｜>
-            if (token.Length > 3 && token.StartsWith('<') && token.EndsWith('>') &&
-                (token.Contains('|') || token.Contains('｜')))
+            // Try to match a special token at current position
+            bool found = false;
+            foreach (var (token, id) in _specialTokens)
             {
-                specials.Add(token);
+                if (pos + token.Length <= text.Length &&
+                    text.AsSpan(pos, token.Length).SequenceEqual(token.AsSpan()))
+                {
+                    // Flush any preceding text
+                    if (pos > 0 && segments.Count == 0 || (segments.Count > 0 && segments[^1].id < 0))
+                    {
+                        // Check if there's text before this match not yet added
+                    }
+                    // Simpler approach: collect start position
+                    segments.Add((token, id));
+                    pos += token.Length;
+                    found = true;
+                    break;
+                }
+            }
+            if (!found)
+            {
+                // Accumulate regular text
+                if (segments.Count > 0 && segments[^1].id < 0)
+                {
+                    segments[^1] = (segments[^1].text + text[pos], -1);
+                }
+                else
+                {
+                    segments.Add((text[pos].ToString(), -1));
+                }
+                pos++;
             }
         }
-        // Sort longest first for greedy matching
-        specials.Sort((a, b) => b.Length.CompareTo(a.Length));
-        return specials.ToArray();
+
+        return segments;
     }
 
     /// <summary>

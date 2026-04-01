@@ -162,6 +162,7 @@ __global__ void batched_rope_backward(float* dData, int T, int numHeads, int hea
 // ── Cross-Entropy Loss + Gradient ──────────────────────────────────────────
 // Per-token: softmax, NLL loss, gradient = softmax - one_hot
 // One block per token. Downloads only scalar loss.
+// target=-1 means ignore this token (completion-only training).
 __global__ void cross_entropy_loss(float* dLogits, float* lossOut,
                                     const float* logits, const int* targets,
                                     int T, int V)
@@ -176,7 +177,20 @@ __global__ void cross_entropy_loss(float* dLogits, float* lossOut,
     const float* logitRow = logits + t * V;
     float* dRow = dLogits + t * V;
     int target = targets[t];
-    float invT = 1.0f / (float)T;
+
+    // Skip masked tokens (target=-1): zero gradient, no loss contribution
+    if (target < 0)
+    {
+        for (int v = tid; v < V; v += stride)
+            dRow[v] = 0.0f;
+        return;
+    }
+
+    // Count non-masked tokens for proper loss averaging
+    int validTokens = 0;
+    for (int tt = 0; tt < T; tt++)
+        if (targets[tt] >= 0) validTokens++;
+    float invT = (validTokens > 0) ? 1.0f / (float)validTokens : 0.0f;
 
     // Pass 1: find max
     float localMax = -1e30f;
