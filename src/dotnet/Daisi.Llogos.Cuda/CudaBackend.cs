@@ -210,7 +210,7 @@ public sealed class CudaBackend : IComputeBackend
     /// Ensure the Q8_1 scratch buffer is large enough for the given K dimension.
     /// Must be called outside batch recording (no cuMemAlloc during batching).
     /// </summary>
-    private ulong EnsureQ8_1Scratch(int K)
+    internal ulong EnsureQ8_1Scratch(int K)
     {
         int numBlocks = K / 32;
         int q8_1Bytes = numBlocks * 36; // [d(f16,2b) + sum(f16,2b) + quants(32b)] = 36 bytes
