@@ -38,6 +38,7 @@ public sealed class GpuTrainingForwardPass : ITrainingForwardPass
     // GPU optimizer state (AdamW m and v for each LoRA param)
     private readonly Dictionary<string, (ITensor mA, ITensor vA, ITensor mB, ITensor vB)> _gpuOptState = new();
     private int _optimStep;
+    private int _debugStep;
 
     public GpuTrainingForwardPass(ModelConfig config, ModelWeights weights,
         LoraAdapter adapter, CudaBackend gpu)
@@ -118,7 +119,17 @@ public sealed class GpuTrainingForwardPass : ITrainingForwardPass
             if (lw is StandardAttentionWeights saw && _config.IsStandardAttention(layer))
                 ForwardAttentionLayer(saw, saved, layer, T);
             else if (lw is DeltaNetWeights dnw)
+            {
                 ForwardDeltaNetLayer(dnw, saved, layer, T);
+                // Debug: compare first token hidden state after DeltaNet
+                if (_debugStep == 0 && layer == 0)
+                {
+                    _gpu.Synchronize();
+                    var h = new float[8];
+                    ((CudaTensor)Pool("hidden", T * H)).DownloadTo(h);
+                    Console.Error.WriteLine($"  DEBUG L0 hidden after DeltaNet: [{string.Join(",", h.Select(v => v.ToString("F6")))}]");
+                }
+            }
 
             // Add residual
             _gpu.ElementAdd(Pool("hidden", T * H), Pool("hidden", T * H), Pool("residual", T * H));
@@ -161,6 +172,28 @@ public sealed class GpuTrainingForwardPass : ITrainingForwardPass
 
         var logits = Pool("logits", T * V);
         _gpu.MatMul(logits, finalNormOut, GpuWeight(_weights.OutputWeight), T, H, V);
+
+        // Debug: check hidden state for NaN/extreme values on first call
+        if (_debugStep == 0)
+        {
+            _gpu.Synchronize();
+            var hiddenCheck = new float[Math.Min(20, T * H)];
+            ((CudaTensor)Pool("hidden", T * H)).DownloadTo(hiddenCheck);
+            var hasNan = hiddenCheck.Any(float.IsNaN);
+            var hasInf = hiddenCheck.Any(float.IsInfinity);
+            var maxAbs = hiddenCheck.Max(Math.Abs);
+            Console.Error.WriteLine($"  DEBUG hidden[0..19]: nan={hasNan} inf={hasInf} maxAbs={maxAbs:F4} " +
+                $"vals=[{string.Join(",", hiddenCheck.Take(8).Select(v => v.ToString("F4")))}]");
+
+            var fnCheck = new float[Math.Min(20, T * H)];
+            ((CudaTensor)finalNormOut).DownloadTo(fnCheck);
+            Console.Error.WriteLine($"  DEBUG finalNorm[0..7]: [{string.Join(",", fnCheck.Take(8).Select(v => v.ToString("F4")))}]");
+
+            var logCheck = new float[Math.Min(20, T * V)];
+            ((CudaTensor)logits).DownloadTo(logCheck);
+            Console.Error.WriteLine($"  DEBUG logits[0..7]: [{string.Join(",", logCheck.Take(8).Select(v => v.ToString("F4")))}]");
+        }
+        _debugStep++;
 
         // 4. Cross-entropy loss + gradient (on GPU, only downloads scalar loss)
         var dLogits = Pool("dlogits", T * V);
