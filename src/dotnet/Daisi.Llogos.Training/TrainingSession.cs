@@ -273,6 +273,12 @@ public sealed class TrainingSession : IDisposable
                     for (int t = 0; t < Math.Min(seq.PromptLen, seqLen); t++)
                         targets[t] = -1;
                 }
+                // Also mask padding tokens (sequences shorter than seqLen are zero-padded)
+                for (int t = 0; t < seqLen; t++)
+                {
+                    if (input[t] == 0 && targets[t] == 0)
+                        targets[t] = -1;
+                }
 
                 // Zero gradients at start of accumulation window
                 if (seqIdx % _config.GradientAccumulationSteps == 0 &&
