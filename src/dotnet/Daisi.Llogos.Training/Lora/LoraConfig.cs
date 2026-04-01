@@ -28,15 +28,24 @@ public sealed class LoraConfig
 public enum LoraTarget
 {
     None = 0,
+    // Standard attention projections
     Q = 1,
     K = 2,
     V = 4,
     O = 8,
     All = Q | K | V | O,
 
-    // DeltaNet projections
-    DeltaQkv = 16,  // AttnQkv: H → qkvDim (input to SSM pipeline)
-    DeltaOut = 32,   // SsmOut: ssmInner → H (output from SSM)
+    // DeltaNet projections (research shows LoRA on SSM internals doesn't work well)
+    DeltaQkv = 16,
+    DeltaOut = 32,
     AllDelta = DeltaQkv | DeltaOut,
-    AllLayers = All | AllDelta,
+
+    // FFN projections (every layer has FFN — this is where knowledge lives)
+    FfnGate = 64,
+    FfnUp = 128,
+    FfnDown = 256,
+    AllFfn = FfnGate | FfnUp | FfnDown,
+
+    // Recommended: attention + FFN (matches Unsloth/HuggingFace defaults)
+    AllLayers = All | AllFfn,
 }

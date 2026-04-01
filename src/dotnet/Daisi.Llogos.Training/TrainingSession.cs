@@ -64,7 +64,9 @@ public sealed class TrainingSession : IDisposable
         // 5. Training loop
         Train(sequences);
 
-        // 6. Save final adapter
+        // 6. Download final weights from GPU and save adapter
+        if (_forwardPass is GpuTrainingForwardPass gpuFwdSave)
+            gpuFwdSave.DownloadLoraWeights();
         var outputPath = _config.OutputPath;
         Directory.CreateDirectory(Path.GetDirectoryName(outputPath) ?? outputPath);
         LoraFile.Save(outputPath, _adapter);
@@ -102,7 +104,10 @@ public sealed class TrainingSession : IDisposable
         return count;
     }
 
-    private List<int[]> LoadData()
+    /// <summary>Sequence with prompt mask — promptLen tokens have target=-1 (ignored in loss).</summary>
+    private record TrainingSequence(int[] Tokens, int PromptLen);
+
+    private List<TrainingSequence> LoadData()
     {
         Console.Error.Write($"Loading training data: {_config.DataPath}...");
 
@@ -117,55 +122,106 @@ public sealed class TrainingSession : IDisposable
             };
         }
 
-        var texts = new List<string>();
+        int seqLen = _config.SeqLen;
+        var sequences = new List<TrainingSequence>();
+        int totalTokens = 0;
+
+        // For JSONL with "text" field: detect chat template and split on assistant response
+        // Format: <|im_start|>user\n...<|im_end|>\n<|im_start|>assistant\n[RESPONSE]<|im_end|>
+        const string assistantMarker = "<|im_start|>assistant\n";
+
         switch (format)
         {
             case DataFormat.PlainText:
-                texts.Add(File.ReadAllText(_config.DataPath));
+            {
+                var allTokens = _tokenizer!.Encode(File.ReadAllText(_config.DataPath));
+                totalTokens = allTokens.Length;
+                for (int i = 0; i + seqLen < allTokens.Length; i += seqLen)
+                {
+                    var seq = new int[seqLen + 1];
+                    Array.Copy(allTokens, i, seq, 0, seqLen + 1);
+                    sequences.Add(new TrainingSequence(seq, 0)); // no masking for plain text
+                }
                 break;
+            }
 
             case DataFormat.Jsonl:
+            {
                 foreach (var line in File.ReadLines(_config.DataPath))
                 {
                     if (string.IsNullOrWhiteSpace(line)) continue;
                     using var doc = JsonDocument.Parse(line);
                     var text = doc.RootElement.GetProperty("text").GetString();
-                    if (!string.IsNullOrEmpty(text)) texts.Add(text);
+                    if (string.IsNullOrEmpty(text)) continue;
+
+                    // Detect chat template: find assistant marker to split prompt/completion
+                    int promptLen = 0;
+                    int markerPos = text.IndexOf(assistantMarker, StringComparison.Ordinal);
+                    if (markerPos >= 0)
+                    {
+                        // Tokenize prompt portion to find token boundary
+                        var promptText = text[..(markerPos + assistantMarker.Length)];
+                        promptLen = _tokenizer!.Encode(promptText).Length;
+                    }
+
+                    var tokens = _tokenizer!.Encode(text);
+                    totalTokens += tokens.Length;
+
+                    // Pad or truncate to seqLen+1
+                    if (tokens.Length >= seqLen + 1)
+                    {
+                        var seq = new int[seqLen + 1];
+                        Array.Copy(tokens, seq, seqLen + 1);
+                        sequences.Add(new TrainingSequence(seq, Math.Min(promptLen, seqLen)));
+                    }
+                    else if (tokens.Length > 10)
+                    {
+                        // Pad short sequences
+                        var seq = new int[seqLen + 1];
+                        Array.Copy(tokens, seq, tokens.Length);
+                        sequences.Add(new TrainingSequence(seq, Math.Min(promptLen, tokens.Length)));
+                    }
                 }
                 break;
+            }
 
             case DataFormat.JsonlChat:
+            {
                 foreach (var line in File.ReadLines(_config.DataPath))
                 {
                     if (string.IsNullOrWhiteSpace(line)) continue;
                     using var doc = JsonDocument.Parse(line);
                     var prompt = doc.RootElement.GetProperty("prompt").GetString() ?? "";
                     var completion = doc.RootElement.GetProperty("completion").GetString() ?? "";
-                    texts.Add(prompt + completion);
+                    var promptTokens = _tokenizer!.Encode(prompt);
+                    var completionTokens = _tokenizer!.Encode(completion);
+                    var allTokens = new int[promptTokens.Length + completionTokens.Length];
+                    Array.Copy(promptTokens, allTokens, promptTokens.Length);
+                    Array.Copy(completionTokens, 0, allTokens, promptTokens.Length, completionTokens.Length);
+                    totalTokens += allTokens.Length;
+
+                    if (allTokens.Length >= seqLen + 1)
+                    {
+                        var seq = new int[seqLen + 1];
+                        Array.Copy(allTokens, seq, seqLen + 1);
+                        sequences.Add(new TrainingSequence(seq, Math.Min(promptTokens.Length, seqLen)));
+                    }
+                    else if (allTokens.Length > 10)
+                    {
+                        var seq = new int[seqLen + 1];
+                        Array.Copy(allTokens, seq, allTokens.Length);
+                        sequences.Add(new TrainingSequence(seq, Math.Min(promptTokens.Length, allTokens.Length)));
+                    }
                 }
                 break;
+            }
         }
 
-        // Tokenize and chunk into sequences of SeqLen+1 (input + target)
-        int seqLen = _config.SeqLen;
-        var allTokens = new List<int>();
-        foreach (var text in texts)
-        {
-            var tokens = _tokenizer!.Encode(text);
-            allTokens.AddRange(tokens);
-        }
-
-        var sequences = new List<int[]>();
-        for (int i = 0; i + seqLen < allTokens.Count; i += seqLen)
-        {
-            var seq = new int[seqLen + 1]; // +1 for target
-            for (int j = 0; j <= seqLen; j++)
-                seq[j] = allTokens[i + j];
-            sequences.Add(seq);
-        }
-
+        int maskedSeqs = sequences.Count(s => s.PromptLen > 0);
         Console.Error.WriteLine($" done");
-        Console.Error.WriteLine($"  Tokens: {allTokens.Count:N0}, Sequences: {sequences.Count:N0} (seqLen={seqLen})");
+        Console.Error.WriteLine($"  Tokens: {totalTokens:N0}, Sequences: {sequences.Count:N0} (seqLen={seqLen})");
+        if (maskedSeqs > 0)
+            Console.Error.WriteLine($"  Completion-only loss: {maskedSeqs} sequences with prompt masking");
 
         if (sequences.Count == 0)
             throw new InvalidOperationException("No training sequences produced — data may be too short.");
@@ -173,7 +229,7 @@ public sealed class TrainingSession : IDisposable
         return sequences;
     }
 
-    private void Train(List<int[]> sequences)
+    private void Train(List<TrainingSequence> sequences)
     {
         int totalSteps = sequences.Count * _config.Epochs / _config.GradientAccumulationSteps;
         int warmupSteps = _config.WarmupSteps;
@@ -207,12 +263,21 @@ public sealed class TrainingSession : IDisposable
                 int seqLen = _config.SeqLen;
 
                 // Input: tokens[0..seqLen-1], Target: tokens[1..seqLen]
-                var input = seq[..seqLen];
-                var targets = seq[1..(seqLen + 1)];
+                var input = seq.Tokens[..seqLen];
+                var targets = seq.Tokens[1..(seqLen + 1)];
+
+                // Mask prompt tokens: set target=-1 for tokens the model shouldn't learn to predict
+                // (loss computation skips target=-1). This focuses learning on the completion only.
+                if (seq.PromptLen > 0)
+                {
+                    for (int t = 0; t < Math.Min(seq.PromptLen, seqLen); t++)
+                        targets[t] = -1;
+                }
 
                 // Zero gradients at start of accumulation window
-                if (seqIdx % _config.GradientAccumulationSteps == 0)
-                    _adapter!.ZeroGrad();
+                if (seqIdx % _config.GradientAccumulationSteps == 0 &&
+                    _forwardPass is not GpuTrainingForwardPass)
+                    _adapter!.ZeroGrad(); // GPU path zeros grads in GpuOptimizerStep
 
                 // Forward + backward
                 _forwardPass!.Forward(input, out float loss, targets);
@@ -226,17 +291,20 @@ public sealed class TrainingSession : IDisposable
                 if ((seqIdx + 1) % _config.GradientAccumulationSteps == 0)
                 {
                     step++;
-
-                    // Gradient clipping
-                    ClipGradNorm(_config.MaxGradNorm);
-
-                    // LR schedule
                     float lrMult = AdamW.CosineSchedule(step, warmupSteps, totalSteps);
-                    _optimizer!.Step(_adapter!.Parameters(), lrMult);
 
-                    // Re-upload LoRA weights to GPU after optimizer step
                     if (_forwardPass is GpuTrainingForwardPass gpuFwd)
-                        gpuFwd.SyncLoraWeights();
+                    {
+                        // Entire optimizer step on GPU — no CPU round-trip
+                        gpuFwd.GpuOptimizerStep(_config.LearningRate,
+                            0.9f, 0.999f, 1e-8f, _config.WeightDecay,
+                            _config.MaxGradNorm, lrMult);
+                    }
+                    else
+                    {
+                        ClipGradNorm(_config.MaxGradNorm);
+                        _optimizer!.Step(_adapter!.Parameters(), lrMult);
+                    }
 
                     // Logging
                     if (step % _config.LogEverySteps == 0)
@@ -246,7 +314,7 @@ public sealed class TrainingSession : IDisposable
                         float seqPerSec = epochSteps / elapsed;
                         Console.Error.WriteLine(
                             $"  epoch {epoch + 1}/{_config.Epochs} | step {step}/{totalSteps} | " +
-                            $"loss {avgLoss:F4} | lr {_optimizer.CurrentLr:E2} | " +
+                            $"loss {avgLoss:F4} | lr {_config.LearningRate * lrMult:E2} | " +
                             $"{seqPerSec:F1} seq/s");
                         runningLoss = 0;
                         lossCount = 0;

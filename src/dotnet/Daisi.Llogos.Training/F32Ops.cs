@@ -415,31 +415,40 @@ public static class F32Ops
         float totalLoss = 0;
         var softmaxBuf = new float[V];
 
+        // Count valid (non-masked) tokens for proper averaging
+        int validTokens = 0;
+        for (int t = 0; t < T; t++)
+            if (targets[t] >= 0) validTokens++;
+        if (validTokens == 0) validTokens = T; // fallback: all tokens valid
+
         for (int t = 0; t < T; t++)
         {
             var logitSlice = logits.Slice(t * V, V);
             var dSlice = dLogits.Slice(t * V, V);
+            int target = targets[t];
+
+            // Skip masked tokens (target=-1): zero gradient
+            if (target < 0)
+            {
+                dSlice.Clear();
+                continue;
+            }
 
             // Softmax
             Softmax(softmaxBuf, logitSlice, V);
 
             // NLL loss: -log(softmax[target])
-            int target = targets[t];
             float prob = Math.Max(softmaxBuf[target], 1e-10f);
             totalLoss -= MathF.Log(prob);
 
-            // Gradient: softmax - one_hot
+            // Gradient: softmax - one_hot, averaged over valid tokens only
+            float invT = 1.0f / validTokens;
             for (int v = 0; v < V; v++)
-                dSlice[v] = softmaxBuf[v];
-            dSlice[target] -= 1.0f;
-
-            // Average over T
-            float invT = 1.0f / T;
-            for (int v = 0; v < V; v++)
-                dSlice[v] *= invT;
+                dSlice[v] = softmaxBuf[v] * invT;
+            dSlice[target] -= invT;
         }
 
-        return totalLoss / T;
+        return totalLoss / validTokens;
     }
 
     // ── Element-wise Operations ─────────────────────────────────────────────

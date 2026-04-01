@@ -85,18 +85,25 @@ else
     }
 
     ModelWeights weights;
-    if (options.UseMmap)
+    if (options.LoraPaths.Count > 0)
+    {
+        // LoRA merge: load on CPU, merge adapters, then re-upload merged weights to target backend
+        var cpuBackend = new CpuBackend();
+        weights = ModelLoader.Load(gguf, stream, cpuBackend, config);
+        foreach (var loraPath in options.LoraPaths)
+        {
+            Console.Error.Write($"Loading LoRA adapter: {loraPath}... ");
+            var adapter = LoraInference.LoadAndMerge(loraPath, weights, cpuBackend, config);
+            Console.Error.WriteLine($"done ({adapter.ParameterCount:N0} params, rank={adapter.Config.Rank})");
+        }
+        // Re-upload to target backend if needed (merged weights are F32 CpuTensors)
+        if (backend is not CpuBackend)
+            LoraInference.UploadWeights(weights, backend, config);
+    }
+    else if (options.UseMmap)
         weights = MmapModelLoader.Load(gguf, options.ModelPath, backend, config, remapper);
     else
         weights = ModelLoader.Load(gguf, stream, backend, config);
-
-    // Merge LoRA adapters if provided (multiple --lora flags stack additively)
-    foreach (var loraPath in options.LoraPaths)
-    {
-        Console.Error.Write($"Loading LoRA adapter: {loraPath}... ");
-        var adapter = LoraInference.LoadAndMerge(loraPath, weights, backend, config);
-        Console.Error.WriteLine($"done ({adapter.ParameterCount:N0} params, rank={adapter.Config.Rank})");
-    }
 
     var strategy = AttentionStrategy.Parse(options.Attention);
     int maxContext = strategy.Mode != AttentionMode.Full && strategy.CacheCapacity > 0
@@ -605,6 +612,7 @@ static int RunTraining(string[] args)
         if (targets.Contains('k')) loraTargets |= LoraTarget.K;
         if (targets.Contains('v')) loraTargets |= LoraTarget.V;
         if (targets.Contains('o')) loraTargets |= LoraTarget.O;
+        if (targets.Contains('f')) loraTargets |= LoraTarget.AllFfn;
         if (targets.Contains('d')) loraTargets |= LoraTarget.DeltaQkv | LoraTarget.DeltaOut;
     }
 
