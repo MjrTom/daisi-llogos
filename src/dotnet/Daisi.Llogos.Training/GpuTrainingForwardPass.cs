@@ -692,7 +692,7 @@ public sealed class GpuTrainingForwardPass : ITrainingForwardPass
 
     private ITensor CreateF32Tensor(string name, float[] data)
     {
-        var t = _gpu.CreateTensor(name, GgmlType.F32, [data.Length]);
+        var t = Pool(name, data.Length);
         UploadF32(t, data);
         return t;
     }
