@@ -25,11 +25,9 @@ public sealed class GpuTrainingForwardPass : ITrainingForwardPass
     // Per-layer GPU saved activations for backward
     private GpuLayerActivations[]? _saved;
 
-    // GPU scratch tensors (reused across layers)
-    private ITensor? _hidden;     // [T × H]
-    private ITensor? _residual;   // [T × H]
-    private ITensor? _normOut;    // [T × H]
-    private ITensor? _dHidden;    // [T × H]
+    // GPU tensor pool — pre-allocates on first call, reuses on subsequent calls.
+    // Eliminates thousands of cuMemAlloc/cuMemFree per step.
+    private readonly Dictionary<string, ITensor> _pool = new();
     private int _lastT;
 
     // LoRA tensors on GPU (uploaded from CPU, re-uploaded after optimizer step)
@@ -54,20 +52,20 @@ public sealed class GpuTrainingForwardPass : ITrainingForwardPass
         {
             var gpuA = CreateF32Tensor($"lora.{name}.A", layer.A.Data);
             var gpuB = CreateF32Tensor($"lora.{name}.B", layer.B.Data);
-            var gpuDA = _gpu.CreateTensor($"lora.{name}.dA", GgmlType.F32, [layer.A.Size]);
-            var gpuDB = _gpu.CreateTensor($"lora.{name}.dB", GgmlType.F32, [layer.B.Size]);
+            var gpuDA = Pool($"lora.{name}.dA", layer.A.Size);
+            var gpuDB = Pool($"lora.{name}.dB", layer.B.Size);
             _gpuLora[name] = (gpuA, gpuB);
             _gpuLoraGrad[name] = (gpuDA, gpuDB);
 
             // Intermediate buffer for LoRA forward
-            var inter = _gpu.CreateTensor($"lora.{name}.inter", GgmlType.F32, [1]); // resized later
+            var inter = Pool($"lora.{name}.inter", 1); // resized later
             _gpuLoraIntermediate[name] = inter;
 
             // Optimizer state (m and v for AdamW, initialized to zero)
-            var mA = _gpu.CreateTensor($"opt.{name}.mA", GgmlType.F32, [layer.A.Size]);
-            var vA = _gpu.CreateTensor($"opt.{name}.vA", GgmlType.F32, [layer.A.Size]);
-            var mB = _gpu.CreateTensor($"opt.{name}.mB", GgmlType.F32, [layer.B.Size]);
-            var vB = _gpu.CreateTensor($"opt.{name}.vB", GgmlType.F32, [layer.B.Size]);
+            var mA = Pool($"opt.{name}.mA", layer.A.Size);
+            var vA = Pool($"opt.{name}.vA", layer.A.Size);
+            var mB = Pool($"opt.{name}.mB", layer.B.Size);
+            var vB = Pool($"opt.{name}.vB", layer.B.Size);
             _gpu.ZeroTensor(mA); _gpu.ZeroTensor(vA);
             _gpu.ZeroTensor(mB); _gpu.ZeroTensor(vB);
             _gpuOptState[name] = (mA, vA, mB, vB);
@@ -80,7 +78,6 @@ public sealed class GpuTrainingForwardPass : ITrainingForwardPass
         int H = _config.HiddenDim;
         int V = _config.VocabSize;
 
-        EnsureScratch(T, H);
 
         // Dequantize embedding table (cached on GPU)
         if (_embeddingTable == null)
@@ -99,8 +96,7 @@ public sealed class GpuTrainingForwardPass : ITrainingForwardPass
 
         // 1. Embedding lookup → hidden [T × H] (GPU kernel)
         var gpuTokenIds = CreateIntTensor("token_ids", tokenIds);
-        _gpu.BatchedEmbeddingLookup(_hidden!, _embeddingTable, gpuTokenIds, T, H);
-        gpuTokenIds.Dispose();
+        _gpu.BatchedEmbeddingLookup(Pool("hidden", T * H), _embeddingTable, gpuTokenIds, T, H);
 
         // 2. Transformer layers
         for (int layer = 0; layer < _config.NumLayers; layer++)
@@ -109,13 +105,13 @@ public sealed class GpuTrainingForwardPass : ITrainingForwardPass
 
             // Pre-attention norm
             var normWeight = DequantToGpu($"l{layer}.attn_norm", lw.AttnNorm);
-            _gpu.CopyTensor(_residual!, _hidden!);
-            _gpu.RmsNorm(_normOut!, _hidden!, normWeight, _config.NormEps);
+            _gpu.CopyTensor(Pool("residual", T * H), Pool("hidden", T * H));
+            _gpu.RmsNorm(Pool("normout", T * H), Pool("hidden", T * H), normWeight, _config.NormEps);
 
             var saved = new GpuLayerActivations
             {
-                InputToLayer = CloneGpuTensor($"l{layer}.input", _residual!),
-                NormOut = CloneGpuTensor($"l{layer}.normout", _normOut!),
+                InputToLayer = CloneGpuTensor($"l{layer}.input", Pool("residual", T * H)),
+                NormOut = CloneGpuTensor($"l{layer}.normout", Pool("normout", T * H)),
                 AttnNormWeight = normWeight,
             };
 
@@ -125,28 +121,28 @@ public sealed class GpuTrainingForwardPass : ITrainingForwardPass
                 ForwardDeltaNetLayer(dnw, saved, layer, T);
 
             // Add residual
-            _gpu.ElementAdd(_hidden!, _hidden!, _residual!);
+            _gpu.ElementAdd(Pool("hidden", T * H), Pool("hidden", T * H), Pool("residual", T * H));
 
             // Post-attention norm + FFN
             var postNormWeight = DequantToGpu($"l{layer}.post_norm", lw.PostAttnNorm);
             saved.PostAttnNormWeight = postNormWeight;
-            saved.PostAttnHidden = CloneGpuTensor($"l{layer}.post_hidden", _hidden!);
+            saved.PostAttnHidden = CloneGpuTensor($"l{layer}.post_hidden", Pool("hidden", T * H));
 
-            var ffnNormOut = _gpu.CreateTensor($"l{layer}.ffn_norm", GgmlType.F32, [T * H]);
-            _gpu.RmsNorm(ffnNormOut, _hidden!, postNormWeight, _config.NormEps);
+            var ffnNormOut = Pool($"l{layer}.ffn_norm", T * H);
+            _gpu.RmsNorm(ffnNormOut, Pool("hidden", T * H), postNormWeight, _config.NormEps);
             saved.FfnNormOut = ffnNormOut;
-            saved.FfnResidual = CloneGpuTensor($"l{layer}.ffn_res", _hidden!);
+            saved.FfnResidual = CloneGpuTensor($"l{layer}.ffn_res", Pool("hidden", T * H));
 
             int I = _config.IntermediateDim;
-            var gateOut = _gpu.CreateTensor($"l{layer}.gate", GgmlType.F32, [T * I]);
-            var upOut = _gpu.CreateTensor($"l{layer}.up", GgmlType.F32, [T * I]);
-            var ffnGated = _gpu.CreateTensor($"l{layer}.ffn_gated", GgmlType.F32, [T * I]);
+            var gateOut = Pool($"l{layer}.gate", T * I);
+            var upOut = Pool($"l{layer}.up", T * I);
+            var ffnGated = Pool($"l{layer}.ffn_gated", T * I);
 
             _gpu.MatMul(gateOut, ffnNormOut, GpuWeight(lw.FfnGate), T, H, I);
             _gpu.MatMul(upOut, ffnNormOut, GpuWeight(lw.FfnUp), T, H, I);
             _gpu.SwiGLU(ffnGated, gateOut, upOut);
 
-            var ffnOut = _gpu.CreateTensor($"l{layer}.ffn_out", GgmlType.F32, [T * H]);
+            var ffnOut = Pool($"l{layer}.ffn_out", T * H);
             _gpu.MatMul(ffnOut, ffnGated, GpuWeight(lw.FfnDown), T, I, H);
 
             saved.GateInput = gateOut;
@@ -154,30 +150,25 @@ public sealed class GpuTrainingForwardPass : ITrainingForwardPass
             saved.FfnGated = ffnGated;
 
             // hidden = ffnOut + residual
-            _gpu.ElementAdd(_hidden!, ffnOut, saved.FfnResidual!);
-            ffnOut.Dispose();
+            _gpu.ElementAdd(Pool("hidden", T * H), ffnOut, saved.FfnResidual!);
 
             _saved[layer] = saved;
         }
 
         // 3. Final norm + logit projection
-        var finalNormOut = _gpu.CreateTensor("final_norm", GgmlType.F32, [T * H]);
-        _gpu.RmsNorm(finalNormOut, _hidden!, _outputNormWeight!, _config.NormEps);
+        var finalNormOut = Pool("final_norm", T * H);
+        _gpu.RmsNorm(finalNormOut, Pool("hidden", T * H), _outputNormWeight!, _config.NormEps);
 
-        var logits = _gpu.CreateTensor("logits", GgmlType.F32, [T * V]);
+        var logits = Pool("logits", T * V);
         _gpu.MatMul(logits, finalNormOut, GpuWeight(_weights.OutputWeight), T, H, V);
 
         // 4. Cross-entropy loss + gradient (on GPU, only downloads scalar loss)
-        var dLogits = _gpu.CreateTensor("dlogits", GgmlType.F32, [T * V]);
+        var dLogits = Pool("dlogits", T * V);
         var gpuTargets = CreateIntTensor("targets", targets);
         totalLoss = _gpu.CrossEntropyLoss(dLogits, logits, gpuTargets, T, V);
-        gpuTargets.Dispose();
-        logits.Dispose();
 
         // 5. Backward pass
         Backward(dLogits, finalNormOut, T);
-        dLogits.Dispose();
-        finalNormOut.Dispose();
 
         // Note: LoRA gradients stay on GPU — GpuOptimizerStep uses them directly
 
@@ -200,9 +191,9 @@ public sealed class GpuTrainingForwardPass : ITrainingForwardPass
         int kOutDim = numKvHeads * keyDim;
         int vOutDim = numKvHeads * valDim;
 
-        var qRaw = _gpu.CreateTensor($"l{layer}.q", GgmlType.F32, [T * qOutDim]);
-        var kRaw = _gpu.CreateTensor($"l{layer}.k", GgmlType.F32, [T * kOutDim]);
-        var vRaw = _gpu.CreateTensor($"l{layer}.v", GgmlType.F32, [T * vOutDim]);
+        var qRaw = Pool($"l{layer}.q", T * qOutDim);
+        var kRaw = Pool($"l{layer}.k", T * kOutDim);
+        var vRaw = Pool($"l{layer}.v", T * vOutDim);
 
         _gpu.MatMul(qRaw, saved.NormOut!, GpuWeight(saw.AttnQ), T, H, qOutDim);
         _gpu.MatMul(kRaw, saved.NormOut!, GpuWeight(saw.AttnK), T, H, kOutDim);
@@ -219,8 +210,8 @@ public sealed class GpuTrainingForwardPass : ITrainingForwardPass
         ITensor qAttn, qGate;
         if (hasGatedQ)
         {
-            qAttn = _gpu.CreateTensor($"l{layer}.qattn", GgmlType.F32, [T * qAttnDim]);
-            qGate = _gpu.CreateTensor($"l{layer}.qgate", GgmlType.F32, [T * qAttnDim]);
+            qAttn = Pool($"l{layer}.qattn", T * qAttnDim);
+            qGate = Pool($"l{layer}.qgate", T * qAttnDim);
             // DeInterleaveQ exists on GPU backend — call per token row
             for (int t = 0; t < T; t++)
             {
@@ -243,7 +234,7 @@ public sealed class GpuTrainingForwardPass : ITrainingForwardPass
         else
         {
             qAttn = qRaw; // same tensor, no gate
-            qGate = _gpu.CreateTensor($"l{layer}.qgate", GgmlType.F32, [T * qAttnDim]);
+            qGate = Pool($"l{layer}.qgate", T * qAttnDim);
             _gpu.FillTensor(qGate, 88.0f); // sigmoid(88) ≈ 1
         }
 
@@ -252,20 +243,19 @@ public sealed class GpuTrainingForwardPass : ITrainingForwardPass
 
         // Causal gated attention — GPU kernel (saves probs for backward)
         int attnOutDim = numHeads * valDim;
-        var attnOut = _gpu.CreateTensor($"l{layer}.attn_out", GgmlType.F32, [T * attnOutDim]);
-        var savedProbs = _gpu.CreateTensor($"l{layer}.probs", GgmlType.F32, [numHeads * T * T]);
+        var attnOut = Pool($"l{layer}.attn_out", T * attnOutDim);
+        var savedProbs = Pool($"l{layer}.probs", numHeads * T * T);
         _gpu.TrainingCausalGatedAttention(attnOut, savedProbs, qAttn, qGate, kRaw, vRaw,
             T, numHeads, numKvHeads, keyDim, valDim, scale);
 
         // O projection
         int oDim = (int)saw.AttnO.Dimensions[0];
-        var oOut = _gpu.CreateTensor($"l{layer}.oout", GgmlType.F32, [T * H]);
+        var oOut = Pool($"l{layer}.oout", T * H);
         _gpu.MatMul(oOut, attnOut, GpuWeight(saw.AttnO), T, oDim, H);
         ApplyLoraForward($"{prefix}.attn_o", attnOut, oOut, T);
 
         // Write to hidden
-        _gpu.CopyTensor(_hidden!, oOut);
-        oOut.Dispose();
+        _gpu.CopyTensor(Pool("hidden", T * H), oOut);
 
         saved.IsAttention = true;
         saved.HasGatedQ = hasGatedQ;
@@ -282,7 +272,7 @@ public sealed class GpuTrainingForwardPass : ITrainingForwardPass
         string prefix = $"blk.{layer}";
 
         int qkvDim = (int)dnw.AttnQkv.Dimensions[1];
-        var qkvOut = _gpu.CreateTensor($"l{layer}.qkv", GgmlType.F32, [T * qkvDim]);
+        var qkvOut = Pool($"l{layer}.qkv", T * qkvDim);
         _gpu.MatMul(qkvOut, saved.NormOut!, GpuWeight(dnw.AttnQkv), T, H, qkvDim);
         ApplyLoraForward($"{prefix}.delta_qkv", saved.NormOut!, qkvOut, T);
 
@@ -292,7 +282,7 @@ public sealed class GpuTrainingForwardPass : ITrainingForwardPass
         saved.DeltaQkvPostSilu = CloneGpuTensor($"l{layer}.qkv_post", qkvOut);
 
         int gateDim = (int)dnw.AttnGate.Dimensions[1];
-        var gateOut = _gpu.CreateTensor($"l{layer}.gate", GgmlType.F32, [T * gateDim]);
+        var gateOut = Pool($"l{layer}.gate", T * gateDim);
         _gpu.MatMul(gateOut, saved.NormOut!, GpuWeight(dnw.AttnGate), T, H, gateDim);
         saved.DeltaGatePreSilu = CloneGpuTensor($"l{layer}.gate_pre", gateOut);
         _gpu.SiLU(gateOut, gateOut);
@@ -300,18 +290,15 @@ public sealed class GpuTrainingForwardPass : ITrainingForwardPass
 
         // SSM approximation: ssmApprox = qkvPostSilu * gatePostSilu (truncated to outInDim)
         int outInDim = (int)dnw.SsmOut.Dimensions[0];
-        var ssmApprox = _gpu.CreateTensor($"l{layer}.ssm", GgmlType.F32, [T * outInDim]);
+        var ssmApprox = Pool($"l{layer}.ssm", T * outInDim);
         _gpu.TruncatedElementMul(ssmApprox, qkvOut, gateOut, T, outInDim, qkvDim, gateDim);
         saved.DeltaSsmApprox = ssmApprox;
 
-        var layerOut = _gpu.CreateTensor($"l{layer}.delta_out", GgmlType.F32, [T * H]);
+        var layerOut = Pool($"l{layer}.delta_out", T * H);
         _gpu.MatMul(layerOut, ssmApprox, GpuWeight(dnw.SsmOut), T, outInDim, H);
         ApplyLoraForward($"{prefix}.delta_out", ssmApprox, layerOut, T);
 
-        _gpu.CopyTensor(_hidden!, layerOut);
-        layerOut.Dispose();
-        qkvOut.Dispose();
-        gateOut.Dispose();
+        _gpu.CopyTensor(Pool("hidden", T * H), layerOut);
 
         saved.IsDeltaNet = true;
     }
@@ -322,17 +309,15 @@ public sealed class GpuTrainingForwardPass : ITrainingForwardPass
         int V = _config.VocabSize;
 
         // dFinalNormOut = dLogits × outputWeight
-        var dFinalNormOut = _gpu.CreateTensor("d_fnorm", GgmlType.F32, [T * H]);
+        var dFinalNormOut = Pool("d_fnorm", T * H);
         // Need F32 output weight for backward matmul
         var outWeightF32 = DequantToGpu("out_weight_f32", _weights.OutputWeight);
         _gpu.SgemmF32(dFinalNormOut, dLogits, outWeightF32, T, V, H);
 
         // Backward through final RMS norm
-        EnsureDHidden(T, H);
-        _gpu.ZeroTensor(_dHidden!);
-        _gpu.BatchedRmsNormBackward(_dHidden!, dFinalNormOut, _hidden!, _outputNormWeight!,
+        _gpu.ZeroTensor(Pool("dhidden", T * H));
+        _gpu.BatchedRmsNormBackward(Pool("dhidden", T * H), dFinalNormOut, Pool("hidden", T * H), _outputNormWeight!,
             _config.NormEps, H, T);
-        dFinalNormOut.Dispose();
 
         // Backward through layers in reverse
         for (int layer = _config.NumLayers - 1; layer >= 0; layer--)
@@ -342,44 +327,40 @@ public sealed class GpuTrainingForwardPass : ITrainingForwardPass
             int I = _config.IntermediateDim;
 
             // FFN backward
-            var dFfnOut = CloneGpuTensor($"d_l{layer}.ffn_out", _dHidden!);
+            var dFfnOut = CloneGpuTensor($"d_l{layer}.ffn_out", Pool("dhidden", T * H));
 
             // Down projection backward
             var downF32 = DequantToGpu($"d_l{layer}.down", lw.FfnDown);
-            var dFfnGated = _gpu.CreateTensor($"d_l{layer}.ffn_gated", GgmlType.F32, [T * I]);
+            var dFfnGated = Pool($"d_l{layer}.ffn_gated", T * I);
             _gpu.SgemmF32(dFfnGated, dFfnOut, downF32, T, H, I);
 
             // SwiGLU backward
-            var dGate = _gpu.CreateTensor($"d_l{layer}.gate", GgmlType.F32, [T * I]);
-            var dUp = _gpu.CreateTensor($"d_l{layer}.up", GgmlType.F32, [T * I]);
+            var dGate = Pool($"d_l{layer}.gate", T * I);
+            var dUp = Pool($"d_l{layer}.up", T * I);
             _gpu.ZeroTensor(dGate);
             _gpu.ZeroTensor(dUp);
             _gpu.SwiGLUBackward(dGate, dUp, dFfnGated, saved.GateInput!, saved.UpInput!);
-            dFfnGated.Dispose();
 
             // Gate/up projection backward
-            var dFfnNormOut = _gpu.CreateTensor($"d_l{layer}.ffn_norm", GgmlType.F32, [T * H]);
+            var dFfnNormOut = Pool($"d_l{layer}.ffn_norm", T * H);
             _gpu.ZeroTensor(dFfnNormOut);
             var gateF32 = DequantToGpu($"d_l{layer}.gate_w", lw.FfnGate);
             var upF32 = DequantToGpu($"d_l{layer}.up_w", lw.FfnUp);
-            var dFromGate = _gpu.CreateTensor($"d_l{layer}.from_gate", GgmlType.F32, [T * H]);
-            var dFromUp = _gpu.CreateTensor($"d_l{layer}.from_up", GgmlType.F32, [T * H]);
+            var dFromGate = Pool($"d_l{layer}.from_gate", T * H);
+            var dFromUp = Pool($"d_l{layer}.from_up", T * H);
             _gpu.SgemmF32(dFromGate, dGate, gateF32, T, I, H);
             _gpu.AddInPlace(dFfnNormOut, dFromGate);
             _gpu.SgemmF32(dFromUp, dUp, upF32, T, I, H);
             _gpu.AddInPlace(dFfnNormOut, dFromUp);
-            dGate.Dispose(); dUp.Dispose(); dFromGate.Dispose(); dFromUp.Dispose();
 
             // Post-attention RmsNorm backward
-            var dPostAttnHidden = _gpu.CreateTensor($"d_l{layer}.post_attn", GgmlType.F32, [T * H]);
+            var dPostAttnHidden = Pool($"d_l{layer}.post_attn", T * H);
             _gpu.ZeroTensor(dPostAttnHidden);
             _gpu.BatchedRmsNormBackward(dPostAttnHidden, dFfnNormOut,
                 saved.PostAttnHidden!, saved.PostAttnNormWeight!, _config.NormEps, H, T);
-            dFfnNormOut.Dispose();
 
             // Add residual gradient
             _gpu.AddInPlace(dPostAttnHidden, dFfnOut);
-            dFfnOut.Dispose();
 
             var dAttnOut = CloneGpuTensor($"d_l{layer}.attn", dPostAttnHidden);
 
@@ -388,10 +369,9 @@ public sealed class GpuTrainingForwardPass : ITrainingForwardPass
                 BackwardAttentionLayer(saved, dAttnOut, layer, T);
             else if (saved.IsDeltaNet)
                 BackwardDeltaNetLayer(saved, dAttnOut, layer, T);
-            dAttnOut.Dispose();
 
             // Pre-attention RmsNorm backward
-            var dInputToLayer = _gpu.CreateTensor($"d_l{layer}.input", GgmlType.F32, [T * H]);
+            var dInputToLayer = Pool($"d_l{layer}.input", T * H);
             _gpu.ZeroTensor(dInputToLayer);
             if (saved.DNormOut != null)
             {
@@ -400,9 +380,7 @@ public sealed class GpuTrainingForwardPass : ITrainingForwardPass
             }
 
             // Combine: dHidden = dResidual + dInputToLayer
-            _gpu.ElementAdd(_dHidden!, dPostAttnHidden, dInputToLayer);
-            dPostAttnHidden.Dispose();
-            dInputToLayer.Dispose();
+            _gpu.ElementAdd(Pool("dhidden", T * H), dPostAttnHidden, dInputToLayer);
 
             // Release saved activations
             saved.Dispose();
@@ -432,21 +410,20 @@ public sealed class GpuTrainingForwardPass : ITrainingForwardPass
 
         // O projection backward: dAttnOut = dOOut × wO
         var oF32 = DequantToGpu($"d_l{layer}.oW", saw.AttnO);
-        var dAttnOutFromO = _gpu.CreateTensor($"d_l{layer}.attn_out", GgmlType.F32, [T * oDim]);
+        var dAttnOutFromO = Pool($"d_l{layer}.attn_out", T * oDim);
         _gpu.SgemmF32(dAttnOutFromO, dOOut, oF32, T, H, oDim);
 
         // Attention backward — GPU kernel
-        var dQAttn = _gpu.CreateTensor($"d_l{layer}.dqattn", GgmlType.F32, [T * qAttnDim]);
-        var dQGate = _gpu.CreateTensor($"d_l{layer}.dqgate", GgmlType.F32, [T * qAttnDim]);
-        var dK = _gpu.CreateTensor($"d_l{layer}.dk", GgmlType.F32, [T * kOutDim]);
-        var dV = _gpu.CreateTensor($"d_l{layer}.dv", GgmlType.F32, [T * vOutDim]);
+        var dQAttn = Pool($"d_l{layer}.dqattn", T * qAttnDim);
+        var dQGate = Pool($"d_l{layer}.dqgate", T * qAttnDim);
+        var dK = Pool($"d_l{layer}.dk", T * kOutDim);
+        var dV = Pool($"d_l{layer}.dv", T * vOutDim);
         _gpu.ZeroTensor(dQAttn); _gpu.ZeroTensor(dQGate);
         _gpu.ZeroTensor(dK); _gpu.ZeroTensor(dV);
         _gpu.CausalGatedAttentionBackward(dQAttn, dQGate, dK, dV,
             dAttnOutFromO, saved.QAttn!, saved.QGate!,
             saved.KRaw!, saved.VRaw!, saved.SavedProbs!, saved.AttnOut!,
             T, numHeads, numKvHeads, keyDim, valDim, scale);
-        dAttnOutFromO.Dispose();
 
         // RoPE backward — GPU kernel
         _gpu.BatchedRoPEBackward(dQAttn, T, numHeads, keyDim, ropeDim, 0, _config.RopeTheta);
@@ -470,18 +447,17 @@ public sealed class GpuTrainingForwardPass : ITrainingForwardPass
         {
             dQRaw = dQAttn; // same tensor, no gate
         }
-        dQGate.Dispose();
 
-        var dNormOut = _gpu.CreateTensor($"d_l{layer}.dnorm", GgmlType.F32, [T * H]);
+        var dNormOut = Pool($"d_l{layer}.dnorm", T * H);
         _gpu.ZeroTensor(dNormOut);
 
         var qF32 = DequantToGpu($"d_l{layer}.qW", saw.AttnQ);
         var kF32 = DequantToGpu($"d_l{layer}.kW", saw.AttnK);
         var vF32 = DequantToGpu($"d_l{layer}.vW", saw.AttnV);
 
-        var dFromQ = _gpu.CreateTensor($"d_l{layer}.fq", GgmlType.F32, [T * H]);
-        var dFromK = _gpu.CreateTensor($"d_l{layer}.fk", GgmlType.F32, [T * H]);
-        var dFromV = _gpu.CreateTensor($"d_l{layer}.fv", GgmlType.F32, [T * H]);
+        var dFromQ = Pool($"d_l{layer}.fq", T * H);
+        var dFromK = Pool($"d_l{layer}.fk", T * H);
+        var dFromV = Pool($"d_l{layer}.fv", T * H);
         _gpu.SgemmF32(dFromQ, dQRaw, qF32, T, qRawDim, H);
         _gpu.AddInPlace(dNormOut, dFromQ);
         _gpu.SgemmF32(dFromK, dK, kF32, T, kOutDim, H);
@@ -494,8 +470,6 @@ public sealed class GpuTrainingForwardPass : ITrainingForwardPass
         ApplyLoraBackward($"{prefix}.attn_k", saved.NormOut!, dK, T);
         ApplyLoraBackward($"{prefix}.attn_v", saved.NormOut!, dV, T);
 
-        dQRaw.Dispose(); dK.Dispose(); dV.Dispose();
-        dFromQ.Dispose(); dFromK.Dispose(); dFromV.Dispose();
 
         saved.DNormOut = dNormOut;
     }
@@ -514,46 +488,42 @@ public sealed class GpuTrainingForwardPass : ITrainingForwardPass
 
         // SsmOut backward
         var outF32 = DequantToGpu($"d_l{layer}.ssmW", dnw.SsmOut);
-        var dSsmApprox = _gpu.CreateTensor($"d_l{layer}.dssm", GgmlType.F32, [T * outInDim]);
+        var dSsmApprox = Pool($"d_l{layer}.dssm", T * outInDim);
         _gpu.SgemmF32(dSsmApprox, dLayerOut, outF32, T, H, outInDim);
 
         // Element-wise product backward (GPU kernel handles dimension mismatch)
-        var dQkvPost = _gpu.CreateTensor($"d_l{layer}.dqkv_post", GgmlType.F32, [T * qkvDim]);
-        var dGatePost = _gpu.CreateTensor($"d_l{layer}.dgate_post", GgmlType.F32, [T * gateDim]);
+        var dQkvPost = Pool($"d_l{layer}.dqkv_post", T * qkvDim);
+        var dGatePost = Pool($"d_l{layer}.dgate_post", T * gateDim);
         _gpu.ZeroTensor(dQkvPost);
         _gpu.ZeroTensor(dGatePost);
         _gpu.TruncatedElementMulBackward(dQkvPost, dGatePost, dSsmApprox,
             saved.DeltaQkvPostSilu!, saved.DeltaGatePostSilu!, T, outInDim, qkvDim, gateDim);
-        dSsmApprox.Dispose();
 
         // SiLU backward (GPU)
-        var dQkvPre = _gpu.CreateTensor($"d_l{layer}.dqkv", GgmlType.F32, [T * qkvDim]);
+        var dQkvPre = Pool($"d_l{layer}.dqkv", T * qkvDim);
         _gpu.ZeroTensor(dQkvPre);
         _gpu.SiLUBackward(dQkvPre, dQkvPost, saved.DeltaQkvPreSilu!);
-        dQkvPost.Dispose();
 
-        var dGatePre = _gpu.CreateTensor($"d_l{layer}.dgate", GgmlType.F32, [T * gateDim]);
+        var dGatePre = Pool($"d_l{layer}.dgate", T * gateDim);
         _gpu.ZeroTensor(dGatePre);
         _gpu.SiLUBackward(dGatePre, dGatePost, saved.DeltaGatePreSilu!);
-        dGatePost.Dispose();
 
         // LoRA backward for AttnQkv
         ApplyLoraBackward($"{prefix}.delta_qkv", saved.NormOut!, dQkvPre, T);
 
         // Projection backward → dNormOut
-        var dNormOut = _gpu.CreateTensor($"d_l{layer}.dnorm", GgmlType.F32, [T * H]);
+        var dNormOut = Pool($"d_l{layer}.dnorm", T * H);
         _gpu.ZeroTensor(dNormOut);
 
         var qkvF32 = DequantToGpu($"d_l{layer}.qkvW", dnw.AttnQkv);
         var gateF32 = DequantToGpu($"d_l{layer}.gateW", dnw.AttnGate);
-        var dFromQkv = _gpu.CreateTensor($"d_l{layer}.fqkv", GgmlType.F32, [T * H]);
-        var dFromGate = _gpu.CreateTensor($"d_l{layer}.fgate", GgmlType.F32, [T * H]);
+        var dFromQkv = Pool($"d_l{layer}.fqkv", T * H);
+        var dFromGate = Pool($"d_l{layer}.fgate", T * H);
         _gpu.SgemmF32(dFromQkv, dQkvPre, qkvF32, T, qkvDim, H);
         _gpu.AddInPlace(dNormOut, dFromQkv);
         _gpu.SgemmF32(dFromGate, dGatePre, gateF32, T, gateDim, H);
         _gpu.AddInPlace(dNormOut, dFromGate);
 
-        dQkvPre.Dispose(); dGatePre.Dispose(); dFromQkv.Dispose(); dFromGate.Dispose();
         saved.DNormOut = dNormOut;
     }
 
@@ -574,12 +544,11 @@ public sealed class GpuTrainingForwardPass : ITrainingForwardPass
         // intermediate = input × A^T → [T × rank]
         _gpu.SgemmTransB(inter, input, lora.a, T, inDim, rank);
         // loraOut = intermediate × B^T → [T × outDim]
-        var loraOut = _gpu.CreateTensor($"lora.{name}.out", GgmlType.F32, [T * outDim]);
+        var loraOut = Pool($"lora.{name}.out", T * outDim);
         _gpu.SgemmTransB(loraOut, inter, lora.b, T, rank, outDim);
         // output += scaling * loraOut
         _gpu.ScaleInPlace(loraOut, layer.Scaling);
         _gpu.AddInPlace(output, loraOut);
-        loraOut.Dispose();
     }
 
     private void ApplyLoraBackward(string name, ITensor input, ITensor dOutput, int T)
@@ -600,14 +569,12 @@ public sealed class GpuTrainingForwardPass : ITrainingForwardPass
         _gpu.SgemmTransAAccumulate(grad.dB, scaledDOut, inter, outDim, T, rank);
 
         // dIntermediate = scaledDOut × B → [T × rank]
-        var dInter = _gpu.CreateTensor($"lora.{name}.dinter", GgmlType.F32, [T * rank]);
+        var dInter = Pool($"lora.{name}.dinter", T * rank);
         _gpu.SgemmF32(dInter, scaledDOut, lora.b, T, outDim, rank);
-        scaledDOut.Dispose();
 
         // dA += dIntermediate^T × input → [rank × inDim]
         _gpu.SgemmTransAAccumulate(grad.dA, dInter, input, rank, T, inDim);
 
-        dInter.Dispose();
     }
 
     private void DownloadLoraGradients()
@@ -695,25 +662,32 @@ public sealed class GpuTrainingForwardPass : ITrainingForwardPass
         }
     }
 
-    // ── GPU tensor helpers ──────────────────────────────────────────────────
+    // ── GPU tensor pool ──────────────────────────────────────────────────
 
-    private void EnsureScratch(int T, int H)
+    /// <summary>
+    /// Get or create a named GPU tensor. Pre-allocates on first call,
+    /// returns the same tensor on subsequent calls. Eliminates per-step
+    /// cuMemAlloc/cuMemFree overhead.
+    /// </summary>
+    private ITensor Pool(string name, int size)
     {
-        if (_lastT == T) return;
-        _hidden?.Dispose();
-        _residual?.Dispose();
-        _normOut?.Dispose();
-        _hidden = _gpu.CreateTensor("hidden", GgmlType.F32, [T * H]);
-        _residual = _gpu.CreateTensor("residual", GgmlType.F32, [T * H]);
-        _normOut = _gpu.CreateTensor("normout", GgmlType.F32, [T * H]);
-        _lastT = T;
+        if (_pool.TryGetValue(name, out var existing))
+        {
+            if (existing.ElementCount == size)
+                return existing;
+            existing.Dispose();
+        }
+        var t = _gpu.CreateTensor(name, GgmlType.F32, [size]);
+        _pool[name] = t;
+        return t;
     }
 
-    private void EnsureDHidden(int T, int H)
+    /// <summary>Get a pooled tensor and zero it.</summary>
+    private ITensor PoolZ(string name, int size)
     {
-        if (_dHidden != null && _dHidden.ElementCount == T * H) return;
-        _dHidden?.Dispose();
-        _dHidden = _gpu.CreateTensor("dhidden", GgmlType.F32, [T * H]);
+        var t = Pool(name, size);
+        _gpu.ZeroTensor(t);
+        return t;
     }
 
     private ITensor CreateF32Tensor(string name, float[] data)
@@ -725,8 +699,7 @@ public sealed class GpuTrainingForwardPass : ITrainingForwardPass
 
     private ITensor CreateIntTensor(string name, int[] data)
     {
-        // Store as raw bytes (4 bytes per int)
-        var t = _gpu.CreateTensor(name, GgmlType.F32, [data.Length]); // abuse F32 for int storage
+        var t = Pool(name, data.Length);
         var bytes = new byte[data.Length * sizeof(int)];
         Buffer.BlockCopy(data, 0, bytes, 0, bytes.Length);
         t.CopyFrom(bytes);
@@ -754,7 +727,7 @@ public sealed class GpuTrainingForwardPass : ITrainingForwardPass
 
     private ITensor CloneGpuTensor(string name, ITensor src)
     {
-        var dst = _gpu.CreateTensor(name, GgmlType.F32, [(int)src.ElementCount]);
+        var dst = Pool(name, (int)src.ElementCount);
         _gpu.CopyTensor(dst, src);
         return dst;
     }
@@ -791,17 +764,15 @@ public sealed class GpuTrainingForwardPass : ITrainingForwardPass
         if (_gpuLoraIntermediate.TryGetValue(name, out var existing) && existing.ElementCount >= size)
             return existing;
         existing?.Dispose();
-        var t = _gpu.CreateTensor($"lora.{name}.inter", GgmlType.F32, [size]);
+        var t = Pool($"lora.{name}.inter", size);
         _gpuLoraIntermediate[name] = t;
         return t;
     }
 
     public void Dispose()
     {
-        _hidden?.Dispose();
-        _residual?.Dispose();
-        _normOut?.Dispose();
-        _dHidden?.Dispose();
+        foreach (var t in _pool.Values) t.Dispose();
+        _pool.Clear();
         _embeddingTable?.Dispose();
         _outputNormWeight?.Dispose();
         foreach (var (a, b) in _gpuLora.Values) { a.Dispose(); b.Dispose(); }
@@ -848,16 +819,6 @@ internal sealed class GpuLayerActivations : IDisposable
 
     public void Dispose()
     {
-        InputToLayer?.Dispose(); NormOut?.Dispose();
-        PostAttnHidden?.Dispose(); FfnNormOut?.Dispose(); FfnResidual?.Dispose();
-        QRaw?.Dispose(); KRaw?.Dispose(); VRaw?.Dispose();
-        QAttn?.Dispose(); QGate?.Dispose();
-        AttnOut?.Dispose(); SavedProbs?.Dispose();
-        GateInput?.Dispose(); UpInput?.Dispose(); FfnGated?.Dispose();
-        DeltaQkvPreSilu?.Dispose(); DeltaQkvPostSilu?.Dispose();
-        DeltaGatePreSilu?.Dispose(); DeltaGatePostSilu?.Dispose();
-        DeltaSsmApprox?.Dispose();
-        DNormOut?.Dispose();
-        // Don't dispose AttnNormWeight/PostAttnNormWeight — owned by dequant cache
+        // Tensors are owned by the pool — nothing to dispose here.
     }
 }
