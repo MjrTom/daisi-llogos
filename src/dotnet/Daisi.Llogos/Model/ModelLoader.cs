@@ -27,17 +27,11 @@ public static class ModelLoader
                 layers[i] = LoadDeltaNetLayer(gguf, stream, backend, tensorMap, i);
         }
 
-        // Fuse Q+K+V and gate+up weights from raw GGUF data (before GPU repacking)
-        for (int i = 0; i < config.NumLayers; i++)
-        {
-            if (layers[i] is StandardAttentionWeights saw)
-            {
-                saw.FusedQKV = TryFuseFromGguf(gguf, stream, backend, tensorMap, i,
-                    "attn_q", "attn_k", "attn_v");
-                saw.FusedGateUp = TryFuseFromGguf(gguf, stream, backend, tensorMap, i,
-                    "ffn_gate", "ffn_up");
-            }
-        }
+        // NOTE: Tensor fusion (FusedQKV, FusedGateUp) is disabled in stream loading.
+        // The byte-level concatenation has a layout bug with GQA architectures (e.g. TinyLlama)
+        // that produces garbage output on CPU. MmapModelLoader (the default path) doesn't fuse
+        // and works correctly. CUDA/Vulkan backends handle individual tensors fine.
+        // TODO: Fix the fused byte layout for GQA and re-enable.
 
         return new ModelWeights
         {

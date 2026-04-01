@@ -5,9 +5,9 @@ namespace Daisi.Llogos.Model;
 /// </summary>
 public sealed class ModelWeights : IDisposable
 {
-    public required ITensor TokenEmbedding { get; init; }
-    public required ITensor OutputNorm { get; init; }
-    public required ITensor? Output { get; init; }
+    public required ITensor TokenEmbedding { get; set; }
+    public required ITensor OutputNorm { get; set; }
+    public required ITensor? Output { get; set; }
     public required LayerWeights[] Layers { get; init; }
 
     /// <summary>
@@ -30,11 +30,11 @@ public sealed class ModelWeights : IDisposable
 /// </summary>
 public abstract class LayerWeights : IDisposable
 {
-    public required ITensor AttnNorm { get; init; }
-    public required ITensor PostAttnNorm { get; init; }
-    public required ITensor FfnGate { get; init; }
-    public required ITensor FfnUp { get; init; }
-    public required ITensor FfnDown { get; init; }
+    public required ITensor AttnNorm { get; set; }
+    public required ITensor PostAttnNorm { get; set; }
+    public required ITensor FfnGate { get; set; }
+    public required ITensor FfnUp { get; set; }
+    public required ITensor FfnDown { get; set; }
 
     public virtual void Dispose()
     {
@@ -52,12 +52,12 @@ public abstract class LayerWeights : IDisposable
 /// </summary>
 public sealed class StandardAttentionWeights : LayerWeights
 {
-    public required ITensor AttnQ { get; init; }
-    public required ITensor AttnK { get; init; }
-    public required ITensor AttnV { get; init; }
-    public required ITensor AttnO { get; init; }
-    public ITensor? AttnQNorm { get; init; }
-    public ITensor? AttnKNorm { get; init; }
+    public required ITensor AttnQ { get; set; }
+    public required ITensor AttnK { get; set; }
+    public required ITensor AttnV { get; set; }
+    public required ITensor AttnO { get; set; }
+    public ITensor? AttnQNorm { get; set; }
+    public ITensor? AttnKNorm { get; set; }
 
     /// <summary>Fused Q+K+V weight tensor (concatenated rows). Null if types differ.</summary>
     public ITensor? FusedQKV { get; set; }
@@ -103,15 +103,15 @@ public sealed class StandardAttentionWeights : LayerWeights
 /// </summary>
 public sealed class DeltaNetWeights : LayerWeights
 {
-    public required ITensor AttnQkv { get; init; }
-    public required ITensor AttnGate { get; init; }
-    public required ITensor SsmA { get; init; }
-    public required ITensor SsmAlpha { get; init; }
-    public required ITensor SsmBeta { get; init; }
-    public required ITensor SsmConv1d { get; init; }
-    public required ITensor SsmDtBias { get; init; }
-    public required ITensor SsmNorm { get; init; }
-    public required ITensor SsmOut { get; init; }
+    public required ITensor AttnQkv { get; set; }
+    public required ITensor AttnGate { get; set; }
+    public required ITensor SsmA { get; set; }
+    public required ITensor SsmAlpha { get; set; }
+    public required ITensor SsmBeta { get; set; }
+    public required ITensor SsmConv1d { get; set; }
+    public required ITensor SsmDtBias { get; set; }
+    public required ITensor SsmNorm { get; set; }
+    public required ITensor SsmOut { get; set; }
 
     public override void Dispose()
     {

@@ -6,6 +6,7 @@
   </PropertyGroup>
   <ItemGroup>
     <InternalsVisibleTo Include="Daisi.Llogos.Tests" />
+    <InternalsVisibleTo Include="Daisi.Llogos.Training" />
   </ItemGroup>
   <ItemGroup>
     <ProjectReference Include="..\Daisi.Llogos\Daisi.Llogos.csproj" />
@@ -16,5 +17,6 @@
     <EmbeddedResource Include="kernels\dequant_matmul.cu" LogicalName="dequant_matmul.cu" />
     <EmbeddedResource Include="kernels\composite_ops.cu" LogicalName="composite_ops.cu" />
     <EmbeddedResource Include="kernels\turbo_quant.cu" LogicalName="turbo_quant.cu" />
+    <EmbeddedResource Include="kernels\backward_ops.cu" LogicalName="backward_ops.cu" />
   </ItemGroup>
 </Project>
