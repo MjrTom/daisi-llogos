@@ -118,6 +118,40 @@ See [Tested Models](docs/tested-models.md) for verified models, performance benc
 - **Qwen2/2.5** — Attention bias support for Qwen2 architecture family.
 - **Per-model tool prompts** — Tool formatting adapts preamble per model family (Qwen3, Llama3, Gemma, etc.).
 
+## Supported Architectures
+
+Each architecture page covers implementation approach, what worked and what didn't, and model-specific benchmarks.
+
+```
+  Architecture Family Tree
+  ========================
+
+  Transformer
+       |
+       +-- LLaMA ──────── Standard attention, SwiGLU, RoPE
+       |   (llama)         TinyLlama, Llama 3, DeepSeek R1
+       |
+       +-- Qwen 2/2.5 ─── Standard attention + Q/K/V biases
+       |   (qwen2)         Qwen2.5-0.5B, Qwen2.5-7B
+       |
+       +-- Qwen 3 ──────── Gated Q + Q/K norms + thinking mode
+       |   (qwen3)         Qwen3-8B, Bonsai-8B (1-bit)
+       |
+       +-- Qwen 3.5 ────── Hybrid: DeltaNet + gated attention
+       |   (qwen35)        Qwen3.5-0.8B/4B/9B
+       |
+       +-- BitNet ──────── Ternary weights (I2_S: {-1, 0, +1})
+           (bitnet-b1.58)  BitNet b1.58
+```
+
+| Architecture | Key Difference | Models | Doc |
+|-------------|----------------|--------|-----|
+| **LLaMA** | Baseline transformer, GQA, SwiGLU | TinyLlama, Llama 3, DeepSeek R1 | [Details](docs/arch-llama.md) |
+| **Qwen 2/2.5** | Attention biases on Q/K/V | Qwen2.5-0.5B | [Details](docs/arch-qwen2.md) |
+| **Qwen 3** | Gated Q (DeInterleaveQ), per-head Q/K norms, thinking | Qwen3-8B, Bonsai-8B | [Details](docs/arch-qwen3.md) |
+| **Qwen 3.5** | Hybrid DeltaNet + standard attention | Qwen3.5-0.8B/4B/9B | [Details](docs/arch-qwen35.md) |
+| **BitNet** | Ternary I2_S weights, per-tensor scale | BitNet b1.58 | [Details](docs/arch-bitnet.md) |
+
 ### Benchmarks
 
 Measured on AMD Ryzen 9 9900X + NVIDIA RTX 5080, 128 decode tokens, FP16 KV cache. Compared against llama.cpp b8461.
@@ -252,6 +286,11 @@ flowchart LR
 | [LLogos Turbo](docs/llogos-turbo.md) | Extreme KV cache compression (8-12x) via TurboQuant — architecture, usage, benchmarks, roadmap |
 | [Long Context](docs/roadmap/phase-11-long-context.md) | Flash attention, paged KV cache, RAM offloading for 200K+ context |
 | [LoRA Training](docs/lora-training.md) | Native GPU LoRA fine-tuning — architecture, DeltaNet support, data formats, performance |
+| [Arch: LLaMA](docs/arch-llama.md) | LLaMA family — implementation, benchmarks, what worked |
+| [Arch: Qwen 2](docs/arch-qwen2.md) | Qwen 2/2.5 — attention biases, implementation notes |
+| [Arch: Qwen 3](docs/arch-qwen3.md) | Qwen 3 — gated Q, Bonsai 1-bit, kernel optimizations |
+| [Arch: Qwen 3.5](docs/arch-qwen35.md) | Qwen 3.5 — hybrid DeltaNet, training approach, lessons learned |
+| [Arch: BitNet](docs/arch-bitnet.md) | BitNet b1.58 — ternary I2_S, dedicated kernels |
 | [Tested Models](docs/tested-models.md) | Verified models, performance benchmarks, supported quantization formats |
 | [Known Issues](docs/known-issues.md) | Investigation notes on K-quant accumulation errors and DeltaNet architecture |
 
