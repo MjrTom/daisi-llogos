@@ -58,6 +58,9 @@ public sealed class StandardAttentionWeights : LayerWeights
     public required ITensor AttnO { get; set; }
     public ITensor? AttnQNorm { get; set; }
     public ITensor? AttnKNorm { get; set; }
+    public ITensor? AttnQBias { get; set; }
+    public ITensor? AttnKBias { get; set; }
+    public ITensor? AttnVBias { get; set; }
 
     /// <summary>Fused Q+K+V weight tensor (concatenated rows). Null if types differ.</summary>
     public ITensor? FusedQKV { get; set; }

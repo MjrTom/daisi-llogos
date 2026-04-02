@@ -581,6 +581,43 @@ __global__ void dequant_matmul_f16(float* output, const float* a,
         output[n] = sum;
 }
 
+// ── BF16 Dequant + MatMul ─────────────────────────────────────────────────
+// BF16 → F32 is just a left-shift by 16 bits. Same structure as F16 kernel.
+
+__device__ __forceinline__ float bf16_to_fp32(unsigned short bf)
+{
+    unsigned int f32_bits = (unsigned int)bf << 16;
+    return *reinterpret_cast<float*>(&f32_bits);
+}
+
+__global__ void dequant_matmul_bf16(float* output, const float* a,
+                                     const unsigned short* b,
+                                     int M, int K, int N)
+{
+    extern __shared__ float shared[];
+    int n = blockIdx.x;
+    int tid = threadIdx.x;
+    int blockSize = blockDim.x;
+
+    if (n >= N) return;
+
+    const unsigned short* b_row = b + (long long)n * K;
+
+    float sum = 0.0f;
+    for (int k = tid; k < K; k += blockSize)
+        sum += a[k] * bf16_to_fp32(b_row[k]);
+
+    sum = warp_reduce_sum(sum);
+    int lane = tid & 31;
+    int warp = tid >> 5;
+    if (lane == 0) shared[warp] = sum;
+    __syncthreads();
+    int numWarps = blockSize >> 5;
+    if (tid < numWarps) sum = shared[tid]; else sum = 0.0f;
+    sum = warp_reduce_sum(sum);
+    if (tid == 0) output[n] = sum;
+}
+
 // ── Q4_0 × Q8_1 dp4a MatMul ──────────────────────────────────────────────
 // 1 thread per Q4_0 block, 8 dp4a ops per block (full 32 elements).
 // Multi-row: 2 output rows per CUDA block for weight data reuse.
