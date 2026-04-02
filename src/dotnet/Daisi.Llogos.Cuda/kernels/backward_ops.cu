@@ -244,7 +244,7 @@ __global__ void cross_entropy_loss(float* dLogits, float* lossOut,
         __syncthreads();
     }
     if (tid == 0)
-        atomicAdd(lossOut, sdata[0] / (float)T);
+        atomicAdd(lossOut, sdata[0] / (float)validTokens);
 }
 
 // ── Causal Gated Attention Backward ────────────────────────────────────────

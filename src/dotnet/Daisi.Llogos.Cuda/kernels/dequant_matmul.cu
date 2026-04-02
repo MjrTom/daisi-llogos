@@ -1441,4 +1441,101 @@ void dequant_matmul_swiGLU_q4_k(float* __restrict__ output,
     }
 }
 
+// ── Q1_0 / Q1_0_g128 (Bonsai 1-bit binary) Dequant + MatMul ──────────────
+// Binary sign: weight_i = sign_bit_i ? +scale : -scale.
+// Optimizations:
+//   - Scale multiply hoisted outside inner loop (1 mul per 128 elems, not per-elem)
+//   - Float4 activation loads via __ldg (read-only texture cache)
+//   - Multi-row: 4 output neurons per block (activation reuse)
+//   - Branchless sign via integer (2*bit-1), no divergent branches
+//   - 32 sign bits loaded as uint32, processed in float4 groups
+// Grid: ceil(N/4) blocks. Block: 256 threads.
+
+#define Q1_ROWS 16
+
+__global__ void dequant_matmul_q1_0(float* output, const float* a,
+                                     const unsigned char* b,
+                                     int M, int K, int N, int blockSizeQ)
+{
+    extern __shared__ float shared[];
+    int n_base = blockIdx.x * Q1_ROWS;
+    int tid = threadIdx.x;
+    int numThreads = blockDim.x;
+
+    if (n_base >= N) return;
+
+    int signBytes = blockSizeQ / 8;
+    int bytesPerBlock = 2 + signBytes;
+    int blocksPerRow = K / blockSizeQ;
+    long bytesPerRow = (long)blocksPerRow * bytesPerBlock;
+    // groups32: number of 32-element groups per quant block (1 for Q1_0, 4 for Q1_0_g128)
+    int groups32 = blockSizeQ / 32;
+
+    float sums[Q1_ROWS] = {0};
+
+    for (int blk = tid; blk < blocksPerRow; blk += numThreads)
+    {
+        int baseIdx = blk * blockSizeQ;
+
+        // Load activations as float4 (8 float4 = 32 floats per group)
+        // Process each 32-element group within the quant block
+        for (int g = 0; g < groups32; g++)
+        {
+            const float4* ap = reinterpret_cast<const float4*>(a + baseIdx + g * 32);
+            float4 ac[8];
+            #pragma unroll
+            for (int i = 0; i < 8; i++) ac[i] = __ldg(&ap[i]);
+
+            #pragma unroll
+            for (int r = 0; r < Q1_ROWS; r++)
+            {
+                int n = n_base + r;
+                if (n >= N) break;
+
+                const unsigned char* bp = b + (long)n * bytesPerRow + blk * bytesPerBlock;
+                unsigned short scaleRaw = (unsigned short)bp[0] | ((unsigned short)bp[1] << 8);
+                float scale = fp16_to_fp32(scaleRaw);
+
+                // Load 32 sign bits as uint32 (byte-level to avoid alignment issues)
+                const unsigned char* sp = bp + 2 + g * 4;
+                unsigned int signs = (unsigned int)sp[0] | ((unsigned int)sp[1] << 8)
+                                   | ((unsigned int)sp[2] << 16) | ((unsigned int)sp[3] << 24);
+
+                // FMA with branchless sign: accumulate a[i] * (2*bit - 1), scale once
+                float bs = 0.0f;
+                #pragma unroll
+                for (int i = 0; i < 8; i++)
+                {
+                    float4 ai = ac[i];
+                    float s0 = (float)(int)((signs & 1) * 2 - 1); signs >>= 1;
+                    float s1 = (float)(int)((signs & 1) * 2 - 1); signs >>= 1;
+                    float s2 = (float)(int)((signs & 1) * 2 - 1); signs >>= 1;
+                    float s3 = (float)(int)((signs & 1) * 2 - 1); signs >>= 1;
+                    bs = __fmaf_rn(ai.x, s0, bs);
+                    bs = __fmaf_rn(ai.y, s1, bs);
+                    bs = __fmaf_rn(ai.z, s2, bs);
+                    bs = __fmaf_rn(ai.w, s3, bs);
+                }
+                sums[r] = __fmaf_rn(scale, bs, sums[r]);
+            }
+        }
+    }
+
+    // Reduce and write each row
+    int numWarps = numThreads >> 5;
+    #pragma unroll
+    for (int r = 0; r < Q1_ROWS; r++)
+    {
+        float sum = warp_reduce_sum(sums[r]);
+        int lane = tid & 31;
+        int warp = tid >> 5;
+        if (lane == 0) shared[warp] = sum;
+        __syncthreads();
+        if (tid < numWarps) sum = shared[tid]; else sum = 0.0f;
+        sum = warp_reduce_sum(sum);
+        if (tid == 0 && n_base + r < N) output[n_base + r] = sum;
+        __syncthreads();
+    }
+}
+
 } // extern "C"

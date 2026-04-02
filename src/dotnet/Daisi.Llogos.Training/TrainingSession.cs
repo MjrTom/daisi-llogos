@@ -61,6 +61,52 @@ public sealed class TrainingSession : IDisposable
         }
         _optimizer = new AdamW(_config.LearningRate, weightDecay: _config.WeightDecay);
 
+        // Debug: verify base model loss using inference forward pass
+        {
+            // Use CPU backend for inference test (training loads weights on CPU)
+            var seq = sequences[0];
+            int seqLen = _config.SeqLen;
+            var input = seq.Tokens[..seqLen];
+            var targets = seq.Tokens[1..(seqLen + 1)];
+            if (seq.PromptLen > 0)
+                for (int t = 0; t < Math.Min(seq.PromptLen, seqLen); t++)
+                    targets[t] = -1;
+            for (int t = 0; t < seqLen; t++)
+                if (input[t] == 0 && targets[t] == 0) targets[t] = -1;
+
+            // Run inference forward on the same tokens
+            var cpuBe = new Daisi.Llogos.Cpu.CpuBackend();
+            var kvCache = new Inference.KvCache(cpuBe, _modelConfig!, maxSeqLen: seqLen + 10);
+            var deltaState = new Inference.DeltaNetState(cpuBe, _modelConfig!, _weights);
+            var infFwd = new Inference.ForwardPass(cpuBe, _modelConfig!, _weights!, kvCache, deltaState);
+            infFwd.ArgMaxVocabLimit = _modelConfig!.VocabSize;
+            deltaState.Reset();
+
+            // Run one token at a time and collect logits
+            float totalLoss = 0;
+            int validCount = 0;
+            for (int t = 0; t < seqLen; t++)
+            {
+                var logits = infFwd.Forward(input[t], t);
+                if (targets[t] >= 0)
+                {
+                    // Compute NLL for this position
+                    float maxL = float.MinValue;
+                    for (int v = 0; v < logits.Length; v++)
+                        if (logits[v] > maxL) maxL = logits[v];
+                    float sumExp = 0;
+                    for (int v = 0; v < logits.Length; v++)
+                        sumExp += MathF.Exp(logits[v] - maxL);
+                    float prob = MathF.Exp(logits[targets[t]] - maxL) / sumExp;
+                    totalLoss -= MathF.Log(MathF.Max(prob, 1e-10f));
+                    validCount++;
+                }
+            }
+            float avgLoss = validCount > 0 ? totalLoss / validCount : 0;
+            Console.Error.WriteLine($"  Inference baseline loss: {avgLoss:F4} ({validCount} tokens)");
+            infFwd.Dispose(); kvCache.Dispose(); deltaState.Dispose();
+        }
+
         // 5. Training loop
         Train(sequences);
 
@@ -278,6 +324,17 @@ public sealed class TrainingSession : IDisposable
                 {
                     if (input[t] == 0 && targets[t] == 0)
                         targets[t] = -1;
+                }
+
+                // Debug: print valid token count on first sequence
+                if (seqIdx == 0 && epoch == 0)
+                {
+                    int valid = 0;
+                    for (int t = 0; t < seqLen; t++)
+                        if (targets[t] >= 0) valid++;
+                    Console.Error.WriteLine($"  DEBUG seq0: seqLen={seqLen} promptLen={seq.PromptLen} " +
+                        $"validTokens={valid} input[0..3]=[{string.Join(",", input.Take(4))}] " +
+                        $"targets[0..3]=[{string.Join(",", targets.Take(4))}]");
                 }
 
                 // Zero gradients at start of accumulation window
