@@ -585,6 +585,33 @@ __global__ void embedding_lookup_q4_1(float* output, const unsigned char* table,
     output[idx] = d * (float)nibble + m;
 }
 
+// ── Q1_0 embedding lookup ─────────────────────────────────────────────────────
+// Handles both Q1_0 (32 elem/block, 6 bytes) and Q1_0_g128 (128 elem/block, 18 bytes).
+// Block layout: [FP16 scale (2b)] [sign bits (blockSize/8 bytes)].
+// bit=1 → +scale, bit=0 → -scale.
+
+__global__ void embedding_lookup_q1_0(float* output, const unsigned char* table,
+                                       int hidden_dim, int token_id,
+                                       int block_size_q, int bytes_per_block)
+{
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= hidden_dim) return;
+
+    int blocks_per_row = hidden_dim / block_size_q;
+    int bytes_per_row = blocks_per_row * bytes_per_block;
+    const unsigned char* row = table + (long long)token_id * bytes_per_row;
+
+    int block_idx = idx / block_size_q;
+    int elem_in_block = idx % block_size_q;
+    const unsigned char* blk = row + block_idx * bytes_per_block;
+
+    unsigned short scale_bits = ((unsigned short)blk[1] << 8) | blk[0];
+    float scale = fp16_to_fp32_emb(scale_bits);
+
+    int bit = (blk[2 + elem_in_block / 8] >> (elem_in_block % 8)) & 1;
+    output[idx] = bit ? scale : -scale;
+}
+
 // ── Fused: Residual save + RMSNorm ────────────────────────────────────────────
 // residual[i] = input[i]; output[i] = (input[i] / rms) * weight[i]
 // Saves one kernel launch + one full read/write of the hidden state.
@@ -1273,6 +1300,18 @@ __global__ void dequant_to_f32(float* __restrict__ output,
         float sc = d * (float)((signed char)sbp[192 + half*8 + quadrant*2 + l/16]);
         val = sc * (float)q;
     }
+    else if (typeTag == 40) { // Q1_0: 6 bytes per 32 elements (FP16 scale + 4 sign bytes)
+        const unsigned char* bp = input + blk * 6;
+        float scale = fp16_to_fp32_dq(((unsigned short)bp[1] << 8) | bp[0]);
+        int bit = (bp[2 + elem/8] >> (elem%8)) & 1;
+        val = bit ? scale : -scale;
+    }
+    else if (typeTag == 41) { // Q1_0_g128: 18 bytes per 128 elements (FP16 scale + 16 sign bytes)
+        const unsigned char* bp = input + blk * 18;
+        float scale = fp16_to_fp32_dq(((unsigned short)bp[1] << 8) | bp[0]);
+        int bit = (bp[2 + elem/8] >> (elem%8)) & 1;
+        val = bit ? scale : -scale;
+    }
 
     output[idx] = val;
 }
@@ -1370,6 +1409,18 @@ __global__ void dequant_to_f16(unsigned short* __restrict__ output,
         else { low = ql[subElem - 8] >> 4; high = ((qh[subElem - 8] >> 2) & 3) << 4; }
         int qval = low | high;
         val = d * (float)sc * ((float)qval - 32.0f);
+    }
+    else if (typeTag == 40) { // Q1_0
+        const unsigned char* bp = input + blk * 6;
+        float scale = fp16_to_fp32_dq(((unsigned short)bp[1] << 8) | bp[0]);
+        int bit = (bp[2 + elem/8] >> (elem%8)) & 1;
+        val = bit ? scale : -scale;
+    }
+    else if (typeTag == 41) { // Q1_0_g128
+        const unsigned char* bp = input + blk * 18;
+        float scale = fp16_to_fp32_dq(((unsigned short)bp[1] << 8) | bp[0]);
+        int bit = (bp[2 + elem/8] >> (elem%8)) & 1;
+        val = bit ? scale : -scale;
     }
 
     output[idx] = fp32_to_fp16_cvt(val);

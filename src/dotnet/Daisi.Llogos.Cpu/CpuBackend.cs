@@ -49,6 +49,16 @@ public sealed class CpuBackend : IComputeBackend
             var bRaw = ((CpuTensor)b).RawData;
             Cpu.I2SDequant.Multiply(o, aSpan, bRaw, M, K, N);
         }
+        else if (b.Type == GgmlType.Q1_0)
+        {
+            var bRaw = ((CpuTensor)b).RawData;
+            Cpu.Q1_0Dequant.Multiply(o, aSpan, bRaw, M, K, N, blockSize: 32);
+        }
+        else if (b.Type == GgmlType.Q1_0_g128)
+        {
+            var bRaw = ((CpuTensor)b).RawData;
+            Cpu.Q1_0Dequant.Multiply(o, aSpan, bRaw, M, K, N, blockSize: 128);
+        }
         else if (b.Type == GgmlType.F16)
         {
             var bRaw = ((CpuTensor)b).RawData;
