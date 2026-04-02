@@ -252,14 +252,12 @@ public sealed class CudaBackend : IComputeBackend
         // Repack Q8_0 to aligned layout: 34-byte blocks → 36-byte blocks
         // Old: [scale(2b) | quants(32b)] = 34 bytes, quants NOT 4-byte aligned
         // New: [scale(2b) | pad(2b) | quants(32b)] = 36 bytes, quants 4-byte aligned
-        if (type == GgmlType.Q8_0 && dimensions.Length >= 2 && dimensions[0] >= 2048)
+        // Required for dp4a matmul kernel which assumes aligned block stride.
+        if (type == GgmlType.Q8_0 && dimensions.Length >= 2)
         {
             _hasQ8_0Weights = true;
             // Pre-allocate Q8_1 scratch for dp4a matmul (must happen outside stream capture)
             EnsureQ8_1Scratch((int)dimensions[0]);
-
-            // dp4a Q8_0 matmul uses pre-allocated Q8_1 scratch (no runtime alloc needed for graph capture)
-            // Only repack weight matrices with K >= 2048 (not small embeddings or 1D tensors)
             int blockCount = data.Length / 34;
             var aligned = new byte[blockCount * 36];
             for (int i = 0; i < blockCount; i++)
@@ -479,6 +477,11 @@ public sealed class CudaBackend : IComputeBackend
         {
             var (grid, threads, smem) = AdaptiveLaunch(N, 1, K / 8);
             LaunchMatMul("dequant_matmul_f16", outPtr, aPtr, bPtr, M, K, N, grid, threads, smem);
+        }
+        else if (b.Type == GgmlType.BF16)
+        {
+            var (grid, threads, smem) = AdaptiveLaunch(N, 1, K / 8);
+            LaunchMatMul("dequant_matmul_bf16", outPtr, aPtr, bPtr, M, K, N, grid, threads, smem);
         }
         else if (b.Type == GgmlType.Q4_K && _q8_1FusedReady
                  && _q8_1CachedInputPtr == aPtr && _q8_1CachedGeneration == _q8_1CacheGeneration)
@@ -903,6 +906,16 @@ public sealed class CudaBackend : IComputeBackend
         else if (table.Type == GgmlType.Q4_1)
         {
             var func = _elementwiseModule.GetFunction("embedding_lookup_q4_1");
+            nint* kArgs = stackalloc nint[4];
+            kArgs[0] = (nint)(&outPtr);
+            kArgs[1] = (nint)(&tablePtr);
+            kArgs[2] = (nint)(&hiddenDim);
+            kArgs[3] = (nint)(&tokenId);
+            _stream.Launch(func, grid, 1, 1, (uint)BlockSize, 1, 1, 0, kArgs);
+        }
+        else if (table.Type == GgmlType.BF16)
+        {
+            var func = _elementwiseModule.GetFunction("embedding_lookup_bf16");
             nint* kArgs = stackalloc nint[4];
             kArgs[0] = (nint)(&outPtr);
             kArgs[1] = (nint)(&tablePtr);

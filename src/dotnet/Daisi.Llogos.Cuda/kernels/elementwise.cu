@@ -407,6 +407,20 @@ __global__ void embedding_lookup_f32(float* output, const float* table,
         output[idx] = table[token_id * hidden_dim + idx];
 }
 
+// BF16 embedding lookup: convert one row from BF16 to F32.
+// BF16: 2 bytes per element, sign(1) + exp(8) + mantissa(7).
+
+__global__ void embedding_lookup_bf16(float* output, const unsigned short* table,
+                                       int hidden_dim, int token_id)
+{
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= hidden_dim) return;
+    unsigned short bf = table[(long long)token_id * hidden_dim + idx];
+    // BF16 → F32: just shift left by 16 (BF16 is truncated F32)
+    unsigned int f32_bits = (unsigned int)bf << 16;
+    output[idx] = *reinterpret_cast<float*>(&f32_bits);
+}
+
 // Q8_0 embedding lookup: dequantize one row.
 // Q8_0 block: 2 bytes (fp16 scale) + 32 bytes (int8 quants) = 34 bytes per block.
 
@@ -1300,6 +1314,11 @@ __global__ void dequant_to_f32(float* __restrict__ output,
         float sc = d * (float)((signed char)sbp[192 + half*8 + quadrant*2 + l/16]);
         val = sc * (float)q;
     }
+    else if (typeTag == 30) { // BF16: 2 bytes per element, shift left 16 to get F32
+        const unsigned char* bp = input + idx * 2;
+        unsigned int f32_bits = ((unsigned int)bp[1] << 24) | ((unsigned int)bp[0] << 16);
+        val = *reinterpret_cast<float*>(&f32_bits);
+    }
     else if (typeTag == 40) { // Q1_0: 6 bytes per 32 elements (FP16 scale + 4 sign bytes)
         const unsigned char* bp = input + blk * 6;
         float scale = fp16_to_fp32_dq(((unsigned short)bp[1] << 8) | bp[0]);
@@ -1409,6 +1428,11 @@ __global__ void dequant_to_f16(unsigned short* __restrict__ output,
         else { low = ql[subElem - 8] >> 4; high = ((qh[subElem - 8] >> 2) & 3) << 4; }
         int qval = low | high;
         val = d * (float)sc * ((float)qval - 32.0f);
+    }
+    else if (typeTag == 30) { // BF16
+        const unsigned char* bp = input + idx * 2;
+        unsigned int f32_bits = ((unsigned int)bp[1] << 24) | ((unsigned int)bp[0] << 16);
+        val = *reinterpret_cast<float*>(&f32_bits);
     }
     else if (typeTag == 40) { // Q1_0
         const unsigned char* bp = input + blk * 6;
