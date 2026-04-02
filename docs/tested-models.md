@@ -15,6 +15,9 @@ These models produce correct, coherent output on all available backends.
 | [Qwen3.5-9B](https://huggingface.co/unsloth/Qwen3.5-9B-GGUF) | qwen35 (hybrid DeltaNet) | 9B | Q8_0, Q4_0, Q4_K_M | CPU, CUDA, Vulkan | [Q8_0](https://huggingface.co/unsloth/Qwen3.5-9B-GGUF/resolve/main/Qwen3.5-9B-Q8_0.gguf) (9.8 GB), [Q4_0](https://huggingface.co/unsloth/Qwen3.5-9B-GGUF/resolve/main/Qwen3.5-9B-Q4_0.gguf) (5.1 GB) |
 | [TinyLlama 1.1B Chat v1.0](https://huggingface.co/TheBloke/TinyLlama-1.1B-Chat-v1.0-GGUF) | llama | 1.1B | Q8_0 | CPU, CUDA, Vulkan | [Q8_0](https://huggingface.co/TheBloke/TinyLlama-1.1B-Chat-v1.0-GGUF/resolve/main/tinyllama-1.1b-chat-v1.0.Q8_0.gguf) (1.1 GB) |
 | [BitNet b1.58 (ggml-model-i2_s)](https://huggingface.co/1bitLLM/bitnet_b1_58-large) | bitnet-b1.58 | 0.7B | I2_S (ternary) | CPU, CUDA | Custom build (1.2 GB) |
+| [Bonsai-8B](https://huggingface.co/prism-ml/Bonsai-8B-gguf) | qwen3 (1-bit) | 8B | Q1_0_g128 | CPU, CUDA | [Q1_0_g128](https://huggingface.co/prism-ml/Bonsai-8B-gguf/resolve/main/Bonsai-8B.gguf) (1.1 GB) |
+| [Qwen2.5-0.5B](https://huggingface.co/Qwen/Qwen2.5-0.5B-GGUF) | qwen2 | 0.5B | Q8_0 | CPU, CUDA | [Q8_0](https://huggingface.co/Qwen/Qwen2.5-0.5B-Instruct-GGUF) (0.5 GB) |
+| [Llama 3.2-1B](https://huggingface.co/bartowski/Llama-3.2-1B-Instruct-GGUF) | llama | 1B | Q8_0 | CPU, CUDA | [Q8_0](https://huggingface.co/bartowski/Llama-3.2-1B-Instruct-GGUF) (1.3 GB) |
 
 ## Performance (NVIDIA RTX 5080)
 
@@ -102,6 +105,9 @@ These formats have dedicated GPU kernels for maximum performance:
 | Q4_K | GPU (uint32) | GPU | 4-bit K-quant |
 | Q5_K | GPU | GPU | 5-bit K-quant |
 | Q6_K | GPU | — | 6-bit K-quant |
+| BF16 | GPU (cuBLAS) | GPU | Brain floating point |
+| Q1_0 | GPU (FMA) | GPU | 1-bit binary sign, 32 elem/block |
+| Q1_0_g128 | GPU (FMA) | GPU | 1-bit binary sign, 128 elem/block (Bonsai) |
 | I2_S | GPU | — | BitNet ternary |
 | TQ1_0 | GPU | — | Ternary base-3 |
 
