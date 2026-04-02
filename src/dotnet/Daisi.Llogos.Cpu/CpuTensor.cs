@@ -129,6 +129,12 @@ public sealed class CpuTensor : ITensor
             case GgmlType.I2_S:
                 I2SDequant.Dequantize(_data, destination, ElementCount);
                 break;
+            case GgmlType.Q1_0:
+                Q1_0Dequant.Dequantize(_data, destination, ElementCount);
+                break;
+            case GgmlType.Q1_0_g128:
+                Q1_0Dequant.DequantizeG128(_data, destination, ElementCount);
+                break;
             default:
                 throw new NotSupportedException($"Dequantization not implemented for {Type}.");
         }

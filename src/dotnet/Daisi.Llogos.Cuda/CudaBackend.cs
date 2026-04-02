@@ -206,6 +206,19 @@ public sealed class CudaBackend : IComputeBackend
         _stream.Launch(func, grid, 1, 1, threads, 1, 1, smem, kArgs);
     }
 
+    /// <summary>Launch Q1_0 matmul kernel with extra blockSizeQ parameter.</summary>
+    private unsafe void LaunchMatMulQ1_0(ulong outPtr, ulong aPtr, ulong bPtr,
+        int M, int K, int N, int blockSizeQ, uint grid, uint threads, uint smem)
+    {
+        var func = _matmulModule.GetFunction("dequant_matmul_q1_0");
+        int nVal = N;
+        nint* kArgs = stackalloc nint[7];
+        kArgs[0] = (nint)(&outPtr); kArgs[1] = (nint)(&aPtr); kArgs[2] = (nint)(&bPtr);
+        kArgs[3] = (nint)(&M); kArgs[4] = (nint)(&K); kArgs[5] = (nint)(&nVal);
+        kArgs[6] = (nint)(&blockSizeQ);
+        _stream.Launch(func, grid, 1, 1, threads, 1, 1, smem, kArgs);
+    }
+
     /// <summary>
     /// Ensure the Q8_1 scratch buffer is large enough for the given K dimension.
     /// Must be called outside batch recording (no cuMemAlloc during batching).
@@ -239,14 +252,12 @@ public sealed class CudaBackend : IComputeBackend
         // Repack Q8_0 to aligned layout: 34-byte blocks → 36-byte blocks
         // Old: [scale(2b) | quants(32b)] = 34 bytes, quants NOT 4-byte aligned
         // New: [scale(2b) | pad(2b) | quants(32b)] = 36 bytes, quants 4-byte aligned
-        if (type == GgmlType.Q8_0 && dimensions.Length >= 2 && dimensions[0] >= 2048)
+        // Required for dp4a matmul kernel which assumes aligned block stride.
+        if (type == GgmlType.Q8_0 && dimensions.Length >= 2)
         {
             _hasQ8_0Weights = true;
             // Pre-allocate Q8_1 scratch for dp4a matmul (must happen outside stream capture)
             EnsureQ8_1Scratch((int)dimensions[0]);
-
-            // dp4a Q8_0 matmul uses pre-allocated Q8_1 scratch (no runtime alloc needed for graph capture)
-            // Only repack weight matrices with K >= 2048 (not small embeddings or 1D tensors)
             int blockCount = data.Length / 34;
             var aligned = new byte[blockCount * 36];
             for (int i = 0; i < blockCount; i++)
@@ -452,10 +463,25 @@ public sealed class CudaBackend : IComputeBackend
             var (grid, threads, smem) = AdaptiveLaunch(N, 1, K / 8);
             LaunchMatMul("dequant_matmul_tq1_0", outPtr, aPtr, bPtr, M, K, N, grid, threads, smem);
         }
+        else if (b.Type == GgmlType.Q1_0 || b.Type == GgmlType.Q1_0_g128)
+        {
+            int blockSizeQ = b.Type == GgmlType.Q1_0 ? 32 : 128;
+            // Multi-row: 4 output neurons per block, 256 threads
+            uint q1Rows = 16;
+            uint q1Grid = ((uint)N + q1Rows - 1) / q1Rows;
+            uint q1Threads = 32;
+            uint q1Smem = (q1Threads / 32) * sizeof(float);
+            LaunchMatMulQ1_0(outPtr, aPtr, bPtr, M, K, N, blockSizeQ, q1Grid, q1Threads, q1Smem);
+        }
         else if (b.Type == GgmlType.F16)
         {
             var (grid, threads, smem) = AdaptiveLaunch(N, 1, K / 8);
             LaunchMatMul("dequant_matmul_f16", outPtr, aPtr, bPtr, M, K, N, grid, threads, smem);
+        }
+        else if (b.Type == GgmlType.BF16)
+        {
+            var (grid, threads, smem) = AdaptiveLaunch(N, 1, K / 8);
+            LaunchMatMul("dequant_matmul_bf16", outPtr, aPtr, bPtr, M, K, N, grid, threads, smem);
         }
         else if (b.Type == GgmlType.Q4_K && _q8_1FusedReady
                  && _q8_1CachedInputPtr == aPtr && _q8_1CachedGeneration == _q8_1CacheGeneration)
@@ -885,6 +911,30 @@ public sealed class CudaBackend : IComputeBackend
             kArgs[1] = (nint)(&tablePtr);
             kArgs[2] = (nint)(&hiddenDim);
             kArgs[3] = (nint)(&tokenId);
+            _stream.Launch(func, grid, 1, 1, (uint)BlockSize, 1, 1, 0, kArgs);
+        }
+        else if (table.Type == GgmlType.BF16)
+        {
+            var func = _elementwiseModule.GetFunction("embedding_lookup_bf16");
+            nint* kArgs = stackalloc nint[4];
+            kArgs[0] = (nint)(&outPtr);
+            kArgs[1] = (nint)(&tablePtr);
+            kArgs[2] = (nint)(&hiddenDim);
+            kArgs[3] = (nint)(&tokenId);
+            _stream.Launch(func, grid, 1, 1, (uint)BlockSize, 1, 1, 0, kArgs);
+        }
+        else if (table.Type == GgmlType.Q1_0 || table.Type == GgmlType.Q1_0_g128)
+        {
+            int blockSizeQ = table.Type == GgmlType.Q1_0 ? 32 : 128;
+            int bytesPerBlock = table.Type == GgmlType.Q1_0 ? 6 : 18;
+            var func = _elementwiseModule.GetFunction("embedding_lookup_q1_0");
+            nint* kArgs = stackalloc nint[6];
+            kArgs[0] = (nint)(&outPtr);
+            kArgs[1] = (nint)(&tablePtr);
+            kArgs[2] = (nint)(&hiddenDim);
+            kArgs[3] = (nint)(&tokenId);
+            kArgs[4] = (nint)(&blockSizeQ);
+            kArgs[5] = (nint)(&bytesPerBlock);
             _stream.Launch(func, grid, 1, 1, (uint)BlockSize, 1, 1, 0, kArgs);
         }
         else

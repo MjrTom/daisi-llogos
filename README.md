@@ -88,7 +88,93 @@ dotnet run --project src/Daisi.Llogos.Cli -- \
 dotnet run --project src/Daisi.Llogos.Cli -- \
     --model C:\GGUFS\Qwen3.5-0.8B-Q8_0.gguf \
     --bench --backend cuda
+
+# LoRA training (GPU)
+dotnet run --project src/Daisi.Llogos.Cli -- train \
+    --model C:\GGUFS\Qwen3.5-0.8B-Q8_0.gguf \
+    --data training-data.jsonl \
+    --rank 8 --targets qkvofd --backend cuda
+
+# Inference with LoRA adapter
+dotnet run --project src/Daisi.Llogos.Cli -- \
+    --model C:\GGUFS\Qwen3.5-0.8B-Q8_0.gguf \
+    --lora trained-adapter.llra \
+    --prompt "What did I train you on?"
+
+# Bonsai 1-bit model (1.1 GB for 8B params, 90 tok/s)
+dotnet run --project src/Daisi.Llogos.Cli -- \
+    --model C:\GGUFS\Bonsai-8B.gguf \
+    --prompt "Hello" --backend cuda
 ```
+
+### LoRA Training
+
+Train LoRA adapters directly on GGUF models. Supports CPU and CUDA GPU training with ChatML-aware prompt masking.
+
+```bash
+# Train a LoRA adapter (CUDA — ~30s per epoch on RTX 5080)
+dotnet run --project src/Daisi.Llogos.Cli -- train \
+    --model C:\GGUFS\Qwen3.5-9B-Q8_0.gguf \
+    --data training_data.jsonl \
+    --output adapter.llra \
+    --backend cuda \
+    --rank 8 --alpha 16 \
+    --epochs 3 --lr 1e-4
+
+# Run inference with a trained adapter (merges into weights, zero overhead)
+dotnet run --project src/Daisi.Llogos.Cli -- \
+    --model C:\GGUFS\Qwen3.5-9B-Q8_0.gguf \
+    --lora adapter.llra \
+    --prompt "Hello" --backend cuda
+```
+
+**Training data formats** (auto-detected from content):
+- **Plain text** (`.txt`) — next-token prediction on raw text
+- **JSONL** (`.jsonl`) — `{"text": "..."}` with automatic ChatML prompt masking
+- **JSONL chat** (`.jsonl`) — `{"prompt": "...", "completion": "..."}` with explicit prompt/completion split
+
+ChatML-formatted text is detected automatically — everything before `<|im_start|>assistant\n` is masked so the model only trains on completions.
+
+**Training options:** `--rank`, `--alpha`, `--targets` (qkvo, qkvof, all), `--lr`, `--epochs`, `--seq-len`, `--warmup`, `--weight-decay`, `--max-grad-norm`, `--grad-accum`, `--seed`, `--save-every`, `--log-every`, `--backend`.
+
+### GBNF Grammar-Constrained Generation
+
+Pure C# GBNF grammar engine — no external parser dependencies. Constrain model output to match any BNF grammar (JSON schemas, tool call formats, structured output).
+
+```bash
+dotnet run --project src/Daisi.Llogos.Cli -- \
+    --model C:\GGUFS\Qwen3.5-9B-Q8_0.gguf \
+    --grammar 'root ::= "{" ws "\"name\"" ws ":" ws string "}"' \
+    --prompt "Output a JSON object"
+```
+
+Grammar states are pre-resolved to terminals with first-char filtering (~99% candidate reduction). Used by daisi-minion for reliable tool calling.
+
+### Hybrid GPU/CPU Inference
+
+Split model layers between GPU and CPU when the full model doesn't fit in VRAM:
+
+```bash
+# First 24 layers on GPU, remaining on CPU
+dotnet run --project src/Daisi.Llogos.Cli -- \
+    --model C:\GGUFS\Qwen3.5-9B-Q8_0.gguf \
+    --backend cuda --hybrid-layers 24 \
+    --prompt "Hello"
+```
+
+Only 20KB of hidden state transfers between GPU and CPU per layer boundary — VRAM bandwidth (960 GB/s) handles the compute-heavy layers while DDR5 (80 GB/s) handles the rest.
+
+### LLogos Bench (Benchmark Dashboard)
+
+Interactive Next.js dashboard for visual benchmark comparison across models, backends, and KV strategies.
+
+```bash
+cd src/bench
+npm install
+npm run dev   # http://localhost:3000
+```
+
+Auto-discovers GGUF models, runs benchmarks via the CLI, and displays prefill/decode tok/s with LLogos Turbo compression stats.
 
 ### Test model
 
@@ -100,7 +186,52 @@ See [Tested Models](docs/tested-models.md) for verified models, performance benc
 
 ## Current Status
 
-**End-to-end text generation on CPU, CUDA, and Vulkan.** 251+ passing tests. Supports Q8_0, Q4_0, Q4_1, F16, F32, I2_S (BitNet), TQ1_0, and K-quant (Q4_K, Q5_K, Q6_K) formats across all backends.
+**End-to-end text generation and LoRA training on CPU, CUDA, and Vulkan.** 251+ passing tests. Supports Q8_0, Q4_0, Q4_1, F16, BF16, F32, Q1_0/Q1_0_g128 (Bonsai 1-bit), I2_S (BitNet), TQ1_0, and K-quant (Q4_K, Q5_K, Q6_K) formats.
+
+### Recent Additions
+
+- **LoRA Training** — Native GPU training with AdamW optimizer. Targets attention, DeltaNet, and FFN projections. See [LoRA Training](docs/lora-training.md).
+- **Q1_0/Q1_0_g128** — PrismML Bonsai 1-bit quantization. 8B model in 1.1 GB, 90 tok/s decode on CUDA.
+- **BF16 CUDA** — Full BF16 support: embedding lookup, matmul, and dequant kernels.
+- **Qwen2/2.5** — Attention bias support for Qwen2 architecture family.
+- **Per-model tool prompts** — Tool formatting adapts preamble per model family (Qwen3, Llama3, Gemma, etc.).
+- **GBNF Grammar** — Pure C# grammar-constrained generation with pre-resolved states and first-char filtering.
+- **DaisiChain** — Layer-wise pipeline parallelism across hosts with 20KB hidden state transfer.
+- **Hybrid GPU/CPU** — `--hybrid-layers N` splits model between GPU and CPU.
+
+## Supported Architectures
+
+Each architecture page covers implementation approach, what worked and what didn't, and model-specific benchmarks.
+
+```
+  Architecture Family Tree
+  ========================
+
+  Transformer
+       |
+       +-- LLaMA ──────── Standard attention, SwiGLU, RoPE
+       |   (llama)         TinyLlama, Llama 3, DeepSeek R1
+       |
+       +-- Qwen 2/2.5 ─── Standard attention + Q/K/V biases
+       |   (qwen2)         Qwen2.5-0.5B, Qwen2.5-7B
+       |
+       +-- Qwen 3 ──────── Gated Q + Q/K norms + thinking mode
+       |   (qwen3)         Qwen3-8B, Bonsai-8B (1-bit)
+       |
+       +-- Qwen 3.5 ────── Hybrid: DeltaNet + gated attention
+       |   (qwen35)        Qwen3.5-0.8B/4B/9B
+       |
+       +-- BitNet ──────── Ternary weights (I2_S: {-1, 0, +1})
+           (bitnet-b1.58)  BitNet b1.58
+```
+
+| Architecture | Key Difference | Models | Doc |
+|-------------|----------------|--------|-----|
+| **LLaMA** | Baseline transformer, GQA, SwiGLU | TinyLlama, Llama 3, DeepSeek R1 | [Details](docs/arch-llama.md) |
+| **Qwen 2/2.5** | Attention biases on Q/K/V | Qwen2.5-0.5B | [Details](docs/arch-qwen2.md) |
+| **Qwen 3** | Gated Q (DeInterleaveQ), per-head Q/K norms, thinking | Qwen3-8B, Bonsai-8B | [Details](docs/arch-qwen3.md) |
+| **Qwen 3.5** | Hybrid DeltaNet + standard attention | Qwen3.5-0.8B/4B/9B | [Details](docs/arch-qwen35.md) |
+| **BitNet** | Ternary I2_S weights, per-tensor scale | BitNet b1.58 | [Details](docs/arch-bitnet.md) |
 
 ### Benchmarks
 
@@ -153,10 +284,14 @@ What works today:
 - [**LLogos Turbo**](docs/llogos-turbo.md): Extreme KV cache compression (8-12x) via Walsh-Hadamard rotation + scalar quantization + QJL correction (`--kv-quant turbo:3`)
 - Sliding window + attention sinks for fixed-memory streaming (`--attention sinks:64,4096`)
 - Paged KV cache with dynamic allocation (`--paged`), RAM offloading (`--offload-pages`)
+- GBNF grammar-constrained generation (pure C#, pre-resolved states, first-char filtering)
+- **LoRA training**: rank-decomposed adapters targeting attention (Q/K/V/O) and FFN (gate/up/down), ChatML-aware prompt masking, GPU-accelerated AdamW with cosine warmup, `.llra` binary format
+- **DaisiChain**: Layer-wise pipeline parallelism across hosts — split model loading, 20KB hidden state transfer between stages, identical output to single-process inference
+- **Hybrid GPU/CPU inference**: `--hybrid-layers N` offloads first N layers to GPU, rest on CPU
 - Candidate-based sampler with temperature, top-k, top-p, repetition penalty (O(k) not O(N log N))
 - Memory-mapped model loading (zero intermediate byte[] copies)
 - Benchmark suite with separate prefill/decode timing (`--bench`)
-- CLI: `--backend cpu|cuda|vulkan`, `--bench`, `--no-mmap`, `--attention`, `--paged`, `--offload-pages`, `--vocab-limit`, model path, prompt, sampling parameters
+- CLI: `--backend cpu|cuda|vulkan`, `--bench`, `--no-mmap`, `--attention`, `--paged`, `--offload-pages`, `--hybrid-layers`, `--vocab-limit`, `--lora`, `--grammar`, model path, prompt, sampling parameters
 
 **WebGPU** (TypeScript, browser + Node.js):
 - Runs in Chrome 113+, Edge 113+, or Node.js via Dawn bindings
@@ -235,6 +370,12 @@ flowchart LR
 | [WebGPU Backend](docs/webgpu-backend.md) | Browser-native GPU inference, WGSL shaders, DeltaNet on GPU |
 | [LLogos Turbo](docs/llogos-turbo.md) | Extreme KV cache compression (8-12x) via TurboQuant — architecture, usage, benchmarks, roadmap |
 | [Long Context](docs/roadmap/phase-11-long-context.md) | Flash attention, paged KV cache, RAM offloading for 200K+ context |
+| [LoRA Training](docs/lora-training.md) | Native GPU LoRA fine-tuning — architecture, DeltaNet support, data formats, performance |
+| [Arch: LLaMA](docs/arch-llama.md) | LLaMA family — implementation, benchmarks, what worked |
+| [Arch: Qwen 2](docs/arch-qwen2.md) | Qwen 2/2.5 — attention biases, implementation notes |
+| [Arch: Qwen 3](docs/arch-qwen3.md) | Qwen 3 — gated Q, Bonsai 1-bit, kernel optimizations |
+| [Arch: Qwen 3.5](docs/arch-qwen35.md) | Qwen 3.5 — hybrid DeltaNet, training approach, lessons learned |
+| [Arch: BitNet](docs/arch-bitnet.md) | BitNet b1.58 — ternary I2_S, dedicated kernels |
 | [Tested Models](docs/tested-models.md) | Verified models, performance benchmarks, supported quantization formats |
 | [Known Issues](docs/known-issues.md) | Investigation notes on K-quant accumulation errors and DeltaNet architecture |
 
@@ -244,13 +385,15 @@ flowchart LR
 daisi-llogos/
 ├── src/
 │   ├── dotnet/                      .NET inference engine suite
-│   │   ├── Daisi.Llogos/            Core library (GGUF, model, inference, tokenizer)
+│   │   ├── Daisi.Llogos/            Core library (GGUF, model, inference, tokenizer, GBNF grammar)
+│   │   ├── Daisi.Llogos.Training/   LoRA training (adapters, forward/backward, AdamW optimizer)
 │   │   ├── Daisi.Llogos.Cpu/        CPU compute backend (AVX2/AVX-512 SIMD)
 │   │   ├── Daisi.Llogos.Cuda/       NVIDIA CUDA backend (dp4a, fused kernels)
 │   │   ├── Daisi.Llogos.Vulkan/     Vulkan compute backend (SPIR-V shaders)
-│   │   ├── Daisi.Llogos.Cli/        Command-line interface
+│   │   ├── Daisi.Llogos.Cli/        Command-line interface (inference + training)
 │   │   ├── tests/                   Unit and integration tests
 │   │   └── Daisi.Llogos.sln         Solution file
+│   ├── bench/                       LLogos Bench — Next.js benchmark dashboard
 │   └── webgpu/                      Browser/Node.js inference engine [TypeScript]
 │       ├── src/                     Engine source (GGUF, GPU, model, tokenizer)
 │       ├── test/                    72 automated tests (including GPU via Dawn)

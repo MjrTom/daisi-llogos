@@ -41,6 +41,11 @@ block-beta
 | **Q4_K** | K-quant 4-bit format. Uses a super-block of 256 elements with nested sub-blocks, two FP16 scales (d, dmin), and per-sub-block 6-bit scales/mins. More accurate than Q4_0 at similar size. |
 | **K-quants** | Family of quantization formats (Q2_K through Q8_K) using nested block structures with per-sub-block scaling for better accuracy than legacy quants. |
 | **IQ-quants** | Importance-weighted quantization formats (IQ1_S through IQ4_XS). Use lookup tables and importance matrices for extremely low bit-widths with minimal quality loss. |
+| **Q1_0** | 1-bit binary sign quantization (PrismML Bonsai). Each weight is +scale or -scale. Block: 32 elements, 6 bytes (2-byte FP16 scale + 4 sign bytes). 1.5 bits/weight effective. |
+| **Q1_0_g128** | 1-bit with group size 128. Block: 128 elements, 18 bytes (2-byte FP16 scale + 16 sign bytes). 1.125 bits/weight effective. Used by Bonsai-8B. |
+| **BF16** | Brain float16. Same range as FP32 (8-bit exponent) with reduced precision (7-bit mantissa). BF16 -> FP32 is a single left-shift by 16 bits. |
+| **LoRA** | Low-Rank Adaptation. Decomposes weight updates as `W' = W + scaling * B @ A` where A is `[rank x in]` and B is `[out x rank]`. Only A and B are trained. |
+| **.llra** | Llogos LoRA adapter file format. Binary file storing per-layer A/B matrices, rank, alpha, and layer names. |
 
 ### Quantization block structure — Q8_0
 
@@ -64,6 +69,20 @@ packet-beta
 > **Total: 18 bytes per block of 32 elements.**
 > Each byte holds two 4-bit weights. Weights are unsigned [0..15], re-centered by subtracting 8.
 > To dequantize: `weight[i] = scale * (nibble[i] - 8)`
+
+### Quantization block structure -- Q1_0_g128
+
+```
+  +-------------------+-------------------------------------------+
+  | Scale (FP16, 2B)  | 128 sign bits packed into 16 bytes         |
+  +-------------------+-------------------------------------------+
+  Byte 0-1              Byte 2-17 (1 bit per weight, LSB-first)
+```
+
+> **Total: 18 bytes per block of 128 elements. 1.125 bits/weight.**
+> Each weight is either +scale or -scale. No zero state (binary, not ternary).
+> Bit = 1 means +scale, bit = 0 means -scale.
+> To dequantize: `weight[i] = (sign_bit[i] ? +1 : -1) * scale`
 
 ### Quantization block structure — Q4_K
 

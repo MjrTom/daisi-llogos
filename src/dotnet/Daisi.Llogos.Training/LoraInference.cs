@@ -216,6 +216,10 @@ public static class LoraInference
     {
         var rawBytes = new byte[cpu.ByteSize];
         cpu.CopyRawTo(rawBytes);
+        // Ensure Q8_1 scratch for Q8_0 weights with small K (LoadTensor only does this for K >= 2048)
+        if (cpu.Type == Gguf.GgmlType.Q8_0 && cpu.Dimensions.Length >= 2
+            && target is Cuda.CudaBackend cuda)
+            cuda.EnsureQ8_1Scratch((int)cpu.Dimensions[0]);
         var gpu = target.LoadTensor(cpu.Name, cpu.Type, cpu.Dimensions, rawBytes);
         cpu.Dispose();
         return gpu;

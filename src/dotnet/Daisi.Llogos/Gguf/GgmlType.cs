@@ -43,7 +43,8 @@ public enum GgmlType : uint
     I2_S = 36, // BitNet ternary: 2-bit packed, per-tensor scale, 128-element interleaved groups
     // 37-38 reserved
     MXFP4 = 39,
-    NVFP4 = 40,
+    Q1_0 = 40,      // PrismML Bonsai: 1-bit binary sign, 32 elements/block, 6 bytes (2 FP16 scale + 4 sign bits)
+    Q1_0_g128 = 41,  // PrismML Bonsai: 1-bit binary sign, 128 elements/block, 18 bytes (2 FP16 scale + 16 sign bits)
 }
 
 /// <summary>
@@ -89,7 +90,8 @@ public static class GgmlTypeInfo
         GgmlType.TQ2_0 => 256,
         GgmlType.I2_S => 1,
         GgmlType.MXFP4 => 256,
-        GgmlType.NVFP4 => 64,
+        GgmlType.Q1_0 => 32,
+        GgmlType.Q1_0_g128 => 128,
         _ => throw new NotSupportedException($"Unknown GGML type: {type}")
     };
 
@@ -131,7 +133,8 @@ public static class GgmlTypeInfo
         GgmlType.TQ2_0 => 64,
         GgmlType.I2_S => 1,
         GgmlType.MXFP4 => 132,
-        GgmlType.NVFP4 => 36,
+        GgmlType.Q1_0 => 6,       // 2 bytes FP16 scale + 4 bytes sign bits (32/8)
+        GgmlType.Q1_0_g128 => 18,  // 2 bytes FP16 scale + 16 bytes sign bits (128/8)
         _ => throw new NotSupportedException($"Unknown GGML type: {type}")
     };
 

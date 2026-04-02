@@ -374,6 +374,11 @@ public sealed class ForwardPass : IForwardPass
             }
         }
 
+        // Attention biases (Qwen2/2.5 — optional, null for Qwen3+)
+        if (w.AttnQBias != null) _backend.ElementAdd(_qAttn, _qAttn, w.AttnQBias);
+        if (w.AttnKBias != null) _backend.ElementAdd(_kProj, _kProj, w.AttnKBias);
+        if (w.AttnVBias != null) _backend.ElementAdd(_vProj, _vProj, w.AttnVBias);
+
         // RoPE (partial — only first ropeDim dims)
         _backend.RoPE(_qAttn, _kProj, keyLen, ropeDim, position, _config.RopeTheta);
 

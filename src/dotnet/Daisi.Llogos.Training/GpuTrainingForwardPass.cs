@@ -138,12 +138,16 @@ public sealed class GpuTrainingForwardPass : ITrainingForwardPass
             var upOut = Pool($"l{layer}.up", T * I);
             var ffnGated = Pool($"l{layer}.ffn_gated", T * I);
 
-            _gpu.MatMul(gateOut, ffnNormOut, GpuWeight(lw.FfnGate), T, H, I);
-            _gpu.MatMul(upOut, ffnNormOut, GpuWeight(lw.FfnUp), T, H, I);
+            string ffnPrefix = $"blk.{layer}";
+            _gpu.MatMul(gateOut, ffnNormOut, DequantToGpu($"l{layer}.ffn_gate_w", lw.FfnGate), T, H, I);
+            ApplyLoraForward($"{ffnPrefix}.ffn_gate", ffnNormOut, gateOut, T);
+            _gpu.MatMul(upOut, ffnNormOut, DequantToGpu($"l{layer}.ffn_up_w", lw.FfnUp), T, H, I);
+            ApplyLoraForward($"{ffnPrefix}.ffn_up", ffnNormOut, upOut, T);
             _gpu.SwiGLU(ffnGated, gateOut, upOut);
 
             var ffnOut = Pool($"l{layer}.ffn_out", T * H);
-            _gpu.MatMul(ffnOut, ffnGated, GpuWeight(lw.FfnDown), T, I, H);
+            _gpu.MatMul(ffnOut, ffnGated, DequantToGpu($"l{layer}.ffn_down_w", lw.FfnDown), T, I, H);
+            ApplyLoraForward($"{ffnPrefix}.ffn_down", ffnGated, ffnOut, T);
 
             saved.GateInput = gateOut;
             saved.UpInput = upOut;
@@ -160,9 +164,9 @@ public sealed class GpuTrainingForwardPass : ITrainingForwardPass
         _gpu.RmsNorm(finalNormOut, Pool("hidden", T * H), _outputNormWeight!, _config.NormEps);
 
         var logits = Pool("logits", T * V);
-        _gpu.MatMul(logits, finalNormOut, GpuWeight(_weights.OutputWeight), T, H, V);
+        _gpu.MatMul(logits, finalNormOut, DequantToGpu("out_logit_w", _weights.OutputWeight), T, H, V);
 
-        // 4. Cross-entropy loss + gradient (on GPU, only downloads scalar loss)
+        // 4. Cross-entropy loss + gradient
         var dLogits = Pool("dlogits", T * V);
         var gpuTargets = CreateIntTensor("targets", targets);
         totalLoss = _gpu.CrossEntropyLoss(dLogits, logits, gpuTargets, T, V);
@@ -195,9 +199,9 @@ public sealed class GpuTrainingForwardPass : ITrainingForwardPass
         var kRaw = Pool($"l{layer}.k", T * kOutDim);
         var vRaw = Pool($"l{layer}.v", T * vOutDim);
 
-        _gpu.MatMul(qRaw, saved.NormOut!, GpuWeight(saw.AttnQ), T, H, qOutDim);
-        _gpu.MatMul(kRaw, saved.NormOut!, GpuWeight(saw.AttnK), T, H, kOutDim);
-        _gpu.MatMul(vRaw, saved.NormOut!, GpuWeight(saw.AttnV), T, H, vOutDim);
+        _gpu.MatMul(qRaw, saved.NormOut!, DequantToGpu($"l{layer}.attn_q_w", saw.AttnQ), T, H, qOutDim);
+        _gpu.MatMul(kRaw, saved.NormOut!, DequantToGpu($"l{layer}.attn_k_w", saw.AttnK), T, H, kOutDim);
+        _gpu.MatMul(vRaw, saved.NormOut!, DequantToGpu($"l{layer}.attn_v_w", saw.AttnV), T, H, vOutDim);
 
         // Apply LoRA
         string prefix = $"blk.{layer}";
@@ -251,7 +255,7 @@ public sealed class GpuTrainingForwardPass : ITrainingForwardPass
         // O projection
         int oDim = (int)saw.AttnO.Dimensions[0];
         var oOut = Pool($"l{layer}.oout", T * H);
-        _gpu.MatMul(oOut, attnOut, GpuWeight(saw.AttnO), T, oDim, H);
+        _gpu.MatMul(oOut, attnOut, DequantToGpu($"l{layer}.attn_o_w", saw.AttnO), T, oDim, H);
         ApplyLoraForward($"{prefix}.attn_o", attnOut, oOut, T);
 
         // Write to hidden
@@ -270,10 +274,8 @@ public sealed class GpuTrainingForwardPass : ITrainingForwardPass
     {
         // Real DeltaNet forward — uses the same kernels as inference.
         // Processes tokens sequentially (DeltaNet is recurrent).
-        // No simplified approximation — correct hidden states for FFN LoRA.
         int H = _config.HiddenDim;
         int convKernel = _config.SsmConvKernel;
-        // Derive dimensions from weight tensors (matching inference ForwardDeltaNet exactly)
         int headDim = _config.SsmStateSize > 0 ? _config.SsmStateSize : _config.SsmHeadDim;
         int numVHeads = (int)dnw.SsmAlpha.Dimensions[1];
         int valueDim = numVHeads * headDim;
@@ -284,21 +286,9 @@ public sealed class GpuTrainingForwardPass : ITrainingForwardPass
         float scale = 1.0f / MathF.Sqrt(headDim);
         int convChannels = (int)(dnw.SsmConv1d.ElementCount / convKernel);
 
-        // State and conv buffer — reset per sequence
-        // Debug: print dimensions on first call
-        if (layer <= 1 && !_pool.ContainsKey($"delta.state.{layer}"))
-        {
-            Console.Error.WriteLine($"  DeltaNet L{layer}: H={H} headDim={headDim} numVHeads={numVHeads} " +
-                $"valueDim={valueDim} qkvDim={qkvDim} keyDim={keyDim} numKHeads={numKHeads} " +
-                $"repeat={repeatFactor} convK={convKernel} convCh={convChannels} " +
-                $"SsmAlpha.Dims=[{string.Join(",", dnw.SsmAlpha.Dimensions.ToArray())}] " +
-                $"AttnQkv.Dims=[{string.Join(",", dnw.AttnQkv.Dimensions.ToArray())}]");
-        }
-
         var state = PoolZ($"delta.state.{layer}", numVHeads * headDim * headDim);
         var convBuf = PoolZ($"delta.conv.{layer}", (convKernel - 1) * convChannels);
 
-        // Single-token scratch tensors (reused across tokens)
         var qkvBuf = Pool("delta.qkv_tok", qkvDim);
         var ssmQ = Pool("delta.q", valueDim);
         var ssmK = Pool("delta.k", valueDim);
@@ -314,19 +304,18 @@ public sealed class GpuTrainingForwardPass : ITrainingForwardPass
 
         var hiddenBuf = Pool("hidden", T * H);
 
-        // Process each token sequentially
         for (int t = 0; t < T; t++)
         {
-            // Extract single token's normOut
             _gpu.CopyTensorSlice(normOut1, 0, saved.NormOut!, t * H, H);
 
-            // Step 1: QKV projection
-            _gpu.MatMul(qkvBuf, normOut1, GpuWeight(dnw.AttnQkv), 1, H, qkvDim);
+            // Step 1: QKV projection (use F32 weights to avoid Q8_0 dp4a alignment issues for M=1)
+            var qkvWeight = DequantToGpu($"l{layer}.delta_qkv_w", dnw.AttnQkv);
+            _gpu.MatMul(qkvBuf, normOut1, qkvWeight, 1, H, qkvDim);
 
-            // Step 2: CausalConv1d (in-place on qkvBuf)
+            // Step 2: CausalConv1d
             _gpu.CausalConv1d(qkvBuf, convBuf, GpuWeight(dnw.SsmConv1d), convChannels, convKernel);
 
-            // Step 3: SiLU in-place
+            // Step 3: SiLU
             _gpu.SiLUInPlace(qkvBuf);
 
             // Step 4: Split QKV
@@ -335,44 +324,41 @@ public sealed class GpuTrainingForwardPass : ITrainingForwardPass
             else
                 _gpu.SplitUnequalQKV(ssmQ, ssmK, ssmV, qkvBuf, keyDim, valueDim);
 
-            // Step 5: L2 normalize Q and K by group
+            // Step 5: L2 norm
             _gpu.L2NormGroups(ssmQ, numKHeads, headDim);
             _gpu.L2NormGroups(ssmK, numKHeads, headDim);
 
-            // Step 6: Repeat-tile if needed (GQA expansion)
+            // Step 6: Repeat-tile
             if (repeatFactor > 1)
             {
                 _gpu.RepeatTile(ssmQ, numKHeads, headDim, repeatFactor);
                 _gpu.RepeatTile(ssmK, numKHeads, headDim, repeatFactor);
             }
 
-            // Step 7: Alpha/Beta projections
-            _gpu.MatMul(ssmAlpha, normOut1, GpuWeight(dnw.SsmAlpha), 1, H, numVHeads);
-            _gpu.MatMul(ssmBeta, normOut1, GpuWeight(dnw.SsmBeta), 1, H, numVHeads);
+            // Step 7: Alpha/Beta projections (F32 weights for M=1)
+            _gpu.MatMul(ssmAlpha, normOut1, DequantToGpu($"l{layer}.delta_alpha_w", dnw.SsmAlpha), 1, H, numVHeads);
+            _gpu.MatMul(ssmBeta, normOut1, DequantToGpu($"l{layer}.delta_beta_w", dnw.SsmBeta), 1, H, numVHeads);
 
             // Step 8: Compute decay and beta values
             _gpu.ComputeDecayBeta(ssmDecay, ssmBetaVal, ssmAlpha, ssmBeta,
                 GpuWeight(dnw.SsmA), GpuWeight(dnw.SsmDtBias), numVHeads);
 
-            // Step 9: DeltaNet state update + output (the core SSM operation)
+            // Step 9: DeltaNet state update + output
             _gpu.DeltaNetStep(ssmOutput, ssmQ, ssmK, ssmV,
                 state, ssmDecay, ssmBetaVal,
                 GpuWeight(dnw.SsmNorm), numVHeads, headDim, scale, _config.NormEps);
 
-            // Step 10: Gate projection + SiLU gate
-            _gpu.MatMul(ssmGate, normOut1, GpuWeight(dnw.AttnGate), 1, H, valueDim);
+            // Step 10: Gate + SiLU gate (F32 weight for M=1)
+            _gpu.MatMul(ssmGate, normOut1, DequantToGpu($"l{layer}.delta_gate_w", dnw.AttnGate), 1, H, valueDim);
             _gpu.SiLUGate(ssmOutput, ssmOutput, ssmGate);
 
-            // Step 11: Output projection → single token hidden
-            _gpu.MatMul(hidden1, ssmOutput, GpuWeight(dnw.SsmOut), 1, valueDim, H);
+            // Step 11: Output projection (F32 weight for M=1)
+            _gpu.MatMul(hidden1, ssmOutput, DequantToGpu($"l{layer}.delta_out_w", dnw.SsmOut), 1, valueDim, H);
 
-            // Store output at position t
             _gpu.CopyTensorSlice(hiddenBuf, t * H, hidden1, 0, H);
         }
 
         saved.IsDeltaNet = true;
-        // No DeltaNet-specific activations saved — backward passes gradient through residual.
-        // The correct forward hidden states ensure FFN LoRA learns properly.
     }
 
     private void Backward(ITensor dLogits, ITensor finalNormOut, int T)
@@ -399,7 +385,11 @@ public sealed class GpuTrainingForwardPass : ITrainingForwardPass
             int I = _config.IntermediateDim;
 
             // FFN backward
+            string bPrefix = $"blk.{layer}";
             var dFfnOut = CloneGpuTensor($"d_l{layer}.ffn_out", Pool("dhidden", T * H));
+
+            // Down projection LoRA backward (accumulate dA/dB)
+            ApplyLoraBackward($"{bPrefix}.ffn_down", saved.FfnGated!, dFfnOut, T);
 
             // Down projection backward
             var downF32 = DequantToGpu($"d_l{layer}.down", lw.FfnDown);
@@ -412,6 +402,10 @@ public sealed class GpuTrainingForwardPass : ITrainingForwardPass
             _gpu.ZeroTensor(dGate);
             _gpu.ZeroTensor(dUp);
             _gpu.SwiGLUBackward(dGate, dUp, dFfnGated, saved.GateInput!, saved.UpInput!);
+
+            // Gate/up LoRA backward (accumulate dA/dB)
+            ApplyLoraBackward($"{bPrefix}.ffn_gate", saved.FfnNormOut!, dGate, T);
+            ApplyLoraBackward($"{bPrefix}.ffn_up", saved.FfnNormOut!, dUp, T);
 
             // Gate/up projection backward
             var dFfnNormOut = Pool($"d_l{layer}.ffn_norm", T * H);
@@ -439,9 +433,7 @@ public sealed class GpuTrainingForwardPass : ITrainingForwardPass
             // Layer-specific backward
             if (saved.IsAttention)
                 BackwardAttentionLayer(saved, dAttnOut, layer, T);
-            // DeltaNet: gradient passes through residual only.
-            // Real DeltaNet forward produces correct hidden states for FFN,
-            // but we don't backprop through the SSM (no DeltaNet LoRA needed).
+            // DeltaNet: gradient passes through residual (real forward, no saved approx activations)
 
             // Pre-attention RmsNorm backward
             var dInputToLayer = Pool($"d_l{layer}.input", T * H);
@@ -816,7 +808,33 @@ public sealed class GpuTrainingForwardPass : ITrainingForwardPass
             return cached;
         var rawBytes = new byte[cpuWeight.ByteSize];
         cpuWeight.CopyRawTo(rawBytes);
-        // Ensure Q8_1 scratch is allocated for Q8_0 matmul (small models may not trigger it in LoadTensor)
+
+        // Fix: LoadTensor only repacks Q8_0 to aligned (36-byte) blocks for K >= 2048.
+        // For small models (K < 2048), DeltaNet M=1 matmul uses the aligned kernel but
+        // gets unaligned data, producing NaN. Repack here before uploading.
+        if (cpuWeight.Type == Gguf.GgmlType.Q8_0 && cpuWeight.Dimensions.Length >= 2
+            && cpuWeight.Dimensions[0] < 2048)
+        {
+            _gpu.EnsureQ8_1Scratch((int)cpuWeight.Dimensions[0]);
+            int blockCount = rawBytes.Length / 34;
+            var aligned = new byte[blockCount * 36];
+            for (int i = 0; i < blockCount; i++)
+            {
+                int srcOff = i * 34;
+                int dstOff = i * 36;
+                aligned[dstOff] = rawBytes[srcOff];
+                aligned[dstOff + 1] = rawBytes[srcOff + 1];
+                // 2 bytes padding (zero)
+                Buffer.BlockCopy(rawBytes, srcOff + 2, aligned, dstOff + 4, 32);
+            }
+            var tensor = new CudaTensor(cpuWeight.Name, cpuWeight.Type,
+                cpuWeight.Dimensions, pinned: false, alignedQ8_0: true);
+            tensor.Memory.CopyFromHost(aligned);
+            _gpuWeightCache[cpuWeight] = tensor;
+            return tensor;
+        }
+
+        // Ensure Q8_1 scratch is allocated for Q8_0 matmul
         if (cpuWeight.Type == Gguf.GgmlType.Q8_0 && cpuWeight.Dimensions.Length >= 2)
             _gpu.EnsureQ8_1Scratch((int)cpuWeight.Dimensions[0]);
         var gpu = _gpu.LoadTensor(cpuWeight.Name, cpuWeight.Type, cpuWeight.Dimensions, rawBytes);
