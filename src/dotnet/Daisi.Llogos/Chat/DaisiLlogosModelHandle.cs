@@ -24,6 +24,11 @@ public sealed class DaisiLlogosModelHandle : IDisposable
     public ChatTemplate ChatTemplate { get; }
     public GgufFile Gguf { get; }
 
+    /// <summary>
+    /// Create a tool formatter that uses the model-native preamble for tool definitions.
+    /// </summary>
+    public IToolFormatter CreateToolFormatter() => new DefaultToolFormatter(ChatTemplate.Format);
+
     private readonly int _contextSize;
     private readonly int? _seed;
 
