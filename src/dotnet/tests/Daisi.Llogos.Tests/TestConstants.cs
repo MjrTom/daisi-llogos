@@ -34,4 +34,16 @@ public static class TestConstants
     /// Returns true if the 9B model file exists on disk.
     /// </summary>
     public static bool Model9BExists => File.Exists(Qwen35_9B_Q8_0);
+
+    /// <summary>
+    /// Path to the BitNet b1.58 2B I2_S GGUF file. Ternary quantization — fast on CPU.
+    /// </summary>
+    public static readonly string BitNet_I2S = RuntimeInformation.IsOSPlatform(OSPlatform.Windows)
+        ? @"C:\GGUFS\ggml-model-i2_s.gguf"
+        : Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.UserProfile), "GGUFS", "ggml-model-i2_s.gguf");
+
+    /// <summary>
+    /// Returns true if the BitNet model file exists on disk.
+    /// </summary>
+    public static bool BitNetExists => File.Exists(BitNet_I2S);
 }
