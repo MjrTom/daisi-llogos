@@ -15,13 +15,15 @@ import { fetchGgufHeader, parseGguf, GgufModelInfo, GgufTensorInfo } from './ggu
 import { GgmlType } from './gguf/quantization.js';
 import { downloadFile, extractTensorData, DownloadProgress } from './storage/download-manager.js';
 import { streamTensors } from './storage/streaming-loader.js';
-import { GgmlType } from './gguf/quantization.js';
 import { BpeTokenizer, tokenizerFromGguf } from './tokenizer/bpe-tokenizer.js';
 import { applyTemplate, ChatMessage } from './tokenizer/chat-template.js';
 import { VocabRemapper } from './tokenizer/vocab-remapper.js';
 import { LlamaModel } from './model/llama-model.js';
 import { Qwen35Model } from './model/qwen35-model.js';
+import { LayerSwapModel } from './model/layer-swap-model.js';
 import { Sampler, SamplerOptions } from './model/sampler.js';
+import { fetchManifest, fetchShard, fetchShardTensors, shardUrl } from './storage/shard-loader.js';
+import type { ShardManifest } from './gguf/shard-reader.js';
 
 export type EngineStatus = 'uninitialized' | 'ready' | 'loading' | 'loaded' | 'generating' | 'error';
 
@@ -145,6 +147,127 @@ export class LlogosEngine {
       // Clear CPU tensor data after GPU upload
       tensorMap.clear();
       console.log('[llogos] Model loaded successfully');
+
+      this._status = 'loaded';
+      return info;
+    } catch (e) {
+      this._status = 'error';
+      throw e;
+    }
+  }
+
+  /**
+   * Load a model from pre-split shard files for partial downloads.
+   *
+   * Modes:
+   * - Pipeline stage: specify startLayer/endLayer to load only assigned layers.
+   * - Layer-swap: set layerSwap=true to load one layer at a time during inference (low VRAM).
+   * - Full shard load: omit startLayer/endLayer for full model from shards.
+   */
+  async loadModelFromShards(
+    baseUrl: string,
+    options?: {
+      startLayer?: number;
+      endLayer?: number;
+      includeEmbedding?: boolean;
+      includeOutputHead?: boolean;
+      layerSwap?: boolean;
+      onProgress?: (progress: { phase: string; shardsDownloaded: number; totalShards: number }) => void;
+    },
+  ): Promise<GgufModelInfo> {
+    if (!this.compute) throw new Error('GPU not initialized. Call initGpu() first.');
+    this._status = 'loading';
+
+    try {
+      // 1. Fetch manifest
+      options?.onProgress?.({ phase: 'Fetching manifest', shardsDownloaded: 0, totalShards: 0 });
+      const manifest = await fetchManifest(baseUrl);
+
+      // 2. Fetch header shard → parse GGUF metadata
+      options?.onProgress?.({ phase: 'Parsing header', shardsDownloaded: 0, totalShards: manifest.totalLayers + 3 });
+      const headerBuffer = await fetchShard(shardUrl(baseUrl, manifest.header.fileName));
+      const info = parseGguf(headerBuffer);
+      this.modelInfo = info;
+      this.tokenizer = tokenizerFromGguf(info.metadata);
+
+      const startLayer = options?.startLayer ?? 0;
+      const endLayer = options?.endLayer ?? info.blockCount;
+      const includeEmbedding = options?.includeEmbedding ?? true;
+      const includeOutputHead = options?.includeOutputHead ?? true;
+
+      // Build tensor info lookup
+      const tensorInfoMap = new Map<string, GgufTensorInfo>();
+      for (const t of info.tensors) tensorInfoMap.set(t.name, t);
+
+      // 3. Select model class
+      let model: LlamaModel | Qwen35Model;
+      if (info.architecture === 'qwen35') {
+        model = new Qwen35Model(this.compute, info);
+      } else {
+        model = new LlamaModel(this.compute, info);
+      }
+
+      if (options?.layerSwap) {
+        // Layer-swap mode: load only embedding + output, layers loaded on-demand during inference
+        options?.onProgress?.({ phase: 'Loading embed/output shards', shardsDownloaded: 1, totalShards: manifest.totalLayers + 3 });
+
+        // Fetch embed + output shards
+        const tensorMap = new Map<string, { buffer: ArrayBuffer; info: GgufTensorInfo }>();
+        const embedTensors = await fetchShardTensors(shardUrl(baseUrl, manifest.embed.fileName), tensorInfoMap);
+        for (const [k, v] of embedTensors) tensorMap.set(k, v);
+
+        const outputTensors = await fetchShardTensors(shardUrl(baseUrl, manifest.output.fileName), tensorInfoMap);
+        for (const [k, v] of outputTensors) tensorMap.set(k, v);
+
+        // Init model with only embedding + output (no layers)
+        await (model as LlamaModel).initWeightsPartial(tensorMap, info.blockCount, info.blockCount, true, true);
+        tensorMap.clear();
+
+        // Create layer-swap wrapper
+        this.model = new LayerSwapModel(
+          this.compute, info, model as LlamaModel,
+          baseUrl, manifest.modelFileName, tensorInfoMap,
+        ) as any;
+
+        // Optionally preload all layer shards
+        options?.onProgress?.({ phase: 'Preloading layer shards', shardsDownloaded: 2, totalShards: manifest.totalLayers + 3 });
+        await (this.model as unknown as LayerSwapModel).preloadShards((loaded, total) => {
+          options?.onProgress?.({ phase: `Preloading layers (${loaded}/${total})`, shardsDownloaded: loaded + 2, totalShards: total + 3 });
+        });
+      } else {
+        // Pipeline/full mode: fetch only needed shards and upload to GPU
+        const tensorMap = new Map<string, { buffer: ArrayBuffer; info: GgufTensorInfo }>();
+        let shardsLoaded = 1; // header already loaded
+
+        if (includeEmbedding) {
+          options?.onProgress?.({ phase: 'Loading embed shard', shardsDownloaded: shardsLoaded, totalShards: endLayer - startLayer + 3 });
+          const embedTensors = await fetchShardTensors(shardUrl(baseUrl, manifest.embed.fileName), tensorInfoMap);
+          for (const [k, v] of embedTensors) tensorMap.set(k, v);
+          shardsLoaded++;
+        }
+
+        if (includeOutputHead) {
+          options?.onProgress?.({ phase: 'Loading output shard', shardsDownloaded: shardsLoaded, totalShards: endLayer - startLayer + 3 });
+          const outputTensors = await fetchShardTensors(shardUrl(baseUrl, manifest.output.fileName), tensorInfoMap);
+          for (const [k, v] of outputTensors) tensorMap.set(k, v);
+          shardsLoaded++;
+        }
+
+        for (let i = startLayer; i < endLayer; i++) {
+          const layerShard = manifest.layers.find(l => l.layerIndex === i);
+          if (!layerShard) throw new Error(`Missing layer shard for layer ${i}`);
+          options?.onProgress?.({ phase: `Loading layer ${i}`, shardsDownloaded: shardsLoaded, totalShards: endLayer - startLayer + 3 });
+          const layerTensors = await fetchShardTensors(shardUrl(baseUrl, layerShard.fileName), tensorInfoMap);
+          for (const [k, v] of layerTensors) tensorMap.set(k, v);
+          shardsLoaded++;
+        }
+
+        // Upload to GPU
+        options?.onProgress?.({ phase: 'Uploading to GPU', shardsDownloaded: shardsLoaded, totalShards: shardsLoaded });
+        await (model as LlamaModel).initWeightsPartial(tensorMap, startLayer, endLayer, includeEmbedding, includeOutputHead);
+        tensorMap.clear();
+        this.model = model;
+      }
 
       this._status = 'loaded';
       return info;
