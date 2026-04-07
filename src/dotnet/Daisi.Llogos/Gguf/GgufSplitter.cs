@@ -20,7 +20,10 @@ public static class GgufSplitter
     /// <param name="outputDir">Directory to write shard files to. Created if it doesn't exist.</param>
     /// <param name="log">Optional log callback for progress reporting.</param>
     /// <returns>The manifest describing all generated shard files.</returns>
-    public static GgufShardManifest Split(string inputPath, string outputDir, Action<string>? log = null)
+    /// <param name="gpuAligned">If true, repack Q4_0/Q8_0 to GPU-aligned layout in layer shards.
+    /// Enables zero-copy loading: mmap → pinned → async DMA with no per-token repack.</param>
+    public static GgufShardManifest Split(string inputPath, string outputDir,
+        Action<string>? log = null, bool gpuAligned = false)
     {
         Directory.CreateDirectory(outputDir);
 
@@ -106,7 +109,10 @@ public static class GgufSplitter
                 .ToList();
 
             var layerTensors = CollectTensors(gguf, tensorMap, layerTensorNames);
-            WriteShardFile(layerPath, GgufShardFormat.ShardType.Layer, i, layerTensors, inputStream);
+            if (gpuAligned)
+                WriteShardFileGpuAligned(layerPath, GgufShardFormat.ShardType.Layer, i, layerTensors, tensorMap, inputStream);
+            else
+                WriteShardFile(layerPath, GgufShardFormat.ShardType.Layer, i, layerTensors, inputStream);
 
             manifest.Layers.Add(new LayerShardInfo
             {
@@ -115,6 +121,8 @@ public static class GgufSplitter
                 SizeBytes = new FileInfo(layerPath).Length,
             });
         }
+
+        manifest.GpuAligned = gpuAligned;
 
         // 5. Write manifest
         var manifestPath = Path.Combine(outputDir, $"{baseName}.manifest.json");
@@ -192,5 +200,111 @@ public static class GgufSplitter
     {
         using var output = File.Create(path);
         GgufShardFormat.WriteShardFromSource(output, type, layerIndex, tensors, source);
+    }
+
+    /// <summary>
+    /// Write a shard file with GPU-aligned quantized data.
+    /// Q4_0: 18-byte blocks → 20-byte (2b scale + 2b pad + 16b nibbles).
+    /// Q8_0: 34-byte blocks → 36-byte (2b scale + 2b pad + 32b quants).
+    /// Other types: copied verbatim.
+    /// The shard index records the REPACKED sizes so the reader sees correct byte counts.
+    /// </summary>
+    private static void WriteShardFileGpuAligned(string path, GgufShardFormat.ShardType type,
+        int layerIndex, List<(string name, long sourceOffset, long size)> tensors,
+        Dictionary<string, GgufTensorInfo> tensorMap, Stream source)
+    {
+        using var output = File.Create(path);
+
+        // Compute repacked sizes for the shard index
+        var repackedRefs = new List<(string name, long repackedSize)>(tensors.Count);
+        foreach (var (name, _, size) in tensors)
+        {
+            var info = tensorMap[name];
+            long repacked;
+            if (info.Type == GgmlType.Q4_0 && info.Dimensions.Length >= 2)
+                repacked = (size / 18) * 20;
+            else if (info.Type == GgmlType.Q8_0 && info.Dimensions.Length >= 2)
+                repacked = (size / 34) * 36;
+            else
+                repacked = size;
+            repackedRefs.Add((name, repacked));
+        }
+
+        // Write shard header with repacked sizes
+        using var writer = new BinaryWriter(output, System.Text.Encoding.UTF8, leaveOpen: true);
+        writer.Write(GgufShardFormat.Magic);
+        writer.Write(GgufShardFormat.FormatVersion);
+        writer.Write((uint)type);
+        writer.Write(layerIndex);
+        writer.Write(repackedRefs.Count);
+
+        long currentDataOffset = 0;
+        foreach (var (name, repacked) in repackedRefs)
+        {
+            var nameBytes = System.Text.Encoding.UTF8.GetBytes(name);
+            writer.Write(nameBytes.Length);
+            writer.Write(nameBytes);
+            writer.Write(currentDataOffset);
+            writer.Write(repacked);
+            currentDataOffset += repacked;
+        }
+
+        // Alignment padding
+        long pos = output.Position;
+        long remainder = pos % GgufShardFormat.Alignment;
+        if (remainder != 0)
+            writer.Write(new byte[(int)(GgufShardFormat.Alignment - remainder)]);
+
+        // Write tensor data — repack Q4_0/Q8_0 on the fly
+        var readBuf = new byte[1024 * 1024];
+        foreach (var (name, sourceOffset, size) in tensors)
+        {
+            var info = tensorMap[name];
+            source.Seek(sourceOffset, SeekOrigin.Begin);
+
+            if (info.Type == GgmlType.Q4_0 && info.Dimensions.Length >= 2)
+            {
+                // Repack Q4_0: 18 → 20 byte blocks
+                int blockCount = (int)(size / 18);
+                var srcBlock = new byte[18];
+                var dstBlock = new byte[20]; // [scale 2b][pad 2b][nibbles 16b]
+                for (int b = 0; b < blockCount; b++)
+                {
+                    source.ReadExactly(srcBlock);
+                    dstBlock[0] = srcBlock[0]; dstBlock[1] = srcBlock[1];
+                    dstBlock[2] = 0; dstBlock[3] = 0;
+                    Buffer.BlockCopy(srcBlock, 2, dstBlock, 4, 16);
+                    output.Write(dstBlock);
+                }
+            }
+            else if (info.Type == GgmlType.Q8_0 && info.Dimensions.Length >= 2)
+            {
+                // Repack Q8_0: 34 → 36 byte blocks
+                int blockCount = (int)(size / 34);
+                var srcBlock = new byte[34];
+                var dstBlock = new byte[36]; // [scale 2b][pad 2b][quants 32b]
+                for (int b = 0; b < blockCount; b++)
+                {
+                    source.ReadExactly(srcBlock);
+                    dstBlock[0] = srcBlock[0]; dstBlock[1] = srcBlock[1];
+                    dstBlock[2] = 0; dstBlock[3] = 0;
+                    Buffer.BlockCopy(srcBlock, 2, dstBlock, 4, 32);
+                    output.Write(dstBlock);
+                }
+            }
+            else
+            {
+                // Verbatim copy
+                long rem = size;
+                while (rem > 0)
+                {
+                    int toRead = (int)Math.Min(rem, readBuf.Length);
+                    int read = source.Read(readBuf, 0, toRead);
+                    if (read == 0) throw new EndOfStreamException();
+                    output.Write(readBuf, 0, read);
+                    rem -= read;
+                }
+            }
+        }
     }
 }

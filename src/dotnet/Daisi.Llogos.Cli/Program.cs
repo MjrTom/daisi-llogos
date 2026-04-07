@@ -497,6 +497,7 @@ static int RunSplit(string[] args)
 {
     string? modelPath = null;
     string? outputDir = null;
+    bool alignGpu = false;
     bool showHelp = false;
 
     for (int i = 0; i < args.Length; i++)
@@ -508,6 +509,9 @@ static int RunSplit(string[] args)
                 break;
             case "--output-dir" or "-o":
                 outputDir = NextArg(args, ref i);
+                break;
+            case "--align-gpu":
+                alignGpu = true;
                 break;
             case "--help" or "-h":
                 showHelp = true;
@@ -527,6 +531,7 @@ static int RunSplit(string[] args)
 
             Options:
               --output-dir, -o <path>  Output directory (default: {model}.shards/)
+              --align-gpu              Pre-repack Q4_0/Q8_0 to GPU-aligned layout (faster pipelined inference)
               --help, -h               Show this help
             """);
         return showHelp ? 0 : 1;
@@ -540,7 +545,7 @@ static int RunSplit(string[] args)
 
     outputDir ??= modelPath + ".shards";
 
-    GgufSplitter.Split(modelPath, outputDir, msg => Console.Error.WriteLine($"  {msg}"));
+    GgufSplitter.Split(modelPath, outputDir, msg => Console.Error.WriteLine($"  {msg}"), gpuAligned: alignGpu);
     return 0;
 }
 

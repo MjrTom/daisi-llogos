@@ -25,6 +25,7 @@ public sealed class PipelinedForwardPass : IForwardPass
     private readonly CudaBackend _cuda;
     private readonly ModelConfig _config;
     private readonly ForwardPass _forward;
+    private readonly bool _gpuAligned;
     private readonly CudaStream _copyStream;
     private readonly nint _copyDoneA; // CUDA event: signaled when slot A's DMA finishes
     private readonly nint _copyDoneB; // CUDA event: signaled when slot B's DMA finishes
@@ -58,7 +59,8 @@ public sealed class PipelinedForwardPass : IForwardPass
         LayerShardData[] layerData, List<IDisposable> mmapHandles,
         ForwardPass forward, CudaStream copyStream,
         nint copyDoneA, nint copyDoneB,
-        CudaPinnedMemory pinnedA, CudaPinnedMemory pinnedB)
+        CudaPinnedMemory pinnedA, CudaPinnedMemory pinnedB,
+        bool gpuAligned)
     {
         _cuda = cuda;
         _config = config;
@@ -76,6 +78,7 @@ public sealed class PipelinedForwardPass : IForwardPass
         _copyDoneB = copyDoneB;
         _pinnedA = pinnedA;
         _pinnedB = pinnedB;
+        _gpuAligned = gpuAligned;
     }
 
     public ReadOnlySpan<float> Forward(int tokenId, int position)
@@ -166,20 +169,20 @@ public sealed class PipelinedForwardPass : IForwardPass
         _forward.ResetState();
     }
 
-    /// <summary>Repack from mmap directly into pinned buffer + upload to GPU synchronously.</summary>
+    /// <summary>Copy (or repack) from mmap into pinned buffer + upload to GPU synchronously.</summary>
     private unsafe void UploadLayerSync(int layerIndex, ModelWeights targetWeights, int slot)
     {
         var pinned = slot == 0 ? _pinnedA : _pinnedB;
         LayerShardData.RepackAndUpload(_layerData[layerIndex], targetWeights.Layers[layerIndex],
-            (byte*)pinned.HostPtr, null, synchronous: true);
+            (byte*)pinned.HostPtr, null, synchronous: true, gpuAligned: _gpuAligned);
     }
 
-    /// <summary>Repack from mmap directly into pinned buffer + async DMA to GPU.</summary>
+    /// <summary>Copy (or repack) from mmap into pinned buffer + async DMA to GPU.</summary>
     private unsafe void UploadLayerAsync(int layerIndex, ModelWeights targetWeights, int slot)
     {
         var pinned = slot == 0 ? _pinnedA : _pinnedB;
         LayerShardData.RepackAndUpload(_layerData[layerIndex], targetWeights.Layers[layerIndex],
-            (byte*)pinned.HostPtr, _copyStream, synchronous: false);
+            (byte*)pinned.HostPtr, _copyStream, synchronous: false, gpuAligned: _gpuAligned);
     }
 
     public void Dispose()
@@ -213,28 +216,34 @@ public sealed class PipelinedForwardPass : IForwardPass
         var sw = Stopwatch.StartNew();
         var mmapHandles = new List<IDisposable>();
 
+        // Check if shards are GPU-aligned (pre-repacked at split time)
+        var baseName = MmapModelLoader.FindShardBaseName(shardDir);
+        var manifestPath = Path.Combine(shardDir, $"{baseName}.manifest.json");
+        bool gpuAligned = false;
+        if (File.Exists(manifestPath))
+        {
+            var manifest = GgufShardManifest.FromJsonFile(manifestPath);
+            gpuAligned = manifest.GpuAligned;
+        }
+
         // Persistent: embedding + output on GPU
         var embedWeights = MmapModelLoader.LoadPartialFromShards(
             gguf, shardDir, cuda, config, 0, 0, true, false);
         var outputWeights = MmapModelLoader.LoadPartialFromShards(
             gguf, shardDir, cuda, config, config.NumLayers, config.NumLayers, false, true);
 
-        // KV cache + DeltaNet state for all layers (persistent, small)
+        // KV cache for all layers (persistent, small)
         var kvCache = new KvCache(cuda, config, maxSeqLen: maxContext);
 
-        // DeltaNetState needs weights to detect layer types — load temporarily
-        var tmpWeights = MmapModelLoader.LoadPartialFromShards(
-            gguf, shardDir, cuda, config, 0, config.NumLayers, false, false);
-        var deltaState = new DeltaNetState(cuda, config, tmpWeights);
-        tmpWeights.Dispose();
-
         // Allocate two sets of layer weight GPU buffers (empty — will be filled per layer)
-        var weightsA = AllocateLayerSlot(cuda, config, gguf, "slotA");
-        var weightsB = AllocateLayerSlot(cuda, config, gguf, "slotB");
+        var weightsA = AllocateLayerSlot(cuda, config, gguf, "slotA", gpuAligned);
+        var weightsB = AllocateLayerSlot(cuda, config, gguf, "slotB", gpuAligned);
 
-        // Memory-map layer shard files and prepare CPU-side pinned copies for async transfer
+        // DeltaNetState needs weights to detect layer types — use slot A
+        var deltaState = new DeltaNetState(cuda, config, weightsA);
+
+        // Memory-map layer shard files
         var layerData = new LayerShardData[config.NumLayers];
-        var baseName = MmapModelLoader.FindShardBaseName(shardDir);
         for (int i = 0; i < config.NumLayers; i++)
         {
             var shardPath = Path.Combine(shardDir, $"{baseName}.layer.{i}");
@@ -292,7 +301,7 @@ public sealed class PipelinedForwardPass : IForwardPass
         return new PipelinedForwardPass(
             cuda, config, embedWeights, outputWeights,
             kvCache, deltaState, weightsA, weightsB,
-            layerData, mmapHandles, forward, copyStream, copyDoneA, copyDoneB, pinnedA, pinnedB);
+            layerData, mmapHandles, forward, copyStream, copyDoneA, copyDoneB, pinnedA, pinnedB, gpuAligned);
     }
 
     /// <summary>
@@ -300,7 +309,7 @@ public sealed class PipelinedForwardPass : IForwardPass
     /// These are the double-buffer slots that get overwritten each layer.
     /// </summary>
     private static ModelWeights AllocateLayerSlot(CudaBackend cuda, ModelConfig config,
-        GgufFile gguf, string prefix)
+        GgufFile gguf, string prefix, bool gpuAligned = false)
     {
         var tensorInfoMap = new Dictionary<string, GgufTensorInfo>();
         foreach (var t in gguf.Tensors) tensorInfoMap[t.Name] = t;
@@ -309,9 +318,9 @@ public sealed class PipelinedForwardPass : IForwardPass
         for (int i = 0; i < config.NumLayers; i++)
         {
             if (config.IsStandardAttention(i))
-                layers[i] = AllocateStandardLayer(cuda, tensorInfoMap, i, prefix);
+                layers[i] = AllocateStandardLayer(cuda, tensorInfoMap, i, prefix, gpuAligned);
             else
-                layers[i] = AllocateDeltaNetLayer(cuda, tensorInfoMap, i, prefix);
+                layers[i] = AllocateDeltaNetLayer(cuda, tensorInfoMap, i, prefix, gpuAligned);
         }
 
         // Placeholders for embed/output — not used in layer slots
@@ -326,13 +335,16 @@ public sealed class PipelinedForwardPass : IForwardPass
     }
 
     private static StandardAttentionWeights AllocateStandardLayer(
-        CudaBackend cuda, Dictionary<string, GgufTensorInfo> infoMap, int i, string prefix)
+        CudaBackend cuda, Dictionary<string, GgufTensorInfo> infoMap, int i, string prefix,
+        bool gpuAligned = false)
     {
         ITensor Alloc(string name)
         {
             var info = infoMap[name];
             var dims = info.Dimensions.Select(d => (long)d).ToArray();
-            // Allocate with proper alignment for quantized types
+            // When gpuAligned, the shard contains repacked data (Q4_0: 20b/block, Q8_0: 36b/block).
+            // CudaBackend.LoadTensor handles repacking internally and allocates the aligned size.
+            // We need to pass the ORIGINAL byte size so LoadTensor does its own repacking.
             return cuda.LoadTensor($"{prefix}.{name}", info.Type, dims,
                 new byte[GgmlTypeInfo.ByteSize(info.Type, info.ElementCount)]);
         }
@@ -365,7 +377,8 @@ public sealed class PipelinedForwardPass : IForwardPass
     }
 
     private static DeltaNetWeights AllocateDeltaNetLayer(
-        CudaBackend cuda, Dictionary<string, GgufTensorInfo> infoMap, int i, string prefix)
+        CudaBackend cuda, Dictionary<string, GgufTensorInfo> infoMap, int i, string prefix,
+        bool gpuAligned = false)
     {
         ITensor Alloc(string name)
         {
@@ -416,11 +429,12 @@ public sealed class PipelinedForwardPass : IForwardPass
         }
 
         /// <summary>
-        /// Repack all tensors directly from mmap into the pinned buffer, then issue
-        /// per-tensor async DMA to GPU. Returns total bytes written to pinned buffer.
+        /// Copy (or repack) all tensors from mmap into the pinned buffer, then issue
+        /// per-tensor async DMA to GPU. When gpuAligned=true, shard data is already in
+        /// GPU layout — just memcpy (no per-block repack loop). Returns total bytes written.
         /// </summary>
         internal static unsafe long RepackAndUpload(LayerShardData data, LayerWeights targetLayer,
-            byte* pinnedPtr, CudaStream? copyStream, bool synchronous)
+            byte* pinnedPtr, CudaStream? copyStream, bool synchronous, bool gpuAligned = false)
         {
             long offset = 0;
 
@@ -435,8 +449,13 @@ public sealed class PipelinedForwardPass : IForwardPass
                 byte* dst = pinnedPtr + offset;
                 long repackedSize;
 
-                // Repack quantized formats to GPU-aligned layout
-                if (tr.Type == GgmlType.Q4_0 && tr.NDimensions >= 2)
+                if (gpuAligned)
+                {
+                    // GPU-aligned shards: data is already repacked — straight memcpy
+                    repackedSize = tr.RawByteSize;
+                    Buffer.MemoryCopy(src, dst, repackedSize, repackedSize);
+                }
+                else if (tr.Type == GgmlType.Q4_0 && tr.NDimensions >= 2)
                 {
                     int blockCount = tr.RawByteSize / 18;
                     repackedSize = blockCount * 20;

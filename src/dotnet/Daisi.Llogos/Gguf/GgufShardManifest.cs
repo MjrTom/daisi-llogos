@@ -30,6 +30,13 @@ public sealed class GgufShardManifest
     [JsonPropertyName("layers")]
     public List<LayerShardInfo> Layers { get; set; } = [];
 
+    /// <summary>
+    /// If true, quantized tensor data in layer shards is pre-repacked to GPU-aligned layout
+    /// (Q4_0: 20-byte blocks, Q8_0: 36-byte blocks). Enables zero-copy mmap → pinned → DMA.
+    /// </summary>
+    [JsonPropertyName("gpuAligned")]
+    public bool GpuAligned { get; set; }
+
     private static readonly JsonSerializerOptions JsonOptions = new()
     {
         WriteIndented = true,
