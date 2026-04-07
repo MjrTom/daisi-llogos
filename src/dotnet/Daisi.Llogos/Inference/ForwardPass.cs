@@ -17,7 +17,11 @@ public sealed class ForwardPass : IForwardPass
     /// Swap the active weight set. Used by PipelinedForwardPass to swap layer weights
     /// between double-buffer slots without recreating the ForwardPass.
     /// </summary>
-    public void SetWeights(ModelWeights weights) => _weights = weights;
+    public void SetWeights(ModelWeights weights)
+    {
+        _weights = weights;
+        _backend.InvalidateWeightCache();
+    }
     private readonly IKvCache _kvCache;
     private readonly DeltaNetState _deltaState;
 
@@ -939,7 +943,7 @@ public sealed class ForwardPass : IForwardPass
     /// <param name="beforeLayer">Called with (layerIndex, isLast) before each layer's kernels are dispatched.
     /// Use this to swap weight pointers or synchronize async uploads.</param>
     public void ForwardLayersPipelined(int startLayer, int endLayer, int position,
-        Action<int, bool> beforeLayer)
+        Action<int, bool> beforeLayer, Action<int, bool>? afterLayer = null)
     {
         _backend.BeginCommands();
 
@@ -979,6 +983,8 @@ public sealed class ForwardPass : IForwardPass
 
             if (isLast)
                 _backend.ElementAdd(_hidden, _hidden, _residual);
+
+            afterLayer?.Invoke(layer, isLast);
         }
 
         _backend.FlushCommands();

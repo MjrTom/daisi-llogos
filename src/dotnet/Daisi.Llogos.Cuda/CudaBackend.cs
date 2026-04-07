@@ -37,6 +37,16 @@ public sealed class CudaBackend : IComputeBackend
     /// <summary>Disable CUDA graph capture (needed for TurboQuant which uses different kernel topology).</summary>
     public void DisableGraphCapture() { _graphEnabled = false; }
 
+    /// <summary>Invalidate the Q8_1 activation cache. Must be called when weight data changes
+    /// at the same device address (e.g., pipelined weight swapping).</summary>
+    public void InvalidateWeightCache()
+    {
+        _q8_1CacheGeneration++;
+        _q8_1CachedInputPtr = 0;
+        _q8_1CachedGeneration = 0;
+        _q8_1FusedReady = false;
+    }
+
     public CudaBackend(int deviceOrdinal = 0)
     {
         _context = new CudaContext(deviceOrdinal);

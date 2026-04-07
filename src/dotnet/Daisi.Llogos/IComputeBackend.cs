@@ -234,6 +234,9 @@ public interface IComputeBackend : IDisposable
     /// <summary>Disable graph capture / command batching. Used when multiple models share one backend.</summary>
     void DisableGraphCapture() { }
 
+    /// <summary>Invalidate cached weight-dependent state when weight data changes at the same address.</summary>
+    void InvalidateWeightCache() { }
+
     void BeginCommands() { }
 
     /// <summary>

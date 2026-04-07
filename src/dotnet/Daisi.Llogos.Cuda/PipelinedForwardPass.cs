@@ -27,8 +27,10 @@ public sealed class PipelinedForwardPass : IForwardPass
     private readonly ForwardPass _forward;
     private readonly bool _gpuAligned;
     private readonly CudaStream _copyStream;
-    private readonly nint _copyDoneA; // CUDA event: signaled when slot A's DMA finishes
-    private readonly nint _copyDoneB; // CUDA event: signaled when slot B's DMA finishes
+    private readonly nint _copyDoneA;    // signaled when slot A's DMA finishes (copy → compute sync)
+    private readonly nint _copyDoneB;    // signaled when slot B's DMA finishes
+    private readonly nint _computeDoneA; // signaled when slot A's compute finishes (compute → copy sync)
+    private readonly nint _computeDoneB; // signaled when slot B's compute finishes
     // Two CUDA-pinned host buffers — one per slot. Shard data is repacked directly
     // into whichever buffer the GPU isn't currently reading. True async DMA overlap.
     private readonly CudaPinnedMemory _pinnedA;
@@ -58,7 +60,7 @@ public sealed class PipelinedForwardPass : IForwardPass
         ModelWeights weightsA, ModelWeights weightsB,
         LayerShardData[] layerData, List<IDisposable> mmapHandles,
         ForwardPass forward, CudaStream copyStream,
-        nint copyDoneA, nint copyDoneB,
+        nint copyDoneA, nint copyDoneB, nint computeDoneA, nint computeDoneB,
         CudaPinnedMemory pinnedA, CudaPinnedMemory pinnedB,
         bool gpuAligned)
     {
@@ -76,6 +78,8 @@ public sealed class PipelinedForwardPass : IForwardPass
         _copyStream = copyStream;
         _copyDoneA = copyDoneA;
         _copyDoneB = copyDoneB;
+        _computeDoneA = computeDoneA;
+        _computeDoneB = computeDoneB;
         _pinnedA = pinnedA;
         _pinnedB = pinnedB;
         _gpuAligned = gpuAligned;
@@ -83,46 +87,73 @@ public sealed class PipelinedForwardPass : IForwardPass
 
     public ReadOnlySpan<float> Forward(int tokenId, int position)
     {
-        // Embedding (persistent in VRAM, single Begin/Flush)
         _forward.ForwardEmbedding(tokenId);
 
-        // Upload layer 0 synchronously into slot A
+        // Simple sequential path: sync upload + compute per layer (debug correctness)
+        for (int layer = 0; layer < _config.NumLayers; layer++)
+        {
+            int slot = layer % 2;
+            var weights = slot == 0 ? _weightsA : _weightsB;
+            UploadLayerSync(layer, weights, slot);
+            _forward.SetWeights(weights);
+            _forward.ForwardLayers(layer, layer + 1, position,
+                continuation: layer > 0, isFinal: layer == _config.NumLayers - 1);
+        }
+
+        var logits = new float[_config.VocabSize];
+        _forward.ForwardOutputHead(logits);
+        return logits;
+    }
+
+    public ReadOnlySpan<float> Forward_Pipelined_DISABLED(int tokenId, int position)
+    {
+        _forward.ForwardEmbedding(tokenId);
         _activeSlot = 0;
         UploadLayerSync(0, _weightsA, slot: 0);
         _forward.SetWeights(_weightsA);
 
-        // Pipelined layers: single Begin/Flush, per-slot events for correctness
         _forward.ForwardLayersPipelined(0, _config.NumLayers, position,
-            (layer, isLast) =>
+            beforeLayer: (layer, isLast) =>
             {
-                // 1. Compute stream must wait for the CURRENT slot's DMA to be done
-                //    (ensures GPU reads valid weights for this layer)
+                // 1. Compute stream waits for this slot's DMA to finish
                 if (layer > 0)
                 {
-                    var currentEvent = _activeSlot == 0 ? _copyDoneA : _copyDoneB;
-                    CudaApi.Check(CudaApi.StreamWaitEvent(_cuda.ComputeStreamHandle, currentEvent, 0),
+                    var copyEvent = _activeSlot == 0 ? _copyDoneA : _copyDoneB;
+                    CudaApi.Check(CudaApi.StreamWaitEvent(_cuda.ComputeStreamHandle, copyEvent, 0),
                         "cuStreamWaitEvent");
                 }
 
-                // 2. Point ForwardPass at the current slot's weights
+                // 2. Point ForwardPass at current slot
                 _forward.SetWeights(_activeSlot == 0 ? _weightsA : _weightsB);
+            },
+            afterLayer: (layer, isLast) =>
+            {
+                // 3. Record compute-done event for this slot (after kernels dispatched)
+                var computeEvent = _activeSlot == 0 ? _computeDoneA : _computeDoneB;
+                CudaApi.Check(CudaApi.EventRecord(computeEvent, _cuda.ComputeStreamHandle), "cuEventRecord");
 
-                // 3. Start async upload of NEXT layer into the OTHER slot
+                // 4. Start async upload of NEXT layer into the OTHER slot
                 if (!isLast)
                 {
                     int nextSlot = 1 - _activeSlot;
-
-                    // CPU must wait for the OTHER slot's previous DMA to finish
-                    // before overwriting its pinned buffer (CPU-side sync)
-                    var nextEvent = nextSlot == 0 ? _copyDoneA : _copyDoneB;
-                    if (layer > 1) // slot was used 2 layers ago
-                        CudaApi.Check(CudaApi.EventSynchronize(nextEvent), "cuEventSynchronize");
-
                     var nextWeights = nextSlot == 0 ? _weightsA : _weightsB;
+
+                    // Copy stream waits for compute to finish reading the other slot
+                    // before we overwrite it with new DMA data
+                    var nextComputeEvent = nextSlot == 0 ? _computeDoneA : _computeDoneB;
+                    CudaApi.Check(CudaApi.StreamWaitEvent(_copyStream.Handle, nextComputeEvent, 0),
+                        "cuStreamWaitEvent");
+
+                    // CPU waits for the other slot's previous DMA to finish
+                    // before overwriting its pinned buffer
+                    var nextCopyEvent = nextSlot == 0 ? _copyDoneA : _copyDoneB;
+                    if (layer > 1)
+                        CudaApi.Check(CudaApi.EventSynchronize(nextCopyEvent), "cuEventSynchronize");
+
                     UploadLayerAsync(layer + 1, nextWeights, slot: nextSlot);
 
-                    // Record event on copy stream for this slot
-                    CudaApi.Check(CudaApi.EventRecord(nextEvent, _copyStream.Handle), "cuEventRecord");
+                    // Record DMA-done event
+                    CudaApi.Check(CudaApi.EventRecord(nextCopyEvent, _copyStream.Handle), "cuEventRecord");
 
                     _activeSlot = nextSlot;
                 }
@@ -142,23 +173,30 @@ public sealed class PipelinedForwardPass : IForwardPass
         UploadLayerSync(0, _weightsA, slot: 0);
         _forward.SetWeights(_weightsA);
         _forward.ForwardLayersPipelined(0, _config.NumLayers, position,
-            (layer, isLast) =>
+            beforeLayer: (layer, isLast) =>
             {
                 if (layer > 0)
                 {
-                    var currentEvent = _activeSlot == 0 ? _copyDoneA : _copyDoneB;
-                    CudaApi.Check(CudaApi.StreamWaitEvent(_cuda.ComputeStreamHandle, currentEvent, 0),
+                    var copyEvent = _activeSlot == 0 ? _copyDoneA : _copyDoneB;
+                    CudaApi.Check(CudaApi.StreamWaitEvent(_cuda.ComputeStreamHandle, copyEvent, 0),
                         "cuStreamWaitEvent");
                 }
                 _forward.SetWeights(_activeSlot == 0 ? _weightsA : _weightsB);
+            },
+            afterLayer: (layer, isLast) =>
+            {
+                var computeEvent = _activeSlot == 0 ? _computeDoneA : _computeDoneB;
+                CudaApi.Check(CudaApi.EventRecord(computeEvent, _cuda.ComputeStreamHandle), "cuEventRecord");
                 if (!isLast)
                 {
                     int nextSlot = 1 - _activeSlot;
-                    var nextEvent = nextSlot == 0 ? _copyDoneA : _copyDoneB;
+                    var nextComputeEvent = nextSlot == 0 ? _computeDoneA : _computeDoneB;
+                    CudaApi.Check(CudaApi.StreamWaitEvent(_copyStream.Handle, nextComputeEvent, 0), "cuStreamWaitEvent");
+                    var nextCopyEvent = nextSlot == 0 ? _copyDoneA : _copyDoneB;
                     if (layer > 1)
-                        CudaApi.Check(CudaApi.EventSynchronize(nextEvent), "cuEventSynchronize");
+                        CudaApi.Check(CudaApi.EventSynchronize(nextCopyEvent), "cuEventSynchronize");
                     UploadLayerAsync(layer + 1, nextSlot == 0 ? _weightsA : _weightsB, slot: nextSlot);
-                    CudaApi.Check(CudaApi.EventRecord(nextEvent, _copyStream.Handle), "cuEventRecord");
+                    CudaApi.Check(CudaApi.EventRecord(nextCopyEvent, _copyStream.Handle), "cuEventRecord");
                     _activeSlot = nextSlot;
                 }
             });
@@ -169,22 +207,20 @@ public sealed class PipelinedForwardPass : IForwardPass
         _forward.ResetState();
     }
 
-    /// <summary>Place correct layer type at index, then fill pinned + upload synchronously.</summary>
     private unsafe void UploadLayerSync(int layerIndex, ModelWeights targetWeights, int slot)
     {
-        PlaceLayerInSlot(targetWeights, layerIndex, _config.IsStandardAttention(layerIndex));
         var pinned = slot == 0 ? _pinnedA : _pinnedB;
         LayerShardData.RepackAndUpload(_layerData[layerIndex], targetWeights.Layers[layerIndex],
             (byte*)pinned.HostPtr, null, synchronous: true, gpuAligned: _gpuAligned);
+        _cuda.InvalidateWeightCache(); // weights changed at same DevicePtr
     }
 
-    /// <summary>Place correct layer type at index, then fill pinned + async DMA.</summary>
     private unsafe void UploadLayerAsync(int layerIndex, ModelWeights targetWeights, int slot)
     {
-        PlaceLayerInSlot(targetWeights, layerIndex, _config.IsStandardAttention(layerIndex));
         var pinned = slot == 0 ? _pinnedA : _pinnedB;
         LayerShardData.RepackAndUpload(_layerData[layerIndex], targetWeights.Layers[layerIndex],
             (byte*)pinned.HostPtr, _copyStream, synchronous: false, gpuAligned: _gpuAligned);
+        _cuda.InvalidateWeightCache();
     }
 
     public void Dispose()
@@ -194,6 +230,8 @@ public sealed class PipelinedForwardPass : IForwardPass
         _pinnedB.Dispose();
         if (_copyDoneA != 0) CudaApi.EventDestroy(_copyDoneA);
         if (_copyDoneB != 0) CudaApi.EventDestroy(_copyDoneB);
+        if (_computeDoneA != 0) CudaApi.EventDestroy(_computeDoneA);
+        if (_computeDoneB != 0) CudaApi.EventDestroy(_computeDoneB);
         _copyStream.Dispose();
         _kvCache.Dispose();
         _deltaState.Dispose();
@@ -272,6 +310,8 @@ public sealed class PipelinedForwardPass : IForwardPass
         var copyStream = new CudaStream();
         CudaApi.Check(CudaApi.EventCreate(out nint copyDoneA, 0x02), "cuEventCreate");
         CudaApi.Check(CudaApi.EventCreate(out nint copyDoneB, 0x02), "cuEventCreate");
+        CudaApi.Check(CudaApi.EventCreate(out nint computeDoneA, 0x02), "cuEventCreate");
+        CudaApi.Check(CudaApi.EventCreate(out nint computeDoneB, 0x02), "cuEventCreate");
 
         // Shared CUDA-pinned staging buffer sized to the largest layer's repacked data.
         // Data flows: mmap shard → repacked byte[] → pinned staging → async DMA → GPU buffer
@@ -303,7 +343,8 @@ public sealed class PipelinedForwardPass : IForwardPass
         return new PipelinedForwardPass(
             cuda, config, embedWeights, outputWeights,
             kvCache, deltaState, weightsA, weightsB,
-            layerData, mmapHandles, forward, copyStream, copyDoneA, copyDoneB, pinnedA, pinnedB, gpuAligned);
+            layerData, mmapHandles, forward, copyStream,
+            copyDoneA, copyDoneB, computeDoneA, computeDoneB, pinnedA, pinnedB, gpuAligned);
     }
 
     /// <summary>
@@ -337,10 +378,10 @@ public sealed class PipelinedForwardPass : IForwardPass
         DeltaNetWeights? deltaWeights = deltaIdx >= 0
             ? AllocateDeltaNetLayer(cuda, tensorInfoMap, deltaIdx, prefix, gpuAligned) : null;
 
+        // ALL layer indices point to shared std/delta weights (~500MB VRAM per slot)
         var layers = new LayerWeights[config.NumLayers];
-        // Place initial positions so DeltaNetState detection works
-        if (stdWeights != null) layers[stdIdx] = stdWeights;
-        if (deltaWeights != null) layers[deltaIdx] = deltaWeights;
+        for (int i = 0; i < config.NumLayers; i++)
+            layers[i] = config.IsStandardAttention(i) ? (LayerWeights)stdWeights! : deltaWeights!;
 
         var placeholder = cuda.CreateTensor($"{prefix}.placeholder", GgmlType.F32, [1]);
         return new ModelWeights
@@ -352,29 +393,7 @@ public sealed class PipelinedForwardPass : IForwardPass
         };
     }
 
-    /// <summary>
-    /// Place the correct layer type (StandardAttention or DeltaNet) at the specified
-    /// index in the slot's Layers array. Each slot has one of each type pre-allocated.
-    /// </summary>
-    private static void PlaceLayerInSlot(ModelWeights slotWeights, int layerIndex, bool isStandardAttention)
-    {
-        // Find the matching pre-allocated weights (StandardAttention or DeltaNet)
-        LayerWeights? target = null;
-        for (int i = 0; i < slotWeights.Layers.Length; i++)
-        {
-            var lw = slotWeights.Layers[i];
-            if (lw == null) continue;
-            bool isStd = lw is StandardAttentionWeights;
-            if (isStd == isStandardAttention)
-            {
-                target = lw;
-                slotWeights.Layers[i] = null!;
-                break;
-            }
-        }
-        if (target != null)
-            slotWeights.Layers[layerIndex] = target;
-    }
+    // PlaceLayerInSlot removed — all indices pre-point to shared std/delta weights
 
     private static StandardAttentionWeights AllocateStandardLayer(
         CudaBackend cuda, Dictionary<string, GgufTensorInfo> infoMap, int i, string prefix,
@@ -529,6 +548,9 @@ public sealed class PipelinedForwardPass : IForwardPass
 
                 // DMA this tensor from pinned → GPU
                 var ct = (CudaTensor)gpuTensor;
+                if (ct.ByteSize != repackedSize)
+                    throw new InvalidDataException(
+                        $"Size mismatch for {tr.ShortName}: GPU tensor {ct.ByteSize} bytes, shard data {repackedSize} bytes (raw={tr.RawByteSize}, type={tr.Type}, ndim={tr.NDimensions})");
                 if (synchronous)
                     CudaApi.Check(CudaApi.MemcpyHtoD(ct.DevicePtr, dst, (ulong)repackedSize), "cuMemcpyHtoD");
                 else

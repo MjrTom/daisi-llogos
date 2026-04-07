@@ -26,8 +26,12 @@ public sealed class ModelWeights : IDisposable
         TokenEmbedding.Dispose();
         OutputNorm.Dispose();
         Output?.Dispose();
+        var disposed = new HashSet<object>();
         foreach (var layer in Layers)
-            layer?.Dispose();
+        {
+            if (layer != null && disposed.Add(layer))
+                layer.Dispose();
+        }
 
         if (MmapHandles != null)
         {
