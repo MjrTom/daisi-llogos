@@ -1,5 +1,6 @@
 using System.Diagnostics;
 using Daisi.Llogos.Cpu;
+using Daisi.Llogos.Cuda;
 using Daisi.Llogos.Gguf;
 using Daisi.Llogos.Inference;
 using Daisi.Llogos.Model;
@@ -196,6 +197,263 @@ public class DaisiChainShardBenchmark
         foreach (var s in stages) s.Dispose();
 
         Assert.True(generatedCount > 0, "No tokens were generated.");
+    }
+
+    /// <summary>
+    /// Same pipeline but loading N layers per stage instead of 1.
+    /// Reduces SetHidden/GetHidden transfers from 64 to 64/N per token.
+    /// </summary>
+    [Theory]
+    [InlineData(1)]
+    [InlineData(4)]
+    [InlineData(8)]
+    [InlineData(16)]
+    public void ShardBench_27B_ChunkedLayers(int layersPerChunk)
+    {
+        if (!TestConstants.Model27BShardsExist)
+        {
+            Console.Error.WriteLine("Skipping: 27B shard directory not found.");
+            return;
+        }
+
+        var shardDir = TestConstants.Qwen35_27B_Shards;
+        var baseName = "Qwen3.5-27B-Q4_0.gguf";
+        int maxGenerate = 10;
+
+        // Parse header
+        var headerPath = Path.Combine(shardDir, $"{baseName}.header");
+        using var headerStream = File.OpenRead(headerPath);
+        var gguf = GgufFile.Read(headerStream);
+        var config = ModelConfig.FromGguf(gguf);
+        var tokenizer = TokenizerFactory.FromGguf(gguf);
+
+        int numChunks = (config.NumLayers + layersPerChunk - 1) / layersPerChunk;
+        Console.Error.WriteLine($"\n=== Chunk size: {layersPerChunk} layers ({numChunks} chunks for {config.NumLayers} layers) ===");
+
+        // Load chunked stages
+        var loadSw = Stopwatch.StartNew();
+        var chunks = new List<ChunkedStage>();
+        for (int start = 0; start < config.NumLayers; start += layersPerChunk)
+        {
+            int end = Math.Min(start + layersPerChunk, config.NumLayers);
+            var backend = new CpuBackend();
+            var weights = MmapModelLoader.LoadPartialFromShards(
+                gguf, shardDir, backend, config,
+                startLayer: start, endLayer: end,
+                includeEmbedding: false, includeOutputHead: false);
+            var kvCache = new KvCache(backend, config, maxSeqLen: 128,
+                startLayer: start, endLayer: end);
+            var deltaState = new DeltaNetState(backend, config, weights,
+                startLayer: start, endLayer: end);
+            var forward = new ForwardPass(backend, config, weights, kvCache, deltaState);
+            chunks.Add(new ChunkedStage(start, end, backend, weights, kvCache, deltaState, forward));
+        }
+
+        // Embedding + output stages
+        var embedBackend = new CpuBackend();
+        var embedWeights = MmapModelLoader.LoadPartialFromShards(
+            gguf, shardDir, embedBackend, config, 0, 0, true, false);
+        var embedKv = new KvCache(embedBackend, config, maxSeqLen: 128, startLayer: 0, endLayer: 0);
+        var embedDelta = new DeltaNetState(embedBackend, config, embedWeights, startLayer: 0, endLayer: 0);
+        var embedFwd = new ForwardPass(embedBackend, config, embedWeights, embedKv, embedDelta);
+
+        var outBackend = new CpuBackend();
+        var outWeights = MmapModelLoader.LoadPartialFromShards(
+            gguf, shardDir, outBackend, config, config.NumLayers, config.NumLayers, false, true);
+        var outKv = new KvCache(outBackend, config, maxSeqLen: 128,
+            startLayer: config.NumLayers, endLayer: config.NumLayers);
+        var outDelta = new DeltaNetState(outBackend, config, outWeights,
+            startLayer: config.NumLayers, endLayer: config.NumLayers);
+        var outFwd = new ForwardPass(outBackend, config, outWeights, outKv, outDelta);
+
+        Console.Error.WriteLine($"Loaded in {loadSw.Elapsed.TotalSeconds:F1}s");
+
+        var hidden = new float[config.HiddenDim];
+        var logits = new float[config.VocabSize];
+
+        // Tokenize
+        var prompt = "The capital of France is";
+        var promptTokens = tokenizer.Encode(prompt);
+
+        // Helper: run one token through the full pipeline
+        void ForwardToken(int tokenId, int position, bool needLogits)
+        {
+            embedFwd.ForwardEmbedding(tokenId);
+            embedFwd.GetHidden(hidden);
+
+            foreach (var chunk in chunks)
+            {
+                chunk.Forward.SetHidden(hidden);
+                chunk.Forward.ForwardLayers(chunk.Start, chunk.End, position: position);
+                chunk.Forward.GetHidden(hidden);
+            }
+
+            if (needLogits)
+            {
+                outFwd.SetHidden(hidden);
+                outFwd.ForwardOutputHead(logits);
+            }
+        }
+
+        // Prefill
+        var prefillSw = Stopwatch.StartNew();
+        for (int t = 0; t < promptTokens.Length; t++)
+            ForwardToken(promptTokens[t], t, t == promptTokens.Length - 1);
+        prefillSw.Stop();
+
+        // Decode
+        Console.Error.Write($"  Output: {prompt}");
+        var decodeSw = Stopwatch.StartNew();
+        int generated = 0;
+        int eosToken = tokenizer.Vocabulary.EosTokenId;
+
+        for (int g = 0; g < maxGenerate; g++)
+        {
+            int next = ArgMax(logits);
+            if (next == eosToken) break;
+
+            var text = tokenizer.Decode([next]);
+            Console.Error.Write(text);
+            generated++;
+
+            ForwardToken(next, promptTokens.Length + g, true);
+        }
+        decodeSw.Stop();
+        Console.Error.WriteLine();
+
+        double prefillTps = promptTokens.Length / prefillSw.Elapsed.TotalSeconds;
+        double decodeTps = generated > 0 ? generated / decodeSw.Elapsed.TotalSeconds : 0;
+        double secPerToken = generated > 0 ? decodeSw.Elapsed.TotalSeconds / generated : 0;
+
+        Console.Error.WriteLine($"  Prefill: {promptTokens.Length} tok in {prefillSw.Elapsed.TotalSeconds:F1}s ({prefillTps:F2} tok/s)");
+        Console.Error.WriteLine($"  Decode:  {generated} tok in {decodeSw.Elapsed.TotalSeconds:F1}s ({decodeTps:F2} tok/s, {secPerToken:F2}s/tok)");
+        Console.Error.WriteLine($"  Transfers per token: {chunks.Count} (was 64 at chunk=1)");
+
+        // Cleanup
+        embedFwd.Dispose(); embedKv.Dispose(); embedDelta.Dispose(); embedWeights.Dispose(); embedBackend.Dispose();
+        outFwd.Dispose(); outKv.Dispose(); outDelta.Dispose(); outWeights.Dispose(); outBackend.Dispose();
+        foreach (var c in chunks) c.Dispose();
+
+        Assert.True(generated > 0);
+    }
+
+    private sealed class ChunkedStage(
+        int start, int end,
+        CpuBackend backend, ModelWeights weights,
+        KvCache kvCache, DeltaNetState deltaState,
+        ForwardPass forward) : IDisposable
+    {
+        public int Start => start;
+        public int End => end;
+        public ForwardPass Forward => forward;
+
+        public void Dispose()
+        {
+            forward.Dispose(); deltaState.Dispose();
+            kvCache.Dispose(); weights.Dispose(); backend.Dispose();
+        }
+    }
+
+    /// <summary>
+    /// Single CUDA context with ALL weights persistent in VRAM.
+    /// No context switching, no hidden state copies, no weight swapping.
+    /// Tests whether 27B Q4_0 fits in 16GB VRAM.
+    /// If it fits, this is the fastest possible single-GPU path.
+    /// </summary>
+    [Fact]
+    public void ShardBench_27B_CUDA_FullLoad()
+    {
+        if (!TestConstants.Model27BShardsExist)
+        {
+            Console.Error.WriteLine("Skipping: 27B shard directory not found.");
+            return;
+        }
+
+        CudaBackend testCuda;
+        try { testCuda = new CudaBackend(); testCuda.Dispose(); }
+        catch { Console.Error.WriteLine("Skipping: CUDA not available."); return; }
+
+        var shardDir = TestConstants.Qwen35_27B_Shards;
+        var baseName = "Qwen3.5-27B-Q4_0.gguf";
+        int maxGenerate = 30;
+
+        // Parse header
+        var headerPath = Path.Combine(shardDir, $"{baseName}.header");
+        using var headerStream = File.OpenRead(headerPath);
+        var gguf = GgufFile.Read(headerStream);
+        var config = ModelConfig.FromGguf(gguf);
+        var tokenizer = TokenizerFactory.FromGguf(gguf);
+
+        Console.Error.WriteLine($"\n=== CUDA Full Load | {config.NumLayers} layers on single context ===");
+
+        using var cuda = new CudaBackend();
+
+        // Load EVERYTHING on one backend — all 64 layers + embed + output
+        var loadSw = Stopwatch.StartNew();
+        ModelWeights weights;
+        try
+        {
+            weights = MmapModelLoader.LoadPartialFromShards(
+                gguf, shardDir, cuda, config,
+                startLayer: 0, endLayer: config.NumLayers,
+                includeEmbedding: true, includeOutputHead: true);
+        }
+        catch (Exception ex)
+        {
+            Console.Error.WriteLine($"Failed to load full model on GPU: {ex.Message}");
+            Console.Error.WriteLine("Model too large for VRAM. Try the multi-context approach.");
+            return;
+        }
+
+        var kvCache = new KvCache(cuda, config, maxSeqLen: 256);
+        var deltaState = new DeltaNetState(cuda, config, weights);
+        using var forward = new ForwardPass(cuda, config, weights, kvCache, deltaState);
+        Console.Error.WriteLine($"Full model loaded in {loadSw.Elapsed.TotalSeconds:F1}s");
+
+        // Tokenize
+        var prompt = "Explain how distributed machine learning inference works across multiple nodes. The key concepts are";
+        var promptTokens = tokenizer.Encode(prompt);
+        Console.Error.WriteLine($"Prompt: {promptTokens.Length} tokens");
+
+        // Warmup
+        var warmSw = Stopwatch.StartNew();
+        forward.Forward(promptTokens[0], position: 0);
+        Console.Error.WriteLine($"Warmup: {warmSw.Elapsed.TotalMilliseconds:F0}ms");
+
+        // Prefill remaining
+        var prefillSw = Stopwatch.StartNew();
+        ReadOnlySpan<float> lastLogits = default;
+        for (int t = 1; t < promptTokens.Length; t++)
+            lastLogits = forward.Forward(promptTokens[t], position: t);
+        prefillSw.Stop();
+        var logits = lastLogits.ToArray();
+
+        // Decode
+        Console.Error.Write($"  Output: {prompt}");
+        var decodeSw = Stopwatch.StartNew();
+        int generated = 0;
+        int eosToken = tokenizer.Vocabulary.EosTokenId;
+
+        for (int g = 0; g < maxGenerate; g++)
+        {
+            int next = ArgMax(logits);
+            if (next == eosToken) break;
+            Console.Error.Write(tokenizer.Decode([next]));
+            generated++;
+            logits = forward.Forward(next, position: promptTokens.Length + g).ToArray();
+        }
+        decodeSw.Stop();
+        Console.Error.WriteLine();
+
+        double prefillTps = (promptTokens.Length - 1) / prefillSw.Elapsed.TotalSeconds;
+        double decodeTps = generated > 0 ? generated / decodeSw.Elapsed.TotalSeconds : 0;
+        double msPerToken = generated > 0 ? decodeSw.Elapsed.TotalMilliseconds / generated : 0;
+
+        Console.Error.WriteLine($"  Prefill: {promptTokens.Length - 1} tok in {prefillSw.Elapsed.TotalSeconds:F2}s ({prefillTps:F1} tok/s)");
+        Console.Error.WriteLine($"  Decode:  {generated} tok in {decodeSw.Elapsed.TotalSeconds:F2}s ({decodeTps:F2} tok/s, {msPerToken:F0}ms/tok)");
+
+        kvCache.Dispose(); deltaState.Dispose(); weights.Dispose();
+        Assert.True(generated > 0);
     }
 
     private static int ArgMax(float[] values)
