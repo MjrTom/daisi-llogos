@@ -23,7 +23,7 @@ public class SharedTensorDebugTest
         catch { Console.Error.WriteLine("Skipping: CUDA not available."); return; }
 
         var shardDir = TestConstants.Qwen35_27B_Shards;
-        var baseName = MmapModelLoader.FindShardBaseName(shardDir);
+        var baseName = ShardModelLoader.FindShardBaseName(shardDir);
         var headerPath = Path.Combine(shardDir, $"{baseName}.header");
         using var headerStream = File.OpenRead(headerPath);
         var gguf = GgufFile.Read(headerStream);
@@ -38,7 +38,7 @@ public class SharedTensorDebugTest
         using var cuda = new CudaBackend();
 
         // Load layer 0 via normal path
-        var normalWeights = MmapModelLoader.LoadPartialFromShards(
+        var normalWeights = ShardModelLoader.LoadPartialFromShards(
             gguf, shardDir, cuda, config, 0, 1, false, false);
 
         // Load layer 0 via AllocateLayerSlot + RepackAndUpload
@@ -123,7 +123,7 @@ public class SharedTensorDebugTest
         try { using var t = new CudaBackend(); } catch { return; }
 
         var shardDir = TestConstants.Qwen35_27B_Shards;
-        var baseName = MmapModelLoader.FindShardBaseName(shardDir);
+        var baseName = ShardModelLoader.FindShardBaseName(shardDir);
         using var hs = File.OpenRead(Path.Combine(shardDir, $"{baseName}.header"));
         var gguf = GgufFile.Read(hs);
         var config = ModelConfig.FromGguf(gguf);
@@ -131,7 +131,7 @@ public class SharedTensorDebugTest
         using var cuda = new CudaBackend();
 
         // Separate: real tensors per layer
-        var wSep = MmapModelLoader.LoadPartialFromShards(gguf, shardDir, cuda, config, 0, config.NumLayers, false, false);
+        var wSep = ShardModelLoader.LoadPartialFromShards(gguf, shardDir, cuda, config, 0, config.NumLayers, false, false);
         var dsSep = new DeltaNetState(cuda, config, wSep);
 
         // Shared: all DeltaNet layers point to layer 0's tensors, all std point to layer 3's

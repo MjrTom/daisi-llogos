@@ -59,7 +59,7 @@ public class DaisiChainShardTests
         float[] hidden;
         using (var backend = new CpuBackend())
         {
-            var embedWeights = MmapModelLoader.LoadPartialFromShards(
+            var embedWeights = ShardModelLoader.LoadPartialFromShards(
                 gguf, shardDir, backend, config,
                 startLayer: 0, endLayer: 0,
                 includeEmbedding: true, includeOutputHead: false);
@@ -92,7 +92,7 @@ public class DaisiChainShardTests
             using var backend = new CpuBackend();
 
             // Load just this one layer from its shard
-            var weights = MmapModelLoader.LoadPartialFromShards(
+            var weights = ShardModelLoader.LoadPartialFromShards(
                 gguf, shardDir, backend, config,
                 startLayer: layer, endLayer: layer + 1,
                 includeEmbedding: false, includeOutputHead: false);
@@ -126,7 +126,7 @@ public class DaisiChainShardTests
         float[] logits;
         using (var backend = new CpuBackend())
         {
-            var outputWeights = MmapModelLoader.LoadPartialFromShards(
+            var outputWeights = ShardModelLoader.LoadPartialFromShards(
                 gguf, shardDir, backend, config,
                 startLayer: config.NumLayers, endLayer: config.NumLayers,
                 includeEmbedding: false, includeOutputHead: true);
@@ -213,7 +213,7 @@ public class DaisiChainShardTests
 
             // Stage 1: embedding + layers [0, mid)
             using var backend1 = new CpuBackend();
-            var weights1 = MmapModelLoader.LoadPartialFromShards(
+            var weights1 = ShardModelLoader.LoadPartialFromShards(
                 shardGguf, shardDir, backend1, config,
                 startLayer: 0, endLayer: mid,
                 includeEmbedding: true, includeOutputHead: false);
@@ -229,7 +229,7 @@ public class DaisiChainShardTests
 
             // Stage 2: layers [mid, end) + output head
             using var backend2 = new CpuBackend();
-            var weights2 = MmapModelLoader.LoadPartialFromShards(
+            var weights2 = ShardModelLoader.LoadPartialFromShards(
                 shardGguf, shardDir, backend2, config,
                 startLayer: mid, endLayer: config.NumLayers,
                 includeEmbedding: false, includeOutputHead: true);

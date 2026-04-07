@@ -29,7 +29,7 @@ public class PipelinedBenchmark
 
         // Parse header
         var headerPath = Path.Combine(shardDir,
-            MmapModelLoader.FindShardBaseName(shardDir) + ".header");
+            ShardModelLoader.FindShardBaseName(shardDir) + ".header");
         using var headerStream = File.OpenRead(headerPath);
         var gguf = GgufFile.Read(headerStream);
         var config = ModelConfig.FromGguf(gguf);

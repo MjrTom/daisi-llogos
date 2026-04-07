@@ -49,7 +49,7 @@ public class DaisiChainShardBenchmark
         for (int i = 0; i < config.NumLayers; i++)
         {
             var backend = new CpuBackend();
-            var weights = MmapModelLoader.LoadPartialFromShards(
+            var weights = ShardModelLoader.LoadPartialFromShards(
                 gguf, shardDir, backend, config,
                 startLayer: i, endLayer: i + 1,
                 includeEmbedding: false, includeOutputHead: false);
@@ -63,7 +63,7 @@ public class DaisiChainShardBenchmark
 
         // Embedding stage
         var embedBackend = new CpuBackend();
-        var embedWeights = MmapModelLoader.LoadPartialFromShards(
+        var embedWeights = ShardModelLoader.LoadPartialFromShards(
             gguf, shardDir, embedBackend, config,
             startLayer: 0, endLayer: 0,
             includeEmbedding: true, includeOutputHead: false);
@@ -73,7 +73,7 @@ public class DaisiChainShardBenchmark
 
         // Output head stage
         var outBackend = new CpuBackend();
-        var outWeights = MmapModelLoader.LoadPartialFromShards(
+        var outWeights = ShardModelLoader.LoadPartialFromShards(
             gguf, shardDir, outBackend, config,
             startLayer: config.NumLayers, endLayer: config.NumLayers,
             includeEmbedding: false, includeOutputHead: true);
@@ -237,7 +237,7 @@ public class DaisiChainShardBenchmark
         {
             int end = Math.Min(start + layersPerChunk, config.NumLayers);
             var backend = new CpuBackend();
-            var weights = MmapModelLoader.LoadPartialFromShards(
+            var weights = ShardModelLoader.LoadPartialFromShards(
                 gguf, shardDir, backend, config,
                 startLayer: start, endLayer: end,
                 includeEmbedding: false, includeOutputHead: false);
@@ -251,14 +251,14 @@ public class DaisiChainShardBenchmark
 
         // Embedding + output stages
         var embedBackend = new CpuBackend();
-        var embedWeights = MmapModelLoader.LoadPartialFromShards(
+        var embedWeights = ShardModelLoader.LoadPartialFromShards(
             gguf, shardDir, embedBackend, config, 0, 0, true, false);
         var embedKv = new KvCache(embedBackend, config, maxSeqLen: 128, startLayer: 0, endLayer: 0);
         var embedDelta = new DeltaNetState(embedBackend, config, embedWeights, startLayer: 0, endLayer: 0);
         var embedFwd = new ForwardPass(embedBackend, config, embedWeights, embedKv, embedDelta);
 
         var outBackend = new CpuBackend();
-        var outWeights = MmapModelLoader.LoadPartialFromShards(
+        var outWeights = ShardModelLoader.LoadPartialFromShards(
             gguf, shardDir, outBackend, config, config.NumLayers, config.NumLayers, false, true);
         var outKv = new KvCache(outBackend, config, maxSeqLen: 128,
             startLayer: config.NumLayers, endLayer: config.NumLayers);
@@ -393,7 +393,7 @@ public class DaisiChainShardBenchmark
         ModelWeights weights;
         try
         {
-            weights = MmapModelLoader.LoadPartialFromShards(
+            weights = ShardModelLoader.LoadPartialFromShards(
                 gguf, shardDir, cuda, config,
                 startLayer: 0, endLayer: config.NumLayers,
                 includeEmbedding: true, includeOutputHead: true);
