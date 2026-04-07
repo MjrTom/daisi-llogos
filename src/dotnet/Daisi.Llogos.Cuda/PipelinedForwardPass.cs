@@ -89,11 +89,9 @@ public sealed class PipelinedForwardPass : IForwardPass
     {
         _forward.ForwardEmbedding(tokenId);
 
-        // Upload overwrites each layer with shard data (should be same data)
         for (int layer = 0; layer < _config.NumLayers; layer++)
         {
             UploadLayerSync(layer, _weightsA, slot: 0);
-            _forward.SetWeights(_weightsA);
             _forward.ForwardLayers(layer, layer + 1, position,
                 continuation: layer > 0, isFinal: layer == _config.NumLayers - 1);
         }
@@ -209,15 +207,17 @@ public sealed class PipelinedForwardPass : IForwardPass
     {
         var pinned = slot == 0 ? _pinnedA : _pinnedB;
         LayerShardData.RepackAndUpload(_layerData[layerIndex], targetWeights.Layers[layerIndex],
-            (byte*)pinned.HostPtr, null, synchronous: true, gpuAligned: _gpuAligned);
-        _cuda.InvalidateWeightCache(); // weights changed at same DevicePtr
+            (byte*)pinned.HostPtr, null, synchronous: true, gpuAligned: _gpuAligned,
+            computeStreamHandle: _cuda.ComputeStreamHandle);
+        _cuda.InvalidateWeightCache();
     }
 
     private unsafe void UploadLayerAsync(int layerIndex, ModelWeights targetWeights, int slot)
     {
         var pinned = slot == 0 ? _pinnedA : _pinnedB;
         LayerShardData.RepackAndUpload(_layerData[layerIndex], targetWeights.Layers[layerIndex],
-            (byte*)pinned.HostPtr, _copyStream, synchronous: false, gpuAligned: _gpuAligned);
+            (byte*)pinned.HostPtr, _copyStream, synchronous: false, gpuAligned: _gpuAligned,
+            computeStreamHandle: _cuda.ComputeStreamHandle);
         _cuda.InvalidateWeightCache();
     }
 
@@ -375,7 +375,7 @@ public sealed class PipelinedForwardPass : IForwardPass
         DeltaNetWeights? deltaWeights = deltaIdx >= 0
             ? AllocateDeltaNetLayer(cuda, tensorInfoMap, deltaIdx, prefix, gpuAligned) : null;
 
-        // Full per-layer allocation — correct but VRAM heavy
+        // Per-layer allocation — each layer has unique GPU tensors (correct output)
         var layers = new LayerWeights[config.NumLayers];
         for (int i = 0; i < config.NumLayers; i++)
         {
@@ -497,7 +497,8 @@ public sealed class PipelinedForwardPass : IForwardPass
         /// GPU layout — just memcpy (no per-block repack loop). Returns total bytes written.
         /// </summary>
         internal static unsafe long RepackAndUpload(LayerShardData data, LayerWeights targetLayer,
-            byte* pinnedPtr, CudaStream? copyStream, bool synchronous, bool gpuAligned = false)
+            byte* pinnedPtr, CudaStream? copyStream, bool synchronous, bool gpuAligned = false,
+            nint computeStreamHandle = 0)
         {
             long offset = 0;
 
@@ -548,9 +549,12 @@ public sealed class PipelinedForwardPass : IForwardPass
                     Buffer.MemoryCopy(src, dst, repackedSize, repackedSize);
                 }
 
-                // Upload to GPU via CopyFrom (validated path)
-                var repacked = new ReadOnlySpan<byte>(dst, (int)repackedSize);
-                gpuTensor.CopyFrom(repacked);
+                // Upload to GPU — MUST use compute stream handle for sync with kernel dispatch
+                var ct = (CudaTensor)gpuTensor;
+                CudaApi.Check(CudaApi.MemcpyHtoDAsync(ct.DevicePtr, dst, (ulong)repackedSize,
+                    computeStreamHandle), "cuMemcpyHtoDAsync-compute");
+                // Sync compute stream to ensure upload completes before kernel reads
+                CudaApi.Check(CudaApi.StreamSynchronize(computeStreamHandle), "cuStreamSync-upload");
 
                 offset += repackedSize;
             }

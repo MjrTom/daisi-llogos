@@ -39,6 +39,9 @@ public sealed class CudaBackend : IComputeBackend
 
     /// <summary>Invalidate the Q8_1 activation cache. Must be called when weight data changes
     /// at the same device address (e.g., pipelined weight swapping).</summary>
+    /// <summary>Synchronize the compute stream — blocks until all GPU work completes.</summary>
+    public void FlushAndSync() => _stream.Synchronize();
+
     public void InvalidateWeightCache()
     {
         _q8_1CacheGeneration++;
