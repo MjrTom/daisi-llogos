@@ -11,7 +11,13 @@ public sealed class ForwardPass : IForwardPass
 {
     private readonly IComputeBackend _backend;
     private readonly ModelConfig _config;
-    private readonly ModelWeights _weights;
+    private ModelWeights _weights;
+
+    /// <summary>
+    /// Swap the active weight set. Used by PipelinedForwardPass to swap layer weights
+    /// between double-buffer slots without recreating the ForwardPass.
+    /// </summary>
+    public void SetWeights(ModelWeights weights) => _weights = weights;
     private readonly IKvCache _kvCache;
     private readonly DeltaNetState _deltaState;
 
@@ -918,6 +924,60 @@ public sealed class ForwardPass : IForwardPass
             ProjectLinear(_hidden, _gate, lw.FfnDown);
 
             if (layer == endLayer - 1 && isFinal)
+                _backend.ElementAdd(_hidden, _hidden, _residual);
+        }
+
+        _backend.FlushCommands();
+    }
+
+    /// <summary>
+    /// Pipelined layer execution: runs [startLayer, endLayer) with a callback before each layer.
+    /// The callback can swap weight data (e.g., async upload the next layer's weights while
+    /// the current layer's kernels are queued). All kernels are dispatched in a single
+    /// BeginCommands/FlushCommands cycle — no per-layer synchronization.
+    /// </summary>
+    /// <param name="beforeLayer">Called with (layerIndex, isLast) before each layer's kernels are dispatched.
+    /// Use this to swap weight pointers or synchronize async uploads.</param>
+    public void ForwardLayersPipelined(int startLayer, int endLayer, int position,
+        Action<int, bool> beforeLayer)
+    {
+        _backend.BeginCommands();
+
+        for (int layer = startLayer; layer < endLayer; layer++)
+        {
+            bool isLast = layer == endLayer - 1;
+            beforeLayer(layer, isLast);
+
+            var lw = _weights.Layers[layer];
+
+            if (layer == startLayer)
+                _backend.RmsNormResidual(_normOut, _residual, _hidden, lw.AttnNorm, _config.NormEps);
+            else
+                _backend.AddRmsNormResidual(_normOut, _hidden, _residual, _residual, lw.AttnNorm, _config.NormEps);
+
+            if (lw is StandardAttentionWeights saw)
+                ForwardStandardAttention(saw, position, layer);
+            else if (lw is DeltaNetWeights dnw)
+                ForwardDeltaNet(dnw, layer);
+
+            _backend.AddRmsNorm(_normOut, _hidden, _hidden, _residual, lw.PostAttnNorm, _config.NormEps);
+            _backend.CopyTensor(_residual, _hidden);
+
+            if (lw is StandardAttentionWeights sawFfn && sawFfn.FusedGateUp != null && _fusedGateUpOut != null)
+            {
+                int gateDim = _config.IntermediateDim;
+                ProjectLinear(_fusedGateUpOut, _normOut, sawFfn.FusedGateUp);
+                _backend.SplitSwiGLU(_gate, _fusedGateUpOut, gateDim);
+            }
+            else
+            {
+                ProjectLinear(_gate, _normOut, lw.FfnGate);
+                ProjectLinear(_up, _normOut, lw.FfnUp);
+                _backend.SwiGLU(_gate, _gate, _up);
+            }
+            ProjectLinear(_hidden, _gate, lw.FfnDown);
+
+            if (isLast)
                 _backend.ElementAdd(_hidden, _hidden, _residual);
         }
 

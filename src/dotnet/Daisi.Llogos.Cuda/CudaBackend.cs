@@ -13,6 +13,9 @@ public sealed class CudaBackend : IComputeBackend
     private readonly CudaModule _matmulModule;
     private readonly CudaModule _compositeModule;
     private readonly CudaStream _stream;
+
+    /// <summary>The compute stream handle, for cross-stream synchronization (CUDA events).</summary>
+    public nint ComputeStreamHandle => _stream.Handle;
     private readonly nint _cublasHandle;
     private CudaDeviceMemory? _q8_1Scratch; // scratch for quantized activation
     private int _q8_1ScratchK; // K dimension of current scratch

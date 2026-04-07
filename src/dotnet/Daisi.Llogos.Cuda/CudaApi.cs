@@ -99,6 +99,23 @@ internal static partial class CudaApi
     [LibraryImport(Lib, EntryPoint = "cuStreamSynchronize")]
     internal static partial CuResult StreamSynchronize(nint stream);
 
+    // ── Events (for cross-stream synchronization) ─────────────────────────
+
+    [LibraryImport(Lib, EntryPoint = "cuEventCreate")]
+    internal static partial CuResult EventCreate(out nint @event, uint flags);
+
+    [LibraryImport(Lib, EntryPoint = "cuEventDestroy_v2")]
+    internal static partial CuResult EventDestroy(nint @event);
+
+    [LibraryImport(Lib, EntryPoint = "cuEventRecord")]
+    internal static partial CuResult EventRecord(nint @event, nint stream);
+
+    [LibraryImport(Lib, EntryPoint = "cuStreamWaitEvent")]
+    internal static partial CuResult StreamWaitEvent(nint stream, nint @event, uint flags);
+
+    [LibraryImport(Lib, EntryPoint = "cuEventSynchronize")]
+    internal static partial CuResult EventSynchronize(nint @event);
+
     // ── Kernel launch ────────────────────────────────────────────────────────
 
     [LibraryImport(Lib, EntryPoint = "cuLaunchKernel")]

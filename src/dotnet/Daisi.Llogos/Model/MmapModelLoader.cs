@@ -521,7 +521,7 @@ public static class MmapModelLoader
     /// Find the base model name from shard files in a directory.
     /// Looks for *.gguf.header files and derives the base name.
     /// </summary>
-    private static string FindShardBaseName(string shardDir)
+    public static string FindShardBaseName(string shardDir)
     {
         var headerFiles = Directory.GetFiles(shardDir, "*.gguf.header");
         if (headerFiles.Length == 0)
