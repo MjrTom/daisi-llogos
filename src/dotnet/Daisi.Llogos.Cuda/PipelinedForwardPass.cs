@@ -166,50 +166,20 @@ public sealed class PipelinedForwardPass : IForwardPass
         _forward.ResetState();
     }
 
-    /// <summary>Read shard + repack + upload to GPU synchronously.</summary>
-    private void UploadLayerSync(int layerIndex, ModelWeights targetWeights, int slot) =>
-        LoadAndUploadLayer(layerIndex, targetWeights.Layers[layerIndex], synchronous: true, slot);
-
-    /// <summary>Read shard + repack + async DMA to GPU via pinned buffer.</summary>
-    private void UploadLayerAsync(int layerIndex, ModelWeights targetWeights, int slot) =>
-        LoadAndUploadLayer(layerIndex, targetWeights.Layers[layerIndex], synchronous: false, slot);
-
-    /// <summary>
-    /// Read layer weights from mmap'd shard, repack directly into the slot's CUDA-pinned
-    /// buffer, then DMA from pinned → GPU. No intermediate managed arrays.
-    /// The pinned buffer enables true async DMA that overlaps with GPU compute.
-    /// </summary>
-    private unsafe void LoadAndUploadLayer(int layerIndex, LayerWeights targetLayer, bool synchronous, int slot)
+    /// <summary>Repack from mmap directly into pinned buffer + upload to GPU synchronously.</summary>
+    private unsafe void UploadLayerSync(int layerIndex, ModelWeights targetWeights, int slot)
     {
         var pinned = slot == 0 ? _pinnedA : _pinnedB;
-        byte* pinnedPtr = (byte*)pinned.HostPtr;
-        var data = _layerData[layerIndex];
+        LayerShardData.RepackAndUpload(_layerData[layerIndex], targetWeights.Layers[layerIndex],
+            (byte*)pinned.HostPtr, null, synchronous: true);
+    }
 
-        // Pack all tensor data into the pinned buffer contiguously, then DMA each segment
-        long pinnedOffset = 0;
-
-        foreach (var (name, tensorData, gpuTensor) in data.GetTensorsWithTargets(targetLayer))
-        {
-            // Copy repacked data into pinned buffer
-            fixed (byte* src = tensorData)
-                Buffer.MemoryCopy(src, pinnedPtr + pinnedOffset, tensorData.Length, tensorData.Length);
-
-            var ct = (CudaTensor)gpuTensor;
-            if (synchronous)
-            {
-                CudaApi.Check(
-                    CudaApi.MemcpyHtoD(ct.DevicePtr, pinnedPtr + pinnedOffset, (ulong)tensorData.Length),
-                    "cuMemcpyHtoD");
-            }
-            else
-            {
-                CudaApi.Check(
-                    CudaApi.MemcpyHtoDAsync(ct.DevicePtr, pinnedPtr + pinnedOffset, (ulong)tensorData.Length, _copyStream.Handle),
-                    "cuMemcpyHtoDAsync");
-            }
-
-            pinnedOffset += tensorData.Length;
-        }
+    /// <summary>Repack from mmap directly into pinned buffer + async DMA to GPU.</summary>
+    private unsafe void UploadLayerAsync(int layerIndex, ModelWeights targetWeights, int slot)
+    {
+        var pinned = slot == 0 ? _pinnedA : _pinnedB;
+        LayerShardData.RepackAndUpload(_layerData[layerIndex], targetWeights.Layers[layerIndex],
+            (byte*)pinned.HostPtr, _copyStream, synchronous: false);
     }
 
     public void Dispose()
@@ -294,17 +264,21 @@ public sealed class PipelinedForwardPass : IForwardPass
 
         // Shared CUDA-pinned staging buffer sized to the largest layer's repacked data.
         // Data flows: mmap shard → repacked byte[] → pinned staging → async DMA → GPU buffer
-        long maxLayerBytes = 0;
-        foreach (var ld in layerData)
-            foreach (var d in ld.TensorData.Values)
-                maxLayerBytes += d.Length;
-        // maxLayerBytes is the sum across all tensors in the largest layer
-        // Actually compute per-layer total
+        // Compute max repacked size per layer (for pinned buffer sizing)
         long maxPerLayer = 0;
         foreach (var ld in layerData)
         {
             long total = 0;
-            foreach (var d in ld.TensorData.Values) total += d.Length;
+            foreach (var tr in ld.Tensors)
+            {
+                // Repacked size: Q4_0 18→20, Q8_0 34→36, others same
+                if (tr.Type == GgmlType.Q4_0 && tr.NDimensions >= 2)
+                    total += (tr.RawByteSize / 18) * 20;
+                else if (tr.Type == GgmlType.Q8_0 && tr.NDimensions >= 2)
+                    total += (tr.RawByteSize / 34) * 36;
+                else
+                    total += tr.RawByteSize;
+            }
             if (total > maxPerLayer) maxPerLayer = total;
         }
         // Two CUDA-pinned host buffers — one per double-buffer slot.
@@ -420,68 +394,153 @@ public sealed class PipelinedForwardPass : IForwardPass
         };
     }
 
-    // ── Layer shard data (CPU-side, pinned for async transfers) ──────────────
+    // ── Layer shard data: mmap pointers for zero-copy repack ───────────────
 
     /// <summary>
-    /// Holds mmapped + repacked weight data for a single layer, ready for GPU upload.
-    /// Data is stored as managed byte arrays (repacked from mmapped shard files).
-    /// The PipelinedForwardPass copies these into shared CUDA-pinned staging buffers
-    /// before async DMA transfer.
+    /// Lightweight reference to a layer's tensor data in a mmapped shard file.
+    /// No managed byte[] arrays — stores raw mmap pointers and tensor metadata.
+    /// At runtime, data is repacked directly from mmap → pinned buffer → GPU.
     /// </summary>
     internal sealed class LayerShardData
     {
-        /// <summary>Tensor name → (byte array, offset, size) of repacked weight data.</summary>
-        internal Dictionary<string, byte[]> TensorData { get; } = new();
+        /// <summary>Short name → (mmap pointer to raw data, byte size, GgmlType, ndims).</summary>
+        internal List<TensorRef> Tensors { get; } = [];
 
-        internal IEnumerable<(string name, byte[] data, ITensor target)> GetTensorsWithTargets(LayerWeights layer)
+        internal unsafe struct TensorRef
         {
-            if (layer is StandardAttentionWeights saw)
-            {
-                if (TensorData.TryGetValue("attn_norm", out var v)) yield return ("attn_norm", v, saw.AttnNorm);
-                if (TensorData.TryGetValue("post_attn_norm", out v)) yield return ("post_attn_norm", v, saw.PostAttnNorm);
-                if (TensorData.TryGetValue("attn_q", out v)) yield return ("attn_q", v, saw.AttnQ);
-                if (TensorData.TryGetValue("attn_k", out v)) yield return ("attn_k", v, saw.AttnK);
-                if (TensorData.TryGetValue("attn_v", out v)) yield return ("attn_v", v, saw.AttnV);
-                if (TensorData.TryGetValue("attn_o", out v)) yield return ("attn_o", v, saw.AttnO);
-                if (saw.AttnQNorm != null && TensorData.TryGetValue("attn_q_norm", out v)) yield return ("attn_q_norm", v, saw.AttnQNorm);
-                if (saw.AttnKNorm != null && TensorData.TryGetValue("attn_k_norm", out v)) yield return ("attn_k_norm", v, saw.AttnKNorm);
-                if (TensorData.TryGetValue("ffn_gate", out v)) yield return ("ffn_gate", v, saw.FfnGate);
-                if (TensorData.TryGetValue("ffn_up", out v)) yield return ("ffn_up", v, saw.FfnUp);
-                if (TensorData.TryGetValue("ffn_down", out v)) yield return ("ffn_down", v, saw.FfnDown);
-            }
-            else if (layer is DeltaNetWeights dnw)
-            {
-                if (TensorData.TryGetValue("attn_norm", out var v)) yield return ("attn_norm", v, dnw.AttnNorm);
-                if (TensorData.TryGetValue("post_attn_norm", out v)) yield return ("post_attn_norm", v, dnw.PostAttnNorm);
-                if (TensorData.TryGetValue("attn_qkv", out v)) yield return ("attn_qkv", v, dnw.AttnQkv);
-                if (TensorData.TryGetValue("attn_gate", out v)) yield return ("attn_gate", v, dnw.AttnGate);
-                if (TensorData.TryGetValue("ssm_a", out v)) yield return ("ssm_a", v, dnw.SsmA);
-                if (TensorData.TryGetValue("ssm_alpha", out v)) yield return ("ssm_alpha", v, dnw.SsmAlpha);
-                if (TensorData.TryGetValue("ssm_beta", out v)) yield return ("ssm_beta", v, dnw.SsmBeta);
-                if (TensorData.TryGetValue("ssm_conv1d", out v)) yield return ("ssm_conv1d", v, dnw.SsmConv1d);
-                if (TensorData.TryGetValue("ssm_dt_bias", out v)) yield return ("ssm_dt_bias", v, dnw.SsmDtBias);
-                if (TensorData.TryGetValue("ssm_norm", out v)) yield return ("ssm_norm", v, dnw.SsmNorm);
-                if (TensorData.TryGetValue("ssm_out", out v)) yield return ("ssm_out", v, dnw.SsmOut);
-                if (TensorData.TryGetValue("ffn_gate", out v)) yield return ("ffn_gate", v, dnw.FfnGate);
-                if (TensorData.TryGetValue("ffn_up", out v)) yield return ("ffn_up", v, dnw.FfnUp);
-                if (TensorData.TryGetValue("ffn_down", out v)) yield return ("ffn_down", v, dnw.FfnDown);
-            }
+            public string ShortName;
+            public byte* MmapPtr;
+            public int RawByteSize;
+            public GgmlType Type;
+            public int NDimensions;
         }
 
         /// <summary>
-        /// Load a layer shard from disk, repack quantized weights to GPU-aligned layout,
-        /// and pin the data in memory for async PCIe transfers.
+        /// Repack all tensors directly from mmap into the pinned buffer, then issue
+        /// per-tensor async DMA to GPU. Returns total bytes written to pinned buffer.
+        /// </summary>
+        internal static unsafe long RepackAndUpload(LayerShardData data, LayerWeights targetLayer,
+            byte* pinnedPtr, CudaStream? copyStream, bool synchronous)
+        {
+            long offset = 0;
+
+            // Build target tensor list from layer weights in the standard order
+            var targets = GetTargetTensors(data, targetLayer);
+
+            for (int t = 0; t < data.Tensors.Count; t++)
+            {
+                var tr = data.Tensors[t];
+                var gpuTensor = targets[t];
+                byte* src = tr.MmapPtr;
+                byte* dst = pinnedPtr + offset;
+                long repackedSize;
+
+                // Repack quantized formats to GPU-aligned layout
+                if (tr.Type == GgmlType.Q4_0 && tr.NDimensions >= 2)
+                {
+                    int blockCount = tr.RawByteSize / 18;
+                    repackedSize = blockCount * 20;
+                    for (int b = 0; b < blockCount; b++)
+                    {
+                        byte* s = src + b * 18;
+                        byte* d = dst + b * 20;
+                        d[0] = s[0]; d[1] = s[1]; d[2] = 0; d[3] = 0;
+                        Buffer.MemoryCopy(s + 2, d + 4, 16, 16);
+                    }
+                }
+                else if (tr.Type == GgmlType.Q8_0 && tr.NDimensions >= 2)
+                {
+                    int blockCount = tr.RawByteSize / 34;
+                    repackedSize = blockCount * 36;
+                    for (int b = 0; b < blockCount; b++)
+                    {
+                        byte* s = src + b * 34;
+                        byte* d = dst + b * 36;
+                        d[0] = s[0]; d[1] = s[1]; d[2] = 0; d[3] = 0;
+                        Buffer.MemoryCopy(s + 2, d + 4, 32, 32);
+                    }
+                }
+                else
+                {
+                    repackedSize = tr.RawByteSize;
+                    Buffer.MemoryCopy(src, dst, repackedSize, repackedSize);
+                }
+
+                // DMA this tensor from pinned → GPU
+                var ct = (CudaTensor)gpuTensor;
+                if (synchronous)
+                    CudaApi.Check(CudaApi.MemcpyHtoD(ct.DevicePtr, dst, (ulong)repackedSize), "cuMemcpyHtoD");
+                else
+                    CudaApi.Check(CudaApi.MemcpyHtoDAsync(ct.DevicePtr, dst, (ulong)repackedSize, copyStream!.Handle), "cuMemcpyHtoDAsync");
+
+                offset += repackedSize;
+            }
+
+            return offset;
+        }
+
+        private static List<ITensor> GetTargetTensors(LayerShardData data, LayerWeights layer)
+        {
+            var targets = new List<ITensor>(data.Tensors.Count);
+            if (layer is StandardAttentionWeights saw)
+            {
+                foreach (var tr in data.Tensors)
+                {
+                    targets.Add(tr.ShortName switch
+                    {
+                        "attn_norm" => saw.AttnNorm,
+                        "post_attn_norm" => saw.PostAttnNorm,
+                        "attn_q" => saw.AttnQ,
+                        "attn_k" => saw.AttnK,
+                        "attn_v" => saw.AttnV,
+                        "attn_o" => saw.AttnO,
+                        "attn_q_norm" => saw.AttnQNorm!,
+                        "attn_k_norm" => saw.AttnKNorm!,
+                        "ffn_gate" => saw.FfnGate,
+                        "ffn_up" => saw.FfnUp,
+                        "ffn_down" => saw.FfnDown,
+                        _ => throw new InvalidDataException($"Unknown tensor: {tr.ShortName}")
+                    });
+                }
+            }
+            else if (layer is DeltaNetWeights dnw)
+            {
+                foreach (var tr in data.Tensors)
+                {
+                    targets.Add(tr.ShortName switch
+                    {
+                        "attn_norm" => dnw.AttnNorm,
+                        "post_attn_norm" => dnw.PostAttnNorm,
+                        "attn_qkv" => dnw.AttnQkv,
+                        "attn_gate" => dnw.AttnGate,
+                        "ssm_a" => dnw.SsmA,
+                        "ssm_alpha" => dnw.SsmAlpha,
+                        "ssm_beta" => dnw.SsmBeta,
+                        "ssm_conv1d" => dnw.SsmConv1d,
+                        "ssm_dt_bias" => dnw.SsmDtBias,
+                        "ssm_norm" => dnw.SsmNorm,
+                        "ssm_out" => dnw.SsmOut,
+                        "ffn_gate" => dnw.FfnGate,
+                        "ffn_up" => dnw.FfnUp,
+                        "ffn_down" => dnw.FfnDown,
+                        _ => throw new InvalidDataException($"Unknown tensor: {tr.ShortName}")
+                    });
+                }
+            }
+            return targets;
+        }
+
+        /// <summary>
+        /// Create a LayerShardData from a mmapped shard — stores only pointers, no copies.
         /// </summary>
         internal static unsafe LayerShardData Load(string shardPath, int layerIndex,
             ModelConfig config, GgufFile gguf, List<IDisposable> mmapHandles)
         {
             var data = new LayerShardData();
 
-            // Parse shard index
             using var indexStream = File.OpenRead(shardPath);
             var shardIndex = GgufShardIndex.Read(indexStream);
 
-            // Mmap the shard file
             var mmf = MemoryMappedFile.CreateFromFile(shardPath, FileMode.Open, null, 0, MemoryMappedFileAccess.Read);
             var accessor = mmf.CreateViewAccessor(0, 0, MemoryMappedFileAccess.Read);
             mmapHandles.Add(accessor);
@@ -490,93 +549,56 @@ public sealed class PipelinedForwardPass : IForwardPass
             byte* basePtr = null;
             accessor.SafeMemoryMappedViewHandle.AcquirePointer(ref basePtr);
 
-            // Build tensor info lookup from GGUF header
             var tensorInfoMap = new Dictionary<string, GgufTensorInfo>();
             foreach (var t in gguf.Tensors) tensorInfoMap[t.Name] = t;
 
             int i = layerIndex;
 
-            // Prepare each tensor: read from mmap, repack if needed, pin for async transfer
-            void PrepareTensor(string shortName, string fullName)
+            void AddRef(string shortName, string fullName)
             {
                 if (!shardIndex.Tensors.TryGetValue(fullName, out var entry)) return;
                 if (!tensorInfoMap.TryGetValue(fullName, out var info)) return;
-
-                long offset = shardIndex.DataSectionOffset + entry.offset;
-                var rawSpan = new ReadOnlySpan<byte>(basePtr + offset, (int)entry.byteSize);
-
-                // Repack Q8_0/Q4_0 to aligned layout (must match CudaBackend.LoadTensor)
-                byte[] repacked;
-                if (info.Type == GgmlType.Q8_0 && info.Dimensions.Length >= 2)
+                byte* ptr = basePtr + shardIndex.DataSectionOffset + entry.offset;
+                data.Tensors.Add(new TensorRef
                 {
-                    int blockCount = rawSpan.Length / 34;
-                    repacked = new byte[blockCount * 36];
-                    for (int b = 0; b < blockCount; b++)
-                    {
-                        int srcOff = b * 34, dstOff = b * 36;
-                        repacked[dstOff] = rawSpan[srcOff];
-                        repacked[dstOff + 1] = rawSpan[srcOff + 1];
-                        rawSpan.Slice(srcOff + 2, 32).CopyTo(repacked.AsSpan(dstOff + 4, 32));
-                    }
-                }
-                else if (info.Type == GgmlType.Q4_0 && info.Dimensions.Length >= 2)
-                {
-                    int blockCount = rawSpan.Length / 18;
-                    repacked = new byte[blockCount * 20];
-                    for (int b = 0; b < blockCount; b++)
-                    {
-                        int srcOff = b * 18, dstOff = b * 20;
-                        repacked[dstOff] = rawSpan[srcOff];
-                        repacked[dstOff + 1] = rawSpan[srcOff + 1];
-                        rawSpan.Slice(srcOff + 2, 16).CopyTo(repacked.AsSpan(dstOff + 4, 16));
-                    }
-                }
-                else
-                {
-                    repacked = rawSpan.ToArray();
-                }
-
-                data.TensorData[shortName] = repacked;
+                    ShortName = shortName, MmapPtr = ptr, RawByteSize = (int)entry.byteSize,
+                    Type = info.Type, NDimensions = info.Dimensions.Length,
+                });
             }
 
-            // Standard attention tensors
-            PrepareTensor("attn_norm", $"blk.{i}.attn_norm.weight");
-            PrepareTensor("post_attn_norm", tensorInfoMap.ContainsKey($"blk.{i}.post_attention_norm.weight")
+            AddRef("attn_norm", $"blk.{i}.attn_norm.weight");
+            AddRef("post_attn_norm", tensorInfoMap.ContainsKey($"blk.{i}.post_attention_norm.weight")
                 ? $"blk.{i}.post_attention_norm.weight" : $"blk.{i}.ffn_norm.weight");
-            PrepareTensor("ffn_gate", $"blk.{i}.ffn_gate.weight");
-            PrepareTensor("ffn_up", $"blk.{i}.ffn_up.weight");
-            PrepareTensor("ffn_down", $"blk.{i}.ffn_down.weight");
+            AddRef("ffn_gate", $"blk.{i}.ffn_gate.weight");
+            AddRef("ffn_up", $"blk.{i}.ffn_up.weight");
+            AddRef("ffn_down", $"blk.{i}.ffn_down.weight");
 
             if (config.IsStandardAttention(layerIndex))
             {
-                PrepareTensor("attn_q", $"blk.{i}.attn_q.weight");
-                PrepareTensor("attn_k", $"blk.{i}.attn_k.weight");
-                PrepareTensor("attn_v", $"blk.{i}.attn_v.weight");
-                PrepareTensor("attn_o", $"blk.{i}.attn_output.weight");
-                PrepareTensor("attn_q_norm", $"blk.{i}.attn_q_norm.weight");
-                PrepareTensor("attn_k_norm", $"blk.{i}.attn_k_norm.weight");
+                AddRef("attn_q", $"blk.{i}.attn_q.weight");
+                AddRef("attn_k", $"blk.{i}.attn_k.weight");
+                AddRef("attn_v", $"blk.{i}.attn_v.weight");
+                AddRef("attn_o", $"blk.{i}.attn_output.weight");
+                AddRef("attn_q_norm", $"blk.{i}.attn_q_norm.weight");
+                AddRef("attn_k_norm", $"blk.{i}.attn_k_norm.weight");
             }
             else
             {
-                // DeltaNet tensors
-                PrepareTensor("attn_qkv", $"blk.{i}.attn_qkv.weight");
-                PrepareTensor("attn_gate", $"blk.{i}.attn_gate.weight");
-                PrepareTensor("ssm_a", $"blk.{i}.ssm_a");
-                PrepareTensor("ssm_alpha", $"blk.{i}.ssm_alpha.weight");
-                PrepareTensor("ssm_beta", $"blk.{i}.ssm_beta.weight");
-                PrepareTensor("ssm_conv1d", $"blk.{i}.ssm_conv1d.weight");
-                PrepareTensor("ssm_dt_bias", $"blk.{i}.ssm_dt.bias");
-                PrepareTensor("ssm_norm", $"blk.{i}.ssm_norm.weight");
-                PrepareTensor("ssm_out", $"blk.{i}.ssm_out.weight");
+                AddRef("attn_qkv", $"blk.{i}.attn_qkv.weight");
+                AddRef("attn_gate", $"blk.{i}.attn_gate.weight");
+                AddRef("ssm_a", $"blk.{i}.ssm_a");
+                AddRef("ssm_alpha", $"blk.{i}.ssm_alpha.weight");
+                AddRef("ssm_beta", $"blk.{i}.ssm_beta.weight");
+                AddRef("ssm_conv1d", $"blk.{i}.ssm_conv1d.weight");
+                AddRef("ssm_dt_bias", $"blk.{i}.ssm_dt.bias");
+                AddRef("ssm_norm", $"blk.{i}.ssm_norm.weight");
+                AddRef("ssm_out", $"blk.{i}.ssm_out.weight");
             }
 
             return data;
         }
 
-        internal void Free()
-        {
-            TensorData.Clear();
-        }
+        internal void Free() => Tensors.Clear();
     }
 
     /// <summary>
