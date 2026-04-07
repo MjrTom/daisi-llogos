@@ -27,7 +27,7 @@ public sealed class ModelWeights : IDisposable
         OutputNorm.Dispose();
         Output?.Dispose();
         foreach (var layer in Layers)
-            layer.Dispose();
+            layer?.Dispose();
 
         if (MmapHandles != null)
         {

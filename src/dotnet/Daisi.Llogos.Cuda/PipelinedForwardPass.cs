@@ -169,17 +169,19 @@ public sealed class PipelinedForwardPass : IForwardPass
         _forward.ResetState();
     }
 
-    /// <summary>Copy (or repack) from mmap into pinned buffer + upload to GPU synchronously.</summary>
+    /// <summary>Place correct layer type at index, then fill pinned + upload synchronously.</summary>
     private unsafe void UploadLayerSync(int layerIndex, ModelWeights targetWeights, int slot)
     {
+        PlaceLayerInSlot(targetWeights, layerIndex, _config.IsStandardAttention(layerIndex));
         var pinned = slot == 0 ? _pinnedA : _pinnedB;
         LayerShardData.RepackAndUpload(_layerData[layerIndex], targetWeights.Layers[layerIndex],
             (byte*)pinned.HostPtr, null, synchronous: true, gpuAligned: _gpuAligned);
     }
 
-    /// <summary>Copy (or repack) from mmap into pinned buffer + async DMA to GPU.</summary>
+    /// <summary>Place correct layer type at index, then fill pinned + async DMA.</summary>
     private unsafe void UploadLayerAsync(int layerIndex, ModelWeights targetWeights, int slot)
     {
+        PlaceLayerInSlot(targetWeights, layerIndex, _config.IsStandardAttention(layerIndex));
         var pinned = slot == 0 ? _pinnedA : _pinnedB;
         LayerShardData.RepackAndUpload(_layerData[layerIndex], targetWeights.Layers[layerIndex],
             (byte*)pinned.HostPtr, _copyStream, synchronous: false, gpuAligned: _gpuAligned);
@@ -308,22 +310,38 @@ public sealed class PipelinedForwardPass : IForwardPass
     /// Allocate empty GPU tensors matching the shape/type of each layer's weights.
     /// These are the double-buffer slots that get overwritten each layer.
     /// </summary>
+    /// <summary>
+    /// Allocate a single layer weight slot on GPU. Only allocates ONE set of standard
+    /// attention tensors and ONE set of DeltaNet tensors — NOT one per layer.
+    /// The Layers[] array is filled with nulls; the active layer index is set at runtime
+    /// by PlaceLayerInSlot before each layer's compute.
+    /// </summary>
     private static ModelWeights AllocateLayerSlot(CudaBackend cuda, ModelConfig config,
         GgufFile gguf, string prefix, bool gpuAligned = false)
     {
         var tensorInfoMap = new Dictionary<string, GgufTensorInfo>();
         foreach (var t in gguf.Tensors) tensorInfoMap[t.Name] = t;
 
-        var layers = new LayerWeights[config.NumLayers];
+        // Allocate one standard attention layer + one DeltaNet layer per slot.
+        // Find representative indices for each type.
+        int stdIdx = -1, deltaIdx = -1;
         for (int i = 0; i < config.NumLayers; i++)
         {
-            if (config.IsStandardAttention(i))
-                layers[i] = AllocateStandardLayer(cuda, tensorInfoMap, i, prefix, gpuAligned);
-            else
-                layers[i] = AllocateDeltaNetLayer(cuda, tensorInfoMap, i, prefix, gpuAligned);
+            if (config.IsStandardAttention(i) && stdIdx < 0) stdIdx = i;
+            else if (!config.IsStandardAttention(i) && deltaIdx < 0) deltaIdx = i;
+            if (stdIdx >= 0 && deltaIdx >= 0) break;
         }
 
-        // Placeholders for embed/output — not used in layer slots
+        StandardAttentionWeights? stdWeights = stdIdx >= 0
+            ? AllocateStandardLayer(cuda, tensorInfoMap, stdIdx, prefix, gpuAligned) : null;
+        DeltaNetWeights? deltaWeights = deltaIdx >= 0
+            ? AllocateDeltaNetLayer(cuda, tensorInfoMap, deltaIdx, prefix, gpuAligned) : null;
+
+        var layers = new LayerWeights[config.NumLayers];
+        // Place initial positions so DeltaNetState detection works
+        if (stdWeights != null) layers[stdIdx] = stdWeights;
+        if (deltaWeights != null) layers[deltaIdx] = deltaWeights;
+
         var placeholder = cuda.CreateTensor($"{prefix}.placeholder", GgmlType.F32, [1]);
         return new ModelWeights
         {
@@ -332,6 +350,30 @@ public sealed class PipelinedForwardPass : IForwardPass
             Output = null,
             Layers = layers,
         };
+    }
+
+    /// <summary>
+    /// Place the correct layer type (StandardAttention or DeltaNet) at the specified
+    /// index in the slot's Layers array. Each slot has one of each type pre-allocated.
+    /// </summary>
+    private static void PlaceLayerInSlot(ModelWeights slotWeights, int layerIndex, bool isStandardAttention)
+    {
+        // Find the matching pre-allocated weights (StandardAttention or DeltaNet)
+        LayerWeights? target = null;
+        for (int i = 0; i < slotWeights.Layers.Length; i++)
+        {
+            var lw = slotWeights.Layers[i];
+            if (lw == null) continue;
+            bool isStd = lw is StandardAttentionWeights;
+            if (isStd == isStandardAttention)
+            {
+                target = lw;
+                slotWeights.Layers[i] = null!;
+                break;
+            }
+        }
+        if (target != null)
+            slotWeights.Layers[layerIndex] = target;
     }
 
     private static StandardAttentionWeights AllocateStandardLayer(
