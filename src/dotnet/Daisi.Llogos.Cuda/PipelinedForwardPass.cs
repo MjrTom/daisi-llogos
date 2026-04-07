@@ -89,13 +89,11 @@ public sealed class PipelinedForwardPass : IForwardPass
     {
         _forward.ForwardEmbedding(tokenId);
 
-        // Simple sequential path: sync upload + compute per layer (debug correctness)
+        // Upload overwrites each layer with shard data (should be same data)
         for (int layer = 0; layer < _config.NumLayers; layer++)
         {
-            int slot = layer % 2;
-            var weights = slot == 0 ? _weightsA : _weightsB;
-            UploadLayerSync(layer, weights, slot);
-            _forward.SetWeights(weights);
+            UploadLayerSync(layer, _weightsA, slot: 0);
+            _forward.SetWeights(_weightsA);
             _forward.ForwardLayers(layer, layer + 1, position,
                 continuation: layer > 0, isFinal: layer == _config.NumLayers - 1);
         }
@@ -275,11 +273,10 @@ public sealed class PipelinedForwardPass : IForwardPass
         // KV cache for all layers (persistent, small)
         var kvCache = new KvCache(cuda, config, maxSeqLen: maxContext);
 
-        // Allocate two sets of layer weight GPU buffers (empty — will be filled per layer)
+        // Allocate via normal loader for layers [0,64) — creates correct tensor structure
         var weightsA = AllocateLayerSlot(cuda, config, gguf, "slotA", gpuAligned);
         var weightsB = AllocateLayerSlot(cuda, config, gguf, "slotB", gpuAligned);
 
-        // DeltaNetState needs weights to detect layer types — use slot A
         var deltaState = new DeltaNetState(cuda, config, weightsA);
 
         // Memory-map layer shard files
@@ -378,10 +375,15 @@ public sealed class PipelinedForwardPass : IForwardPass
         DeltaNetWeights? deltaWeights = deltaIdx >= 0
             ? AllocateDeltaNetLayer(cuda, tensorInfoMap, deltaIdx, prefix, gpuAligned) : null;
 
-        // ALL layer indices point to shared std/delta weights (~500MB VRAM per slot)
+        // Full per-layer allocation — correct but VRAM heavy
         var layers = new LayerWeights[config.NumLayers];
         for (int i = 0; i < config.NumLayers; i++)
-            layers[i] = config.IsStandardAttention(i) ? (LayerWeights)stdWeights! : deltaWeights!;
+        {
+            if (config.IsStandardAttention(i))
+                layers[i] = AllocateStandardLayer(cuda, tensorInfoMap, i, prefix, gpuAligned);
+            else
+                layers[i] = AllocateDeltaNetLayer(cuda, tensorInfoMap, i, prefix, gpuAligned);
+        }
 
         var placeholder = cuda.CreateTensor($"{prefix}.placeholder", GgmlType.F32, [1]);
         return new ModelWeights
@@ -546,15 +548,9 @@ public sealed class PipelinedForwardPass : IForwardPass
                     Buffer.MemoryCopy(src, dst, repackedSize, repackedSize);
                 }
 
-                // DMA this tensor from pinned → GPU
-                var ct = (CudaTensor)gpuTensor;
-                if (ct.ByteSize != repackedSize)
-                    throw new InvalidDataException(
-                        $"Size mismatch for {tr.ShortName}: GPU tensor {ct.ByteSize} bytes, shard data {repackedSize} bytes (raw={tr.RawByteSize}, type={tr.Type}, ndim={tr.NDimensions})");
-                if (synchronous)
-                    CudaApi.Check(CudaApi.MemcpyHtoD(ct.DevicePtr, dst, (ulong)repackedSize), "cuMemcpyHtoD");
-                else
-                    CudaApi.Check(CudaApi.MemcpyHtoDAsync(ct.DevicePtr, dst, (ulong)repackedSize, copyStream!.Handle), "cuMemcpyHtoDAsync");
+                // Upload to GPU via CopyFrom (validated path)
+                var repacked = new ReadOnlySpan<byte>(dst, (int)repackedSize);
+                gpuTensor.CopyFrom(repacked);
 
                 offset += repackedSize;
             }
