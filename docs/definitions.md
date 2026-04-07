@@ -226,3 +226,20 @@ sequenceDiagram
 | **Attention sinks** | Observation from StreamingLLM: initial tokens in a sequence consistently receive high attention weight across all layers and heads. Retaining these "sink" tokens (typically 4-128) alongside a sliding window preserves generation quality compared to a pure sliding window. |
 | **Token eviction** | Dynamically removing low-importance KV entries from the cache based on cumulative attention scores (Heavy Hitter Oracle / H2O). More adaptive than a fixed sliding window — important tokens survive regardless of position. |
 | **Pinned memory** | Host (CPU) memory that is page-locked, preventing the OS from swapping it. Required for asynchronous GPU↔CPU transfers. Allocated via `cuMemAllocHost`. Enables overlapping compute with data transfer for KV cache offloading. |
+
+---
+
+## Pipelined Inference & Sharding
+
+| Term | Summary |
+|------|---------|
+| **Shard** | A piece of a model file containing weights for a specific part of the model (one layer, the embedding, or the output head). Created by `GgufSplitter.Split()`. Each shard has its own binary index + tensor data. |
+| **Shard manifest** | A JSON file (`model.gguf.manifest.json`) listing all shard files, their sizes, and the total layer count. Used by the ORC to determine which shards each host needs. |
+| **Header shard** | The first portion of the original GGUF file — contains all metadata and tensor descriptors but no weight data. Needed by every host to understand the model's structure. Small (~10 MB). |
+| **GPU-aligned shards** | Shards where quantized data is pre-converted to GPU-ready format at split time (Q4_0: 18→20 byte blocks, Q8_0: 34→36 byte blocks). Eliminates per-token repacking during inference. Created with `--align-gpu` flag. |
+| **PipelinedForwardPass** | Inference implementation that loads one layer at a time from shard files into GPU memory, computes that layer, then overwrites the GPU memory with the next layer's weights. Uses ~1 GB of VRAM regardless of model size. |
+| **Weight slot** | A pre-allocated set of GPU tensors sized to hold one layer's weights. Two slots alternate (double-buffering): while one is being computed, the other can be prepared with the next layer's data. |
+| **Hidden state** | The intermediate result that flows between layers during inference. A small vector (~20 KB for a 5120-dimensional model) containing the model's current "understanding" of the input so far. |
+| **Pipeline parallelism** | Distributing a model's layers across multiple machines (DaisiChain). Each machine processes its assigned layer range and passes the hidden state to the next. Only the hidden state (~20 KB) crosses the network — weights stay local. |
+| **Partial download** | When a DaisiChain host only downloads the shard files for its assigned layers instead of the entire model. A 4-host pipeline on a 15 GB model reduces total downloads from 60 GB to ~16 GB. |
+| **Memory-mapped file (mmap)** | A technique where the operating system maps a file directly into memory address space. The OS loads pages from disk on demand as they're accessed. Used for shard files — only the currently-needed layer's data is paged into RAM. |
