@@ -219,7 +219,7 @@ function f16ToF32(bits: number): number {
 const GPU_MATMUL_TYPES = new Set([GgmlType.F32, GgmlType.Q4_0, GgmlType.Q8_0]);
 
 /** A weight tensor with its quant type. */
-interface WeightBuffer {
+export interface WeightBuffer {
   buffer: GPUBuffer;
   type: GgmlType; // the type the GPU buffer is stored as (F32 if dequanted)
 }
@@ -736,6 +736,198 @@ export class LlamaModel {
     const logits = await this.compute.readBuffer(this.logits, size * 4);
     this.compute.cleanupParams();
     return logits;
+  }
+
+  // ── DaisiChain: Partial Model Loading ─────────────────────────────────────
+
+  /**
+   * Upload only a subset of layers for DaisiChain pipeline stages.
+   * Layers outside [startLayer, endLayer) are set to null.
+   * KV caches are only allocated for loaded layers.
+   */
+  async initWeightsPartial(
+    tensorMap: Map<string, { buffer: ArrayBuffer; info: GgufTensorInfo }>,
+    startLayer: number,
+    endLayer: number,
+    includeEmbedding: boolean,
+    includeOutputHead: boolean,
+  ): Promise<void> {
+    const { compute } = this;
+
+    const uploadAsF32 = (name: string): GPUBuffer => {
+      const tensor = tensorMap.get(name);
+      if (!tensor) throw new Error(`Missing tensor: ${name}`);
+      if (tensor.info.type === GgmlType.F32) {
+        return compute.buffers.createBufferWithData(name, tensor.buffer);
+      }
+      const f32Data = dequantizeToF32(tensor.buffer, tensor.info.type, tensor.info.elementCount);
+      return compute.buffers.createBufferWithData(name, f32Data.buffer);
+    };
+
+    const uploadWeight = (name: string): WeightBuffer => {
+      const tensor = tensorMap.get(name);
+      if (!tensor) throw new Error(`Missing tensor: ${name}`);
+      if (GPU_MATMUL_TYPES.has(tensor.info.type)) {
+        return { buffer: compute.buffers.createBufferWithData(name, tensor.buffer), type: tensor.info.type };
+      }
+      const f32Data = dequantizeToF32(tensor.buffer, tensor.info.type, tensor.info.elementCount);
+      return { buffer: compute.buffers.createBufferWithData(name, f32Data.buffer), type: GgmlType.F32 };
+    };
+
+    const tryUploadAsF32 = (name: string): GPUBuffer | undefined => {
+      return tensorMap.has(name) ? uploadAsF32(name) : undefined;
+    };
+
+    // Embedding: real or placeholder
+    const tokenEmbedding = includeEmbedding
+      ? uploadWeight('token_embd.weight')
+      : { buffer: compute.buffers.createBuffer('token_embd.placeholder', 4), type: GgmlType.F32 };
+
+    // Output head: real or placeholder
+    let outputWeight: WeightBuffer;
+    let outputNorm: GPUBuffer;
+    if (includeOutputHead) {
+      outputNorm = uploadAsF32('output_norm.weight');
+      outputWeight = tensorMap.has('output.weight') ? uploadWeight('output.weight') : tokenEmbedding;
+    } else {
+      outputNorm = compute.buffers.createBuffer('output_norm.placeholder', 4);
+      outputWeight = { buffer: compute.buffers.createBuffer('output.placeholder', 4), type: GgmlType.F32 };
+    }
+
+    // Layers: only load [startLayer, endLayer)
+    const layers: LayerWeights[] = [];
+    for (let i = 0; i < this.numLayers; i++) {
+      if (i >= startLayer && i < endLayer) {
+        layers.push({
+          attnNorm: uploadAsF32(`blk.${i}.attn_norm.weight`),
+          q: uploadWeight(`blk.${i}.attn_q.weight`),
+          k: uploadWeight(`blk.${i}.attn_k.weight`),
+          v: uploadWeight(`blk.${i}.attn_v.weight`),
+          o: uploadWeight(`blk.${i}.attn_output.weight`),
+          qBias: tryUploadAsF32(`blk.${i}.attn_q.bias`),
+          kBias: tryUploadAsF32(`blk.${i}.attn_k.bias`),
+          vBias: tryUploadAsF32(`blk.${i}.attn_v.bias`),
+          postAttnNorm: uploadAsF32(`blk.${i}.ffn_norm.weight`),
+          gateProj: uploadWeight(`blk.${i}.ffn_gate.weight`),
+          upProj: uploadWeight(`blk.${i}.ffn_up.weight`),
+          downProj: uploadWeight(`blk.${i}.ffn_down.weight`),
+        });
+      } else {
+        layers.push(null as unknown as LayerWeights); // placeholder — never accessed
+      }
+    }
+
+    this.weights = { tokenEmbedding, outputNorm, output: outputWeight, layers };
+
+    // Working buffers
+    const E = this.embeddingDim;
+    const F = this.ffnDim;
+    const H = this.numHeads * this.headDim;
+    const KV = this.numKvHeads * this.headDim;
+
+    this.hidden = compute.buffers.createBuffer('hidden', E * 4);
+    this.residual = compute.buffers.createBuffer('residual', E * 4);
+    this.normed = compute.buffers.createBuffer('normed', E * 4);
+    this.qBuf = compute.buffers.createBuffer('q_proj', H * 4);
+    this.kBuf = compute.buffers.createBuffer('k_proj', KV * 4);
+    this.vBuf = compute.buffers.createBuffer('v_proj', KV * 4);
+    this.attnOut = compute.buffers.createBuffer('attn_out', E * 4);
+    this.gateBuf = compute.buffers.createBuffer('gate', F * 4);
+    this.upBuf = compute.buffers.createBuffer('up', F * 4);
+    this.ffnOut = compute.buffers.createBuffer('ffn_out', F * 4);
+    this.temp = compute.buffers.createBuffer('temp', E * 4);
+    this.logits = compute.buffers.createBuffer('logits', this.vocabSize * 4);
+
+    // KV caches: only for loaded layers
+    const maxCtx = Math.min(this.contextLength, 4096);
+    this.kvCaches = [];
+    for (let i = 0; i < this.numLayers; i++) {
+      if (i >= startLayer && i < endLayer) {
+        this.kvCaches.push(new KvCache(
+          compute.device, compute.buffers,
+          this.numKvHeads, this.headDim, maxCtx, `kv_L${i}`,
+        ));
+      } else {
+        this.kvCaches.push(null as unknown as KvCache); // placeholder
+      }
+    }
+  }
+
+  // ── DaisiChain: Partial Forward Pass Methods ──────────────────────────────
+
+  /** Run embedding lookup only. Writes result to hidden buffer. */
+  forwardEmbedding(tokenId: number): void {
+    const { compute, weights } = this;
+    const E = this.embeddingDim;
+    if (weights.tokenEmbedding.type === GgmlType.Q8_0) {
+      compute.embeddingQ8(weights.tokenEmbedding.buffer, this.hidden, tokenId, E);
+    } else {
+      compute.embedding(weights.tokenEmbedding.buffer, this.hidden, tokenId, E);
+    }
+  }
+
+  /** Run transformer layers [startLayer, endLayer) on the current hidden state. */
+  forwardLayers(startLayer: number, endLayer: number): void {
+    const { compute, weights } = this;
+    const E = this.embeddingDim;
+
+    for (let layer = startLayer; layer < endLayer; layer++) {
+      const lw = weights.layers[layer];
+      compute.copyAndRmsNorm(this.hidden, lw.attnNorm, this.normed, this.residual, E, this.rmsNormEps);
+
+      compute.matmul(lw.q.buffer, this.normed, this.qBuf, this.numHeads * this.headDim, E, lw.q.type);
+      compute.matmul(lw.k.buffer, this.normed, this.kBuf, this.numKvHeads * this.headDim, E, lw.k.type);
+      compute.matmul(lw.v.buffer, this.normed, this.vBuf, this.numKvHeads * this.headDim, E, lw.v.type);
+
+      if (lw.qBias) compute.addBias(this.qBuf, lw.qBias, this.numHeads * this.headDim);
+      if (lw.kBias) compute.addBias(this.kBuf, lw.kBias, this.numKvHeads * this.headDim);
+      if (lw.vBias) compute.addBias(this.vBuf, lw.vBias, this.numKvHeads * this.headDim);
+
+      const kvCache = this.kvCaches[layer];
+      const pos = kvCache.seqLen;
+      compute.rope(this.qBuf, this.headDim, this.headDim, pos, this.ropeTheta, this.numHeads * this.headDim);
+      compute.rope(this.kBuf, this.headDim, this.headDim, pos, this.ropeTheta, this.numKvHeads * this.headDim);
+
+      kvCache.write(this.kBuf, this.vBuf, this.numKvHeads * this.headDim * 4, this.numKvHeads * this.headDim * 4);
+
+      compute.attention(
+        this.qBuf, kvCache.kBuffer, kvCache.vBuffer, this.attnOut,
+        this.numHeads, this.numKvHeads, this.headDim,
+        kvCache.seqLen, kvCache.maxSeqLen,
+      );
+
+      compute.matmul(lw.o.buffer, this.attnOut, this.temp, E, this.numHeads * this.headDim, lw.o.type);
+      compute.add(this.temp, this.residual, this.hidden, E);
+
+      compute.copyAndRmsNorm(this.hidden, lw.postAttnNorm, this.normed, this.residual, E, this.rmsNormEps);
+
+      compute.matmul(lw.gateProj.buffer, this.normed, this.gateBuf, this.ffnDim, E, lw.gateProj.type);
+      compute.matmul(lw.upProj.buffer, this.normed, this.upBuf, this.ffnDim, E, lw.upProj.type);
+      compute.siluMul(this.gateBuf, this.upBuf, this.ffnOut, this.ffnDim);
+      compute.matmul(lw.downProj.buffer, this.ffnOut, this.temp, E, this.ffnDim, lw.downProj.type);
+
+      compute.add(this.temp, this.residual, this.hidden, E);
+    }
+  }
+
+  /** Read the current hidden state from GPU back to CPU. */
+  async getHidden(): Promise<Float32Array> {
+    return this.compute.readBuffer(this.hidden, this.embeddingDim * 4);
+  }
+
+  /** Write a hidden state from CPU to the GPU hidden buffer. */
+  setHidden(data: Float32Array): void {
+    this.compute.device.queue.writeBuffer(this.hidden, 0, data.buffer, data.byteOffset, data.byteLength);
+  }
+
+  /** Run output normalization + LM head projection. Returns logits buffer. */
+  forwardOutputHead(): GPUBuffer {
+    const { compute, weights } = this;
+    const E = this.embeddingDim;
+    compute.rmsNorm(this.hidden, weights.outputNorm, this.normed, E, this.rmsNormEps);
+    const lmRows = this._vocabLimit > 0 ? Math.min(this._vocabLimit, this.vocabSize) : this.vocabSize;
+    compute.matmul(weights.output.buffer, this.normed, this.logits, lmRows, E, weights.output.type);
+    return this.logits;
   }
 }
 

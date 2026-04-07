@@ -12,10 +12,14 @@ using Daisi.Llogos.Tokenizer;
 using Daisi.Llogos.Training;
 using Daisi.Llogos.Training.Lora;
 
-// ── Training subcommand ──────────────────────────────────────────────────────
+// ── Subcommands ─────────────────────────────────────────────────────────────
 if (args.Length > 0 && args[0] == "train")
 {
     return RunTraining(args[1..]);
+}
+if (args.Length > 0 && args[0] == "split")
+{
+    return RunSplit(args[1..]);
 }
 
 // Parse arguments
@@ -477,10 +481,67 @@ static void PrintUsage()
           --lora <path>            LoRA adapter file (.llra) to merge into model weights
           --help, -h               Show this help
 
+        Splitting (DaisiChain shard format):
+          daisi-llogos split --model <path> --output-dir <path>
+          Split a GGUF into per-layer shard files for partial downloads.
+
         Training:
           daisi-llogos train --model <path> --data <path> [options]
           Run 'daisi-llogos train --help' for training options.
         """);
+}
+
+// ── Split Subcommand ────────────────────────────────────────────────────────
+
+static int RunSplit(string[] args)
+{
+    string? modelPath = null;
+    string? outputDir = null;
+    bool showHelp = false;
+
+    for (int i = 0; i < args.Length; i++)
+    {
+        switch (args[i])
+        {
+            case "--model" or "-m":
+                modelPath = NextArg(args, ref i);
+                break;
+            case "--output-dir" or "-o":
+                outputDir = NextArg(args, ref i);
+                break;
+            case "--help" or "-h":
+                showHelp = true;
+                break;
+        }
+    }
+
+    if (showHelp || modelPath == null)
+    {
+        Console.Error.WriteLine("""
+            daisi-llogos split - Split GGUF into per-layer shards
+
+            Usage: daisi-llogos split --model <path> [options]
+
+            Required:
+              --model, -m <path>       Path to GGUF model file
+
+            Options:
+              --output-dir, -o <path>  Output directory (default: {model}.shards/)
+              --help, -h               Show this help
+            """);
+        return showHelp ? 0 : 1;
+    }
+
+    if (!File.Exists(modelPath))
+    {
+        Console.Error.WriteLine($"Error: model file not found: {modelPath}");
+        return 1;
+    }
+
+    outputDir ??= modelPath + ".shards";
+
+    GgufSplitter.Split(modelPath, outputDir, msg => Console.Error.WriteLine($"  {msg}"));
+    return 0;
 }
 
 // ── Training Subcommand ──────────────────────────────────────────────────────

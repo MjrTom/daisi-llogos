@@ -15,6 +15,12 @@ public sealed class ModelWeights : IDisposable
     /// </summary>
     public ITensor OutputWeight => Output ?? TokenEmbedding;
 
+    /// <summary>
+    /// Memory-mapped file handles that must stay open for the lifetime of the weights.
+    /// Used when loading from shard files — each shard has its own mmap handle.
+    /// </summary>
+    public List<IDisposable>? MmapHandles { get; set; }
+
     public void Dispose()
     {
         TokenEmbedding.Dispose();
@@ -22,6 +28,13 @@ public sealed class ModelWeights : IDisposable
         Output?.Dispose();
         foreach (var layer in Layers)
             layer.Dispose();
+
+        if (MmapHandles != null)
+        {
+            foreach (var handle in MmapHandles)
+                handle.Dispose();
+            MmapHandles = null;
+        }
     }
 }
 
