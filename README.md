@@ -1,6 +1,16 @@
 # daisi-llogos
 
-A suite of inference engines for GGUF models — from native C# backends (CPU, CUDA, Vulkan, Metal) to a browser-native TypeScript/WebGPU engine. Native performance through direct hardware access across every platform: SIMD intrinsics on CPU, P/Invoke to CUDA/Vulkan/Metal on GPU, and WGSL compute shaders in the browser. No managed wrapper libraries, no ONNX, no Python.
+**Run AI language models on any device** — your gaming PC, a server, or even a web browser. LLogos is an inference engine that takes a trained AI model file (in [GGUF format](docs/definitions.md#gguf-format)) and runs it to generate text, answer questions, or have conversations.
+
+> **New to AI models?** An "inference engine" is the software that runs a pre-trained AI model. Think of the model file as a recipe and the inference engine as the kitchen — LLogos is the kitchen. See our [Definitions](docs/definitions.md) page for all terminology.
+
+LLogos runs on multiple hardware backends:
+- **NVIDIA GPUs** via CUDA (fastest)
+- **Any GPU** via Vulkan (AMD, Intel, NVIDIA)
+- **Web browsers** via WebGPU (no install needed)
+- **CPU** via AVX2/AVX-512 (works everywhere)
+
+All written in C# and TypeScript. No Python, no wrapper libraries — direct hardware access for maximum speed.
 
 **Dependencies**
 There are no external, 3rd-party dependencies for the Daisi.LLogos assembly by itself, but you will need to also clone the Daisi.SDK repo so that the IInferenceBackend is accessible for the solutition to build. The Daisi Host uses it. Expected folder structure looks like this:
@@ -376,6 +386,7 @@ flowchart LR
 | [Arch: Qwen 3](docs/arch-qwen3.md) | Qwen 3 — gated Q, Bonsai 1-bit, kernel optimizations |
 | [Arch: Qwen 3.5](docs/arch-qwen35.md) | Qwen 3.5 — hybrid DeltaNet, training approach, lessons learned |
 | [Arch: BitNet](docs/arch-bitnet.md) | BitNet b1.58 — ternary I2_S, dedicated kernels |
+| [Pipelined Inference](docs/pipelined-inference.md) | Run models bigger than your GPU — per-layer weight streaming from shard files |
 | [Tested Models](docs/tested-models.md) | Verified models, performance benchmarks, supported quantization formats |
 | [Known Issues](docs/known-issues.md) | Investigation notes on K-quant accumulation errors and DeltaNet architecture |
 
