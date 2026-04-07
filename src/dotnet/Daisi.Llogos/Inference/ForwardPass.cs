@@ -11,16 +11,20 @@ public sealed class ForwardPass : IForwardPass
 {
     private readonly IComputeBackend _backend;
     private readonly ModelConfig _config;
-    private ModelWeights _weights;
+    private readonly ModelWeights _weights;
 
     /// <summary>
     /// Swap the active weight set. Used by PipelinedForwardPass to swap layer weights
     /// between double-buffer slots without recreating the ForwardPass.
+    /// Uses Unsafe.AsRef to bypass readonly for this rare operation.
     /// </summary>
     public void SetWeights(ModelWeights weights)
     {
-        _weights = weights;
-        _backend.InvalidateWeightCache();
+        if (_weights != weights)
+        {
+            System.Runtime.CompilerServices.Unsafe.AsRef(in _weights) = weights;
+            _backend.InvalidateWeightCache();
+        }
     }
     private readonly IKvCache _kvCache;
     private readonly DeltaNetState _deltaState;
