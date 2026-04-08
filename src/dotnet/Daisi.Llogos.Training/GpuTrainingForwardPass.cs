@@ -28,6 +28,7 @@ public sealed class GpuTrainingForwardPass : ITrainingForwardPass
     // GPU tensor pool — pre-allocates on first call, reuses on subsequent calls.
     // Eliminates thousands of cuMemAlloc/cuMemFree per step.
     private readonly Dictionary<string, ITensor> _pool = new();
+    private CudaArenaAllocator? _arena; // optional arena (pre-registered tensors, graph-safe)
     private int _lastT;
 
     // LoRA tensors on GPU (uploaded from CPU, re-uploaded after optimizer step)
@@ -736,6 +737,11 @@ public sealed class GpuTrainingForwardPass : ITrainingForwardPass
     /// </summary>
     private ITensor Pool(string name, int size)
     {
+        // Arena path: return pre-allocated tensor (no dynamic alloc, graph-safe)
+        if (_arena != null && _arena.TryGet(name, out var arenaTensor))
+            return arenaTensor;
+
+        // Pool path: create on first call, reuse on subsequent
         if (_pool.TryGetValue(name, out var existing))
         {
             if (existing.ElementCount == size)
@@ -863,8 +869,97 @@ public sealed class GpuTrainingForwardPass : ITrainingForwardPass
         return t;
     }
 
+    /// <summary>
+    /// Pre-register all training tensors in an arena for a fixed sequence length.
+    /// After this call, Pool() returns arena tensors (no dynamic alloc, graph-safe).
+    /// Call once before the training loop starts.
+    /// </summary>
+    public void EnableArena(int seqLen)
+    {
+        int T = seqLen;
+        int H = _config.HiddenDim;
+        int V = _config.VocabSize;
+        int numLayers = _config.NumLayers;
+        int numHeads = _config.NumHeads;
+        int numKvHeads = _config.NumKvHeads;
+        int keyLen = _config.KeyLength;
+        int valueLen = _config.ValueLength;
+        int ffnDim = _config.IntermediateDim;
+
+        var arena = new CudaArenaAllocator();
+
+        // Working tensors (forward + backward)
+        arena.Register("hidden", T * H);
+        arena.Register("residual", T * H);
+        arena.Register("normout", T * H);
+        arena.Register("logits", T * V);
+        arena.Register("dlogits", T * V);
+        arena.Register("dhidden", T * H);
+        arena.Register("d_fnorm", T * H);
+        arena.Register("final_norm", H);
+
+        // Per-layer attention tensors (reused across layers)
+        arena.Register("attn.q", T * numHeads * keyLen);
+        arena.Register("attn.k", T * numKvHeads * keyLen);
+        arena.Register("attn.v", T * numKvHeads * valueLen);
+        arena.Register("attn.scores", T * numHeads * T);
+        arena.Register("attn.out", T * numHeads * valueLen);
+        arena.Register("attn.proj", T * H);
+
+        // FFN tensors
+        arena.Register("ffn.gate", T * ffnDim);
+        arena.Register("ffn.up", T * ffnDim);
+        arena.Register("ffn.gated", T * ffnDim);
+        arena.Register("ffn.out", T * H);
+
+        // DeltaNet tensors (if applicable)
+        if (_config.SsmInnerSize > 0)
+        {
+            int ssmInner = _config.SsmInnerSize;
+            int convChannels = ssmInner * 3; // approximate
+            int numVHeads = _config.SsmGroupCount;
+            int headDim = _config.SsmHeadDim;
+
+            arena.Register("delta.qkv_tok", T * ssmInner * 3);
+            arena.Register("delta.q", T * ssmInner);
+            arena.Register("delta.k", T * ssmInner);
+            arena.Register("delta.v", T * ssmInner);
+            arena.Register("delta.alpha", T * numVHeads);
+            arena.Register("delta.beta", T * numVHeads);
+            arena.Register("delta.betaval", T * ssmInner);
+            arena.Register("delta.decay", T * numVHeads);
+            arena.Register("delta.gate", T * ssmInner);
+            arena.Register("delta.output", T * H);
+            arena.Register("delta.normout1", T * ssmInner);
+            arena.Register("delta.hidden1", T * ssmInner);
+
+            // Per-layer DeltaNet state
+            for (int i = 0; i < numLayers; i++)
+            {
+                if (!_config.IsStandardAttention(i))
+                {
+                    arena.Register($"delta.state.{i}", numVHeads * headDim * headDim);
+                    arena.Register($"delta.conv.{i}", (_config.SsmConvKernel - 1) * convChannels);
+                }
+            }
+        }
+
+        // LoRA intermediates
+        foreach (var (name, layer) in _adapter.Layers)
+        {
+            int rank = layer.Rank;
+            arena.Register($"lora.{name}.inter", T * rank);
+        }
+
+        arena.Allocate(_gpu);
+        _arena = arena;
+
+        Console.Error.WriteLine($"  Training arena enabled: {arena.TensorCount} tensors for seqLen={seqLen}");
+    }
+
     public void Dispose()
     {
+        _arena?.Dispose();
         foreach (var t in _pool.Values) t.Dispose();
         _pool.Clear();
         _embeddingTable?.Dispose();

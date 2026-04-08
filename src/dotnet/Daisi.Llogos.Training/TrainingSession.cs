@@ -51,7 +51,9 @@ public sealed class TrainingSession : IDisposable
         // 4. Initialize training components
         if (_backend is Daisi.Llogos.Cuda.CudaBackend cudaBackend)
         {
-            _forwardPass = new GpuTrainingForwardPass(_modelConfig!, _weights!, _adapter, cudaBackend);
+            var gpuFwd = new GpuTrainingForwardPass(_modelConfig!, _weights!, _adapter, cudaBackend);
+            gpuFwd.EnableArena(_config.SeqLen);
+            _forwardPass = gpuFwd;
             Console.Error.WriteLine($"  Backend: CUDA (GPU training)");
         }
         else
