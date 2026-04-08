@@ -49,12 +49,12 @@ public sealed class TrainingSession : IDisposable
             $"(rank={_config.Lora.Rank}, alpha={_config.Lora.Alpha})");
 
         // 4. Initialize training components
-        if (_backend is Daisi.Llogos.Cuda.CudaBackend cudaBackend)
+        if (_backend is Daisi.Llogos.Cuda.CudaTrainingBackend cudaTraining)
         {
-            var gpuFwd = new GpuTrainingForwardPass(_modelConfig!, _weights!, _adapter, cudaBackend);
+            var gpuFwd = new GpuTrainingForwardPass(_modelConfig!, _weights!, _adapter, cudaTraining);
             gpuFwd.EnableArena(_config.SeqLen);
             _forwardPass = gpuFwd;
-            Console.Error.WriteLine($"  Backend: CUDA (GPU training)");
+            Console.Error.WriteLine($"  Backend: CUDA (GPU training, graph-safe)");
         }
         else
         {

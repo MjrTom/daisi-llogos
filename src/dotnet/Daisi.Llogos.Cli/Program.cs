@@ -704,7 +704,7 @@ static int RunTraining(string[] args)
 
     IComputeBackend trainingBackend = trainBackend switch
     {
-        "cuda" => new CudaBackend(),
+        "cuda" => new CudaTrainingBackend(),
         _ => new CpuBackend(),
     };
 

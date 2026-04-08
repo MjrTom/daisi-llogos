@@ -15,7 +15,7 @@ public sealed class GpuTrainingForwardPass : ITrainingForwardPass
     private readonly ModelConfig _config;
     private readonly ModelWeights _weights;
     private readonly LoraAdapter _adapter;
-    private readonly CudaBackend _gpu;
+    private readonly CudaTrainingBackend _gpu;
 
     // Cached model-level tensors (dequantized once, stay on GPU)
     private ITensor? _embeddingTable;   // F32 [V × H] on GPU
@@ -41,7 +41,7 @@ public sealed class GpuTrainingForwardPass : ITrainingForwardPass
     private int _optimStep;
 
     public GpuTrainingForwardPass(ModelConfig config, ModelWeights weights,
-        LoraAdapter adapter, CudaBackend gpu)
+        LoraAdapter adapter, CudaTrainingBackend gpu)
     {
         _config = config;
         _weights = weights;
