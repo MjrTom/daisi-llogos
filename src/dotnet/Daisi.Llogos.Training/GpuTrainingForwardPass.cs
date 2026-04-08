@@ -944,11 +944,27 @@ public sealed class GpuTrainingForwardPass : ITrainingForwardPass
             }
         }
 
-        // LoRA intermediates
+        // Per-layer saved activations (forward → backward)
+        for (int i = 0; i < numLayers; i++)
+        {
+            arena.Register($"l{i}.input", T * H);
+            arena.Register($"l{i}.normout", T * H);
+            arena.Register($"l{i}.post_hidden", T * H);
+            arena.Register($"l{i}.ffn_res", T * H);
+            arena.Register($"d_l{i}.ffn_out", T * H);
+            arena.Register($"d_l{i}.attn", T * H);
+        }
+
+        // Input/target tensors (overwritten each step before graph replay)
+        arena.Register("token_ids", T);
+        arena.Register("targets", T);
+
+        // LoRA intermediates + backward scaled outputs
         foreach (var (name, layer) in _adapter.Layers)
         {
             int rank = layer.Rank;
             arena.Register($"lora.{name}.inter", T * rank);
+            arena.Register($"lora.{name}.sdout", T * layer.OutFeatures);
         }
 
         arena.Allocate(_gpu);
