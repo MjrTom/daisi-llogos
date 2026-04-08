@@ -1575,4 +1575,76 @@ __global__ void dequant_matmul_q1_0(float* output, const float* a,
     }
 }
 
+// ── Batched Q8_0 × Q8_1 MatMul (M > 1): Tiled dp4a ─────────────────────────
+// output[M×N] = a[M×K] × b^T[N×K]
+//   a: Q8_1 activation [M rows, each row = blocks_per_row × 36 bytes]
+//   b: Q8_0 aligned weight [N rows × blocks_per_row × 36 bytes]
+//
+// Tiling: Each block computes one output column (n) for TILE_M rows at once.
+// threadIdx.x maps to K blocks. threadIdx.y maps to M rows within the tile.
+// Weight data for column n is loaded once and reused across all M rows in the tile.
+//
+// Grid: (N, ceil(M/TILE_M), 1)
+// Block: (K_THREADS, TILE_M, 1)  — e.g., (32, 4, 1) = 128 threads
+
+#define BATCH_Q8_TILE_M 4   // M rows per block
+#define BATCH_Q8_K_THREADS 32  // threads along K dimension
+
+__global__ void batched_matmul_q8_0_q8_1(
+    float* __restrict__ output,           // [M × N]
+    const unsigned char* __restrict__ a,  // Q8_1 [M × blocks_per_row × 36]
+    const unsigned char* __restrict__ b,  // Q8_0 aligned [N × blocks_per_row × 36]
+    int M, int K, int N)
+{
+    int n = blockIdx.x;                               // output column
+    int m_base = blockIdx.y * BATCH_Q8_TILE_M;        // first M row for this block
+    int m_local = threadIdx.y;                         // which row within the tile
+    int k_tid = threadIdx.x;                           // K-dimension thread index
+    int m = m_base + m_local;
+
+    if (n >= N || m >= M) return;
+
+    int blocks_per_row = K / 32;
+    long bytes_per_row = (long)blocks_per_row * 36;
+
+    const unsigned char* a_row = a + (long)m * bytes_per_row;
+    const unsigned char* b_row = b + (long)n * bytes_per_row;
+
+    float sum = 0.0f;
+
+    // Each thread processes K blocks strided by K_THREADS
+    for (int blk = k_tid; blk < blocks_per_row; blk += BATCH_Q8_K_THREADS)
+    {
+        // Load activation block
+        const unsigned char* ablk = a_row + blk * 36;
+        float a_scale = fp16_to_fp32(__ldg(reinterpret_cast<const unsigned short*>(ablk)));
+        const int* a_qs = reinterpret_cast<const int*>(ablk + 4);
+
+        // Load weight block (same for all M rows in tile)
+        const unsigned char* wblk = b_row + blk * 36;
+        float w_scale = fp16_to_fp32(__ldg(reinterpret_cast<const unsigned short*>(wblk)));
+        const int* w_qs = reinterpret_cast<const int*>(wblk + 4);
+
+        int sumi = 0;
+        sumi = __dp4a(__ldg(&a_qs[0]), __ldg(&w_qs[0]), sumi);
+        sumi = __dp4a(__ldg(&a_qs[1]), __ldg(&w_qs[1]), sumi);
+        sumi = __dp4a(__ldg(&a_qs[2]), __ldg(&w_qs[2]), sumi);
+        sumi = __dp4a(__ldg(&a_qs[3]), __ldg(&w_qs[3]), sumi);
+        sumi = __dp4a(__ldg(&a_qs[4]), __ldg(&w_qs[4]), sumi);
+        sumi = __dp4a(__ldg(&a_qs[5]), __ldg(&w_qs[5]), sumi);
+        sumi = __dp4a(__ldg(&a_qs[6]), __ldg(&w_qs[6]), sumi);
+        sumi = __dp4a(__ldg(&a_qs[7]), __ldg(&w_qs[7]), sumi);
+
+        sum += a_scale * w_scale * (float)sumi;
+    }
+
+    // Reduce across K threads within this (n, m) pair
+    // Use warp shuffle since K_THREADS = 32 = one warp
+    sum = warp_reduce_sum(sum);
+
+    // Thread 0 of each warp writes the output
+    if (k_tid == 0)
+        output[m * N + n] = sum;
+}
+
 } // extern "C"

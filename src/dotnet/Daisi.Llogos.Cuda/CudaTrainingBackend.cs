@@ -210,6 +210,66 @@ public sealed class CudaTrainingBackend : IComputeBackend
         ulong aPtr = aT.DevicePtr;
         ulong bPtr = bT.DevicePtr;
 
+        // ── Q8_0 dp4a batched path: quantize activation, direct dp4a matmul ──
+        if (bT.Type == Gguf.GgmlType.Q8_0 && (bT.IsAlignedQ8_0 || K % 32 == 0) && _hasQ8_0Weights)
+        {
+            // Step 1: Quantize activation [M×K] → Q8_1 format
+            int blocksPerRow = K / 32;
+            long q8BytesPerRow = (long)blocksPerRow * 36;
+            long totalQ8Bytes = (long)M * q8BytesPerRow;
+
+            if (_batchQ8ActivationBuf == null || _batchQ8ActivationBufSize < totalQ8Bytes)
+            {
+                _batchQ8ActivationBuf?.Dispose();
+                _batchQ8ActivationBuf = new CudaDeviceMemory((ulong)totalQ8Bytes);
+                _batchQ8ActivationBufSize = totalQ8Bytes;
+            }
+            ulong q8ActPtr = _batchQ8ActivationBuf.DevicePtr;
+
+            // Quantize each row of the activation
+            var qFunc = _matmulModule.GetFunction("quantize_f32_q8_1");
+            int totalBlocks = M * blocksPerRow;
+            uint qGrid = (uint)((totalBlocks + BlockSize - 1) / BlockSize);
+
+            // Quantize entire M×K activation in one kernel launch
+            // Each thread handles one 32-element block
+            for (int row = 0; row < M; row++)
+            {
+                ulong rowSrc = aPtr + (ulong)(row * K * sizeof(float));
+                ulong rowDst = q8ActPtr + (ulong)(row * q8BytesPerRow);
+                int kVal = K;
+                nint* qArgs = stackalloc nint[3];
+                qArgs[0] = (nint)(&rowDst);
+                qArgs[1] = (nint)(&rowSrc);
+                qArgs[2] = (nint)(&kVal);
+                uint rowGrid = (uint)((blocksPerRow + BlockSize - 1) / BlockSize);
+                _stream.Launch(qFunc, rowGrid, 1, 1, (uint)BlockSize, 1, 1, 0, qArgs);
+            }
+
+            // Step 2: Batched dp4a matmul
+            // Grid: (N, ceil(M/TILE_M), 1) — one column per block in X, M rows in Y
+            // Block: (K_THREADS=32, TILE_M=4, 1) — 128 threads
+            var mmFunc = _matmulModule.GetFunction("batched_matmul_q8_0_q8_1");
+            int tileM = 4; // BATCH_Q8_TILE_M
+            uint gridX = (uint)N;
+            uint gridY = (uint)((M + tileM - 1) / tileM);
+            uint blockX = 32;  // BATCH_Q8_K_THREADS (one warp)
+            uint blockY = (uint)tileM;
+
+            int kArg = K, nArg = N;
+            nint* mmArgs = stackalloc nint[5];
+            mmArgs[0] = (nint)(&outPtr);
+            mmArgs[1] = (nint)(&q8ActPtr);
+            mmArgs[2] = (nint)(&bPtr);
+            mmArgs[3] = (nint)(&M);
+            mmArgs[4] = (nint)(&kArg);
+            nint* mmArgs6 = stackalloc nint[6];
+            for (int i = 0; i < 5; i++) mmArgs6[i] = mmArgs[i];
+            mmArgs6[5] = (nint)(&nArg);
+            _stream.Launch(mmFunc, gridX, gridY, 1, blockX, blockY, 1, 0, mmArgs6);
+            return;
+        }
+
         ulong bF32Ptr;
         bool needsDequant = bT.Type != Gguf.GgmlType.F32;
 
@@ -266,6 +326,8 @@ public sealed class CudaTrainingBackend : IComputeBackend
 
     private CudaDeviceMemory? _batchDequantBuf;
     private long _batchDequantBufSize;
+    private CudaDeviceMemory? _batchQ8ActivationBuf;
+    private long _batchQ8ActivationBufSize;
 
     /// <summary>Launch a standard 6-arg matmul kernel: (output, a, b, M, K, N).</summary>
     private unsafe void LaunchMatMul(string kernelName, ulong outPtr, ulong aPtr, ulong bPtr,
