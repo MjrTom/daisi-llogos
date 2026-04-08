@@ -63,6 +63,19 @@ internal static partial class CublasApi
         float* beta,
         ulong C, int ldc);
 
+    /// <summary>Strided batched GEMM for multi-head attention matmuls.</summary>
+    [LibraryImport(Lib, EntryPoint = "cublasGemmStridedBatchedEx")]
+    internal static unsafe partial int GemmStridedBatchedEx(
+        nint handle,
+        int transa, int transb,
+        int m, int n, int k,
+        void* alpha,
+        ulong A, int Atype, int lda, long strideA,
+        ulong B, int Btype, int ldb, long strideB,
+        void* beta,
+        ulong C, int Ctype, int ldc, long strideC,
+        int batchCount, int computeType, int algo);
+
     // cuBLAS enums
     internal const int CUBLAS_OP_N = 0;
     internal const int CUBLAS_OP_T = 1;

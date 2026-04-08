@@ -261,6 +261,19 @@ public interface IComputeBackend : IDisposable
     /// <summary>Whether this backend supports batched prefill operations (CopyTensorSlice, etc.).</summary>
     bool SupportsBatchedOps => false;
 
+    /// <summary>Wait for all pending operations to complete (for profiling). No-op on CPU.</summary>
+    void Synchronize() { }
+
+    /// <summary>
+    /// Batched embedding lookup: write M token embeddings to output[M × hiddenDim].
+    /// Default: sequential lookups.
+    /// </summary>
+    void BatchedEmbeddingLookup(ITensor output, ITensor table, int[] tokenIds)
+    {
+        throw new NotSupportedException("BatchedEmbeddingLookup requires backend support.");
+    }
+
+
     void CopyTensorSlice(ITensor dst, int dstOffset, ITensor src, int srcOffset, int count)
     {
         throw new NotSupportedException("CopyTensorSlice requires backend support.");
