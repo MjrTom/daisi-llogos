@@ -248,7 +248,7 @@ public sealed class CudaTrainingBackend : IComputeBackend
             // Step 2: Tiled MMQ kernel
             // Grid: (ceil(N/TILE_N), ceil(M/TILE_M))
             // Block: (32, 8) = 256 threads
-            const int TILE_M = 32, TILE_N = 32, K_CHUNK = 4;
+            const int TILE_M = 32, TILE_N = 64, K_CHUNK = 8;
             uint gridX = (uint)((N + TILE_N - 1) / TILE_N);
             uint gridY = (uint)((M + TILE_M - 1) / TILE_M);
 

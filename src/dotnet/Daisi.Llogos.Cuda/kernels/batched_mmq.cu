@@ -30,11 +30,12 @@ extern "C" {
 //
 // Each thread accumulates one output element: output[m_base + lane, n_base + warp]
 
-#define MMQ_TILE_M  32   // M rows per block (= warp_size)
-#define MMQ_TILE_N  32   // N cols per block (4 per warp × 8 warps)
-#define MMQ_K_CHUNK 4    // Q8 blocks per shared memory load (128 elements)
+#define MMQ_TILE_M  32   // M rows per block (= warp_size, 1 per lane)
+#define MMQ_TILE_N  64   // N cols per block (8 per warp × 8 warps)
+#define MMQ_K_CHUNK 8    // Q8 blocks per shared memory load (256 elements)
 #define MMQ_NWARPS  8
-#define MMQ_N_PER_WARP 4 // Each warp handles 4 N columns
+#define MMQ_N_PER_WARP 8 // Each warp handles 8 N columns — 8× activation reuse
+#define MMQ_M_PER_LANE 1 // Each lane handles 1 M row
 #define MMQ_BLOCK_SIZE (32 * MMQ_NWARPS)  // 256 threads
 
 // Shared memory: separate arrays for scales and quants for coalesced access
@@ -75,10 +76,13 @@ void tiled_mmq_q8_0_q8_1(
     float*  a_scales = (float*)(w_quants + MMQ_TILE_N * MMQ_K_CHUNK * 8);
     int*    a_quants = (int*)(a_scales + MMQ_TILE_M * MMQ_K_CHUNK);
 
-    // Accumulators: each thread computes N_PER_WARP output elements
-    float acc[MMQ_N_PER_WARP];
+    // Accumulators: each thread computes M_PER_LANE × N_PER_WARP output elements
+    float acc[MMQ_M_PER_LANE][MMQ_N_PER_WARP];
     #pragma unroll
-    for (int i = 0; i < MMQ_N_PER_WARP; i++) acc[i] = 0.0f;
+    for (int mi = 0; mi < MMQ_M_PER_LANE; mi++)
+        #pragma unroll
+        for (int ni = 0; ni < MMQ_N_PER_WARP; ni++)
+            acc[mi][ni] = 0.0f;
 
     // Process K in chunks
     for (int kb = 0; kb < blocks_per_row; kb += MMQ_K_CHUNK)
@@ -143,7 +147,7 @@ void tiled_mmq_q8_0_q8_1(
 
         __syncthreads();
 
-        // ── Compute: each thread does dp4a for N_PER_WARP (m, n) pairs ──
+        // ── Compute: activation-first, N-inner loop for register reuse ──
         if (m < M)
         {
             for (int tk = 0; tk < chunk; tk++)
@@ -151,12 +155,13 @@ void tiled_mmq_q8_0_q8_1(
                 float as_ = a_scales[lane * MMQ_K_CHUNK + tk];
                 int a_base = (lane * MMQ_K_CHUNK + tk) * 8;
 
-                // Load activation quants once, reuse for all N columns
+                // Load activation quants into registers ONCE
                 int a0 = a_quants[a_base+0], a1 = a_quants[a_base+1];
                 int a2 = a_quants[a_base+2], a3 = a_quants[a_base+3];
                 int a4 = a_quants[a_base+4], a5 = a_quants[a_base+5];
                 int a6 = a_quants[a_base+6], a7 = a_quants[a_base+7];
 
+                // Reuse across all N columns
                 #pragma unroll
                 for (int ni = 0; ni < MMQ_N_PER_WARP; ni++)
                 {
@@ -176,7 +181,7 @@ void tiled_mmq_q8_0_q8_1(
                     sumi = __dp4a(a6, w_quants[w_base+6], sumi);
                     sumi = __dp4a(a7, w_quants[w_base+7], sumi);
 
-                    acc[ni] += as_ * ws * (float)sumi;
+                    acc[0][ni] += as_ * ws * (float)sumi;
                 }
             }
         }
@@ -192,7 +197,7 @@ void tiled_mmq_q8_0_q8_1(
         {
             int gn = n_base + warp * MMQ_N_PER_WARP + ni;
             if (gn < N)
-                output[m * N + gn] = acc[ni];
+                output[m * N + gn] = acc[0][ni];
         }
     }
 }
