@@ -40,6 +40,9 @@ public sealed class GpuTrainingForwardPass : ITrainingForwardPass
     private readonly Dictionary<string, (ITensor mA, ITensor vA, ITensor mB, ITensor vB)> _gpuOptState = new();
     private int _optimStep;
 
+    // Contiguous LoRA state for single-kernel optimizer (optional)
+    private ContiguousLoraState? _contiguousLora;
+
     public GpuTrainingForwardPass(ModelConfig config, ModelWeights weights,
         LoraAdapter adapter, CudaTrainingBackend gpu)
     {
@@ -729,6 +732,7 @@ public sealed class GpuTrainingForwardPass : ITrainingForwardPass
     /// <summary>
     /// Run AdamW optimizer step entirely on GPU. No CPU round-trip.
     /// Clips gradients, updates LoRA params, zeros gradients — all on device.
+    /// Uses contiguous buffers when available (3 kernel launches instead of ~192).
     /// </summary>
     public void GpuOptimizerStep(float lr, float beta1, float beta2, float eps,
         float weightDecay, float maxGradNorm, float lrMultiplier)
@@ -738,18 +742,49 @@ public sealed class GpuTrainingForwardPass : ITrainingForwardPass
         float bc1 = 1.0f - MathF.Pow(beta1, _optimStep);
         float bc2 = 1.0f - MathF.Pow(beta2, _optimStep);
 
-        // Gradient clipping: compute total norm across all LoRA params
-        float totalNormSq = 0;
+        if (_contiguousLora != null)
+        {
+            // ── Contiguous path: gather + 3 kernels + scatter ──
+            // Gather per-layer grads → contiguous buffer
+            GatherGrads();
+
+            // 1. Grad norm (single kernel on contiguous grad buffer)
+            float totalNormSq = _gpu.GradNormSq(_contiguousLora.Grads);
+            float totalNorm = MathF.Sqrt(totalNormSq);
+            if (totalNorm > maxGradNorm)
+                _gpu.ScaleInPlace(_contiguousLora.Grads, maxGradNorm / totalNorm);
+
+            // 2. AdamW step (single kernel on contiguous buffers)
+            _gpu.AdamWStep(_contiguousLora.Params, _contiguousLora.Grads,
+                _contiguousLora.M, _contiguousLora.V,
+                effectiveLr, beta1, beta2, eps, weightDecay, bc1, bc2);
+
+            // 3. Scatter updated params back to per-layer tensors
+            ScatterParams();
+
+            // 4. Zero per-layer grads + contiguous buffer
+            _gpu.ZeroTensor(_contiguousLora.Grads);
+            foreach (var (name, _) in _adapter.Layers)
+            {
+                var grad = _gpuLoraGrad[name];
+                _gpu.ZeroTensor(grad.dA);
+                _gpu.ZeroTensor(grad.dB);
+            }
+            return;
+        }
+
+        // ── Per-layer fallback (~192 kernel launches) ──
+        float totalNormSqFallback = 0;
         foreach (var (name, _) in _adapter.Layers)
         {
             var grad = _gpuLoraGrad[name];
-            totalNormSq += _gpu.GradNormSq(grad.dA);
-            totalNormSq += _gpu.GradNormSq(grad.dB);
+            totalNormSqFallback += _gpu.GradNormSq(grad.dA);
+            totalNormSqFallback += _gpu.GradNormSq(grad.dB);
         }
-        float totalNorm = MathF.Sqrt(totalNormSq);
-        if (totalNorm > maxGradNorm)
+        float totalNormFallback = MathF.Sqrt(totalNormSqFallback);
+        if (totalNormFallback > maxGradNorm)
         {
-            float scale = maxGradNorm / totalNorm;
+            float scale = maxGradNorm / totalNormFallback;
             foreach (var (name, _) in _adapter.Layers)
             {
                 var grad = _gpuLoraGrad[name];
@@ -757,20 +792,15 @@ public sealed class GpuTrainingForwardPass : ITrainingForwardPass
                 _gpu.ScaleInPlace(grad.dB, scale);
             }
         }
-
-        // AdamW step on GPU for each LoRA parameter
         foreach (var (name, _) in _adapter.Layers)
         {
             var lora = _gpuLora[name];
             var grad = _gpuLoraGrad[name];
             var opt = _gpuOptState[name];
-
             _gpu.AdamWStep(lora.a, grad.dA, opt.mA, opt.vA,
                 effectiveLr, beta1, beta2, eps, weightDecay, bc1, bc2);
             _gpu.AdamWStep(lora.b, grad.dB, opt.mB, opt.vB,
                 effectiveLr, beta1, beta2, eps, weightDecay, bc1, bc2);
-
-            // Zero gradients for next step
             _gpu.ZeroTensor(grad.dA);
             _gpu.ZeroTensor(grad.dB);
         }
@@ -779,6 +809,12 @@ public sealed class GpuTrainingForwardPass : ITrainingForwardPass
     /// <summary>Download final LoRA weights from GPU to CPU adapter (for saving).</summary>
     public void DownloadLoraWeights()
     {
+        if (_contiguousLora != null)
+        {
+            // Download from contiguous buffer (single D2H transfer)
+            _contiguousLora.DownloadTo(_adapter);
+            return;
+        }
         foreach (var (name, layer) in _adapter.Layers)
         {
             var lora = _gpuLora[name];
@@ -929,6 +965,59 @@ public sealed class GpuTrainingForwardPass : ITrainingForwardPass
     }
 
     /// <summary>
+    /// Enable contiguous LoRA parameter layout for single-kernel optimizer.
+    /// Call after constructor. Creates contiguous GPU buffers and uploads initial weights.
+    /// </summary>
+    public void EnableContiguousOptimizer()
+    {
+        _contiguousLora = ContiguousLoraState.Create(_adapter, _gpu);
+    }
+
+    /// <summary>Gather per-layer grads into contiguous buffer before optimizer step.</summary>
+    private void GatherGrads()
+    {
+        if (_contiguousLora == null) return;
+        var layers = _adapter.Layers.ToList();
+        for (int i = 0; i < layers.Count; i++)
+        {
+            var (oA, sA, oB, sB) = _contiguousLora.LayerOffsets[i];
+            var grad = _gpuLoraGrad[layers[i].Key];
+            CopyRegion(grad.dA, _contiguousLora.Grads, oA, sA);
+            CopyRegion(grad.dB, _contiguousLora.Grads, oB, sB);
+        }
+    }
+
+    /// <summary>Scatter contiguous params back to per-layer tensors after optimizer step.</summary>
+    private void ScatterParams()
+    {
+        if (_contiguousLora == null) return;
+        var layers = _adapter.Layers.ToList();
+        for (int i = 0; i < layers.Count; i++)
+        {
+            var (oA, sA, oB, sB) = _contiguousLora.LayerOffsets[i];
+            var lora = _gpuLora[layers[i].Key];
+            CopyRegionFrom(_contiguousLora.Params, oA, lora.a, sA);
+            CopyRegionFrom(_contiguousLora.Params, oB, lora.b, sB);
+        }
+    }
+
+    /// <summary>Copy from source tensor to a region of dest at element offset.</summary>
+    private static void CopyRegion(ITensor src, ITensor dest, int destOffsetElements, int count)
+    {
+        ulong srcPtr = ((CudaTensor)src).DevicePtr;
+        ulong dstPtr = ((CudaTensor)dest).DevicePtr + (ulong)(destOffsetElements * sizeof(float));
+        CudaApi.Check(CudaApi.MemcpyDtoD(dstPtr, srcPtr, (ulong)(count * sizeof(float))), "cuMemcpyDtoD");
+    }
+
+    /// <summary>Copy from a region of source to dest tensor.</summary>
+    private static void CopyRegionFrom(ITensor src, int srcOffsetElements, ITensor dest, int count)
+    {
+        ulong srcPtr = ((CudaTensor)src).DevicePtr + (ulong)(srcOffsetElements * sizeof(float));
+        ulong dstPtr = ((CudaTensor)dest).DevicePtr;
+        CudaApi.Check(CudaApi.MemcpyDtoD(dstPtr, srcPtr, (ulong)(count * sizeof(float))), "cuMemcpyDtoD");
+    }
+
+    /// <summary>
     /// Pre-register all training tensors in an arena for a fixed sequence length.
     /// After this call, Pool() returns arena tensors (no dynamic alloc, graph-safe).
     /// Call once before the training loop starts.
@@ -1034,6 +1123,7 @@ public sealed class GpuTrainingForwardPass : ITrainingForwardPass
 
     public void Dispose()
     {
+        _contiguousLora?.Dispose();
         _arena?.Dispose();
         foreach (var t in _pool.Values) t.Dispose();
         _pool.Clear();

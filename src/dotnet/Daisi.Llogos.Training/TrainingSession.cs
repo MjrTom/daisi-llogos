@@ -53,6 +53,7 @@ public sealed class TrainingSession : IDisposable
         {
             var gpuFwd = new GpuTrainingForwardPass(_modelConfig!, _weights!, _adapter, cudaTraining);
             gpuFwd.EnableArena(_config.SeqLen);
+            gpuFwd.EnableContiguousOptimizer();
             // Graph capture disabled: too many non-capturable H2D transfers in backward path.
             // CudaTrainingBackend has the graph-safe APIs ready for when the training
             // code eliminates all synchronous cuMemcpyHtoD calls.
