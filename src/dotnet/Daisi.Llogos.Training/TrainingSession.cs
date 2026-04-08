@@ -49,10 +49,17 @@ public sealed class TrainingSession : IDisposable
             $"(rank={_config.Lora.Rank}, alpha={_config.Lora.Alpha})");
 
         // 4. Initialize training components
-        if (_backend is Daisi.Llogos.Cuda.CudaBackend cudaBackend)
+        if (_backend is Daisi.Llogos.Cuda.CudaTrainingBackend cudaTraining)
         {
-            _forwardPass = new GpuTrainingForwardPass(_modelConfig!, _weights!, _adapter, cudaBackend);
-            Console.Error.WriteLine($"  Backend: CUDA (GPU training)");
+            var gpuFwd = new GpuTrainingForwardPass(_modelConfig!, _weights!, _adapter, cudaTraining);
+            gpuFwd.EnableArena(_config.SeqLen);
+            gpuFwd.EnableContiguousOptimizer();
+            // Graph capture disabled: too many non-capturable H2D transfers in backward path.
+            // CudaTrainingBackend has the graph-safe APIs ready for when the training
+            // code eliminates all synchronous cuMemcpyHtoD calls.
+            // gpuFwd.EnableGraphCapture();
+            _forwardPass = gpuFwd;
+            Console.Error.WriteLine($"  Backend: CUDA (GPU training, graph-safe)");
         }
         else
         {

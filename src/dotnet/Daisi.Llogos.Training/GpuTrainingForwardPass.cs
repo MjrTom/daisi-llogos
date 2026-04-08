@@ -15,7 +15,7 @@ public sealed class GpuTrainingForwardPass : ITrainingForwardPass
     private readonly ModelConfig _config;
     private readonly ModelWeights _weights;
     private readonly LoraAdapter _adapter;
-    private readonly CudaBackend _gpu;
+    private readonly CudaTrainingBackend _gpu;
 
     // Cached model-level tensors (dequantized once, stay on GPU)
     private ITensor? _embeddingTable;   // F32 [V × H] on GPU
@@ -28,6 +28,7 @@ public sealed class GpuTrainingForwardPass : ITrainingForwardPass
     // GPU tensor pool — pre-allocates on first call, reuses on subsequent calls.
     // Eliminates thousands of cuMemAlloc/cuMemFree per step.
     private readonly Dictionary<string, ITensor> _pool = new();
+    private CudaArenaAllocator? _arena; // optional arena (pre-registered tensors, graph-safe)
     private int _lastT;
 
     // LoRA tensors on GPU (uploaded from CPU, re-uploaded after optimizer step)
@@ -39,8 +40,11 @@ public sealed class GpuTrainingForwardPass : ITrainingForwardPass
     private readonly Dictionary<string, (ITensor mA, ITensor vA, ITensor mB, ITensor vB)> _gpuOptState = new();
     private int _optimStep;
 
+    // Contiguous LoRA state for single-kernel optimizer (optional)
+    private ContiguousLoraState? _contiguousLora;
+
     public GpuTrainingForwardPass(ModelConfig config, ModelWeights weights,
-        LoraAdapter adapter, CudaBackend gpu)
+        LoraAdapter adapter, CudaTrainingBackend gpu)
     {
         _config = config;
         _weights = weights;
@@ -72,12 +76,62 @@ public sealed class GpuTrainingForwardPass : ITrainingForwardPass
         }
     }
 
+    private int _graphWarmupStep; // 0=warmup, 1=capture, 2+=replay
+    private bool _graphEnabled;
+
+    /// <summary>Enable CUDA graph capture after warmup. Call after EnableArena().</summary>
+    public void EnableGraphCapture()
+    {
+        // Check if gated Q is present — its backward uses CPU roundtrip, incompatible with graph
+        bool hasGatedQ = false;
+        for (int i = 0; i < _config.NumLayers; i++)
+            if (_weights.Layers[i] is StandardAttentionWeights saw && saw.HasGatedQ)
+                { hasGatedQ = true; break; }
+
+        if (hasGatedQ)
+        {
+            Console.Error.WriteLine("  [Training graph: disabled — gated Q backward requires CPU roundtrip]");
+            return;
+        }
+
+        _graphEnabled = true;
+    }
+
     public float[]? Forward(int[] tokenIds, out float totalLoss, int[] targets)
     {
+        // Graph replay path: upload inputs, replay captured graph, read results
+        if (_graphEnabled && _gpu.TrainingGraphReady)
+        {
+            // Upload new input data into pre-allocated arena tensors (OUTSIDE graph)
+            CreateIntTensor("token_ids", tokenIds);
+            CreateIntTensor("targets_gpu", targets);
+
+            // Replay the captured graph
+            _gpu.ReplayTrainingGraph();
+            _gpu.Synchronize();
+
+            // Read deferred results
+            totalLoss = _gpu.ReadLoss();
+            return null;
+        }
+
         int T = tokenIds.Length;
         int H = _config.HiddenDim;
         int V = _config.VocabSize;
 
+        // Graph capture: steps 0-1 = warmup (normal), step 2 = capture, step 3+ = replay
+        bool capturing = false;
+        if (_graphEnabled && _graphWarmupStep == 2 && _arena != null)
+        {
+            // Upload inputs BEFORE capture starts
+            CreateIntTensor("token_ids", tokenIds);
+            CreateIntTensor("targets_gpu", targets);
+
+            Console.Error.WriteLine("  [Training graph: capturing...]");
+            _gpu.BeginTrainingCapture();
+            capturing = true;
+        }
+        if (_graphEnabled) _graphWarmupStep++;
 
         // Dequantize embedding table (cached on GPU)
         if (_embeddingTable == null)
@@ -95,7 +149,8 @@ public sealed class GpuTrainingForwardPass : ITrainingForwardPass
         _saved = new GpuLayerActivations[_config.NumLayers];
 
         // 1. Embedding lookup → hidden [T × H] (GPU kernel)
-        var gpuTokenIds = CreateIntTensor("token_ids", tokenIds);
+        // During graph capture, inputs were uploaded before BeginTrainingCapture
+        var gpuTokenIds = capturing ? Pool("token_ids", T) : CreateIntTensor("token_ids", tokenIds);
         _gpu.BatchedEmbeddingLookup(Pool("hidden", T * H), _embeddingTable, gpuTokenIds, T, H);
 
         // 2. Transformer layers
@@ -168,13 +223,21 @@ public sealed class GpuTrainingForwardPass : ITrainingForwardPass
 
         // 4. Cross-entropy loss + gradient
         var dLogits = Pool("dlogits", T * V);
-        var gpuTargets = CreateIntTensor("targets", targets);
+        var gpuTargets = capturing ? Pool("targets_gpu", T) : CreateIntTensor("targets", targets);
         totalLoss = _gpu.CrossEntropyLoss(dLogits, logits, gpuTargets, T, V);
 
         // 5. Backward pass
         Backward(dLogits, finalNormOut, T);
 
         // Note: LoRA gradients stay on GPU — GpuOptimizerStep uses them directly
+
+        if (capturing)
+        {
+            _gpu.EndTrainingCapture();
+            _gpu.Synchronize();
+            totalLoss = _gpu.ReadLoss();
+            Console.Error.WriteLine("  [Training graph: captured and launched]");
+        }
 
         return null; // logits not downloaded
     }
@@ -669,6 +732,7 @@ public sealed class GpuTrainingForwardPass : ITrainingForwardPass
     /// <summary>
     /// Run AdamW optimizer step entirely on GPU. No CPU round-trip.
     /// Clips gradients, updates LoRA params, zeros gradients — all on device.
+    /// Uses contiguous buffers when available (3 kernel launches instead of ~192).
     /// </summary>
     public void GpuOptimizerStep(float lr, float beta1, float beta2, float eps,
         float weightDecay, float maxGradNorm, float lrMultiplier)
@@ -678,18 +742,49 @@ public sealed class GpuTrainingForwardPass : ITrainingForwardPass
         float bc1 = 1.0f - MathF.Pow(beta1, _optimStep);
         float bc2 = 1.0f - MathF.Pow(beta2, _optimStep);
 
-        // Gradient clipping: compute total norm across all LoRA params
-        float totalNormSq = 0;
+        if (_contiguousLora != null)
+        {
+            // ── Contiguous path: gather + 3 kernels + scatter ──
+            // Gather per-layer grads → contiguous buffer
+            GatherGrads();
+
+            // 1. Grad norm (single kernel on contiguous grad buffer)
+            float totalNormSq = _gpu.GradNormSq(_contiguousLora.Grads);
+            float totalNorm = MathF.Sqrt(totalNormSq);
+            if (totalNorm > maxGradNorm)
+                _gpu.ScaleInPlace(_contiguousLora.Grads, maxGradNorm / totalNorm);
+
+            // 2. AdamW step (single kernel on contiguous buffers)
+            _gpu.AdamWStep(_contiguousLora.Params, _contiguousLora.Grads,
+                _contiguousLora.M, _contiguousLora.V,
+                effectiveLr, beta1, beta2, eps, weightDecay, bc1, bc2);
+
+            // 3. Scatter updated params back to per-layer tensors
+            ScatterParams();
+
+            // 4. Zero per-layer grads + contiguous buffer
+            _gpu.ZeroTensor(_contiguousLora.Grads);
+            foreach (var (name, _) in _adapter.Layers)
+            {
+                var grad = _gpuLoraGrad[name];
+                _gpu.ZeroTensor(grad.dA);
+                _gpu.ZeroTensor(grad.dB);
+            }
+            return;
+        }
+
+        // ── Per-layer fallback (~192 kernel launches) ──
+        float totalNormSqFallback = 0;
         foreach (var (name, _) in _adapter.Layers)
         {
             var grad = _gpuLoraGrad[name];
-            totalNormSq += _gpu.GradNormSq(grad.dA);
-            totalNormSq += _gpu.GradNormSq(grad.dB);
+            totalNormSqFallback += _gpu.GradNormSq(grad.dA);
+            totalNormSqFallback += _gpu.GradNormSq(grad.dB);
         }
-        float totalNorm = MathF.Sqrt(totalNormSq);
-        if (totalNorm > maxGradNorm)
+        float totalNormFallback = MathF.Sqrt(totalNormSqFallback);
+        if (totalNormFallback > maxGradNorm)
         {
-            float scale = maxGradNorm / totalNorm;
+            float scale = maxGradNorm / totalNormFallback;
             foreach (var (name, _) in _adapter.Layers)
             {
                 var grad = _gpuLoraGrad[name];
@@ -697,20 +792,15 @@ public sealed class GpuTrainingForwardPass : ITrainingForwardPass
                 _gpu.ScaleInPlace(grad.dB, scale);
             }
         }
-
-        // AdamW step on GPU for each LoRA parameter
         foreach (var (name, _) in _adapter.Layers)
         {
             var lora = _gpuLora[name];
             var grad = _gpuLoraGrad[name];
             var opt = _gpuOptState[name];
-
             _gpu.AdamWStep(lora.a, grad.dA, opt.mA, opt.vA,
                 effectiveLr, beta1, beta2, eps, weightDecay, bc1, bc2);
             _gpu.AdamWStep(lora.b, grad.dB, opt.mB, opt.vB,
                 effectiveLr, beta1, beta2, eps, weightDecay, bc1, bc2);
-
-            // Zero gradients for next step
             _gpu.ZeroTensor(grad.dA);
             _gpu.ZeroTensor(grad.dB);
         }
@@ -719,6 +809,12 @@ public sealed class GpuTrainingForwardPass : ITrainingForwardPass
     /// <summary>Download final LoRA weights from GPU to CPU adapter (for saving).</summary>
     public void DownloadLoraWeights()
     {
+        if (_contiguousLora != null)
+        {
+            // Download from contiguous buffer (single D2H transfer)
+            _contiguousLora.DownloadTo(_adapter);
+            return;
+        }
         foreach (var (name, layer) in _adapter.Layers)
         {
             var lora = _gpuLora[name];
@@ -736,6 +832,11 @@ public sealed class GpuTrainingForwardPass : ITrainingForwardPass
     /// </summary>
     private ITensor Pool(string name, int size)
     {
+        // Arena path: return pre-allocated tensor (no dynamic alloc, graph-safe)
+        if (_arena != null && _arena.TryGet(name, out var arenaTensor))
+            return arenaTensor;
+
+        // Pool path: create on first call, reuse on subsequent
         if (_pool.TryGetValue(name, out var existing))
         {
             if (existing.ElementCount == size)
@@ -863,8 +964,167 @@ public sealed class GpuTrainingForwardPass : ITrainingForwardPass
         return t;
     }
 
+    /// <summary>
+    /// Enable contiguous LoRA parameter layout for single-kernel optimizer.
+    /// Call after constructor. Creates contiguous GPU buffers and uploads initial weights.
+    /// </summary>
+    public void EnableContiguousOptimizer()
+    {
+        _contiguousLora = ContiguousLoraState.Create(_adapter, _gpu);
+    }
+
+    /// <summary>Gather per-layer grads into contiguous buffer before optimizer step.</summary>
+    private void GatherGrads()
+    {
+        if (_contiguousLora == null) return;
+        var layers = _adapter.Layers.ToList();
+        for (int i = 0; i < layers.Count; i++)
+        {
+            var (oA, sA, oB, sB) = _contiguousLora.LayerOffsets[i];
+            var grad = _gpuLoraGrad[layers[i].Key];
+            CopyRegion(grad.dA, _contiguousLora.Grads, oA, sA);
+            CopyRegion(grad.dB, _contiguousLora.Grads, oB, sB);
+        }
+    }
+
+    /// <summary>Scatter contiguous params back to per-layer tensors after optimizer step.</summary>
+    private void ScatterParams()
+    {
+        if (_contiguousLora == null) return;
+        var layers = _adapter.Layers.ToList();
+        for (int i = 0; i < layers.Count; i++)
+        {
+            var (oA, sA, oB, sB) = _contiguousLora.LayerOffsets[i];
+            var lora = _gpuLora[layers[i].Key];
+            CopyRegionFrom(_contiguousLora.Params, oA, lora.a, sA);
+            CopyRegionFrom(_contiguousLora.Params, oB, lora.b, sB);
+        }
+    }
+
+    /// <summary>Copy from source tensor to a region of dest at element offset.</summary>
+    private static void CopyRegion(ITensor src, ITensor dest, int destOffsetElements, int count)
+    {
+        ulong srcPtr = ((CudaTensor)src).DevicePtr;
+        ulong dstPtr = ((CudaTensor)dest).DevicePtr + (ulong)(destOffsetElements * sizeof(float));
+        CudaApi.Check(CudaApi.MemcpyDtoD(dstPtr, srcPtr, (ulong)(count * sizeof(float))), "cuMemcpyDtoD");
+    }
+
+    /// <summary>Copy from a region of source to dest tensor.</summary>
+    private static void CopyRegionFrom(ITensor src, int srcOffsetElements, ITensor dest, int count)
+    {
+        ulong srcPtr = ((CudaTensor)src).DevicePtr + (ulong)(srcOffsetElements * sizeof(float));
+        ulong dstPtr = ((CudaTensor)dest).DevicePtr;
+        CudaApi.Check(CudaApi.MemcpyDtoD(dstPtr, srcPtr, (ulong)(count * sizeof(float))), "cuMemcpyDtoD");
+    }
+
+    /// <summary>
+    /// Pre-register all training tensors in an arena for a fixed sequence length.
+    /// After this call, Pool() returns arena tensors (no dynamic alloc, graph-safe).
+    /// Call once before the training loop starts.
+    /// </summary>
+    public void EnableArena(int seqLen)
+    {
+        int T = seqLen;
+        int H = _config.HiddenDim;
+        int V = _config.VocabSize;
+        int numLayers = _config.NumLayers;
+        int numHeads = _config.NumHeads;
+        int numKvHeads = _config.NumKvHeads;
+        int keyLen = _config.KeyLength;
+        int valueLen = _config.ValueLength;
+        int ffnDim = _config.IntermediateDim;
+
+        var arena = new CudaArenaAllocator();
+
+        // Working tensors (forward + backward)
+        arena.Register("hidden", T * H);
+        arena.Register("residual", T * H);
+        arena.Register("normout", T * H);
+        arena.Register("logits", T * V);
+        arena.Register("dlogits", T * V);
+        arena.Register("dhidden", T * H);
+        arena.Register("d_fnorm", T * H);
+        arena.Register("final_norm", H);
+
+        // Per-layer attention tensors (reused across layers)
+        arena.Register("attn.q", T * numHeads * keyLen);
+        arena.Register("attn.k", T * numKvHeads * keyLen);
+        arena.Register("attn.v", T * numKvHeads * valueLen);
+        arena.Register("attn.scores", T * numHeads * T);
+        arena.Register("attn.out", T * numHeads * valueLen);
+        arena.Register("attn.proj", T * H);
+
+        // FFN tensors
+        arena.Register("ffn.gate", T * ffnDim);
+        arena.Register("ffn.up", T * ffnDim);
+        arena.Register("ffn.gated", T * ffnDim);
+        arena.Register("ffn.out", T * H);
+
+        // DeltaNet tensors (if applicable)
+        if (_config.SsmInnerSize > 0)
+        {
+            int ssmInner = _config.SsmInnerSize;
+            int convChannels = ssmInner * 3; // approximate
+            int numVHeads = _config.SsmGroupCount;
+            int headDim = _config.SsmHeadDim;
+
+            arena.Register("delta.qkv_tok", T * ssmInner * 3);
+            arena.Register("delta.q", T * ssmInner);
+            arena.Register("delta.k", T * ssmInner);
+            arena.Register("delta.v", T * ssmInner);
+            arena.Register("delta.alpha", T * numVHeads);
+            arena.Register("delta.beta", T * numVHeads);
+            arena.Register("delta.betaval", T * ssmInner);
+            arena.Register("delta.decay", T * numVHeads);
+            arena.Register("delta.gate", T * ssmInner);
+            arena.Register("delta.output", T * H);
+            arena.Register("delta.normout1", T * ssmInner);
+            arena.Register("delta.hidden1", T * ssmInner);
+
+            // Per-layer DeltaNet state
+            for (int i = 0; i < numLayers; i++)
+            {
+                if (!_config.IsStandardAttention(i))
+                {
+                    arena.Register($"delta.state.{i}", numVHeads * headDim * headDim);
+                    arena.Register($"delta.conv.{i}", (_config.SsmConvKernel - 1) * convChannels);
+                }
+            }
+        }
+
+        // Per-layer saved activations (forward → backward)
+        for (int i = 0; i < numLayers; i++)
+        {
+            arena.Register($"l{i}.input", T * H);
+            arena.Register($"l{i}.normout", T * H);
+            arena.Register($"l{i}.post_hidden", T * H);
+            arena.Register($"l{i}.ffn_res", T * H);
+            arena.Register($"d_l{i}.ffn_out", T * H);
+            arena.Register($"d_l{i}.attn", T * H);
+        }
+
+        // Input/target tensors (overwritten each step before graph replay)
+        arena.Register("token_ids", T);
+        arena.Register("targets", T);
+
+        // LoRA intermediates + backward scaled outputs
+        foreach (var (name, layer) in _adapter.Layers)
+        {
+            int rank = layer.Rank;
+            arena.Register($"lora.{name}.inter", T * rank);
+            arena.Register($"lora.{name}.sdout", T * layer.OutFeatures);
+        }
+
+        arena.Allocate(_gpu);
+        _arena = arena;
+
+        Console.Error.WriteLine($"  Training arena enabled: {arena.TensorCount} tensors for seqLen={seqLen}");
+    }
+
     public void Dispose()
     {
+        _contiguousLora?.Dispose();
+        _arena?.Dispose();
         foreach (var t in _pool.Values) t.Dispose();
         _pool.Clear();
         _embeddingTable?.Dispose();
