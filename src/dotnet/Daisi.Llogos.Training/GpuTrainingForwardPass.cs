@@ -73,12 +73,62 @@ public sealed class GpuTrainingForwardPass : ITrainingForwardPass
         }
     }
 
+    private int _graphWarmupStep; // 0=warmup, 1=capture, 2+=replay
+    private bool _graphEnabled;
+
+    /// <summary>Enable CUDA graph capture after warmup. Call after EnableArena().</summary>
+    public void EnableGraphCapture()
+    {
+        // Check if gated Q is present — its backward uses CPU roundtrip, incompatible with graph
+        bool hasGatedQ = false;
+        for (int i = 0; i < _config.NumLayers; i++)
+            if (_weights.Layers[i] is StandardAttentionWeights saw && saw.HasGatedQ)
+                { hasGatedQ = true; break; }
+
+        if (hasGatedQ)
+        {
+            Console.Error.WriteLine("  [Training graph: disabled — gated Q backward requires CPU roundtrip]");
+            return;
+        }
+
+        _graphEnabled = true;
+    }
+
     public float[]? Forward(int[] tokenIds, out float totalLoss, int[] targets)
     {
+        // Graph replay path: upload inputs, replay captured graph, read results
+        if (_graphEnabled && _gpu.TrainingGraphReady)
+        {
+            // Upload new input data into pre-allocated arena tensors (OUTSIDE graph)
+            CreateIntTensor("token_ids", tokenIds);
+            CreateIntTensor("targets_gpu", targets);
+
+            // Replay the captured graph
+            _gpu.ReplayTrainingGraph();
+            _gpu.Synchronize();
+
+            // Read deferred results
+            totalLoss = _gpu.ReadLoss();
+            return null;
+        }
+
         int T = tokenIds.Length;
         int H = _config.HiddenDim;
         int V = _config.VocabSize;
 
+        // Graph capture: steps 0-1 = warmup (normal), step 2 = capture, step 3+ = replay
+        bool capturing = false;
+        if (_graphEnabled && _graphWarmupStep == 2 && _arena != null)
+        {
+            // Upload inputs BEFORE capture starts
+            CreateIntTensor("token_ids", tokenIds);
+            CreateIntTensor("targets_gpu", targets);
+
+            Console.Error.WriteLine("  [Training graph: capturing...]");
+            _gpu.BeginTrainingCapture();
+            capturing = true;
+        }
+        if (_graphEnabled) _graphWarmupStep++;
 
         // Dequantize embedding table (cached on GPU)
         if (_embeddingTable == null)
@@ -96,7 +146,8 @@ public sealed class GpuTrainingForwardPass : ITrainingForwardPass
         _saved = new GpuLayerActivations[_config.NumLayers];
 
         // 1. Embedding lookup → hidden [T × H] (GPU kernel)
-        var gpuTokenIds = CreateIntTensor("token_ids", tokenIds);
+        // During graph capture, inputs were uploaded before BeginTrainingCapture
+        var gpuTokenIds = capturing ? Pool("token_ids", T) : CreateIntTensor("token_ids", tokenIds);
         _gpu.BatchedEmbeddingLookup(Pool("hidden", T * H), _embeddingTable, gpuTokenIds, T, H);
 
         // 2. Transformer layers
@@ -169,13 +220,21 @@ public sealed class GpuTrainingForwardPass : ITrainingForwardPass
 
         // 4. Cross-entropy loss + gradient
         var dLogits = Pool("dlogits", T * V);
-        var gpuTargets = CreateIntTensor("targets", targets);
+        var gpuTargets = capturing ? Pool("targets_gpu", T) : CreateIntTensor("targets", targets);
         totalLoss = _gpu.CrossEntropyLoss(dLogits, logits, gpuTargets, T, V);
 
         // 5. Backward pass
         Backward(dLogits, finalNormOut, T);
 
         // Note: LoRA gradients stay on GPU — GpuOptimizerStep uses them directly
+
+        if (capturing)
+        {
+            _gpu.EndTrainingCapture();
+            _gpu.Synchronize();
+            totalLoss = _gpu.ReadLoss();
+            Console.Error.WriteLine("  [Training graph: captured and launched]");
+        }
 
         return null; // logits not downloaded
     }
