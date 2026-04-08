@@ -1335,20 +1335,12 @@ __global__ void dequant_to_f32(float* __restrict__ output,
     output[idx] = val;
 }
 
-// ── FP32 → FP16 conversion (for tensor core batch matmul) ────────────────────
-
-__device__ unsigned short fp32_to_fp16_cvt(float val)
-{
-    unsigned short result;
-    asm("cvt.rn.f16.f32 %0, %1;" : "=h"(result) : "f"(val));
-    return result;
-}
-
-__global__ void fp32_to_fp16(unsigned short* output, const float* input, int n)
+// ── FP32 → FP16 batch conversion ────────────────────────────────────────────
+__global__ void convert_f32_to_f16(unsigned short* output, const float* input, int n)
 {
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
     if (idx < n)
-        output[idx] = fp32_to_fp16_cvt(input[idx]);
+        output[idx] = fp32_to_fp16(input[idx]);
 }
 
 // ── Dequantize weight tensor to FP16 (for tensor core batch matmul) ─────────
@@ -1447,7 +1439,7 @@ __global__ void dequant_to_f16(unsigned short* __restrict__ output,
         val = bit ? scale : -scale;
     }
 
-    output[idx] = fp32_to_fp16_cvt(val);
+    output[idx] = fp32_to_fp16(val);
 }
 
 } // extern "C"
