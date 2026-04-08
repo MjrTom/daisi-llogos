@@ -55,6 +55,7 @@ public sealed class CudaBackend : IComputeBackend
 
     /// <inheritdoc />
     public string Name => $"CUDA ({_context.DeviceName})";
+    public bool SupportsBatchedOps => true;
 
     /// <summary>GPU compute capability major version (e.g. 8 for Ampere, 12 for Blackwell).</summary>
     public int ComputeCapabilityMajor => _context.ComputeCapabilityMajor;
@@ -137,6 +138,49 @@ public sealed class CudaBackend : IComputeBackend
         ulong aPtr = aT.DevicePtr;
         ulong bPtr = bT.DevicePtr;
 
+        // ── Q8_0 Tiled MMQ: dp4a directly on quantized data, no dequant ──
+        if (bT.Type == Gguf.GgmlType.Q8_0 && bT.IsAlignedQ8_0 && K % 32 == 0)
+        {
+            if (_batchedMmqModule == null)
+            {
+                var opts = new[] { $"--gpu-architecture=compute_{_context.ComputeCapabilityMajor}{_context.ComputeCapabilityMinor}" };
+                _batchedMmqModule = CudaModule.FromEmbeddedResource("batched_mmq.cu", opts);
+            }
+
+            // Quantize activation [M×K] → Q8_1
+            int blocksPerRow = K / 32;
+            long q8Bytes = (long)M * blocksPerRow * 36;
+            if (_batchQ8ActBuf == null || _batchQ8ActBufSize < q8Bytes)
+            {
+                _batchQ8ActBuf?.Dispose();
+                _batchQ8ActBuf = new CudaDeviceMemory((ulong)q8Bytes);
+                _batchQ8ActBufSize = q8Bytes;
+            }
+            ulong q8Ptr = _batchQ8ActBuf.DevicePtr;
+
+            var qFunc = _batchedMmqModule.GetFunction("batched_quantize_f32_q8_1");
+            int totalBlocks = M * blocksPerRow;
+            int mArg = M, kArg = K, nArg = N;
+            nint* qArgs = stackalloc nint[4];
+            qArgs[0] = (nint)(&q8Ptr); qArgs[1] = (nint)(&aPtr);
+            qArgs[2] = (nint)(&mArg); qArgs[3] = (nint)(&kArg);
+            _stream.Launch(qFunc, (uint)((totalBlocks + BlockSize - 1) / BlockSize), 1, 1,
+                (uint)BlockSize, 1, 1, 0, qArgs);
+
+            // Tiled MMQ
+            const int TILE_M = 32, TILE_N = 64, K_CHUNK = 8;
+            uint smem = (uint)(TILE_N * K_CHUNK * (sizeof(float) + 8 * sizeof(int)) +
+                               TILE_M * K_CHUNK * (sizeof(float) + 8 * sizeof(int)));
+            var mmFunc = _batchedMmqModule.GetFunction("tiled_mmq_q8_0_q8_1");
+            nint* mmArgs = stackalloc nint[6];
+            mmArgs[0] = (nint)(&outPtr); mmArgs[1] = (nint)(&q8Ptr); mmArgs[2] = (nint)(&bPtr);
+            mmArgs[3] = (nint)(&mArg); mmArgs[4] = (nint)(&kArg); mmArgs[5] = (nint)(&nArg);
+            _stream.Launch(mmFunc,
+                (uint)((N + TILE_N - 1) / TILE_N), (uint)((M + TILE_M - 1) / TILE_M), 1,
+                32, 8, 1, smem, mmArgs);
+            return;
+        }
+
         ulong bF32Ptr;
         bool needsDequant = bT.Type != Gguf.GgmlType.F32;
 
@@ -193,6 +237,9 @@ public sealed class CudaBackend : IComputeBackend
 
     private CudaDeviceMemory? _batchDequantBuf;
     private long _batchDequantBufSize;
+    private CudaModule? _batchedMmqModule;
+    private CudaDeviceMemory? _batchQ8ActBuf;
+    private long _batchQ8ActBufSize;
 
     /// <summary>Launch a standard 6-arg matmul kernel: (output, a, b, M, K, N).</summary>
     private unsafe void LaunchMatMul(string kernelName, ulong outPtr, ulong aPtr, ulong bPtr,

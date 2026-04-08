@@ -18,5 +18,6 @@
     <EmbeddedResource Include="kernels\composite_ops.cu" LogicalName="composite_ops.cu" />
     <EmbeddedResource Include="kernels\turbo_quant.cu" LogicalName="turbo_quant.cu" />
     <EmbeddedResource Include="kernels\backward_ops.cu" LogicalName="backward_ops.cu" />
+    <EmbeddedResource Include="kernels\batched_mmq.cu" LogicalName="batched_mmq.cu" />
   </ItemGroup>
 </Project>

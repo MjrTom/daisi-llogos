@@ -16,6 +16,7 @@ public sealed class CudaTrainingBackend : IComputeBackend
     private readonly CudaModule _elementwiseModule;
     private readonly CudaModule _matmulModule;
     private readonly CudaModule _compositeModule;
+    private CudaModule? _batchedMmqModule;
     private readonly CudaStream _stream;
     private readonly nint _cublasHandle;
     private CudaDeviceMemory? _q8_1Scratch; // scratch for quantized activation
@@ -210,71 +211,66 @@ public sealed class CudaTrainingBackend : IComputeBackend
         ulong aPtr = aT.DevicePtr;
         ulong bPtr = bT.DevicePtr;
 
-        // ── Q8_0 FP16 tensor core path: dequant weight to FP16, GemmEx with tensor cores ──
-        if (bT.Type == Gguf.GgmlType.Q8_0 && (bT.IsAlignedQ8_0 || K % 32 == 0))
+        // ── Q8_0 Tiled MMQ: shared-memory dp4a, no dequant temp buffer ──
+        if (bT.Type == Gguf.GgmlType.Q8_0 && bT.IsAlignedQ8_0 && K % 32 == 0)
         {
-            // Dequant weight Q8_0 → FP16 (half the memory of F32 dequant)
-            long f16Bytes = (long)K * N * sizeof(short); // FP16 = 2 bytes
-            if (_batchF16WeightBuf == null || _batchF16WeightBufSize < f16Bytes)
+            // Lazy-load the batched MMQ module
+            if (_batchedMmqModule == null)
             {
-                _batchF16WeightBuf?.Dispose();
-                _batchF16WeightBuf = new CudaDeviceMemory((ulong)f16Bytes);
-                _batchF16WeightBufSize = f16Bytes;
+                var archOpts = new[] { $"--gpu-architecture=compute_{ComputeCapabilityMajor}{ComputeCapabilityMinor}" };
+                _batchedMmqModule = CudaModule.FromEmbeddedResource("batched_mmq.cu", archOpts);
             }
-            ulong bF16Ptr = _batchF16WeightBuf.DevicePtr;
 
-            // GPU dequant: Q8_0 → FP16
-            var dqFunc = _elementwiseModule.GetFunction("dequant_to_f16");
-            int totalElements = K * N;
-            int blockSizeQ = Gguf.GgmlTypeInfo.BlockSize(bT.Type);
-            int typeTag = (int)bT.Type;
-            int isAligned = bT.IsAlignedQ8_0 ? 1 : 0;
-            uint dqGrid = (uint)((totalElements + BlockSize - 1) / BlockSize);
-            nint* dArgs = stackalloc nint[6];
-            dArgs[0] = (nint)(&bF16Ptr);
-            dArgs[1] = (nint)(&bPtr);
-            dArgs[2] = (nint)(&totalElements);
-            dArgs[3] = (nint)(&typeTag);
-            dArgs[4] = (nint)(&blockSizeQ);
-            dArgs[5] = (nint)(&isAligned);
-            _stream.Launch(dqFunc, dqGrid, 1, 1, (uint)BlockSize, 1, 1, 0, dArgs);
+            // Step 1: Quantize activation [M×K] → Q8_1
+            int blocksPerRow = K / 32;
+            long q8BytesPerRow = (long)blocksPerRow * 36;
+            long totalQ8Bytes = (long)M * q8BytesPerRow;
 
-            // Convert activation F32 → FP16
-            long aF16Bytes = (long)M * K * sizeof(short);
-            if (_batchF16ActivationBuf == null || _batchF16ActivationBufSize < aF16Bytes)
+            if (_batchQ8ActivationBuf == null || _batchQ8ActivationBufSize < totalQ8Bytes)
             {
-                _batchF16ActivationBuf?.Dispose();
-                _batchF16ActivationBuf = new CudaDeviceMemory((ulong)aF16Bytes);
-                _batchF16ActivationBufSize = aF16Bytes;
+                _batchQ8ActivationBuf?.Dispose();
+                _batchQ8ActivationBuf = new CudaDeviceMemory((ulong)totalQ8Bytes);
+                _batchQ8ActivationBufSize = totalQ8Bytes;
             }
-            ulong aF16Ptr = _batchF16ActivationBuf.DevicePtr;
-            var cvtFunc = _elementwiseModule.GetFunction("convert_f32_to_f16");
-            int aTotalElements = M * K;
-            nint* cvtArgs = stackalloc nint[3];
-            cvtArgs[0] = (nint)(&aF16Ptr);
-            cvtArgs[1] = (nint)(&aPtr);
-            cvtArgs[2] = (nint)(&aTotalElements);
-            uint cvtGrid = (uint)((aTotalElements + BlockSize - 1) / BlockSize);
-            _stream.Launch(cvtFunc, cvtGrid, 1, 1, (uint)BlockSize, 1, 1, 0, cvtArgs);
+            ulong q8ActPtr = _batchQ8ActivationBuf.DevicePtr;
 
-            // cublasGemmEx: C(F32) = A(FP16) × B^T(FP16) with tensor cores
-            // Column-major: C(N×M) = B^T(N×K) × A(K×M)
-            float alphaFp16 = 1.0f, betaFp16 = 0.0f;
-            const int CUDA_R_16F = 2;   // CUBLAS_R_16F
-            const int CUDA_R_32F = 0;   // CUBLAS_R_32F
-            const int CUBLAS_GEMM_DEFAULT_TENSOR_OP = 99;
-            CublasApi.Check(CublasApi.GemmEx(_cublasHandle,
-                CublasApi.CUBLAS_OP_T,  // B^T
-                CublasApi.CUBLAS_OP_N,  // A as-is
-                N, M, K,
-                &alphaFp16,
-                bF16Ptr, CUDA_R_16F, K,   // B: FP16 [N×K] row-major → ldb = K
-                aF16Ptr, CUDA_R_16F, K,   // A: FP16 [M×K] row-major → lda = K
-                &betaFp16,
-                outPtr, CUDA_R_32F, N,    // C: F32 [M×N] row-major → ldc = N
-                CUDA_R_32F,               // computeType = F32
-                CUBLAS_GEMM_DEFAULT_TENSOR_OP),
-                "cublasGemmEx-fp16");
+            var qFunc = _batchedMmqModule.GetFunction("batched_quantize_f32_q8_1");
+            int totalBlocks = M * blocksPerRow;
+            uint qGrid = (uint)((totalBlocks + BlockSize - 1) / BlockSize);
+            nint* qArgs = stackalloc nint[4];
+            qArgs[0] = (nint)(&q8ActPtr);
+            qArgs[1] = (nint)(&aPtr);
+            int mArg = M, kArg = K;
+            qArgs[2] = (nint)(&mArg);
+            qArgs[3] = (nint)(&kArg);
+            _stream.Launch(qFunc, qGrid, 1, 1, (uint)BlockSize, 1, 1, 0, qArgs);
+
+            // Step 2: Tiled MMQ kernel
+            // Grid: (ceil(N/TILE_N), ceil(M/TILE_M))
+            // Block: (32, 8) = 256 threads
+            const int TILE_M = 32, TILE_N = 64, K_CHUNK = 8;
+            uint gridX = (uint)((N + TILE_N - 1) / TILE_N);
+            uint gridY = (uint)((M + TILE_M - 1) / TILE_M);
+
+            // Shared memory: w_scales + w_quants + a_scales + a_quants
+            uint smemBytes = (uint)(
+                TILE_N * K_CHUNK * sizeof(float) +        // w_scales
+                TILE_N * K_CHUNK * 8 * sizeof(int) +      // w_quants
+                TILE_M * K_CHUNK * sizeof(float) +        // a_scales
+                TILE_M * K_CHUNK * 8 * sizeof(int));      // a_quants
+
+            var mmFunc = _batchedMmqModule.GetFunction("tiled_mmq_q8_0_q8_1");
+            int nArg = N;
+            nint* mmArgs = stackalloc nint[5];
+            mmArgs[0] = (nint)(&outPtr);
+            mmArgs[1] = (nint)(&q8ActPtr);
+            mmArgs[2] = (nint)(&bPtr);
+            mmArgs[3] = (nint)(&mArg);
+            mmArgs[4] = (nint)(&kArg);
+            nint* mmArgs6 = stackalloc nint[6];
+            for (int i = 0; i < 5; i++) mmArgs6[i] = mmArgs[i];
+            mmArgs6[5] = (nint)(&nArg);
+            _stream.Launch(mmFunc, gridX, gridY, 1, 32, 8, 1, smemBytes, mmArgs6);
             return;
         }
 
