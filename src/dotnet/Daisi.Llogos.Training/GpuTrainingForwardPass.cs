@@ -194,14 +194,14 @@ public sealed class GpuTrainingForwardPass : ITrainingForwardPass
             var ffnGated = Pool($"l{layer}.ffn_gated", T * I);
 
             string ffnPrefix = $"blk.{layer}";
-            _gpu.MatMul(gateOut, ffnNormOut, DequantToGpu($"l{layer}.ffn_gate_w", lw.FfnGate), T, H, I);
+            _gpu.MatMul(gateOut, ffnNormOut, GpuWeight(lw.FfnGate), T, H, I);
             ApplyLoraForward($"{ffnPrefix}.ffn_gate", ffnNormOut, gateOut, T);
-            _gpu.MatMul(upOut, ffnNormOut, DequantToGpu($"l{layer}.ffn_up_w", lw.FfnUp), T, H, I);
+            _gpu.MatMul(upOut, ffnNormOut, GpuWeight(lw.FfnUp), T, H, I);
             ApplyLoraForward($"{ffnPrefix}.ffn_up", ffnNormOut, upOut, T);
             _gpu.SwiGLU(ffnGated, gateOut, upOut);
 
             var ffnOut = Pool($"l{layer}.ffn_out", T * H);
-            _gpu.MatMul(ffnOut, ffnGated, DequantToGpu($"l{layer}.ffn_down_w", lw.FfnDown), T, I, H);
+            _gpu.MatMul(ffnOut, ffnGated, GpuWeight(lw.FfnDown), T, I, H);
             ApplyLoraForward($"{ffnPrefix}.ffn_down", ffnGated, ffnOut, T);
 
             saved.GateInput = gateOut;
@@ -219,7 +219,7 @@ public sealed class GpuTrainingForwardPass : ITrainingForwardPass
         _gpu.RmsNorm(finalNormOut, Pool("hidden", T * H), _outputNormWeight!, _config.NormEps);
 
         var logits = Pool("logits", T * V);
-        _gpu.MatMul(logits, finalNormOut, DequantToGpu("out_logit_w", _weights.OutputWeight), T, H, V);
+        _gpu.MatMul(logits, finalNormOut, GpuWeight(_weights.OutputWeight), T, H, V);
 
         // 4. Cross-entropy loss + gradient
         var dLogits = Pool("dlogits", T * V);
@@ -262,9 +262,9 @@ public sealed class GpuTrainingForwardPass : ITrainingForwardPass
         var kRaw = Pool($"l{layer}.k", T * kOutDim);
         var vRaw = Pool($"l{layer}.v", T * vOutDim);
 
-        _gpu.MatMul(qRaw, saved.NormOut!, DequantToGpu($"l{layer}.attn_q_w", saw.AttnQ), T, H, qOutDim);
-        _gpu.MatMul(kRaw, saved.NormOut!, DequantToGpu($"l{layer}.attn_k_w", saw.AttnK), T, H, kOutDim);
-        _gpu.MatMul(vRaw, saved.NormOut!, DequantToGpu($"l{layer}.attn_v_w", saw.AttnV), T, H, vOutDim);
+        _gpu.MatMul(qRaw, saved.NormOut!, GpuWeight(saw.AttnQ), T, H, qOutDim);
+        _gpu.MatMul(kRaw, saved.NormOut!, GpuWeight(saw.AttnK), T, H, kOutDim);
+        _gpu.MatMul(vRaw, saved.NormOut!, GpuWeight(saw.AttnV), T, H, vOutDim);
 
         // Apply LoRA
         string prefix = $"blk.{layer}";
@@ -318,7 +318,7 @@ public sealed class GpuTrainingForwardPass : ITrainingForwardPass
         // O projection
         int oDim = (int)saw.AttnO.Dimensions[0];
         var oOut = Pool($"l{layer}.oout", T * H);
-        _gpu.MatMul(oOut, attnOut, DequantToGpu($"l{layer}.attn_o_w", saw.AttnO), T, oDim, H);
+        _gpu.MatMul(oOut, attnOut, GpuWeight(saw.AttnO), T, oDim, H);
         ApplyLoraForward($"{prefix}.attn_o", attnOut, oOut, T);
 
         // Write to hidden
@@ -372,8 +372,7 @@ public sealed class GpuTrainingForwardPass : ITrainingForwardPass
             _gpu.CopyTensorSlice(normOut1, 0, saved.NormOut!, t * H, H);
 
             // Step 1: QKV projection (use F32 weights to avoid Q8_0 dp4a alignment issues for M=1)
-            var qkvWeight = DequantToGpu($"l{layer}.delta_qkv_w", dnw.AttnQkv);
-            _gpu.MatMul(qkvBuf, normOut1, qkvWeight, 1, H, qkvDim);
+            _gpu.MatMul(qkvBuf, normOut1, GpuWeight(dnw.AttnQkv), 1, H, qkvDim);
 
             // Step 2: CausalConv1d
             _gpu.CausalConv1d(qkvBuf, convBuf, GpuWeight(dnw.SsmConv1d), convChannels, convKernel);
@@ -399,8 +398,8 @@ public sealed class GpuTrainingForwardPass : ITrainingForwardPass
             }
 
             // Step 7: Alpha/Beta projections (F32 weights for M=1)
-            _gpu.MatMul(ssmAlpha, normOut1, DequantToGpu($"l{layer}.delta_alpha_w", dnw.SsmAlpha), 1, H, numVHeads);
-            _gpu.MatMul(ssmBeta, normOut1, DequantToGpu($"l{layer}.delta_beta_w", dnw.SsmBeta), 1, H, numVHeads);
+            _gpu.MatMul(ssmAlpha, normOut1, GpuWeight(dnw.SsmAlpha), 1, H, numVHeads);
+            _gpu.MatMul(ssmBeta, normOut1, GpuWeight(dnw.SsmBeta), 1, H, numVHeads);
 
             // Step 8: Compute decay and beta values
             _gpu.ComputeDecayBeta(ssmDecay, ssmBetaVal, ssmAlpha, ssmBeta,
@@ -412,11 +411,11 @@ public sealed class GpuTrainingForwardPass : ITrainingForwardPass
                 GpuWeight(dnw.SsmNorm), numVHeads, headDim, scale, _config.NormEps);
 
             // Step 10: Gate + SiLU gate (F32 weight for M=1)
-            _gpu.MatMul(ssmGate, normOut1, DequantToGpu($"l{layer}.delta_gate_w", dnw.AttnGate), 1, H, valueDim);
+            _gpu.MatMul(ssmGate, normOut1, GpuWeight(dnw.AttnGate), 1, H, valueDim);
             _gpu.SiLUGate(ssmOutput, ssmOutput, ssmGate);
 
             // Step 11: Output projection (F32 weight for M=1)
-            _gpu.MatMul(hidden1, ssmOutput, DequantToGpu($"l{layer}.delta_out_w", dnw.SsmOut), 1, valueDim, H);
+            _gpu.MatMul(hidden1, ssmOutput, GpuWeight(dnw.SsmOut), 1, valueDim, H);
 
             _gpu.CopyTensorSlice(hiddenBuf, t * H, hidden1, 0, H);
         }
@@ -913,8 +912,7 @@ public sealed class GpuTrainingForwardPass : ITrainingForwardPass
         // Fix: LoadTensor only repacks Q8_0 to aligned (36-byte) blocks for K >= 2048.
         // For small models (K < 2048), DeltaNet M=1 matmul uses the aligned kernel but
         // gets unaligned data, producing NaN. Repack here before uploading.
-        if (cpuWeight.Type == Gguf.GgmlType.Q8_0 && cpuWeight.Dimensions.Length >= 2
-            && cpuWeight.Dimensions[0] < 2048)
+        if (cpuWeight.Type == Gguf.GgmlType.Q8_0 && cpuWeight.Dimensions.Length >= 2)
         {
             _gpu.EnsureQ8_1Scratch((int)cpuWeight.Dimensions[0]);
             int blockCount = rawBytes.Length / 34;

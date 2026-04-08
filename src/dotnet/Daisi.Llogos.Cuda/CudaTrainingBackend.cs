@@ -210,6 +210,74 @@ public sealed class CudaTrainingBackend : IComputeBackend
         ulong aPtr = aT.DevicePtr;
         ulong bPtr = bT.DevicePtr;
 
+        // ── Q8_0 FP16 tensor core path: dequant weight to FP16, GemmEx with tensor cores ──
+        if (bT.Type == Gguf.GgmlType.Q8_0 && (bT.IsAlignedQ8_0 || K % 32 == 0))
+        {
+            // Dequant weight Q8_0 → FP16 (half the memory of F32 dequant)
+            long f16Bytes = (long)K * N * sizeof(short); // FP16 = 2 bytes
+            if (_batchF16WeightBuf == null || _batchF16WeightBufSize < f16Bytes)
+            {
+                _batchF16WeightBuf?.Dispose();
+                _batchF16WeightBuf = new CudaDeviceMemory((ulong)f16Bytes);
+                _batchF16WeightBufSize = f16Bytes;
+            }
+            ulong bF16Ptr = _batchF16WeightBuf.DevicePtr;
+
+            // GPU dequant: Q8_0 → FP16
+            var dqFunc = _elementwiseModule.GetFunction("dequant_to_f16");
+            int totalElements = K * N;
+            int blockSizeQ = Gguf.GgmlTypeInfo.BlockSize(bT.Type);
+            int typeTag = (int)bT.Type;
+            int isAligned = bT.IsAlignedQ8_0 ? 1 : 0;
+            uint dqGrid = (uint)((totalElements + BlockSize - 1) / BlockSize);
+            nint* dArgs = stackalloc nint[6];
+            dArgs[0] = (nint)(&bF16Ptr);
+            dArgs[1] = (nint)(&bPtr);
+            dArgs[2] = (nint)(&totalElements);
+            dArgs[3] = (nint)(&typeTag);
+            dArgs[4] = (nint)(&blockSizeQ);
+            dArgs[5] = (nint)(&isAligned);
+            _stream.Launch(dqFunc, dqGrid, 1, 1, (uint)BlockSize, 1, 1, 0, dArgs);
+
+            // Convert activation F32 → FP16
+            long aF16Bytes = (long)M * K * sizeof(short);
+            if (_batchF16ActivationBuf == null || _batchF16ActivationBufSize < aF16Bytes)
+            {
+                _batchF16ActivationBuf?.Dispose();
+                _batchF16ActivationBuf = new CudaDeviceMemory((ulong)aF16Bytes);
+                _batchF16ActivationBufSize = aF16Bytes;
+            }
+            ulong aF16Ptr = _batchF16ActivationBuf.DevicePtr;
+            var cvtFunc = _elementwiseModule.GetFunction("convert_f32_to_f16");
+            int aTotalElements = M * K;
+            nint* cvtArgs = stackalloc nint[3];
+            cvtArgs[0] = (nint)(&aF16Ptr);
+            cvtArgs[1] = (nint)(&aPtr);
+            cvtArgs[2] = (nint)(&aTotalElements);
+            uint cvtGrid = (uint)((aTotalElements + BlockSize - 1) / BlockSize);
+            _stream.Launch(cvtFunc, cvtGrid, 1, 1, (uint)BlockSize, 1, 1, 0, cvtArgs);
+
+            // cublasGemmEx: C(F32) = A(FP16) × B^T(FP16) with tensor cores
+            // Column-major: C(N×M) = B^T(N×K) × A(K×M)
+            float alphaFp16 = 1.0f, betaFp16 = 0.0f;
+            const int CUDA_R_16F = 2;   // CUBLAS_R_16F
+            const int CUDA_R_32F = 0;   // CUBLAS_R_32F
+            const int CUBLAS_GEMM_DEFAULT_TENSOR_OP = 99;
+            CublasApi.Check(CublasApi.GemmEx(_cublasHandle,
+                CublasApi.CUBLAS_OP_T,  // B^T
+                CublasApi.CUBLAS_OP_N,  // A as-is
+                N, M, K,
+                &alphaFp16,
+                bF16Ptr, CUDA_R_16F, K,   // B: FP16 [N×K] row-major → ldb = K
+                aF16Ptr, CUDA_R_16F, K,   // A: FP16 [M×K] row-major → lda = K
+                &betaFp16,
+                outPtr, CUDA_R_32F, N,    // C: F32 [M×N] row-major → ldc = N
+                CUDA_R_32F,               // computeType = F32
+                CUBLAS_GEMM_DEFAULT_TENSOR_OP),
+                "cublasGemmEx-fp16");
+            return;
+        }
+
         ulong bF32Ptr;
         bool needsDequant = bT.Type != Gguf.GgmlType.F32;
 
@@ -266,6 +334,12 @@ public sealed class CudaTrainingBackend : IComputeBackend
 
     private CudaDeviceMemory? _batchDequantBuf;
     private long _batchDequantBufSize;
+    private CudaDeviceMemory? _batchQ8ActivationBuf;
+    private long _batchQ8ActivationBufSize;
+    private CudaDeviceMemory? _batchF16WeightBuf;
+    private long _batchF16WeightBufSize;
+    private CudaDeviceMemory? _batchF16ActivationBuf;
+    private long _batchF16ActivationBufSize;
 
     /// <summary>Launch a standard 6-arg matmul kernel: (output, a, b, M, K, N).</summary>
     private unsafe void LaunchMatMul(string kernelName, ulong outPtr, ulong aPtr, ulong bPtr,
