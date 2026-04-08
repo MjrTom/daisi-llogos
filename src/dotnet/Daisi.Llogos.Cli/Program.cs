@@ -6,7 +6,6 @@ using Daisi.Llogos.Gguf;
 using Daisi.Llogos.Inference;
 using Daisi.Llogos.Model;
 using Daisi.Llogos;
-using Daisi.Llogos.Cuda;
 using Daisi.Llogos.Inference.DaisiTurbo;
 using Daisi.Llogos.Tokenizer;
 using Daisi.Llogos.Training;

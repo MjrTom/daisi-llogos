@@ -42,6 +42,60 @@ extern "C" {
 // Weight tile: MMQ_TILE_N × MMQ_K_CHUNK scales + quants
 // Activation tile: MMQ_TILE_M × MMQ_K_CHUNK scales + quants
 
+// ── L1-cache variant: no shared memory, relies on L2 cache for weight reuse ──
+// Grid: (ceil(N/N_PER_WARP), ceil(M/32), 1), Block: (32, NWARPS, 1)
+// Each warp handles one N column, each lane handles one M row.
+// Simpler than shared-memory version but relies on L2 cache hit for weights.
+
+#define L1_N_PER_BLOCK 8  // N columns per block = NWARPS
+#define L1_NWARPS 8
+
+__global__ __launch_bounds__(32 * L1_NWARPS)
+void l1_mmq_q8_0_q8_1(
+    float* __restrict__ output,
+    const unsigned char* __restrict__ act,
+    const unsigned char* __restrict__ wt,
+    int M, int K, int N)
+{
+    int n = blockIdx.x * L1_N_PER_BLOCK + threadIdx.y;
+    int m = blockIdx.y * 32 + threadIdx.x;
+
+    if (n >= N || m >= M) return;
+
+    int blocks_per_row = K / 32;
+    long bytes_per_row = (long)blocks_per_row * 36;
+
+    const unsigned char* a_row = act + (long)m * bytes_per_row;
+    const unsigned char* b_row = wt + (long)n * bytes_per_row;
+
+    float sum = 0.0f;
+
+    for (int blk = 0; blk < blocks_per_row; blk++)
+    {
+        const unsigned char* ablk = a_row + blk * 36;
+        float a_scale = fp16_to_fp32_mmq(__ldg(reinterpret_cast<const unsigned short*>(ablk)));
+        const int* a_qs = reinterpret_cast<const int*>(ablk + 4);
+
+        const unsigned char* wblk = b_row + blk * 36;
+        float w_scale = fp16_to_fp32_mmq(__ldg(reinterpret_cast<const unsigned short*>(wblk)));
+        const int* w_qs = reinterpret_cast<const int*>(wblk + 4);
+
+        int sumi = 0;
+        sumi = __dp4a(__ldg(&a_qs[0]), __ldg(&w_qs[0]), sumi);
+        sumi = __dp4a(__ldg(&a_qs[1]), __ldg(&w_qs[1]), sumi);
+        sumi = __dp4a(__ldg(&a_qs[2]), __ldg(&w_qs[2]), sumi);
+        sumi = __dp4a(__ldg(&a_qs[3]), __ldg(&w_qs[3]), sumi);
+        sumi = __dp4a(__ldg(&a_qs[4]), __ldg(&w_qs[4]), sumi);
+        sumi = __dp4a(__ldg(&a_qs[5]), __ldg(&w_qs[5]), sumi);
+        sumi = __dp4a(__ldg(&a_qs[6]), __ldg(&w_qs[6]), sumi);
+        sumi = __dp4a(__ldg(&a_qs[7]), __ldg(&w_qs[7]), sumi);
+
+        sum += a_scale * w_scale * (float)sumi;
+    }
+
+    output[m * N + n] = sum;
+}
+
 __global__ __launch_bounds__(MMQ_BLOCK_SIZE)
 void tiled_mmq_q8_0_q8_1(
     float* __restrict__ output,           // [M × N] row-major

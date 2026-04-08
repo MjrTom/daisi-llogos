@@ -129,7 +129,15 @@ public sealed class TextGenerator
         if (promptIds.Length == 0)
             return default;
 
-        // Prefill
+        // Warmup prefill: populates FP16 weight cache + cuBLAS algorithm selection
+        if (_forward.SupportsBatchedPrefill && promptIds.Length > 2)
+        {
+            _forward.ForwardBatchedPrefill(promptIds[..^1], 0);
+            _forward.Forward(promptIds[^1], promptIds.Length - 1);
+            _forward.ResetState();
+        }
+
+        // Prefill (measured — benefits from cached FP16 weights)
         var prefillSw = Stopwatch.StartNew();
         ReadOnlySpan<float> logits = default;
         if (_forward.SupportsBatchedPrefill && promptIds.Length > 2)

@@ -666,4 +666,77 @@ __global__ void deltanet_step(float* output, const float* q, const float* k,
         oh[i] = oh[i] * inv_rms * normWeight[i];
 }
 
+// ── Causal softmax for prefill attention ────────────────────────────────────
+// scores: [numHeads × M × M] row-major, applies causal mask (query i attends to keys 0..startPos+i)
+// Each block handles one row (one query position for one head).
+// Grid: (numHeads * M), Block: 256 threads
+
+__global__ void causal_softmax_inplace(float* scores, int M, int startPosition, float scale)
+{
+    extern __shared__ float sdata[];
+    int row = blockIdx.x;          // which head*M + query
+    int queryToken = row % M;
+    int tid = threadIdx.x;
+    int stride = blockDim.x;
+
+    float* row_data = scores + (long)row * M;
+    int seqLen = startPosition + queryToken + 1;  // causal: see 0..startPos+queryToken
+
+    // Apply scale + mask
+    for (int j = tid; j < M; j += stride)
+    {
+        if (j < seqLen)
+            row_data[j] *= scale;
+        else
+            row_data[j] = -1e30f;  // mask future positions
+    }
+    __syncthreads();
+
+    // Find max (reduction)
+    float local_max = -1e30f;
+    for (int j = tid; j < seqLen; j += stride)
+        local_max = fmaxf(local_max, row_data[j]);
+    sdata[tid] = local_max;
+    __syncthreads();
+    for (int s = blockDim.x / 2; s > 0; s >>= 1) {
+        if (tid < s) sdata[tid] = fmaxf(sdata[tid], sdata[tid + s]);
+        __syncthreads();
+    }
+    float row_max = sdata[0];
+    __syncthreads();
+
+    // Exp and sum
+    float local_sum = 0.0f;
+    for (int j = tid; j < seqLen; j += stride) {
+        float v = expf(row_data[j] - row_max);
+        row_data[j] = v;
+        local_sum += v;
+    }
+    // Zero masked positions
+    for (int j = seqLen + tid; j < M; j += stride)
+        row_data[j] = 0.0f;
+    sdata[tid] = local_sum;
+    __syncthreads();
+    for (int s = blockDim.x / 2; s > 0; s >>= 1) {
+        if (tid < s) sdata[tid] += sdata[tid + s];
+        __syncthreads();
+    }
+    float inv_sum = (sdata[0] > 0.0f) ? 1.0f / sdata[0] : 0.0f;
+
+    // Normalize
+    for (int j = tid; j < seqLen; j += stride)
+        row_data[j] *= inv_sum;
+}
+
+// Apply sigmoid gating: output[i] *= sigmoid(gate[i])
+__global__ void sigmoid_gate_inplace(float* output, const float* gate, int n)
+{
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx < n)
+    {
+        float g = gate[idx];
+        output[idx] *= 1.0f / (1.0f + expf(-g));
+    }
+}
+
 } // extern "C"
