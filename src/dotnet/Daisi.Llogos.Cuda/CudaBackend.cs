@@ -55,6 +55,7 @@ public sealed class CudaBackend : IComputeBackend
 
     /// <inheritdoc />
     public string Name => $"CUDA ({_context.DeviceName})";
+    public bool SupportsBatchedOps => true;
 
     /// <summary>GPU compute capability major version (e.g. 8 for Ampere, 12 for Blackwell).</summary>
     public int ComputeCapabilityMajor => _context.ComputeCapabilityMajor;
