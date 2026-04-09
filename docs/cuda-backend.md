@@ -307,12 +307,29 @@ classDiagram
 
 | Kernel name | Operation | Input types | Notes |
 |-------------|-----------|-------------|-------|
-| `dequant_matmul_q8_0` | Fused dequant + matmul | Q8_0 × FP32 | Primary inference kernel |
+| `dequant_matmul_q8_0` | Fused dequant + matmul | Q8_0 × FP32 | Primary M=1 inference kernel |
 | `dequant_matmul_q4_0` | Fused dequant + matmul | Q4_0 × FP32 | For 4-bit models |
 | `dequant_matmul_q4_k` | Fused dequant + matmul | Q4_K × FP32 | For K-quant models |
+| `dequant_to_f16` | Weight dequant to FP16 | Q8_0/Q4_0/Q4_K/Q6_K → FP16 | For batch GemmEx tensor cores |
+| `convert_f32_to_f16` | Activation to FP16 | FP32 → FP16 | Cached per source tensor |
+| `batched_embedding_q8_0` | M-token embedding | Q8_0 table + int[] IDs | Single kernel for M lookups |
+| `causal_softmax_inplace` | Causal softmax | FP32 [H×M×S] | For cuBLAS attention path |
+| `sigmoid_gate_inplace` | Sigmoid gating | FP32 | For cuBLAS attention path |
+| `batched_split_swiglu` | Batched split+SwiGLU | FP32 [M×2N] → [M×N] | For fused gate+up projection |
 | `rms_norm` | RMSNorm | FP32 | Block-level reduction |
+| `batched_rope` | Batched RoPE | FP32 | M tokens, per-token positions |
 | `softmax` | Softmax | FP32 | Numerically stable (max subtraction) |
 | `silu` | SiLU activation | FP32 | Element-wise |
 | `rope` | RoPE encoding | FP32 | Paired dimension rotation |
 | `element_mul` | Element-wise multiply | FP32 | For SwiGLU gate |
 | `element_add` | Element-wise add | FP32 | For residual connections |
+
+### cuBLAS bindings
+
+| Function | Use | Notes |
+|----------|-----|-------|
+| `cublasGemmEx` | FP16 batch matmul | Tensor cores, FP32 accumulation |
+| `cublasGemmStridedBatchedEx` | Batched attention QK^T and SV | GQA via strideA=0 for KV reuse |
+| `cublasSgemm` | FP32 fallback | For F32 weights only |
+| `cublasSgemv` | M=1 F32 matmul | Vector-matrix multiply |
+| `cuMemGetInfo` | VRAM query | For FP16 weight cache budget |

@@ -407,6 +407,41 @@ __global__ void embedding_lookup_f32(float* output, const float* table,
         output[idx] = table[token_id * hidden_dim + idx];
 }
 
+// Batched embedding lookup: M tokens at once, output is [M × hidden_dim]
+// token_ids is a device array of M int32 values.
+__global__ void batched_embedding_q8_0(float* output, const unsigned char* table,
+                                        const int* token_ids, int hidden_dim, int M,
+                                        int block_stride, int quant_offset)
+{
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    int total = M * hidden_dim;
+    if (idx >= total) return;
+
+    int token = idx / hidden_dim;
+    int elem = idx % hidden_dim;
+    int token_id = token_ids[token];
+
+    int blocks_per_row = hidden_dim / 32;
+    int bytes_per_row = blocks_per_row * block_stride;
+    const unsigned char* row = table + (long long)token_id * bytes_per_row;
+
+    int block_idx = elem / 32;
+    int elem_idx = elem % 32;
+    const unsigned char* block = row + block_idx * block_stride;
+
+    unsigned short h = ((unsigned short)block[1] << 8) | block[0];
+    unsigned int sign = (h >> 15) & 1;
+    unsigned int exp_val = (h >> 10) & 0x1f;
+    unsigned int mant = h & 0x3ff;
+    unsigned int f;
+    if (exp_val == 0) { f = sign << 31; }
+    else if (exp_val == 31) { f = (sign << 31) | 0x7f800000 | (mant << 13); }
+    else { f = (sign << 31) | ((exp_val - 15 + 127) << 23) | (mant << 13); }
+    float scale = *reinterpret_cast<float*>(&f);
+    signed char quant = (signed char)block[quant_offset + elem_idx];
+    output[idx] = scale * (float)quant;
+}
+
 // BF16 embedding lookup: convert one row from BF16 to F32.
 // BF16: 2 bytes per element, sign(1) + exp(8) + mantissa(7).
 
@@ -1057,6 +1092,23 @@ __global__ void split_swiglu(float* output, const float* fused_input, int N)
     }
 }
 
+// Batched split_swiglu: fused_input is [M × 2N], output is [M × N]
+// Each row: [gate_0..gate_{N-1}, up_0..up_{N-1}]
+__global__ void batched_split_swiglu(float* output, const float* fused_input, int N, int M)
+{
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    int total = M * N;
+    if (idx < total)
+    {
+        int token = idx / N;
+        int elem = idx % N;
+        int fused_off = token * 2 * N;
+        float g = fused_input[fused_off + elem];
+        float u = fused_input[fused_off + N + elem];
+        output[idx] = (g / (1.0f + expf(-g))) * u;
+    }
+}
+
 // post_qkv_norm_rope_cache removed — KV cache state management too complex for single kernel
 
 #if 0
@@ -1335,20 +1387,12 @@ __global__ void dequant_to_f32(float* __restrict__ output,
     output[idx] = val;
 }
 
-// ── FP32 → FP16 conversion (for tensor core batch matmul) ────────────────────
-
-__device__ unsigned short fp32_to_fp16_cvt(float val)
-{
-    unsigned short result;
-    asm("cvt.rn.f16.f32 %0, %1;" : "=h"(result) : "f"(val));
-    return result;
-}
-
-__global__ void fp32_to_fp16(unsigned short* output, const float* input, int n)
+// ── FP32 → FP16 batch conversion ────────────────────────────────────────────
+__global__ void convert_f32_to_f16(unsigned short* output, const float* input, int n)
 {
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
     if (idx < n)
-        output[idx] = fp32_to_fp16_cvt(input[idx]);
+        output[idx] = fp32_to_fp16(input[idx]);
 }
 
 // ── Dequantize weight tensor to FP16 (for tensor core batch matmul) ─────────
@@ -1447,7 +1491,7 @@ __global__ void dequant_to_f16(unsigned short* __restrict__ output,
         val = bit ? scale : -scale;
     }
 
-    output[idx] = fp32_to_fp16_cvt(val);
+    output[idx] = fp32_to_fp16(val);
 }
 
 } // extern "C"

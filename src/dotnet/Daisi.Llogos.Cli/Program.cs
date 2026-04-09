@@ -6,7 +6,6 @@ using Daisi.Llogos.Gguf;
 using Daisi.Llogos.Inference;
 using Daisi.Llogos.Model;
 using Daisi.Llogos;
-using Daisi.Llogos.Cuda;
 using Daisi.Llogos.Inference.DaisiTurbo;
 using Daisi.Llogos.Tokenizer;
 using Daisi.Llogos.Training;
@@ -79,8 +78,8 @@ else
     // Build vocab remapper if partial vocab is active (vocab-limit > 1)
     // Same-family models (Qwen3.5) have identical vocabularies, so same remapper works for both
     VocabRemapper? remapper = null;
-    // Disable remapper + partial vocab for speculative decoding (both models must share same ID space)
-    int vocabDivisor = options.DraftModelPath != null ? 1 : (options.VocabLimit ?? 32);
+    // Disable remapper for speculative decoding and pipeline mode (both need full vocab space)
+    int vocabDivisor = options.DraftModelPath != null ? 1 : (options.VocabLimit ?? 1);
     if (vocabDivisor > 1)
     {
         var tokens = gguf.GetMetadata<string[]>("tokenizer.ggml.tokens")!;
@@ -88,11 +87,67 @@ else
         tokenizer.Vocabulary.ApplyRemapper(remapper);
     }
 
+        // ── Pipeline mode: stream layers from shards for models > VRAM ──────────
+    // Check BEFORE loading weights — pipeline loads its own embed/output from shards.
+    if (options.Pipeline && backend is CudaBackend pipelineCuda)
+    {
+        var shardDir = options.ModelPath + ".shards";
+        if (!Directory.Exists(shardDir))
+        {
+            Console.Error.WriteLine($"Shard directory not found: {shardDir}");
+            Console.Error.WriteLine("Run: daisi-llogos split --model <path> --align-gpu");
+            return 1;
+        }
+
+        var pipeForward = PipelinedForwardPass.Create(gguf, shardDir, config, pipelineCuda,
+            maxContext: options.MaxContext);
+
+        loadSw.Stop();
+        Console.Error.WriteLine($"Model loaded in {loadSw.Elapsed.TotalSeconds:F1}s " +
+            $"({config.Architecture}, {config.NumLayers} layers, {config.HiddenDim}d, pipeline)");
+        Console.Error.WriteLine($"Backend: {backend.Name}, Max tokens: {options.MaxTokens}");
+
+        var pipeGenerator = new TextGenerator(pipeForward, tokenizer, options.Seed);
+
+        if (options.Bench)
+        {
+            string benchPrompt = options.Prompt ?? "The meaning of life is";
+            Console.Error.WriteLine($"Benchmarking with prompt: \"{benchPrompt}\"");
+            Console.Error.WriteLine($"Backend: {backend.Name}, Max tokens: {options.MaxTokens}");
+            Console.Error.WriteLine();
+            var result = pipeGenerator.Benchmark(benchPrompt, options.MaxTokens);
+            Console.Error.WriteLine("=== Benchmark Results ===");
+            Console.Error.WriteLine($"  Prefill:  {result.PromptTokens,6} tokens in {result.PrefillTime.TotalMilliseconds,8:F1} ms  ({result.PrefillTokPerSec,8:F1} tok/s)");
+            Console.Error.WriteLine($"  Decode:   {result.GeneratedTokens,6} tokens in {result.DecodeTime.TotalMilliseconds,8:F1} ms  ({result.DecodeTokPerSec,8:F1} tok/s)");
+            Console.Error.WriteLine($"  Total:    {result.PromptTokens + result.GeneratedTokens,6} tokens in {result.TotalTime.TotalMilliseconds,8:F1} ms");
+            Console.Error.WriteLine($"  Load:     {loadSw.Elapsed.TotalMilliseconds,8:F1} ms");
+        }
+        else
+        {
+            foreach (var token in pipeGenerator.Generate(options.Prompt!, new GenerationParams
+            {
+                MaxTokens = options.MaxTokens, Temperature = options.Temperature,
+                TopK = options.TopK, TopP = options.TopP, RepetitionPenalty = options.RepeatPenalty,
+            }))
+            {
+                if (token.IsDone)
+                {
+                    Console.Error.WriteLine();
+                    Console.Error.WriteLine($"\n[prefill: {token.PrefillTokens} tokens, {token.PrefillTokensPerSecond:F1} tok/s | " +
+                        $"decode: {token.TotalTokens} tokens, {token.TokensPerSecond:F1} tok/s]");
+                }
+                else Console.Write(token.Text);
+            }
+        }
+        pipeForward.Dispose();
+        backend.Dispose();
+        return 0;
+    }
+
+    // ── Load full model weights (non-pipeline paths) ───────────────────────
     ModelWeights weights;
     if (options.LoraPaths.Count > 0)
     {
-        // LoRA merge: load via mmap (correct for all models), merge adapters on CPU,
-        // then re-upload merged weights to target backend if needed.
         var cpuBackend = new CpuBackend();
         weights = MmapModelLoader.Load(gguf, options.ModelPath, cpuBackend, config, remapper);
         foreach (var loraPath in options.LoraPaths)
@@ -101,8 +156,6 @@ else
             var adapter = LoraInference.LoadAndMerge(loraPath, weights, cpuBackend, config);
             Console.Error.WriteLine($"done ({adapter.ParameterCount:N0} params, rank={adapter.Config.Rank})");
         }
-        // Re-upload to target backend if needed (merged weights are F32 CpuTensors,
-        // unmerged weights need re-upload from mmap to GPU)
         if (backend is not CpuBackend)
             LoraInference.UploadWeights(weights, backend, config);
     }
@@ -435,6 +488,9 @@ static CliArgs ParseArgs(string[] args)
             case "--hybrid-layers":
                 result.HybridLayers = int.Parse(NextArg(args, ref i));
                 break;
+            case "--pipeline":
+                result.Pipeline = true;
+                break;
             case "--lora":
                 result.LoraPaths.Add(NextArg(args, ref i));
                 break;
@@ -478,6 +534,7 @@ static void PrintUsage()
           --batched-verify         Use batched verify (faster, higher acceptance, different FP from native)
           --kv-quant <mode>        KV cache compression: turbo, turbo:3, turbo:4, turbo:3+qjl32, turbo:3+noqjl
           --hybrid-layers <n>      GPU+CPU split: first N layers on GPU, rest on CPU
+          --pipeline               Stream layers from shards (for models > VRAM, requires split first)
           --lora <path>            LoRA adapter file (.llra) to merge into model weights
           --help, -h               Show this help
 
@@ -704,7 +761,7 @@ static int RunTraining(string[] args)
 
     IComputeBackend trainingBackend = trainBackend switch
     {
-        "cuda" => new CudaBackend(),
+        "cuda" => new CudaTrainingBackend(),
         _ => new CpuBackend(),
     };
 
@@ -739,4 +796,5 @@ class CliArgs
     public string? KvQuant;
     public int HybridLayers;
     public List<string> LoraPaths = new();
+    public bool Pipeline;
 }

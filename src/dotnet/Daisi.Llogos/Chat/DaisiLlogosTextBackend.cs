@@ -47,12 +47,41 @@ public sealed class DaisiLlogosTextBackend : ITextInferenceBackend
         var config = ModelConfig.FromGguf(gguf);
         var tokenizer = TokenizerFactory.FromGguf(gguf);
         var chatTemplate = ChatTemplate.FromGguf(gguf);
+
+        var contextSize = request.ContextSize > 0
+            ? (int)Math.Min(request.ContextSize, config.MaxContext)
+            : config.MaxContext;
+
+        // Pipeline mode: use shard directory (explicit or auto-detected)
+        var shardDir = request.ShardDirectory ?? (request.Pipeline ? request.FilePath + ".shards" : null);
+        if (shardDir == null && Directory.Exists(request.FilePath + ".shards"))
+            shardDir = request.FilePath + ".shards"; // auto-detect
+        if (shardDir != null && Directory.Exists(shardDir))
+        {
+            OnLog?.Invoke($"Pipeline shards detected: {shardDir}");
+            // Create lightweight placeholder weights — pipeline loads its own from shards
+            var placeholder = backend.CreateTensor("placeholder", Gguf.GgmlType.F32, [1]);
+            var placeholderWeights = new ModelWeights
+            {
+                TokenEmbedding = placeholder,
+                OutputNorm = backend.CreateTensor("onorm.placeholder", Gguf.GgmlType.F32, [1]),
+                Output = null,
+                Layers = Enumerable.Range(0, config.NumLayers)
+                    .Select(_ => CreatePlaceholderLayer(backend)).ToArray(),
+            };
+
+            var handle = new DaisiLlogosModelHandle(
+                request.ModelId, request.FilePath, backend, config,
+                placeholderWeights, tokenizer, chatTemplate, gguf, contextSize, seed: null);
+            handle.PipelineShardDir = shardDir;
+            return Task.FromResult<IModelHandle>(new DaisiLlogosModelHandleAdapter(handle));
+        }
+
         ModelWeights weights;
         IForwardPass? offloadForward = null;
 
         if (!config.IsBitNet && request.GpuLayerCount > 0 && request.GpuLayerCount < config.NumLayers)
         {
-            // Partial GPU offload: keep first N layers in VRAM, rest in pinned RAM
             (weights, offloadForward) = TryLoadWithOffload(gguf, request, backend, config);
         }
         else
@@ -62,29 +91,17 @@ public sealed class DaisiLlogosTextBackend : ITextInferenceBackend
                 : MmapModelLoader.Load(gguf, request.FilePath, backend, config);
         }
 
-        var contextSize = request.ContextSize > 0
-            ? (int)Math.Min(request.ContextSize, config.MaxContext)
-            : config.MaxContext;
-
-        var handle = new DaisiLlogosModelHandle(
-            request.ModelId,
-            request.FilePath,
-            backend,
-            config,
-            weights,
-            tokenizer,
-            chatTemplate,
-            gguf,
-            contextSize,
-            seed: null);
+        var handle2 = new DaisiLlogosModelHandle(
+            request.ModelId, request.FilePath, backend, config,
+            weights, tokenizer, chatTemplate, gguf, contextSize, seed: null);
 
         if (offloadForward != null)
-            handle.OffloadForwardFactory = offloadForward;
+            handle2.OffloadForwardFactory = offloadForward;
 
         if (request.GpuLayerCount > 0)
             OnLog?.Invoke($"GPU layers: {Math.Min(request.GpuLayerCount, config.NumLayers)}/{config.NumLayers}");
 
-        return Task.FromResult<IModelHandle>(new DaisiLlogosModelHandleAdapter(handle));
+        return Task.FromResult<IModelHandle>(new DaisiLlogosModelHandleAdapter(handle2));
     }
 
     /// <summary>
@@ -208,6 +225,17 @@ public sealed class DaisiLlogosTextBackend : ITextInferenceBackend
 
         OnLog?.Invoke("Falling back to CPU backend.");
         return CreateCpuBackend;
+    }
+
+    private static Model.StandardAttentionWeights CreatePlaceholderLayer(IComputeBackend backend)
+    {
+        ITensor P(string n) => backend.CreateTensor(n, Gguf.GgmlType.F32, [1]);
+        return new Model.StandardAttentionWeights
+        {
+            AttnNorm = P("an"), PostAttnNorm = P("pan"),
+            AttnQ = P("aq"), AttnK = P("ak"), AttnV = P("av"), AttnO = P("ao"),
+            FfnGate = P("fg"), FfnUp = P("fu"), FfnDown = P("fd"),
+        };
     }
 
     private static IComputeBackend CreateCpuBackend()

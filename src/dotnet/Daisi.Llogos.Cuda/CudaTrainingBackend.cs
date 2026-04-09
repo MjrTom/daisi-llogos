@@ -3,10 +3,14 @@ using Daisi.Llogos.Gguf;
 namespace Daisi.Llogos.Cuda;
 
 /// <summary>
-/// CUDA compute backend. Implements IComputeBackend using GPU kernels via P/Invoke
-/// to the CUDA Driver API. Kernels are JIT-compiled from embedded PTX at initialization.
+/// CUDA compute backend for training. Copy of CudaBackend with graph-safe modifications:
+/// - CrossEntropyLoss: pre-allocated loss scalar, deferred readback
+/// - GradNormSq: pre-allocated norm scalar, deferred readback
+/// - Training graph capture/replay for forward+backward+optimizer
+///
+/// Does NOT modify the original CudaBackend (inference path stays untouched).
 /// </summary>
-public sealed class CudaBackend : IComputeBackend
+public sealed class CudaTrainingBackend : IComputeBackend
 {
     private readonly CudaContext _context;
     private readonly CudaModule _elementwiseModule;
@@ -34,30 +38,7 @@ public sealed class CudaBackend : IComputeBackend
     /// <summary>Disable CUDA graph capture (needed for TurboQuant which uses different kernel topology).</summary>
     public void DisableGraphCapture() { _graphEnabled = false; }
 
-    /// <summary>
-    /// Invalidate all cached weight-derived state. Must be called after overwriting
-    /// GPU weight tensor data (e.g. pipeline layer swap) so that fused RmsNorm Q8_1,
-    /// FP16 dequant caches, and activation quantization caches are not reused with stale data.
-    /// </summary>
-    public void InvalidateWeightCache()
-    {
-        _q8_1CacheGeneration++;
-        _q8_1CachedInputPtr = 0;
-        _q8_1CachedGeneration = 0;
-        _q8_1FusedReady = false;
-
-        // Clear FP16 weight cache — shared tensor DevicePtrs get reused with different data
-        foreach (var buf in _f16WeightCache.Values) buf.Dispose();
-        _f16WeightCache.Clear();
-        _f16CacheBytes = 0;
-        _f16WeightCacheEnabled = true;
-
-        // Clear activation caches
-        _f16ActCachedSrcPtr = 0;
-        _f16ActCachedSize = 0;
-    }
-
-    public CudaBackend(int deviceOrdinal = 0)
+    public CudaTrainingBackend(int deviceOrdinal = 0)
     {
         _context = new CudaContext(deviceOrdinal);
         _stream = new CudaStream();
@@ -78,7 +59,6 @@ public sealed class CudaBackend : IComputeBackend
 
     /// <inheritdoc />
     public string Name => $"CUDA ({_context.DeviceName})";
-    public bool SupportsBatchedOps => true;
 
     /// <summary>GPU compute capability major version (e.g. 8 for Ampere, 12 for Blackwell).</summary>
     public int ComputeCapabilityMajor => _context.ComputeCapabilityMajor;
@@ -140,6 +120,75 @@ public sealed class CudaBackend : IComputeBackend
         CudaApi.Check(CudaApi.GraphLaunch(_graphExec, _stream.Handle), "cuGraphLaunch");
     }
 
+    // ── Training graph capture (separate from inference graph) ──────────────
+
+    private nint _trainingGraphExec;
+    private bool _trainingGraphReady;
+
+    /// <summary>
+    /// Begin recording a training graph. All subsequent GPU operations on the
+    /// compute stream will be captured into a graph (not executed immediately).
+    /// Call EndTrainingCapture() after the full forward+backward+optimizer step.
+    /// </summary>
+    public void BeginTrainingCapture()
+    {
+        EnsureContext();
+        // Disable inference graph capture during training capture
+        _graphEnabled = false;
+        var result = CudaApi.StreamBeginCapture(_stream.Handle, 0);
+        if (result == CuResult.Success)
+            _capturing = true;
+    }
+
+    /// <summary>
+    /// End training graph capture, instantiate the graph executable.
+    /// The captured graph can be replayed with ReplayTrainingGraph().
+    /// </summary>
+    public unsafe void EndTrainingCapture()
+    {
+        if (!_capturing) return;
+        _capturing = false;
+
+        CudaApi.Check(CudaApi.StreamEndCapture(_stream.Handle, out nint graph), "cuStreamEndCapture");
+
+        if (_trainingGraphExec != 0)
+        {
+            var updateResult = CudaApi.GraphExecUpdate(_trainingGraphExec, graph, null);
+            if (updateResult != CuResult.Success)
+            {
+                CudaApi.GraphExecDestroy(_trainingGraphExec);
+                CudaApi.Check(CudaApi.GraphInstantiate(out _trainingGraphExec, graph, 0, 0, 0), "cuGraphInstantiate");
+            }
+        }
+        else
+        {
+            CudaApi.Check(CudaApi.GraphInstantiate(out _trainingGraphExec, graph, 0, 0, 0), "cuGraphInstantiate");
+        }
+
+        CudaApi.GraphDestroy(graph);
+        _trainingGraphReady = true;
+
+        // Launch immediately after first capture
+        CudaApi.Check(CudaApi.GraphLaunch(_trainingGraphExec, _stream.Handle), "cuGraphLaunch");
+    }
+
+    /// <summary>
+    /// Replay the captured training graph. Much faster than re-dispatching
+    /// all kernels individually — single cuGraphLaunch replaces hundreds of
+    /// kernel launches.
+    /// Caller must update input data (token IDs, targets) BEFORE calling this.
+    /// </summary>
+    public void ReplayTrainingGraph()
+    {
+        if (!_trainingGraphReady)
+            throw new InvalidOperationException("No training graph captured. Run one step with BeginTrainingCapture/EndTrainingCapture first.");
+        EnsureContext();
+        CudaApi.Check(CudaApi.GraphLaunch(_trainingGraphExec, _stream.Handle), "cuGraphLaunch");
+    }
+
+    /// <summary>Whether a training graph has been captured and is ready for replay.</summary>
+    public bool TrainingGraphReady => _trainingGraphReady;
+
     /// <summary>
     /// Ensure the CUDA context is current on the calling thread.
     /// Required because minion tasks run on threadpool threads that may not
@@ -167,7 +216,7 @@ public sealed class CudaBackend : IComputeBackend
             long f16WBytes = (long)K * N * 2;
             ulong f16WPtr;
 
-            // Check persistent FP16 weight cache (avoids re-dequant on repeat prefills)
+            // Check persistent FP16 weight cache
             if (_f16WeightCache.TryGetValue(bPtr, out var cached))
             {
                 f16WPtr = cached.DevicePtr;
@@ -175,27 +224,28 @@ public sealed class CudaBackend : IComputeBackend
             else
             {
                 // Dequantize weight → FP16 (temp buffer or cached)
+                bool canCache = _f16WeightCacheEnabled;
                 CudaDeviceMemory? newBuf = null;
-                bool canCache = _f16WeightCacheEnabled && TryAllocF16Cache(f16WBytes, out newBuf);
+                if (canCache)
+                {
+                    try { newBuf = new CudaDeviceMemory((ulong)f16WBytes); }
+                    catch { canCache = false; _f16WeightCacheEnabled = false; }
+                }
+
                 if (canCache)
                 {
                     f16WPtr = newBuf!.DevicePtr;
                     _f16WeightCache[bPtr] = newBuf;
-                    _f16CacheBytes += f16WBytes;
                 }
                 else
                 {
-                    // Fallback: use temp buffer
-                    if (_batchF16WtBuf == null || _batchF16WtBufSize < f16WBytes)
+                    if (_batchF16WeightBuf == null || _batchF16WeightBufSize < f16WBytes)
                     {
-                        _batchF16WtBuf?.Dispose();
-                        _batchF16WtBuf = new CudaDeviceMemory((ulong)f16WBytes);
-                        _batchF16WtBufSize = f16WBytes;
+                        _batchF16WeightBuf?.Dispose();
+                        _batchF16WeightBuf = new CudaDeviceMemory((ulong)f16WBytes);
+                        _batchF16WeightBufSize = f16WBytes;
                     }
-                    f16WPtr = _batchF16WtBuf.DevicePtr;
-                    _f16CacheMisses++;
-                    // Disable further cache attempts after first failure (avoid repeated MemGetInfo calls)
-                    _f16WeightCacheEnabled = false;
+                    f16WPtr = _batchF16WeightBuf.DevicePtr;
                 }
 
                 var dqFunc = _elementwiseModule.GetFunction("dequant_to_f16");
@@ -214,22 +264,22 @@ public sealed class CudaBackend : IComputeBackend
                 _stream.Launch(dqFunc, dqGrid, 1, 1, (uint)BlockSize, 1, 1, 0, dArgs);
             }
 
-            // Convert activation FP32 → FP16 (cached: same normOut feeds Q/K/V and gate/up)
+            // Convert activation FP32 → FP16 (cached for same input)
             long f16ABytes = (long)M * K * 2;
             ulong f16APtr;
-            if (_f16ActCachedSrcPtr == aPtr && _f16ActCachedSize == f16ABytes && _batchF16ActBuf != null)
+            if (_f16ActCachedSrcPtr == aPtr && _f16ActCachedSize == f16ABytes && _batchF16ActivationBuf != null)
             {
-                f16APtr = _batchF16ActBuf.DevicePtr;
+                f16APtr = _batchF16ActivationBuf.DevicePtr;
             }
             else
             {
-                if (_batchF16ActBuf == null || _batchF16ActBufSize < f16ABytes)
+                if (_batchF16ActivationBuf == null || _batchF16ActivationBufSize < f16ABytes)
                 {
-                    _batchF16ActBuf?.Dispose();
-                    _batchF16ActBuf = new CudaDeviceMemory((ulong)f16ABytes);
-                    _batchF16ActBufSize = f16ABytes;
+                    _batchF16ActivationBuf?.Dispose();
+                    _batchF16ActivationBuf = new CudaDeviceMemory((ulong)f16ABytes);
+                    _batchF16ActivationBufSize = f16ABytes;
                 }
-                f16APtr = _batchF16ActBuf.DevicePtr;
+                f16APtr = _batchF16ActivationBuf.DevicePtr;
 
                 var cvtFunc = _elementwiseModule.GetFunction("convert_f32_to_f16");
                 int aElements = M * K;
@@ -244,30 +294,26 @@ public sealed class CudaBackend : IComputeBackend
             }
 
             // GemmEx: C(FP32) = B^T(FP16) × A(FP16) using tensor cores
-            // Column-major: C(N×M) = B^T(N×K) × A(K×M)
             {
             float a16 = 1.0f, b16 = 0.0f;
             CublasApi.Check(CublasApi.GemmEx(_cublasHandle,
-                CublasApi.CUBLAS_OP_T,  // B^T
-                CublasApi.CUBLAS_OP_N,  // A as-is
-                N, M, K,               // column-major dims
+                CublasApi.CUBLAS_OP_T, CublasApi.CUBLAS_OP_N,
+                N, M, K,
                 &a16,
-                f16WPtr, CublasApi.CUDA_R_16F, K,   // B: [N×K] → ldb = K
-                f16APtr, CublasApi.CUDA_R_16F, K,   // A: [M×K] → lda = K
+                f16WPtr, CublasApi.CUDA_R_16F, K,
+                f16APtr, CublasApi.CUDA_R_16F, K,
                 &b16,
-                outPtr, CublasApi.CUDA_R_32F, N,     // C: [M×N] → ldc = N
+                outPtr, CublasApi.CUDA_R_32F, N,
                 CublasApi.CUBLAS_COMPUTE_32F, CublasApi.CUBLAS_GEMM_DEFAULT),
                 "cublasGemmEx");
             }
             return;
         }
 
+        // Dequant (if needed) + cuBLAS SGEMM fallback
         ulong bF32Ptr;
-        bool needsDequant = bT.Type != Gguf.GgmlType.F32;
-
-        if (needsDequant)
+        if (bT.Type != Gguf.GgmlType.F32)
         {
-            // Dequantize weight to temporary FP32 buffer
             long f32Bytes = (long)K * N * sizeof(float);
             if (_batchDequantBuf == null || _batchDequantBufSize < f32Bytes)
             {
@@ -276,89 +322,41 @@ public sealed class CudaBackend : IComputeBackend
                 _batchDequantBufSize = f32Bytes;
             }
             bF32Ptr = _batchDequantBuf.DevicePtr;
-
-            // GPU dequant kernel: expand quantized weight to FP32
             var func = _elementwiseModule.GetFunction("dequant_to_f32");
             int totalElements = K * N;
-            int blockSize = Gguf.GgmlTypeInfo.BlockSize(bT.Type);
+            int blockSizeQ = Gguf.GgmlTypeInfo.BlockSize(bT.Type);
             int typeTag = (int)bT.Type;
             int isAligned = (bT.IsAlignedQ8_0 || bT.IsAlignedQ4_0) ? 1 : 0;
             uint grid = (uint)((totalElements + BlockSize - 1) / BlockSize);
             nint* dArgs = stackalloc nint[6];
-            dArgs[0] = (nint)(&bF32Ptr);
-            dArgs[1] = (nint)(&bPtr);
-            dArgs[2] = (nint)(&totalElements);
-            dArgs[3] = (nint)(&typeTag);
-            dArgs[4] = (nint)(&blockSize);
-            dArgs[5] = (nint)(&isAligned);
+            dArgs[0] = (nint)(&bF32Ptr); dArgs[1] = (nint)(&bPtr);
+            dArgs[2] = (nint)(&totalElements); dArgs[3] = (nint)(&typeTag);
+            dArgs[4] = (nint)(&blockSizeQ); dArgs[5] = (nint)(&isAligned);
             _stream.Launch(func, grid, 1, 1, (uint)BlockSize, 1, 1, 0, dArgs);
         }
-        else
-        {
-            bF32Ptr = bPtr;
-        }
+        else { bF32Ptr = bPtr; }
 
-        // cuBLAS SGEMM: output[M×N] = activation[M×K] × weight^T[K×N]
-        // Weight is GGUF layout: Dimensions[0]=K (inner), Dimensions[1]=N (outer)
-        // Stored in memory as [N rows × K cols] row-major
-        // cuBLAS is column-major: sees weight as [K×N] col-major, need OP_T → [N×K]
         float alpha = 1.0f, beta = 0.0f;
         CublasApi.Check(CublasApi.Sgemm(_cublasHandle,
-            CublasApi.CUBLAS_OP_T,  // weight: [K×N] col-major → transpose → [N×K]
-            CublasApi.CUBLAS_OP_N,  // activation: [K×M] col-major = [M×K] row-major
+            CublasApi.CUBLAS_OP_T, CublasApi.CUBLAS_OP_N,
             N, M, K,
             &alpha,
-            bF32Ptr, K,            // weight lda=K (column stride in col-major)
-            aPtr, K,               // activation ldb=K
+            bF32Ptr, K, aPtr, K,
             &beta,
-            outPtr, N),            // output ldc=N
+            outPtr, N),
             "cublasSgemm");
     }
 
     private CudaDeviceMemory? _batchDequantBuf;
     private long _batchDequantBufSize;
-    private CudaDeviceMemory? _batchF16WtBuf;
-    private long _batchF16WtBufSize;
-    private CudaDeviceMemory? _batchF16ActBuf;
-    private long _batchF16ActBufSize;
-    private ulong _f16ActCachedSrcPtr;  // DevicePtr of last converted activation
-    private long _f16ActCachedSize;     // byte size of last conversion
-
-    // Persistent FP16 weight cache: avoids re-dequanting on subsequent prefills
+    private CudaDeviceMemory? _batchF16WeightBuf;
+    private long _batchF16WeightBufSize;
+    private CudaDeviceMemory? _batchF16ActivationBuf;
+    private long _batchF16ActivationBufSize;
+    private ulong _f16ActCachedSrcPtr;
+    private long _f16ActCachedSize;
     private readonly Dictionary<ulong, CudaDeviceMemory> _f16WeightCache = new();
     private bool _f16WeightCacheEnabled = true;
-    private long _f16CacheBytes;
-    private int _f16CacheMisses;
-    private const long F16CacheVramHeadroom = 512L * 1024 * 1024; // keep 512 MB free
-
-    /// <summary>Log FP16 weight cache stats. Called once after first prefill.</summary>
-    internal void LogF16CacheStats()
-    {
-        if (_f16WeightCache.Count > 0 || _f16CacheMisses > 0)
-        {
-            Console.Error.WriteLine($"  FP16 weight cache: {_f16WeightCache.Count} tensors cached " +
-                $"({_f16CacheBytes / (1024 * 1024)} MB), {_f16CacheMisses} uncached");
-        }
-    }
-
-    private bool TryAllocF16Cache(long bytes, out CudaDeviceMemory? buf)
-    {
-        buf = null;
-        EnsureContext();
-        if (CudaApi.MemGetInfo(out ulong free, out _) != CuResult.Success)
-            return false;
-        if ((long)free - bytes < F16CacheVramHeadroom)
-            return false;
-        try
-        {
-            buf = new CudaDeviceMemory((ulong)bytes);
-            return true;
-        }
-        catch
-        {
-            return false;
-        }
-    }
 
     /// <summary>Launch a standard 6-arg matmul kernel: (output, a, b, M, K, N).</summary>
     private unsafe void LaunchMatMul(string kernelName, ulong outPtr, ulong aPtr, ulong bPtr,
@@ -477,6 +475,9 @@ public sealed class CudaBackend : IComputeBackend
     /// <inheritdoc />
     public unsafe void MatMul(ITensor output, ITensor a, ITensor b, int M, int K, int N)
     {
+        // Note: MatMul is read-only on the activation tensor, so it does NOT
+        // invalidate the Q8_1 cache. Only ops that WRITE to tensors bump the generation.
+
         var outT = (CudaTensor)output;
         var aT = (CudaTensor)a;
         var bT = (CudaTensor)b;
@@ -822,60 +823,6 @@ public sealed class CudaBackend : IComputeBackend
         kArgs[6] = (nint)(&nVal);
         _stream.Launch(func, (uint)N, 1, 1, 128, 1, 1, smem, kArgs);
     }
-
-    /// <inheritdoc />
-    public unsafe void BatchedEmbeddingLookup(ITensor output, ITensor table, int[] tokenIds)
-    {
-        EnsureContext();
-        var outT = (CudaTensor)output;
-        var tblT = (CudaTensor)table;
-        ulong outPtr = outT.DevicePtr;
-        ulong tblPtr = tblT.DevicePtr;
-        int hiddenDim = (int)table.Dimensions[0];
-        int M = tokenIds.Length;
-
-        if (table.Type == GgmlType.Q8_0)
-        {
-            int blockStride = tblT.IsAlignedQ8_0 ? 36 : 34;
-            int quantOffset = blockStride == 36 ? 4 : 2;
-
-            // Upload token IDs to GPU
-            if (_batchTokenIdsBuf == null || _batchTokenIdsBufSize < M)
-            {
-                _batchTokenIdsBuf?.Dispose();
-                _batchTokenIdsBuf = new CudaDeviceMemory((ulong)(M * sizeof(int)));
-                _batchTokenIdsBufSize = M;
-            }
-            fixed (int* p = tokenIds)
-                CudaApi.Check(CudaApi.MemcpyHtoDAsync(_batchTokenIdsBuf.DevicePtr, p,
-                    (ulong)(M * sizeof(int)), _stream.Handle), "upload tokenIds");
-            ulong idsPtr = _batchTokenIdsBuf.DevicePtr;
-
-            var func = _elementwiseModule.GetFunction("batched_embedding_q8_0");
-            int total = M * hiddenDim;
-            uint grid = (uint)((total + BlockSize - 1) / BlockSize);
-            nint* kArgs = stackalloc nint[7];
-            kArgs[0] = (nint)(&outPtr);
-            kArgs[1] = (nint)(&tblPtr);
-            kArgs[2] = (nint)(&idsPtr);
-            kArgs[3] = (nint)(&hiddenDim);
-            kArgs[4] = (nint)(&M);
-            kArgs[5] = (nint)(&blockStride);
-            kArgs[6] = (nint)(&quantOffset);
-            _stream.Launch(func, grid, 1, 1, (uint)BlockSize, 1, 1, 0, kArgs);
-        }
-        else
-        {
-            // Fallback: sequential
-            for (int i = 0; i < M; i++)
-            {
-                EmbeddingLookup(output, table, tokenIds[i]);
-                // This only works for single-token output buffer — not ideal for batch
-            }
-        }
-    }
-    private CudaDeviceMemory? _batchTokenIdsBuf;
-    private int _batchTokenIdsBufSize;
 
     /// <inheritdoc />
     public unsafe void RmsNorm(ITensor output, ITensor input, ITensor weight, float eps)
@@ -1401,97 +1348,11 @@ public sealed class CudaBackend : IComputeBackend
         ulong vcPtr = vcT.DevicePtr;
         int cacheIsFp16 = kCache.Type == GgmlType.F16 ? 1 : 0;
 
-        // ── cuBLAS matmul path for FP32 cache (avoids O(M²) redundant KV reads) ──
-        if (cacheIsFp16 == 0 && M > 32)
-        {
-            int headsPerKv = numHeads / numKvHeads;
-            int seqLen = startPosition + M;  // total KV entries
-
-            // Allocate scores buffer: [numHeads × M × seqLen]
-            long scoreBytes = (long)numHeads * M * seqLen * sizeof(float);
-            if (_attnScoreBuf == null || _attnScoreBufSize < scoreBytes)
-            {
-                _attnScoreBuf?.Dispose();
-                _attnScoreBuf = new CudaDeviceMemory((ulong)scoreBytes);
-                _attnScoreBufSize = scoreBytes;
-            }
-            ulong scorePtr = _attnScoreBuf.DevicePtr;
-
-            // Step 1: QK^T via cuBLAS — one strided batched GEMM per KV head group
-            float alpha = 1.0f, beta = 0.0f;
-            for (int kh = 0; kh < numKvHeads; kh++)
-            {
-                ulong kPtr = kcPtr + (ulong)((long)kh * maxSeqLen * keyLength * sizeof(float));
-                int firstHead = kh * headsPerKv;
-                ulong qGroupPtr = qaPtr + (ulong)(firstHead * keyLength * sizeof(float));
-                ulong sGroupPtr = scorePtr + (ulong)((long)firstHead * M * seqLen * sizeof(float));
-
-                CublasApi.Check(CublasApi.GemmStridedBatchedEx(_cublasHandle,
-                    CublasApi.CUBLAS_OP_T, CublasApi.CUBLAS_OP_N,
-                    seqLen, M, keyLength,
-                    &alpha,
-                    kPtr, CublasApi.CUDA_R_32F, keyLength, 0,
-                    qGroupPtr, CublasApi.CUDA_R_32F, numHeads * keyLength, keyLength,
-                    &beta,
-                    sGroupPtr, CublasApi.CUDA_R_32F, seqLen, (long)M * seqLen,
-                    headsPerKv,
-                    CublasApi.CUBLAS_COMPUTE_32F, CublasApi.CUBLAS_GEMM_DEFAULT),
-                    "QK^T");
-            }
-
-            // Step 2: Causal softmax in-place on scores
-            var softmaxFunc = _compositeModule.GetFunction("causal_softmax_inplace");
-            uint softmaxGrid = (uint)(numHeads * M);
-            uint softmaxSmem = (uint)(BlockSize * sizeof(float));
-            int startPos = startPosition;
-            nint* smArgs = stackalloc nint[4];
-            smArgs[0] = (nint)(&scorePtr);
-            smArgs[1] = (nint)(&seqLen);  // row width = seqLen
-            smArgs[2] = (nint)(&startPos);
-            smArgs[3] = (nint)(&scale);
-            // Note: scale already applied in GEMM (alpha=1), softmax just needs to apply scale
-            // Actually, we need scale in softmax. Let me set alpha=scale in GEMM instead.
-            // For now, pass scale=1 since we already factored it as GEMM alpha.
-            // Wait — I set alpha=1.0 in GEMM. Need to apply scale in softmax.
-            _stream.Launch(softmaxFunc, softmaxGrid, 1, 1, (uint)BlockSize, 1, 1, softmaxSmem, smArgs);
-
-            // Step 3: Score × V via strided batched GEMM per KV head group
-            for (int kh = 0; kh < numKvHeads; kh++)
-            {
-                ulong vPtr = vcPtr + (ulong)((long)kh * maxSeqLen * valueLength * sizeof(float));
-                int firstHead = kh * headsPerKv;
-                ulong sGroupPtr = scorePtr + (ulong)((long)firstHead * M * seqLen * sizeof(float));
-                ulong oGroupPtr = outPtr + (ulong)(firstHead * valueLength * sizeof(float));
-
-                CublasApi.Check(CublasApi.GemmStridedBatchedEx(_cublasHandle,
-                    CublasApi.CUBLAS_OP_N, CublasApi.CUBLAS_OP_N,
-                    valueLength, M, seqLen,
-                    &alpha,
-                    vPtr, CublasApi.CUDA_R_32F, valueLength, 0,
-                    sGroupPtr, CublasApi.CUDA_R_32F, seqLen, (long)M * seqLen,
-                    &beta,
-                    oGroupPtr, CublasApi.CUDA_R_32F, numHeads * valueLength, valueLength,
-                    headsPerKv,
-                    CublasApi.CUBLAS_COMPUTE_32F, CublasApi.CUBLAS_GEMM_DEFAULT),
-                    "ScoreV");
-            }
-
-            // Step 4: Apply sigmoid gating
-            var gateFunc = _compositeModule.GetFunction("sigmoid_gate_inplace");
-            int gateN = M * numHeads * valueLength;
-            uint gateGrid = (uint)((gateN + BlockSize - 1) / BlockSize);
-            nint* gArgs = stackalloc nint[3];
-            gArgs[0] = (nint)(&outPtr);
-            gArgs[1] = (nint)(&qgPtr);
-            gArgs[2] = (nint)(&gateN);
-            _stream.Launch(gateFunc, gateGrid, 1, 1, (uint)BlockSize, 1, 1, 0, gArgs);
-            return;
-        }
-
-        // ── Fallback: custom kernel (for FP16 cache or small M) ──
         const int tileSize = 256;
         uint sharedMem = (uint)((tileSize + BlockSize) * sizeof(float));
         var func = _compositeModule.GetFunction("batched_gated_attention");
+
+        // Grid: M * numHeads blocks (one per query_token × head)
         uint gridX = (uint)(M * numHeads);
 
         nint* kArgs = stackalloc nint[14];
@@ -1511,8 +1372,6 @@ public sealed class CudaBackend : IComputeBackend
         kArgs[13] = (nint)(&cacheIsFp16);
         _stream.Launch(func, gridX, 1, 1, (uint)BlockSize, 1, 1, sharedMem, kArgs);
     }
-    private CudaDeviceMemory? _attnScoreBuf;
-    private long _attnScoreBufSize;
 
     /// <inheritdoc />
     public unsafe void CausalConv1d(ITensor qkv, ITensor convBuffer, ITensor convWeight, int channels, int kernelSize)
@@ -1996,7 +1855,7 @@ public sealed class CudaBackend : IComputeBackend
         kArgs[3] = (nint)(&n);
 
         // Fused path: SwiGLU + Q8_1 quantization for dp4a matmul (M=1 only)
-        // Skip for batched (M>1): Q8_1 scratch is sized for single-token K, not M*N.
+        // Skip for batched (M>1): Q8_1 scratch is sized for single-token only.
         if ((_hasQ4_0Weights || _hasQ8_0Weights) && _q8_1Scratch != null && n <= _q8_1ScratchK)
         {
             ulong q8Ptr = _q8_1Scratch.DevicePtr;
@@ -2282,26 +2141,57 @@ public sealed class CudaBackend : IComputeBackend
         _stream.Launch(func, grid, 1, 1, (uint)BlockSize, 1, 1, 0, k);
     }
 
+    // ── Graph-safe: pre-allocated loss scalar, deferred readback ──────────
+
+    private CudaDeviceMemory? _lossScalar;
+
+    /// <summary>
+    /// Graph-safe cross-entropy loss. Uses a pre-allocated scalar instead of
+    /// per-call cuMemAlloc. Does NOT synchronize or read back the loss value —
+    /// call ReadLoss() after the graph completes.
+    /// </summary>
     public unsafe float CrossEntropyLoss(ITensor dLogits, ITensor logits, ITensor targets,
         int T, int V)
     {
         ulong dlPtr = ((CudaTensor)dLogits).DevicePtr;
         ulong lPtr = ((CudaTensor)logits).DevicePtr;
         ulong tPtr = ((CudaTensor)targets).DevicePtr;
-        // Allocate scalar for loss result
-        using var lossMem = new CudaDeviceMemory(sizeof(float));
-        CudaApi.MemsetD8(lossMem.DevicePtr, 0, sizeof(float));
-        ulong lossPtr = lossMem.DevicePtr;
+
+        // Pre-allocate loss scalar once (graph-safe: no cuMemAlloc during capture)
+        _lossScalar ??= new CudaDeviceMemory(sizeof(float));
+        CudaApi.MemsetD8(_lossScalar.DevicePtr, 0, sizeof(float));
+        ulong lossPtr = _lossScalar.DevicePtr;
+
         var func = BackwardModule.GetFunction("cross_entropy_loss");
         uint sharedMem = (uint)(BlockSize * sizeof(float));
         nint* k = stackalloc nint[6];
         k[0] = (nint)(&dlPtr); k[1] = (nint)(&lossPtr); k[2] = (nint)(&lPtr);
         k[3] = (nint)(&tPtr); k[4] = (nint)(&T); k[5] = (nint)(&V);
         _stream.Launch(func, (uint)T, 1, 1, (uint)BlockSize, 1, 1, sharedMem, k);
-        // Download scalar loss
+
+        // Deferred readback — caller must call ReadLoss() after stream sync
+        if (!_capturing)
+        {
+            // Not in graph capture — read back immediately (backward compatible)
+            _stream.Synchronize();
+            float loss = 0;
+            _lossScalar.CopyToHost(new Span<float>(ref loss));
+            return loss;
+        }
+
+        // During graph capture: return 0, actual loss read after graph replay
+        return 0f;
+    }
+
+    /// <summary>
+    /// Read back the loss value after graph replay completes.
+    /// Must be called AFTER Synchronize() following graph launch.
+    /// </summary>
+    public float ReadLoss()
+    {
+        if (_lossScalar == null) return 0f;
         float loss = 0;
-        _stream.Synchronize();
-        lossMem.CopyToHost(new Span<float>(ref loss));
+        _lossScalar.CopyToHost(new Span<float>(ref loss));
         return loss;
     }
 
@@ -2324,7 +2214,9 @@ public sealed class CudaBackend : IComputeBackend
         ulong aoPtr = ((CudaTensor)attnOutput).DevicePtr;
         var func = BackwardModule.GetFunction("causal_gated_attention_backward");
         int blocks = numHeads * T;
-        uint threads = (uint)Math.Min(T, BlockSize);
+        // Round threads to next power-of-2 for correct shared-memory reduction
+        uint threads = 32;
+        while (threads < (uint)T && threads < BlockSize) threads *= 2;
         nint* k = stackalloc nint[16];
         k[0] = (nint)(&dqPtr); k[1] = (nint)(&dgPtr); k[2] = (nint)(&dkPtr); k[3] = (nint)(&dvPtr);
         k[4] = (nint)(&doPtr); k[5] = (nint)(&qaPtr); k[6] = (nint)(&qgPtr);
@@ -2401,22 +2293,55 @@ public sealed class CudaBackend : IComputeBackend
         _stream.Launch(func, grid, 1, 1, (uint)BlockSize, 1, 1, 0, k2);
     }
 
+    // ── Graph-safe: pre-allocated norm scalar, deferred readback ──────────
+
+    private CudaDeviceMemory? _normScalar;
+
+    /// <summary>
+    /// Graph-safe gradient norm squared. Pre-allocated scalar, no sync during capture.
+    /// Accumulates across multiple calls (caller must zero and read back manually for graph mode).
+    /// </summary>
     public unsafe float GradNormSq(ITensor grad)
     {
         ulong gPtr = ((CudaTensor)grad).DevicePtr;
         int n = (int)grad.ElementCount;
-        using var result = new CudaDeviceMemory(sizeof(float));
-        CudaApi.MemsetD8(result.DevicePtr, 0, sizeof(float));
-        ulong rPtr = result.DevicePtr;
+
+        _normScalar ??= new CudaDeviceMemory(sizeof(float));
+        // NOTE: caller must zero _normScalar before accumulating multiple grads
+        ulong rPtr = _normScalar.DevicePtr;
+
         var func = BackwardModule.GetFunction("grad_norm_sq");
         uint sharedMem = (uint)(BlockSize * sizeof(float));
         uint grid = (uint)((n + BlockSize - 1) / BlockSize);
         nint* k = stackalloc nint[3];
         k[0] = (nint)(&rPtr); k[1] = (nint)(&gPtr); k[2] = (nint)(&n);
         _stream.Launch(func, grid, 1, 1, (uint)BlockSize, 1, 1, sharedMem, k);
+
+        if (!_capturing)
+        {
+            // Not in graph capture — read back immediately (backward compatible)
+            _stream.Synchronize();
+            float normSq = 0;
+            _normScalar.CopyToHost(new Span<float>(ref normSq));
+            return normSq;
+        }
+
+        return 0f; // During capture: defer to ReadNormSq()
+    }
+
+    /// <summary>Zero the norm accumulator before a batch of GradNormSq calls.</summary>
+    public void ZeroNormAccumulator()
+    {
+        if (_normScalar != null)
+            CudaApi.MemsetD8(_normScalar.DevicePtr, 0, sizeof(float));
+    }
+
+    /// <summary>Read accumulated norm squared after graph replay + sync.</summary>
+    public float ReadNormSq()
+    {
+        if (_normScalar == null) return 0f;
         float normSq = 0;
-        _stream.Synchronize();
-        result.CopyToHost(new Span<float>(ref normSq));
+        _normScalar.CopyToHost(new Span<float>(ref normSq));
         return normSq;
     }
 
@@ -2433,7 +2358,9 @@ public sealed class CudaBackend : IComputeBackend
         ulong vPtr = ((CudaTensor)v).DevicePtr;
         var func = BackwardModule.GetFunction("training_causal_gated_attention");
         int blocks = numHeads * T;
-        uint threads = (uint)Math.Min(Math.Max(T, 32), BlockSize);
+        // Round threads to next power-of-2 for correct shared-memory reduction
+        uint threads = 32;
+        while (threads < (uint)T && threads < BlockSize) threads *= 2;
         uint sharedMem = (uint)(threads * sizeof(float));
         nint* args = stackalloc nint[12];
         args[0] = (nint)(&oPtr); args[1] = (nint)(&spPtr);
@@ -2496,9 +2423,6 @@ public sealed class CudaBackend : IComputeBackend
     /// <summary>Synchronize the CUDA stream (wait for all queued operations to complete).</summary>
     public void Synchronize() => _stream.Synchronize();
 
-    /// <summary>Raw handle to the compute stream (for pipeline H2D transfers).</summary>
-    internal nint ComputeStreamHandle => _stream.Handle;
-
     /// <inheritdoc />
     public void Dispose()
     {
@@ -2506,6 +2430,9 @@ public sealed class CudaBackend : IComputeBackend
         {
             _context.MakeCurrent();
             if (_graphExec != 0) CudaApi.GraphExecDestroy(_graphExec);
+            if (_trainingGraphExec != 0) CudaApi.GraphExecDestroy(_trainingGraphExec);
+            _lossScalar?.Dispose();
+            _normScalar?.Dispose();
             _argmaxResult?.Dispose();
             _q8_1Scratch?.Dispose();
             _backwardModule?.Dispose();

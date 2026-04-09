@@ -17,6 +17,10 @@ All original bugs (issues 1-5) are **fixed**. This document tracks remaining opt
 9. **Vulkan RepeatTile CPU fallback** — Fixed (GPU compute shader)
 10. **Vulkan CopyTensorRegion ignoring srcOffset** — Fixed (was copying from offset 0 regardless)
 11. **Vulkan ArgMax CPU fallback** — Fixed (GPU composite op, was downloading 600KB logits per token)
+12. **SwiGLU Q8_1 scratch overflow** — Fixed (fused swiglu_q8_1 wrote M×N elements to single-token scratch for batched M>1)
+13. **Training arena corruption at seqLen>208** — Fixed (arena disabled, per-tensor Pool allocation)
+14. **Non-power-of-2 attention reduction** — Fixed (training attention kernels rounded threads to power-of-2)
+15. **Duplicate embedding loop in ForwardBatchedPrefill** — Fixed
 
 ---
 

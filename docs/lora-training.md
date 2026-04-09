@@ -158,9 +158,9 @@ All training operations run on GPU via CUDA:
 ```
 
 Key optimizations:
-- **Tensor pool**: Pre-allocated GPU buffers, zero per-step allocations
-- **F32 weight cache**: Dequantized weights cached on GPU (avoids Q8_0 kernel issues)
-- **GPU AdamW**: Entire optimizer step on device, no CPU round-trip
+- **FP16 tensor core GemmEx**: Batch matmuls use `dequant_to_f16` + `cublasGemmEx` (tensor cores) with persistent FP16 weight cache
+- **Batched DeltaNet projections**: 5 linear projections (QKV, Alpha, Beta, Gate, Out) batched for all T tokens; only conv1d + state update remain sequential
+- **GPU AdamW**: Entire optimizer step on device with contiguous LoRA params (3 kernel launches)
 - **Gradient clipping**: Computed on GPU via `GradNormSq` kernel
 
 ## Data Formats
@@ -236,20 +236,30 @@ Binary format storing LoRA A/B matrices per layer:
 
 ## Performance
 
-Benchmarks on RTX 5080 with Qwen 3.5 0.8B Q8_0, seq-len 64:
+Benchmarks on RTX 5080 with Qwen 3.5 0.8B Q8_0:
 
-| Metric | Value |
-|--------|-------|
-| Training speed | 4.3 seq/s |
-| Loss convergence | 4.5 -> 0.001 (1 epoch) |
-| Trainable params | 4.67M (rank=8, targets=qkvofd) |
-| GPU memory | ~2 GB (model + activations + optimizer) |
-| Training time | 5.2 min (1320 steps, 1 epoch) |
+| Metric | seq-len 128 | seq-len 256 |
+|--------|------------|------------|
+| Training speed | 2.5 seq/s | 0.6 seq/s |
+| Trainable params | 540K (rank=8, targets=qkvo) | 540K |
+| GPU memory | ~2 GB | ~2.5 GB |
+| Loss convergence | 2.0 → 0.92 (80 steps, 10 epochs) | Stable (2.82 avg) |
+
+Training is 96x faster than CPU (0.026 seq/s).
 
 ## Bug Fixes Applied
 
+### SwiGLU Q8_1 Scratch Overflow (Critical)
+The fused `swiglu_q8_1` kernel wrote Q8_1 data for ALL M×N elements during batched FFN, but `_q8_1Scratch` was sized for single-token only. This caused GPU memory corruption and garbage output from all batched prefill and training forward passes with M>1. Fixed by checking `n <= _q8_1ScratchK` before using the fused path.
+
+### Arena Corruption at seqLen>208
+The training CudaArenaAllocator caused non-deterministic forward results at seqLen>208 (loss diverged from 2.7 to 23.0 even with LR=0). Arena disabled in favor of per-tensor Pool dict allocation until root cause in tensor adjacency is resolved.
+
+### Non-Power-of-2 Attention Reduction
+`training_causal_gated_attention` and its backward kernel launched with `threads=T`, but the shared-memory parallel reduction (`blockDim.x / 2`) drops elements when blockDim.x is not a power of 2. Fixed by rounding thread count to next power of 2.
+
+### DeltaNet Arena Registrations
+Arena registered DeltaNet single-token buffers with massively oversized dimensions (`T * ssmInner * 3 = 1.5M` for a tensor needing only `qkvDim = 6K`). Fixed by using actual weight dimensions from model tensors.
+
 ### Q8_0 Alignment (K < 2048)
 The dp4a matmul kernel requires 36-byte aligned Q8_0 blocks. `LoadTensor` only repacked for K >= 2048, causing NaN on the 0.8B model (K=1024). Fixed by repacking all Q8_0 2D tensors.
-
-### F32 Weight Forward
-The `dequant_to_f32` kernel had issues with aligned Q8_0 format in `BatchMatMul`. Training forward now uses `DequantToGpu` (cached F32 via cuBLAS SGEMM) for all matmuls, bypassing the buggy kernel.

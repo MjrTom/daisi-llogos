@@ -62,15 +62,12 @@ public sealed class PipelinedForwardPass : IForwardPass
 
     public ReadOnlySpan<float> Forward(int tokenId, int position)
     {
-        SwapWeights(_weightsA);
         _forward.ForwardEmbedding(tokenId);
 
         for (int layer = 0; layer < _config.NumLayers; layer++)
         {
-            int slot = layer % 2;
-            var weights = slot == 0 ? _weightsA : _weightsB;
-            UploadLayer(layer, weights);
-            SwapWeights(weights);
+            UploadLayer(layer, _weightsA);
+            _cuda.InvalidateWeightCache();
             _forward.ForwardLayers(layer, layer + 1, position,
                 continuation: layer > 0, isFinal: layer == _config.NumLayers - 1);
         }
@@ -82,15 +79,12 @@ public sealed class PipelinedForwardPass : IForwardPass
 
     public void ForwardHidden(int tokenId, int position)
     {
-        SwapWeights(_weightsA);
         _forward.ForwardEmbedding(tokenId);
 
         for (int layer = 0; layer < _config.NumLayers; layer++)
         {
-            int slot = layer % 2;
-            var weights = slot == 0 ? _weightsA : _weightsB;
-            UploadLayer(layer, weights);
-            SwapWeights(weights);
+            UploadLayer(layer, _weightsA);
+            _cuda.InvalidateWeightCache();
             _forward.ForwardLayers(layer, layer + 1, position,
                 continuation: layer > 0, isFinal: layer == _config.NumLayers - 1);
         }
@@ -98,62 +92,74 @@ public sealed class PipelinedForwardPass : IForwardPass
 
     public void ResetState() => _forward.ResetState();
 
-    /// <summary>Swap ForwardPass._weights via reflection (zero impact on normal path).</summary>
-    private void SwapWeights(ModelWeights weights) =>
+    /// <summary>Swap ForwardPass._weights via reflection and invalidate stale caches.</summary>
+    private void SwapWeights(ModelWeights weights)
+    {
         WeightsField.SetValue(_forward, weights);
+        _cuda.InvalidateWeightCache();
+    }
 
-    /// <summary>Upload layer weights from mmap shard into the slot's GPU tensors.</summary>
+    /// <summary>Upload layer weights from mmap shard into the slot's GPU tensors.
+    /// Uses async H2D on the compute stream to ensure proper cache coherence.</summary>
     private unsafe void UploadLayer(int layerIndex, ModelWeights targetWeights)
     {
         var data = _layerData[layerIndex];
         var targets = LayerShardData.GetTargetTensors(data, targetWeights.Layers[layerIndex]);
+        nint computeStream = _cuda.ComputeStreamHandle;
 
         for (int t = 0; t < data.Tensors.Count; t++)
         {
             var tr = data.Tensors[t];
             byte* src = tr.MmapPtr;
+            var ct = (CudaTensor)targets[t];
 
-            // Repack quantized data to GPU-aligned layout (or straight copy if gpuAligned)
-            byte[] repacked;
             if (_gpuAligned)
             {
-                repacked = new byte[tr.RawByteSize];
-                fixed (byte* dst = repacked)
-                    Buffer.MemoryCopy(src, dst, tr.RawByteSize, tr.RawByteSize);
+                // GPU-aligned shards: data is already in GPU layout — direct async copy
+                CudaApi.Check(CudaApi.MemcpyHtoDAsync(ct.DevicePtr, src, (ulong)tr.RawByteSize,
+                    computeStream), "cuMemcpyHtoDAsync");
             }
             else if (tr.Type == GgmlType.Q4_0 && tr.NDimensions >= 2)
             {
                 int bc = tr.RawByteSize / 18;
-                repacked = new byte[bc * 20];
+                var repacked = new byte[bc * 20];
                 fixed (byte* dst = repacked)
+                {
                     for (int b = 0; b < bc; b++)
                     {
                         byte* s = src + b * 18; byte* d = dst + b * 20;
                         d[0] = s[0]; d[1] = s[1]; d[2] = 0; d[3] = 0;
                         Buffer.MemoryCopy(s + 2, d + 4, 16, 16);
                     }
+                    CudaApi.Check(CudaApi.MemcpyHtoDAsync(ct.DevicePtr, dst, (ulong)repacked.Length,
+                        computeStream), "cuMemcpyHtoDAsync");
+                }
             }
             else if (tr.Type == GgmlType.Q8_0 && tr.NDimensions >= 2)
             {
                 int bc = tr.RawByteSize / 34;
-                repacked = new byte[bc * 36];
+                var repacked = new byte[bc * 36];
                 fixed (byte* dst = repacked)
+                {
                     for (int b = 0; b < bc; b++)
                     {
                         byte* s = src + b * 34; byte* d = dst + b * 36;
                         d[0] = s[0]; d[1] = s[1]; d[2] = 0; d[3] = 0;
                         Buffer.MemoryCopy(s + 2, d + 4, 32, 32);
                     }
+                    CudaApi.Check(CudaApi.MemcpyHtoDAsync(ct.DevicePtr, dst, (ulong)repacked.Length,
+                        computeStream), "cuMemcpyHtoDAsync");
+                }
             }
             else
             {
-                repacked = new byte[tr.RawByteSize];
-                fixed (byte* dst = repacked)
-                    Buffer.MemoryCopy(src, dst, tr.RawByteSize, tr.RawByteSize);
+                CudaApi.Check(CudaApi.MemcpyHtoDAsync(ct.DevicePtr, src, (ulong)tr.RawByteSize,
+                    computeStream), "cuMemcpyHtoDAsync");
             }
-
-            targets[t].CopyFrom(repacked);
         }
+
+        // Sync compute stream to ensure all uploads complete before kernels read the data
+        CudaApi.Check(CudaApi.StreamSynchronize(computeStream), "cuStreamSynchronize");
     }
 
     public void Dispose()
@@ -197,8 +203,9 @@ public sealed class PipelinedForwardPass : IForwardPass
 
         var weightsA = AllocateSlot(cuda, config, tensorInfoMap, "slotA",
             embedWeights, outputWeights);
-        var weightsB = AllocateSlot(cuda, config, tensorInfoMap, "slotB",
-            embedWeights, outputWeights);
+        // Only one slot needed — Forward always uploads to weightsA before each layer.
+        // Second slot was for async double-buffering (currently unused).
+        var weightsB = weightsA;
 
         // DeltaNetState
         var deltaState = new DeltaNetState(cuda, config, weightsA);
@@ -210,6 +217,20 @@ public sealed class PipelinedForwardPass : IForwardPass
             var shardPath = Path.Combine(shardDir, $"{baseName}.layer.{i}");
             layerData[i] = LayerShardData.Load(shardPath, i, config, gguf, mmapHandles);
         }
+
+        // Ensure Q8_1 scratch covers ALL tensor dimensions (not just the shared allocation's).
+        // With shared allocation, only 1-2 layers are allocated via LoadTensor, which sizes
+        // the scratch for those layers' K dimensions. Other layers may have larger K (e.g.
+        // FfnDown with intermediate_dim > hidden_dim). Pre-size for the max across all layers.
+        int maxK = 0;
+        foreach (var t in gguf.Tensors)
+        {
+            if (t.Dimensions.Length >= 2 &&
+                (t.Type == Gguf.GgmlType.Q4_0 || t.Type == Gguf.GgmlType.Q8_0))
+                maxK = Math.Max(maxK, (int)t.Dimensions[0]);
+        }
+        if (maxK > 0)
+            cuda.EnsureQ8_1Scratch(maxK);
 
         // Create ForwardPass with slot A weights (graph capture disabled for weight swapping)
         var forward = new ForwardPass(cuda, config, weightsA, kvCache, deltaState);
@@ -226,6 +247,9 @@ public sealed class PipelinedForwardPass : IForwardPass
         Dictionary<string, GgufTensorInfo> tensorInfoMap, string prefix,
         ModelWeights embedWeights, ModelWeights outputWeights)
     {
+        // Per-layer allocation: each layer gets its own GPU tensors.
+        // Upload overwrites tensor data via H2D before each layer's compute.
+        // All tensors start zeroed; real data arrives via UploadLayer.
         var layers = new LayerWeights[config.NumLayers];
         for (int i = 0; i < config.NumLayers; i++)
         {
@@ -237,7 +261,6 @@ public sealed class PipelinedForwardPass : IForwardPass
 
         return new ModelWeights
         {
-            // Share embed/output with the persistent weights
             TokenEmbedding = embedWeights.TokenEmbedding,
             OutputNorm = outputWeights.OutputNorm,
             Output = outputWeights.Output,
@@ -341,6 +364,9 @@ public sealed class PipelinedForwardPass : IForwardPass
                         "attn_o" => saw.AttnO,
                         "attn_q_norm" => saw.AttnQNorm!,
                         "attn_k_norm" => saw.AttnKNorm!,
+                        "attn_q_bias" => saw.AttnQBias!,
+                        "attn_k_bias" => saw.AttnKBias!,
+                        "attn_v_bias" => saw.AttnVBias!,
                         "ffn_gate" => saw.FfnGate,
                         "ffn_up" => saw.FfnUp,
                         "ffn_down" => saw.FfnDown,
@@ -418,6 +444,9 @@ public sealed class PipelinedForwardPass : IForwardPass
                 AddRef("attn_o", $"blk.{i}.attn_output.weight");
                 AddRef("attn_q_norm", $"blk.{i}.attn_q_norm.weight");
                 AddRef("attn_k_norm", $"blk.{i}.attn_k_norm.weight");
+                AddRef("attn_q_bias", $"blk.{i}.attn_q.bias");
+                AddRef("attn_k_bias", $"blk.{i}.attn_k.bias");
+                AddRef("attn_v_bias", $"blk.{i}.attn_v.bias");
             }
             else
             {

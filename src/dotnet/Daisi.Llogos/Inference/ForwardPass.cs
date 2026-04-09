@@ -11,7 +11,7 @@ public sealed class ForwardPass : IForwardPass
 {
     private readonly IComputeBackend _backend;
     private readonly ModelConfig _config;
-    private readonly ModelWeights _weights;
+    private ModelWeights _weights; // not readonly: PipelinedForwardPass swaps via reflection
     private readonly IKvCache _kvCache;
     private readonly DeltaNetState _deltaState;
 
@@ -65,6 +65,7 @@ public sealed class ForwardPass : IForwardPass
     private ITensor? _bGate, _bUp;
     private ITensor? _bFusedQkvOut, _bFusedGateUpOut;
     private ITensor? _bQFull;
+    private ITensor? _bDnQkv, _bDnAlpha, _bDnBeta, _bDnGate, _bDnOutput;
 
     public ForwardPass(IComputeBackend backend, ModelConfig config, ModelWeights weights,
         IKvCache kvCache, DeltaNetState deltaState)
@@ -247,6 +248,7 @@ public sealed class ForwardPass : IForwardPass
             // Last layer: do ElementAdd now (no next layer to fuse with)
             if (layer == _config.NumLayers - 1)
                 _backend.ElementAdd(_hidden, _hidden, _residual);
+
             // Other layers: defer ElementAdd to fuse with next layer's RmsNormResidual
 
             // Early exit profiling: check what token each layer would predict
@@ -404,6 +406,86 @@ public sealed class ForwardPass : IForwardPass
 
     // ── DeltaNet (Gated Linear Attention) ────────────────────────────────────
 
+    /// <summary>
+    /// Batched DeltaNet prefill: batch the linear projections, loop only over
+    /// the sequential recurrent state updates.
+    /// </summary>
+    private void BatchedForwardDeltaNet(DeltaNetWeights w, int layer, int startPosition, int M)
+    {
+        int hDim = _config.HiddenDim;
+        int convKernel = _config.SsmConvKernel;
+        int headDim = _config.SsmStateSize > 0 ? _config.SsmStateSize : _config.SsmHeadDim;
+        int numVHeads = (int)w.SsmAlpha.Dimensions[1];
+        int valueDim = numVHeads * headDim;
+        int qkvOutDim = (int)w.AttnQkv.Dimensions[1];
+        int keyDim = (qkvOutDim - valueDim) / 2;
+        int numKHeads = keyDim / headDim;
+        int repeatFactor = numVHeads / numKHeads;
+        int convChannels = (int)(w.SsmConv1d.ElementCount / convKernel);
+
+        // ── Phase 1: Batched linear projections (all M tokens at once) ──
+        ProjectLinearBatched(_bDnQkv!, _bNormOut!, w.AttnQkv, M);
+        ProjectLinearBatched(_bDnAlpha!, _bNormOut!, w.SsmAlpha, M);
+        ProjectLinearBatched(_bDnBeta!, _bNormOut!, w.SsmBeta, M);
+        ProjectLinearBatched(_bDnGate!, _bNormOut!, w.AttnGate, M);
+
+        // ── Phase 2: Sequential per-token processing (conv1d + state update) ──
+        for (int t = 0; t < M; t++)
+        {
+            // Extract token t's pre-computed QKV projection
+            _backend.CopyTensorSlice(_qkvBuf, 0, _bDnQkv!, t * qkvOutDim, qkvOutDim);
+
+            // CausalConv1d (state-dependent — uses conv buffer)
+            var convBuf = _deltaState.GetConvBufferTensor(layer);
+            _backend.CausalConv1d(_qkvBuf, convBuf, w.SsmConv1d, convChannels, convKernel);
+
+            // SiLU activation
+            _backend.SiLUInPlace(_qkvBuf);
+
+            // Split Q/K/V
+            if (keyDim == valueDim)
+                _backend.SplitQKV(_ssmQ, _ssmK, _ssmV, _qkvBuf, keyDim);
+            else
+                _backend.SplitUnequalQKV(_ssmQ, _ssmK, _ssmV, _qkvBuf, keyDim, valueDim);
+
+            // L2-normalize Q and K
+            _backend.L2NormGroups(_ssmQ, numKHeads, headDim);
+            _backend.L2NormGroups(_ssmK, numKHeads, headDim);
+
+            // Tile Q and K from num_k_heads → num_v_heads
+            if (repeatFactor > 1)
+            {
+                _backend.RepeatTile(_ssmQ, numKHeads, headDim, repeatFactor);
+                _backend.RepeatTile(_ssmK, numKHeads, headDim, repeatFactor);
+            }
+
+            // Extract pre-computed alpha/beta
+            _backend.CopyTensorSlice(_ssmAlpha, 0, _bDnAlpha!, t * numVHeads, numVHeads);
+            _backend.CopyTensorSlice(_ssmBeta, 0, _bDnBeta!, t * numVHeads, numVHeads);
+
+            // Compute decay and beta values
+            _backend.ComputeDecayBeta(_ssmDecay, _ssmBetaVal, _ssmAlpha, _ssmBeta,
+                w.SsmA, w.SsmDtBias, numVHeads);
+
+            // DeltaNet state update (state-dependent)
+            var stateTensor = _deltaState.GetStateTensor(layer);
+            float scale = 1.0f / MathF.Sqrt(headDim);
+            _backend.DeltaNetStep(_ssmOutput, _ssmQ, _ssmK, _ssmV,
+                stateTensor, _ssmDecay, _ssmBetaVal,
+                w.SsmNorm, numVHeads, headDim, scale, _config.NormEps);
+
+            // Extract pre-computed gate, apply SiLU gate
+            _backend.CopyTensorSlice(_ssmGate, 0, _bDnGate!, t * valueDim, valueDim);
+            _backend.SiLUGate(_ssmOutput, _ssmOutput, _ssmGate);
+
+            // Collect output for batched output projection
+            _backend.CopyTensorSlice(_bDnOutput!, t * valueDim, _ssmOutput, 0, valueDim);
+        }
+
+        // ── Phase 3: Batched output projection ──
+        ProjectLinearBatched(_bHidden!, _bDnOutput!, w.SsmOut, M);
+    }
+
     private void ForwardDeltaNet(DeltaNetWeights w, int layer)
     {
         int convKernel = _config.SsmConvKernel;
@@ -552,22 +634,19 @@ public sealed class ForwardPass : IForwardPass
 
         EnsureBatchBuffers(M);
 
-        // Don't use BeginCommands — graph capture disallows cuMemAlloc which
-        // BatchMatMul needs for dequant buffers. Batched prefill is one-shot
-        // anyway, so graph replay provides no benefit.
-
         // 1. Embedding lookup: M tokens → [M × hiddenDim]
         int hDim = _config.HiddenDim;
-        for (int i = 0; i < M; i++)
+        if (_backend.SupportsBatchedOps)
         {
-            _backend.EmbeddingLookup(_hidden, _weights.TokenEmbedding, tokenIds[i]);
-            _backend.CopyTensorSlice(_bHidden!, i * hDim, _hidden, 0, hDim);
+            _backend.BatchedEmbeddingLookup(_bHidden!, _weights.TokenEmbedding, tokenIds);
         }
-
-        for (int i = 0; i < M; i++)
+        else
         {
-            _backend.EmbeddingLookup(_hidden, _weights.TokenEmbedding, tokenIds[i]);
-            _backend.CopyTensorSlice(_bHidden!, i * hDim, _hidden, 0, hDim);
+            for (int i = 0; i < M; i++)
+            {
+                _backend.EmbeddingLookup(_hidden, _weights.TokenEmbedding, tokenIds[i]);
+                _backend.CopyTensorSlice(_bHidden!, i * hDim, _hidden, 0, hDim);
+            }
         }
 
         // 2. Transformer layers
@@ -575,7 +654,7 @@ public sealed class ForwardPass : IForwardPass
         {
             var lw = _weights.Layers[layer];
 
-            // Fused RmsNorm (batched — detects M from tensor size)
+            // Fused RmsNorm (batched)
             if (layer == 0)
                 _backend.RmsNormResidual(_bNormOut!, _bResidual!, _bHidden!, lw.AttnNorm, _config.NormEps);
             else
@@ -583,33 +662,32 @@ public sealed class ForwardPass : IForwardPass
 
             if (lw is StandardAttentionWeights saw)
             {
-                // Standard attention (fully batched)
                 BatchedForwardStandardAttention(saw, startPosition, layer, M);
             }
             else if (lw is DeltaNetWeights dnw)
             {
-                // DeltaNet: process each token sequentially (state updates are order-dependent)
-                // Extract single-token normOut → run DeltaNet → put hidden back
-                for (int t = 0; t < M; t++)
+                if (_bDnQkv != null)
+                    BatchedForwardDeltaNet(dnw, layer, startPosition, M);
+                else
                 {
-                    _backend.CopyTensorSlice(_normOut, 0, _bNormOut!, t * hDim, hDim);
-                    ForwardDeltaNet(dnw, layer);
-                    _backend.CopyTensorSlice(_bHidden!, t * hDim, _hidden, 0, hDim);
+                    for (int t = 0; t < M; t++)
+                    {
+                        _backend.CopyTensorSlice(_normOut, 0, _bNormOut!, t * hDim, hDim);
+                        ForwardDeltaNet(dnw, layer);
+                        _backend.CopyTensorSlice(_bHidden!, t * hDim, _hidden, 0, hDim);
+                    }
                 }
             }
 
             _backend.AddRmsNorm(_bNormOut!, _bHidden!, _bHidden!, _bResidual!, lw.PostAttnNorm, _config.NormEps);
             _backend.CopyTensor(_bResidual!, _bHidden!);
 
-            // FFN (batched — MatMul handles M>1 via cuBLAS)
-            // Always use non-fused path: SplitSwiGLU assumes flat [gate|up] layout
-            // which doesn't work for M>1 (per-token interleaving).
+            // FFN (batched)
             ProjectLinearBatched(_bGate!, _bNormOut!, lw.FfnGate, M);
             ProjectLinearBatched(_bUp!, _bNormOut!, lw.FfnUp, M);
             _backend.SwiGLU(_bGate!, _bGate!, _bUp!);
             ProjectLinearBatched(_bHidden!, _bGate!, lw.FfnDown, M);
 
-            // Last layer: do ElementAdd
             if (layer == _config.NumLayers - 1)
                 _backend.ElementAdd(_bHidden!, _bHidden!, _bResidual!);
         }
@@ -693,9 +771,6 @@ public sealed class ForwardPass : IForwardPass
         int ropeDim = _config.RopeDimCount;
         float scale = 1.0f / MathF.Sqrt(keyLen);
 
-        // Q/K/V projections (M-wide MatMul via cuBLAS SGEMM)
-        // Always use separate projections for batched prefill — fused QKV would
-        // require M scatter copies to deinterleave the per-token [Q,K,V] layout.
         if (w.HasGatedQ)
         {
             ProjectLinearBatched(_bKProj!, _bNormOut!, w.AttnK, M);
@@ -718,25 +793,19 @@ public sealed class ForwardPass : IForwardPass
             }
         }
 
-        // Batched RoPE (M positions)
         _backend.BatchedRoPE(_bQAttn!, _bKProj!, keyLen, ropeDim, startPosition, _config.RopeTheta,
             numHeads, numKvHeads);
-
-        // Batched KV cache write
         _kvCache.BatchedWrite(_backend, layer, startPosition, M, _bKProj!, _bVProj!);
 
-        // Batched causal attention
         var kCacheTensor = _kvCache.GetKCacheTensor(layer);
         var vCacheTensor = _kvCache.GetVCacheTensor(layer);
 
-        // Fill gate with 88.0 for non-gated models (sigmoid(88)≈1)
         if (!w.HasGatedQ)
             _backend.FillTensor(_bQGate!, 88.0f);
 
         _backend.BatchedGatedAttention(_bAttnOut!, _bQAttn!, _bQGate!, kCacheTensor, vCacheTensor,
             numHeads, numKvHeads, keyLen, valLen, _kvCache.MaxSeqLen, startPosition, M, scale);
 
-        // Output projection (M-wide)
         ProjectLinearBatched(_bHidden!, _bAttnOut!, w.AttnO, M);
     }
 
@@ -767,6 +836,29 @@ public sealed class ForwardPass : IForwardPass
 
         if (_qFull != null)
             _bQFull = CreateF32("batch_q_full", M * numHeads * keyLen * 2);
+
+        // DeltaNet batch buffers
+        if (_config.HasDeltaNet)
+        {
+            DeltaNetWeights? dlw = null;
+            for (int i = 0; i < _config.NumLayers; i++)
+                if (!_config.IsStandardAttention(i) && _weights.Layers[i] is DeltaNetWeights dw)
+                    { dlw = dw; break; }
+            if (dlw != null)
+            {
+                int qkvDim = (int)dlw.AttnQkv.Dimensions[1];
+                int nVHeads = (int)dlw.SsmAlpha.Dimensions[1];
+                int hd = _config.SsmStateSize > 0 ? _config.SsmStateSize : _config.SsmHeadDim;
+                int vDim = nVHeads * hd;
+                int gateDim = (int)dlw.AttnGate.Dimensions[1];
+
+                _bDnQkv = CreateF32("batch_dn_qkv", M * qkvDim);
+                _bDnAlpha = CreateF32("batch_dn_alpha", M * nVHeads);
+                _bDnBeta = CreateF32("batch_dn_beta", M * nVHeads);
+                _bDnGate = CreateF32("batch_dn_gate", M * gateDim);
+                _bDnOutput = CreateF32("batch_dn_out", M * vDim);
+            }
+        }
     }
 
     private void DisposeBatchBuffers()
@@ -777,9 +869,12 @@ public sealed class ForwardPass : IForwardPass
         _bGate?.Dispose(); _bUp?.Dispose();
         _bFusedQkvOut?.Dispose(); _bFusedGateUpOut?.Dispose();
         _bQFull?.Dispose();
+        _bDnQkv?.Dispose(); _bDnAlpha?.Dispose(); _bDnBeta?.Dispose();
+        _bDnGate?.Dispose(); _bDnOutput?.Dispose();
         _bHidden = _bResidual = _bNormOut = null;
         _bQAttn = _bQGate = _bKProj = _bVProj = _bAttnOut = null;
         _bGate = _bUp = _bFusedQkvOut = _bFusedGateUpOut = _bQFull = null;
+        _bDnQkv = _bDnAlpha = _bDnBeta = _bDnGate = _bDnOutput = null;
         _batchM = 0;
     }
 

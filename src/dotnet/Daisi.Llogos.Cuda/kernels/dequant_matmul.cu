@@ -1575,4 +1575,131 @@ __global__ void dequant_matmul_q1_0(float* output, const float* a,
     }
 }
 
+// ── Batched Q8_0 × Q8_1 MatMul (M > 1): Shared-memory weight tiling ────────
+// output[M×N] = a[M×K] × b^T[N×K]
+//   a: Q8_1 activation [M rows, each row = blocks_per_row × 36 bytes]
+//   b: Q8_0 aligned weight [N rows × blocks_per_row × 36 bytes]
+//
+// Strategy: One block per output column (n). Weight row loaded into shared
+// memory ONCE, then reused for ALL M activation rows. This reduces global
+// memory reads of weights from N×M to N (128× savings for M=128).
+//
+// Grid: (N, 1, 1) — one block per output column
+// Block: (256, 1, 1) — 8 warps cooperate on K reduction
+//
+// K dimension processed in chunks that fit shared memory.
+// For each K chunk: load weight into shared memory, then for each M row,
+// load activation from global, dp4a with shared weight, warp-reduce, write.
+
+#define BATCH_Q8_BLOCK_SIZE 256
+#define BATCH_Q8_K_CHUNK 32  // Q8_0 blocks per shared memory chunk (32×36=1152 bytes)
+
+__global__ __launch_bounds__(BATCH_Q8_BLOCK_SIZE)
+void batched_matmul_q8_0_q8_1(
+    float* __restrict__ output,           // [M × N]
+    const unsigned char* __restrict__ a,  // Q8_1 [M × blocks_per_row × 36]
+    const unsigned char* __restrict__ b,  // Q8_0 aligned [N × blocks_per_row × 36]
+    int M, int K, int N)
+{
+    int n = blockIdx.x;
+    if (n >= N) return;
+
+    int tid = threadIdx.x;
+    int blocks_per_row = K / 32;
+    long bytes_per_row = (long)blocks_per_row * 36;
+
+    // Shared memory: weight scales + quants for K_CHUNK blocks
+    // Layout: [K_CHUNK × float scale] [K_CHUNK × 8 × int quants]
+    extern __shared__ float smem[];
+    float* w_scales = smem;                             // K_CHUNK floats
+    int* w_quants = (int*)(smem + BATCH_Q8_K_CHUNK);   // K_CHUNK × 8 ints
+
+    const unsigned char* b_row = b + (long)n * bytes_per_row;
+
+    // Per-row partial sums stored in registers (accumulate across K chunks)
+    // Process M rows in batches to limit register pressure
+    #define BATCH_M_TILE 8
+    for (int m_start = 0; m_start < M; m_start += BATCH_M_TILE)
+    {
+        int m_end = m_start + BATCH_M_TILE;
+        if (m_end > M) m_end = M;
+        int tile_m = m_end - m_start;
+
+        float sums[BATCH_M_TILE];
+        #pragma unroll
+        for (int i = 0; i < BATCH_M_TILE; i++) sums[i] = 0.0f;
+
+        // Outer loop: K chunks. Weight loaded once per chunk, reused for tile_m rows.
+        for (int k_start = 0; k_start < blocks_per_row; k_start += BATCH_Q8_K_CHUNK)
+        {
+            int k_end = k_start + BATCH_Q8_K_CHUNK;
+            if (k_end > blocks_per_row) k_end = blocks_per_row;
+            int chunk_size = k_end - k_start;
+
+            // Load weight K chunk into shared memory (all threads cooperate)
+            for (int blk = tid; blk < chunk_size; blk += BATCH_Q8_BLOCK_SIZE)
+            {
+                const unsigned char* wblk = b_row + (k_start + blk) * 36;
+                w_scales[blk] = fp16_to_fp32(__ldg(reinterpret_cast<const unsigned short*>(wblk)));
+                const int* wq = reinterpret_cast<const int*>(wblk + 4);
+                int base = blk * 8;
+                w_quants[base+0] = __ldg(&wq[0]); w_quants[base+1] = __ldg(&wq[1]);
+                w_quants[base+2] = __ldg(&wq[2]); w_quants[base+3] = __ldg(&wq[3]);
+                w_quants[base+4] = __ldg(&wq[4]); w_quants[base+5] = __ldg(&wq[5]);
+                w_quants[base+6] = __ldg(&wq[6]); w_quants[base+7] = __ldg(&wq[7]);
+            }
+            __syncthreads();
+
+            // Inner loop: process each M row against the shared weight chunk
+            for (int mi = 0; mi < tile_m; mi++)
+            {
+                int m = m_start + mi;
+                const unsigned char* a_row = a + (long)m * bytes_per_row;
+
+                for (int blk = tid; blk < chunk_size; blk += BATCH_Q8_BLOCK_SIZE)
+                {
+                    const unsigned char* ablk = a_row + (k_start + blk) * 36;
+                    float a_scale = fp16_to_fp32(__ldg(reinterpret_cast<const unsigned short*>(ablk)));
+                    const int* a_qs = reinterpret_cast<const int*>(ablk + 4);
+
+                    float ws = w_scales[blk];
+                    int base = blk * 8;
+
+                    int sumi = 0;
+                    sumi = __dp4a(__ldg(&a_qs[0]), w_quants[base+0], sumi);
+                    sumi = __dp4a(__ldg(&a_qs[1]), w_quants[base+1], sumi);
+                    sumi = __dp4a(__ldg(&a_qs[2]), w_quants[base+2], sumi);
+                    sumi = __dp4a(__ldg(&a_qs[3]), w_quants[base+3], sumi);
+                    sumi = __dp4a(__ldg(&a_qs[4]), w_quants[base+4], sumi);
+                    sumi = __dp4a(__ldg(&a_qs[5]), w_quants[base+5], sumi);
+                    sumi = __dp4a(__ldg(&a_qs[6]), w_quants[base+6], sumi);
+                    sumi = __dp4a(__ldg(&a_qs[7]), w_quants[base+7], sumi);
+
+                    sums[mi] += a_scale * ws * (float)sumi;
+                }
+            }
+            __syncthreads(); // ensure all threads done before next K chunk overwrites shared mem
+        }
+
+        // Reduce and write results for this M tile
+        for (int mi = 0; mi < tile_m; mi++)
+        {
+            float s = warp_reduce_sum(sums[mi]);
+            int lane = tid & 31;
+            int warp = tid >> 5;
+            float* red = smem;
+            if (lane == 0) red[warp] = s;
+            __syncthreads();
+            int numWarps = BATCH_Q8_BLOCK_SIZE >> 5;
+            if (tid < numWarps) s = red[tid]; else s = 0.0f;
+            s = warp_reduce_sum(s);
+
+            if (tid == 0)
+                output[(m_start + mi) * N + n] = s;
+            __syncthreads();
+        }
+    }
+    #undef BATCH_M_TILE
+}
+
 } // extern "C"
