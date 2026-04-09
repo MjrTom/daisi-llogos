@@ -47,6 +47,12 @@ public sealed class DaisiLlogosModelHandle : IDisposable
     /// </summary>
     public IForwardPass? OffloadForwardFactory { get; set; }
 
+    /// <summary>
+    /// Optional shard directory for pipelined inference (models > VRAM).
+    /// When set, CreateInferenceResources uses PipelinedForwardPass via reflection.
+    /// </summary>
+    public string? PipelineShardDir { get; set; }
+
     /// <summary>Number of layers kept in VRAM (0 = all). Set by backend.</summary>
     public int GpuLayerCount { get; set; }
 
@@ -97,11 +103,17 @@ public sealed class DaisiLlogosModelHandle : IDisposable
         }
         else
         {
+            // Pipeline mode: stream layers from shards (for models > VRAM)
+            if (PipelineShardDir != null)
+            {
+                var pipeForward = TryCreatePipelineForward(contextSize);
+                if (pipeForward != null)
+                    return (pipeForward, pipeForward.KvCache);
+            }
+
             IKvCache kvCache;
             if (TurboConfig != null)
             {
-                // Use CPU TurboQuant — CUDA version has dispose threading issues
-                // TODO: switch to CudaTurboQuantKvCache when CUDA dispose is fixed
                 kvCache = new TurboQuantKvCache(Backend, Config, contextSize, TurboConfig);
             }
             else
@@ -111,7 +123,6 @@ public sealed class DaisiLlogosModelHandle : IDisposable
             var deltaState = new DeltaNetState(Backend, Config, Weights);
             IForwardPass forward = new ForwardPass(Backend, Config, Weights, kvCache, deltaState);
 
-            // Wrap with offload forward pass if GPU layer offloading is active
             if (GpuLayerCount > 0)
             {
                 forward = TryWrapWithOffload(forward) ?? forward;
@@ -125,6 +136,23 @@ public sealed class DaisiLlogosModelHandle : IDisposable
     /// Try to wrap a forward pass with OffloadForwardPass via reflection.
     /// Returns null if offload classes aren't available or swapper isn't initialized.
     /// </summary>
+    private IForwardPass? TryCreatePipelineForward(int contextSize)
+    {
+        try
+        {
+            var pfType = Type.GetType("Daisi.Llogos.Cuda.PipelinedForwardPass, Daisi.Llogos.Cuda");
+            if (pfType == null) return null;
+            var createMethod = pfType.GetMethod("Create", System.Reflection.BindingFlags.Public | System.Reflection.BindingFlags.Static);
+            if (createMethod == null) return null;
+            return (IForwardPass?)createMethod.Invoke(null, [Gguf, PipelineShardDir, Config, Backend, contextSize]);
+        }
+        catch (Exception ex)
+        {
+            Console.Error.WriteLine($"  Pipeline init failed: {ex.InnerException?.Message ?? ex.Message}");
+            return null;
+        }
+    }
+
     private IForwardPass? TryWrapWithOffload(IForwardPass inner)
     {
         try

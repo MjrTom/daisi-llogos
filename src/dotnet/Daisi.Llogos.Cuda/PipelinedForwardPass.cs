@@ -237,7 +237,6 @@ public sealed class PipelinedForwardPass : IForwardPass
 
         return new ModelWeights
         {
-            // Share embed/output with the persistent weights
             TokenEmbedding = embedWeights.TokenEmbedding,
             OutputNorm = outputWeights.OutputNorm,
             Output = outputWeights.Output,
