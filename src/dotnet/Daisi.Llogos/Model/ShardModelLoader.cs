@@ -22,6 +22,11 @@ public static class ShardModelLoader
         var baseName = FindShardBaseName(shardDir);
         var mmapHandles = new List<IDisposable>();
 
+        // Check manifest for GPU-aligned shards
+        var manifestPath = Path.Combine(shardDir, $"{baseName}.manifest.json");
+        bool gpuAligned = File.Exists(manifestPath)
+            && Gguf.GgufShardManifest.FromJsonFile(manifestPath).GpuAligned;
+
         var tensorInfoMap = new Dictionary<string, GgufTensorInfo>(headerGguf.Tensors.Count);
         foreach (var t in headerGguf.Tensors)
             tensorInfoMap[t.Name] = t;
@@ -75,7 +80,7 @@ public static class ShardModelLoader
             if (i >= startLayer && i < endLayer)
             {
                 var layerPath = Path.Combine(shardDir, $"{baseName}.layer.{i}");
-                layers[i] = LoadLayerFromShard(layerPath, i, config, tensorInfoMap, backend, mmapHandles);
+                layers[i] = LoadLayerFromShard(layerPath, i, config, tensorInfoMap, backend, mmapHandles, gpuAligned);
             }
             else
             {
@@ -132,7 +137,7 @@ public static class ShardModelLoader
 
     private static unsafe LayerWeights LoadLayerFromShard(string shardPath, int layerIndex,
         ModelConfig config, Dictionary<string, GgufTensorInfo> tensorInfoMap,
-        IComputeBackend backend, List<IDisposable> handles)
+        IComputeBackend backend, List<IDisposable> handles, bool gpuAligned = false)
     {
         using var indexStream = File.OpenRead(shardPath);
         var shardIndex = GgufShardIndex.Read(indexStream);
@@ -153,6 +158,37 @@ public static class ShardModelLoader
                 throw new InvalidDataException($"Tensor '{name}' not found in layer shard");
             long offset = shardIndex.DataSectionOffset + entry.offset;
             var span = new ReadOnlySpan<byte>(basePtr + offset, (int)entry.byteSize);
+
+            // GPU-aligned shards have Q4_0 and Q8_0 data pre-repacked to aligned layout.
+            // backend.LoadTensor expects original layout, so de-align before loading.
+            if (gpuAligned && info.Dimensions.Length >= 2)
+            {
+                if (info.Type == Gguf.GgmlType.Q4_0)
+                {
+                    int bc = span.Length / 20;
+                    var orig = new byte[bc * 18];
+                    for (int b = 0; b < bc; b++)
+                    {
+                        int s = b * 20, d = b * 18;
+                        orig[d] = span[s]; orig[d + 1] = span[s + 1];
+                        span.Slice(s + 4, 16).CopyTo(orig.AsSpan(d + 2, 16));
+                    }
+                    return backend.LoadTensor(name, info.Type, ConvertDimensions(info), orig);
+                }
+                if (info.Type == Gguf.GgmlType.Q8_0)
+                {
+                    int bc = span.Length / 36;
+                    var orig = new byte[bc * 34];
+                    for (int b = 0; b < bc; b++)
+                    {
+                        int s = b * 36, d = b * 34;
+                        orig[d] = span[s]; orig[d + 1] = span[s + 1];
+                        span.Slice(s + 4, 32).CopyTo(orig.AsSpan(d + 2, 32));
+                    }
+                    return backend.LoadTensor(name, info.Type, ConvertDimensions(info), orig);
+                }
+            }
+
             return backend.LoadTensor(name, info.Type, ConvertDimensions(info), span);
         }
 
