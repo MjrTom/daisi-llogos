@@ -110,6 +110,62 @@ else
     else
         weights = ModelLoader.Load(gguf, stream, backend, config);
 
+    // ── Pipeline mode: stream layers from shards for models > VRAM ──────────
+    if (options.Pipeline && backend is CudaBackend pipelineCuda)
+    {
+        var shardDir = options.ModelPath + ".shards";
+        if (!Directory.Exists(shardDir))
+        {
+            Console.Error.WriteLine($"Shard directory not found: {shardDir}");
+            Console.Error.WriteLine("Run: daisi-llogos split --model <path> --align-gpu");
+            return 1;
+        }
+
+        var pipeForward = PipelinedForwardPass.Create(gguf, shardDir, config, pipelineCuda,
+            maxContext: options.MaxContext);
+
+        loadSw.Stop();
+        Console.Error.WriteLine($"Model loaded in {loadSw.Elapsed.TotalSeconds:F1}s " +
+            $"({config.Architecture}, {config.NumLayers} layers, {config.HiddenDim}d, pipeline)");
+        Console.Error.WriteLine($"Backend: {backend.Name}, Max tokens: {options.MaxTokens}");
+
+        var pipeGenerator = new TextGenerator(pipeForward, tokenizer, options.Seed);
+
+        if (options.Bench)
+        {
+            string benchPrompt = options.Prompt ?? "The meaning of life is";
+            Console.Error.WriteLine($"Benchmarking with prompt: \"{benchPrompt}\"");
+            Console.Error.WriteLine($"Backend: {backend.Name}, Max tokens: {options.MaxTokens}");
+            Console.Error.WriteLine();
+            var result = pipeGenerator.Benchmark(benchPrompt, options.MaxTokens);
+            Console.Error.WriteLine("=== Benchmark Results ===");
+            Console.Error.WriteLine($"  Prefill:  {result.PromptTokens,6} tokens in {result.PrefillTime.TotalMilliseconds,8:F1} ms  ({result.PrefillTokPerSec,8:F1} tok/s)");
+            Console.Error.WriteLine($"  Decode:   {result.GeneratedTokens,6} tokens in {result.DecodeTime.TotalMilliseconds,8:F1} ms  ({result.DecodeTokPerSec,8:F1} tok/s)");
+            Console.Error.WriteLine($"  Total:    {result.PromptTokens + result.GeneratedTokens,6} tokens in {result.TotalTime.TotalMilliseconds,8:F1} ms");
+            Console.Error.WriteLine($"  Load:     {loadSw.Elapsed.TotalMilliseconds,8:F1} ms");
+        }
+        else
+        {
+            foreach (var token in pipeGenerator.Generate(options.Prompt!, new GenerationParams
+            {
+                MaxTokens = options.MaxTokens, Temperature = options.Temperature,
+                TopK = options.TopK, TopP = options.TopP, RepetitionPenalty = options.RepeatPenalty,
+            }))
+            {
+                if (token.IsDone)
+                {
+                    Console.Error.WriteLine();
+                    Console.Error.WriteLine($"\n[prefill: {token.PrefillTokens} tokens, {token.PrefillTokensPerSecond:F1} tok/s | " +
+                        $"decode: {token.TotalTokens} tokens, {token.TokensPerSecond:F1} tok/s]");
+                }
+                else Console.Write(token.Text);
+            }
+        }
+        pipeForward.Dispose();
+        backend.Dispose();
+        return 0;
+    }
+
     var strategy = AttentionStrategy.Parse(options.Attention);
     int maxContext = strategy.Mode != AttentionMode.Full && strategy.CacheCapacity > 0
         ? strategy.CacheCapacity
@@ -434,6 +490,9 @@ static CliArgs ParseArgs(string[] args)
             case "--hybrid-layers":
                 result.HybridLayers = int.Parse(NextArg(args, ref i));
                 break;
+            case "--pipeline":
+                result.Pipeline = true;
+                break;
             case "--lora":
                 result.LoraPaths.Add(NextArg(args, ref i));
                 break;
@@ -477,6 +536,7 @@ static void PrintUsage()
           --batched-verify         Use batched verify (faster, higher acceptance, different FP from native)
           --kv-quant <mode>        KV cache compression: turbo, turbo:3, turbo:4, turbo:3+qjl32, turbo:3+noqjl
           --hybrid-layers <n>      GPU+CPU split: first N layers on GPU, rest on CPU
+          --pipeline               Stream layers from shards (for models > VRAM, requires split first)
           --lora <path>            LoRA adapter file (.llra) to merge into model weights
           --help, -h               Show this help
 
@@ -738,4 +798,5 @@ class CliArgs
     public string? KvQuant;
     public int HybridLayers;
     public List<string> LoraPaths = new();
+    public bool Pipeline;
 }

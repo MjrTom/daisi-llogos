@@ -84,6 +84,11 @@ public sealed class DaisiLlogosTextBackend : ITextInferenceBackend
         if (request.GpuLayerCount > 0)
             OnLog?.Invoke($"GPU layers: {Math.Min(request.GpuLayerCount, config.NumLayers)}/{config.NumLayers}");
 
+        // Auto-detect pipeline shards for large models
+        var shardDir = request.FilePath + ".shards";
+        if (Directory.Exists(shardDir))
+            handle.PipelineShardDir = shardDir;
+
         return Task.FromResult<IModelHandle>(new DaisiLlogosModelHandleAdapter(handle));
     }
 
