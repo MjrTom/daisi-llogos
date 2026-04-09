@@ -34,6 +34,29 @@ public sealed class CudaBackend : IComputeBackend
     /// <summary>Disable CUDA graph capture (needed for TurboQuant which uses different kernel topology).</summary>
     public void DisableGraphCapture() { _graphEnabled = false; }
 
+    /// <summary>
+    /// Invalidate all cached weight-derived state. Must be called after overwriting
+    /// GPU weight tensor data (e.g. pipeline layer swap) so that fused RmsNorm Q8_1,
+    /// FP16 dequant caches, and activation quantization caches are not reused with stale data.
+    /// </summary>
+    public void InvalidateWeightCache()
+    {
+        _q8_1CacheGeneration++;
+        _q8_1CachedInputPtr = 0;
+        _q8_1CachedGeneration = 0;
+        _q8_1FusedReady = false;
+
+        // Clear FP16 weight cache — shared tensor DevicePtrs get reused with different data
+        foreach (var buf in _f16WeightCache.Values) buf.Dispose();
+        _f16WeightCache.Clear();
+        _f16CacheBytes = 0;
+        _f16WeightCacheEnabled = true;
+
+        // Clear activation caches
+        _f16ActCachedSrcPtr = 0;
+        _f16ActCachedSize = 0;
+    }
+
     public CudaBackend(int deviceOrdinal = 0)
     {
         _context = new CudaContext(deviceOrdinal);
@@ -2472,6 +2495,9 @@ public sealed class CudaBackend : IComputeBackend
 
     /// <summary>Synchronize the CUDA stream (wait for all queued operations to complete).</summary>
     public void Synchronize() => _stream.Synchronize();
+
+    /// <summary>Raw handle to the compute stream (for pipeline H2D transfers).</summary>
+    internal nint ComputeStreamHandle => _stream.Handle;
 
     /// <inheritdoc />
     public void Dispose()
