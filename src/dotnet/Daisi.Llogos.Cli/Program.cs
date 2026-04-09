@@ -78,8 +78,8 @@ else
     // Build vocab remapper if partial vocab is active (vocab-limit > 1)
     // Same-family models (Qwen3.5) have identical vocabularies, so same remapper works for both
     VocabRemapper? remapper = null;
-    // Disable remapper + partial vocab for speculative decoding (both models must share same ID space)
-    int vocabDivisor = options.DraftModelPath != null ? 1 : (options.VocabLimit ?? 32);
+    // Disable remapper for speculative decoding and pipeline mode (both need full vocab space)
+    int vocabDivisor = options.DraftModelPath != null ? 1 : (options.VocabLimit ?? 1);
     if (vocabDivisor > 1)
     {
         var tokens = gguf.GetMetadata<string[]>("tokenizer.ggml.tokens")!;
@@ -87,30 +87,8 @@ else
         tokenizer.Vocabulary.ApplyRemapper(remapper);
     }
 
-    ModelWeights weights;
-    if (options.LoraPaths.Count > 0)
-    {
-        // LoRA merge: load via mmap (correct for all models), merge adapters on CPU,
-        // then re-upload merged weights to target backend if needed.
-        var cpuBackend = new CpuBackend();
-        weights = MmapModelLoader.Load(gguf, options.ModelPath, cpuBackend, config, remapper);
-        foreach (var loraPath in options.LoraPaths)
-        {
-            Console.Error.Write($"Loading LoRA adapter: {loraPath}... ");
-            var adapter = LoraInference.LoadAndMerge(loraPath, weights, cpuBackend, config);
-            Console.Error.WriteLine($"done ({adapter.ParameterCount:N0} params, rank={adapter.Config.Rank})");
-        }
-        // Re-upload to target backend if needed (merged weights are F32 CpuTensors,
-        // unmerged weights need re-upload from mmap to GPU)
-        if (backend is not CpuBackend)
-            LoraInference.UploadWeights(weights, backend, config);
-    }
-    else if (options.UseMmap)
-        weights = MmapModelLoader.Load(gguf, options.ModelPath, backend, config, remapper);
-    else
-        weights = ModelLoader.Load(gguf, stream, backend, config);
-
-    // ── Pipeline mode: stream layers from shards for models > VRAM ──────────
+        // ── Pipeline mode: stream layers from shards for models > VRAM ──────────
+    // Check BEFORE loading weights — pipeline loads its own embed/output from shards.
     if (options.Pipeline && backend is CudaBackend pipelineCuda)
     {
         var shardDir = options.ModelPath + ".shards";
@@ -165,6 +143,26 @@ else
         backend.Dispose();
         return 0;
     }
+
+    // ── Load full model weights (non-pipeline paths) ───────────────────────
+    ModelWeights weights;
+    if (options.LoraPaths.Count > 0)
+    {
+        var cpuBackend = new CpuBackend();
+        weights = MmapModelLoader.Load(gguf, options.ModelPath, cpuBackend, config, remapper);
+        foreach (var loraPath in options.LoraPaths)
+        {
+            Console.Error.Write($"Loading LoRA adapter: {loraPath}... ");
+            var adapter = LoraInference.LoadAndMerge(loraPath, weights, cpuBackend, config);
+            Console.Error.WriteLine($"done ({adapter.ParameterCount:N0} params, rank={adapter.Config.Rank})");
+        }
+        if (backend is not CpuBackend)
+            LoraInference.UploadWeights(weights, backend, config);
+    }
+    else if (options.UseMmap)
+        weights = MmapModelLoader.Load(gguf, options.ModelPath, backend, config, remapper);
+    else
+        weights = ModelLoader.Load(gguf, stream, backend, config);
 
     var strategy = AttentionStrategy.Parse(options.Attention);
     int maxContext = strategy.Mode != AttentionMode.Full && strategy.CacheCapacity > 0
