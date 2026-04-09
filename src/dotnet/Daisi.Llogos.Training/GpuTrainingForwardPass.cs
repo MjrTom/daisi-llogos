@@ -154,7 +154,8 @@ public sealed class GpuTrainingForwardPass : ITrainingForwardPass
         _gpu.BatchedEmbeddingLookup(Pool("hidden", T * H), _embeddingTable, gpuTokenIds, T, H);
 
         // 2. Transformer layers
-        for (int layer = 0; layer < _config.NumLayers; layer++)
+        int maxLayerDebug = _config.NumLayers;
+        for (int layer = 0; layer < maxLayerDebug; layer++)
         {
             var lw = _weights.Layers[layer];
 
@@ -335,8 +336,6 @@ public sealed class GpuTrainingForwardPass : ITrainingForwardPass
     private void ForwardDeltaNetLayer(DeltaNetWeights dnw, GpuLayerActivations saved,
         int layer, int T)
     {
-        // Real DeltaNet forward — uses the same kernels as inference.
-        // Processes tokens sequentially (DeltaNet is recurrent).
         int H = _config.HiddenDim;
         int convKernel = _config.SsmConvKernel;
         int headDim = _config.SsmStateSize > 0 ? _config.SsmStateSize : _config.SsmHeadDim;
@@ -872,8 +871,12 @@ public sealed class GpuTrainingForwardPass : ITrainingForwardPass
     private ITensor Pool(string name, int size)
     {
         // Arena path: return pre-allocated tensor (no dynamic alloc, graph-safe)
-        if (_arena != null && _arena.TryGet(name, out var arenaTensor))
-            return arenaTensor;
+        // Arena disabled: causes memory corruption at seqLen>208 due to an unresolved
+        // issue where arena-allocated tensors produce non-deterministic forward results.
+        // Pool dict allocates each tensor separately (safe but slower for graph capture).
+        // TODO: investigate CudaTensor aliasing or arena offset bug.
+        // if (_arena != null && _arena.TryGet(name, out var arenaTensor))
+        //     return arenaTensor;
 
         // Pool path: create on first call, reuse on subsequent
         if (_pool.TryGetValue(name, out var existing))
@@ -1098,33 +1101,41 @@ public sealed class GpuTrainingForwardPass : ITrainingForwardPass
         arena.Register("ffn.gated", T * ffnDim);
         arena.Register("ffn.out", T * H);
 
-        // DeltaNet tensors (if applicable)
+        // DeltaNet tensors (if applicable) — use actual weight dimensions, not config estimates
         if (_config.SsmInnerSize > 0)
         {
-            int ssmInner = _config.SsmInnerSize;
-            int convChannels = ssmInner * 3; // approximate
-            int numVHeads = _config.SsmGroupCount;
-            int headDim = _config.SsmHeadDim;
+            // Get actual dimensions from first DeltaNet layer's weight tensors
+            DeltaNetWeights? firstDnw = null;
+            for (int i = 0; i < numLayers; i++)
+                if (!_config.IsStandardAttention(i) && _weights.Layers[i] is DeltaNetWeights dw)
+                    { firstDnw = dw; break; }
 
-            arena.Register("delta.qkv_tok", T * ssmInner * 3);
-            arena.Register("delta.q", T * ssmInner);
-            arena.Register("delta.k", T * ssmInner);
-            arena.Register("delta.v", T * ssmInner);
-            arena.Register("delta.alpha", T * numVHeads);
-            arena.Register("delta.beta", T * numVHeads);
-            arena.Register("delta.betaval", T * ssmInner);
-            arena.Register("delta.decay", T * numVHeads);
-            arena.Register("delta.gate", T * ssmInner);
-            arena.Register("delta.output", T * H);
-            arena.Register("delta.normout1", T * ssmInner);
-            arena.Register("delta.hidden1", T * ssmInner);
+            int numVHeads = firstDnw != null ? (int)firstDnw.SsmAlpha.Dimensions[1] : _config.SsmGroupCount;
+            int headDim2 = _config.SsmStateSize > 0 ? _config.SsmStateSize : _config.SsmHeadDim;
+            int valueDim2 = numVHeads * headDim2;
+            int qkvDim2 = firstDnw != null ? (int)firstDnw.AttnQkv.Dimensions[1] : _config.SsmInnerSize * 3;
+            int convChannels = firstDnw != null ? (int)(firstDnw.SsmConv1d.ElementCount / _config.SsmConvKernel) : qkvDim2;
+
+            // Single-token buffers (reused per-token in sequential loop)
+            arena.Register("delta.qkv_tok", qkvDim2);
+            arena.Register("delta.q", valueDim2);
+            arena.Register("delta.k", valueDim2);
+            arena.Register("delta.v", valueDim2);
+            arena.Register("delta.alpha", numVHeads);
+            arena.Register("delta.beta", numVHeads);
+            arena.Register("delta.betaval", numVHeads);
+            arena.Register("delta.decay", numVHeads);
+            arena.Register("delta.gate", valueDim2);
+            arena.Register("delta.output", valueDim2);
+            arena.Register("delta.normout1", H);
+            arena.Register("delta.hidden1", H);
 
             // Per-layer DeltaNet state
             for (int i = 0; i < numLayers; i++)
             {
                 if (!_config.IsStandardAttention(i))
                 {
-                    arena.Register($"delta.state.{i}", numVHeads * headDim * headDim);
+                    arena.Register($"delta.state.{i}", numVHeads * headDim2 * headDim2);
                     arena.Register($"delta.conv.{i}", (_config.SsmConvKernel - 1) * convChannels);
                 }
             }
