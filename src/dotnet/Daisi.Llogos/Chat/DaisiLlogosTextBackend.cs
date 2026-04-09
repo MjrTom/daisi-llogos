@@ -52,9 +52,11 @@ public sealed class DaisiLlogosTextBackend : ITextInferenceBackend
             ? (int)Math.Min(request.ContextSize, config.MaxContext)
             : config.MaxContext;
 
-        // Auto-detect pipeline shards — skip full weight load if shards exist
-        var shardDir = request.FilePath + ".shards";
-        if (Directory.Exists(shardDir))
+        // Pipeline mode: use shard directory (explicit or auto-detected)
+        var shardDir = request.ShardDirectory ?? (request.Pipeline ? request.FilePath + ".shards" : null);
+        if (shardDir == null && Directory.Exists(request.FilePath + ".shards"))
+            shardDir = request.FilePath + ".shards"; // auto-detect
+        if (shardDir != null && Directory.Exists(shardDir))
         {
             OnLog?.Invoke($"Pipeline shards detected: {shardDir}");
             // Create lightweight placeholder weights — pipeline loads its own from shards
