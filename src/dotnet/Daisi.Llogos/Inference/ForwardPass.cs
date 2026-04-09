@@ -11,7 +11,7 @@ public sealed class ForwardPass : IForwardPass
 {
     private readonly IComputeBackend _backend;
     private readonly ModelConfig _config;
-    private readonly ModelWeights _weights;
+    private ModelWeights _weights; // not readonly: PipelinedForwardPass swaps via reflection
     private readonly IKvCache _kvCache;
     private readonly DeltaNetState _deltaState;
 
@@ -248,6 +248,7 @@ public sealed class ForwardPass : IForwardPass
             // Last layer: do ElementAdd now (no next layer to fuse with)
             if (layer == _config.NumLayers - 1)
                 _backend.ElementAdd(_hidden, _hidden, _residual);
+
             // Other layers: defer ElementAdd to fuse with next layer's RmsNormResidual
 
             // Early exit profiling: check what token each layer would predict
