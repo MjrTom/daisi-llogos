@@ -237,34 +237,45 @@ Batched prefill processes all M prompt tokens simultaneously through each layer:
 
 ### Results
 
-RTX 5080, CUDA 13, greedy sampling. Prefill measured with 128-token prompt; decode with short prompt to isolate decode performance (longer prompts inflate KV cache and slow attention — see note below).
+RTX 5080, CUDA 13, greedy sampling. Prefill measured with 231-token prompt; decode with short prompt.
 
 | Model | Architecture | Llogos pp | llama.cpp pp | Ratio | Llogos tg | llama.cpp tg | Ratio |
 |-------|-------------|----------:|-------------:|------:|----------:|-------------:|------:|
-| TinyLlama 1.1B Q8_0 | LLaMA | **2,050** | 15,730 | 0.13x | 444 | 448 | 0.99x |
-| Qwen3-8B Q8_0 | Std attn | **456** | 5,184 | 0.09x | 89 | 91 | 0.98x |
-| Qwen3-8B Q4_K_M | Std attn | **462** | 5,278 | 0.09x | 122 | 138 | 0.88x |
-| Qwen3.5-4B Q8_0 | DeltaNet | **224** | 5,704 | 0.04x | **142** | 134 | **1.05x** |
-| Qwen3.5-9B Q8_0 | DeltaNet | **165** | 4,714 | 0.03x | **86** | 84 | **1.02x** |
-| Qwen3.5-9B Q4_0 | DeltaNet | **155** | 4,954 | 0.03x | 99 | 126 | 0.79x |
+| DeepSeek-R1-Llama 8B Q8_0 | LLaMA | **2,518** | 6,400 | **0.39x** | 82 | — | — |
+| Qwen3.5-9B Q8_0 | DeltaNet | **315** | 5,667 | 0.06x | 81 | 84 | **0.96x** |
 
-Batched prefill delivers a 5-9x speedup on pure attention models and 1.5-1.8x on DeltaNet hybrids (where only RmsNorm, FFN, and attention layers are batched). llama.cpp's fused quantized GEMM remains 8-30x faster on prefill.
+**Prefill optimization progression** (DeepSeek Llama 8B Q8_0, 231 tokens):
+
+| Step | tok/s | vs llama.cpp |
+|------|------:|:-------------|
+| Baseline (SwiGLU bug, dequant→SGEMM) | 197 | 32x slower |
+| + SwiGLU bug fix + FP16 GemmEx | 1,432 | 4.5x slower |
+| + FP16 weight cache (warm) | 2,130 | 3.0x slower |
+| + Batched embedding kernel | 2,198 | 2.9x slower |
+| + cuBLAS strided batched attention | 2,518 | **2.5x slower** |
+| llama.cpp CUDA | 6,400 | baseline |
+
+Pure attention models now achieve **39% of llama.cpp** prefill throughput (up from 3%). DeltaNet hybrids remain slower due to sequential recurrent state processing (18/24 layers).
 
 **Prompt length affects decode speed.** Decode tok/s depends on the KV cache size: a 169-token prompt leaves 169 KV entries that the attention kernel must scan every decode step. On TinyLlama, this costs ~15% vs a 1-token prompt. All decode numbers in this paper use a short prompt to measure pure decode throughput.
 
 ### Implementation
 
-Five new CUDA kernels enable the batched forward pass:
+CUDA kernels and cuBLAS paths enabling the batched forward pass:
 
-1. **`batched_rope`** — Applies rotary position embedding to M tokens with positions `[startPos..startPos+M-1]`. Each token's Q/K heads are rotated by their own position angle. The token index is derived from the global head index: `token = head / headsPerToken`.
+1. **`batched_rope`** — RoPE for M tokens with positions `[startPos..startPos+M-1]`.
 
-2. **`batched_kv_cache_write`** — Writes M K/V pairs at consecutive positions in a single kernel launch. Input is `[M × nKvHeads × keyLen]`, scattered into the `[nKvHeads × maxSeqLen × keyLen]` cache layout.
+2. **`batched_kv_cache_write`** — Writes M K/V pairs at consecutive cache positions.
 
-3. **`batched_gated_attention`** — The core kernel. Grid of `M × numHeads` blocks, one per (query_token, head) pair. Each block computes tiled online-softmax attention with a causal cutoff: query token m sees keys `[0..startPos+m]`. Uses the same tile size and online softmax algorithm as the single-token kernel, just with per-query sequence length bounds.
+3. **cuBLAS strided batched attention** — Replaces the custom `batched_gated_attention` kernel for M>32. Uses `cublasGemmStridedBatchedEx` for QK^T and Score×V (one call per KV head group with `strideA=0` for GQA K/V reuse), plus `causal_softmax_inplace` and `sigmoid_gate_inplace` custom kernels. Eliminates O(M²) redundant KV cache reads from the old per-block approach.
 
-4. **`batched_rms_norm`** (and variants) — Normalizes M independent rows. One block per row. Weight vector is shared across rows.
+4. **`batched_rms_norm`** (and variants) — Normalizes M independent rows.
 
-5. **`dequant_to_f16`** — Expands quantized weight matrices to FP16 for `cublasGemmEx` with tensor cores. Handles Q8_0, Q4_0, Q4_K, Q6_K, and F16. Paired with `fp32_to_fp16` activation conversion.
+5. **`dequant_to_f16`** — Expands quantized weights to FP16 for `cublasGemmEx` tensor cores. Handles Q8_0, Q4_0, Q4_K, Q6_K, BF16, and F16.
+
+6. **`batched_embedding_q8_0`** — Single kernel for M token embedding lookups (replaces M sequential calls).
+
+7. **`convert_f32_to_f16`** — Activation FP32→FP16 conversion (cached per source tensor).
 
 The batched forward pass (`ForwardBatchedPrefill`) allocates M-wide scratch tensors lazily and reuses them across calls with the same batch size. It always uses separate Q/K/V and gate/up projections (fused layouts produce per-token interleaved output that would require M scatter copies to deinterleave).
 
@@ -288,25 +299,31 @@ The 5.4x speedup on TinyLlama (173 tokens) is less than the theoretical 173x fro
 
 3. **Embedding scatter.** The M embeddings are looked up individually and copied into the batch tensor via M `cuMemcpyDtoDAsync` calls. This is negligible for large M but measurable for small prompts.
 
-### Closing the Prefill Gap: What We Tried
+### Optimizations Applied
 
-Our batched prefill is 6-8x slower than llama.cpp on prompt processing. The root cause is the intermediate dequantization buffer: we read Q8_0 weights, write FP16 to a temp buffer, then read the FP16 data back for the GEMM — ~5× the minimum memory traffic. llama.cpp reads Q8_0 once and dequantizes in-register during the GEMM. We attempted several approaches to close this gap:
+**FP16 tensor core GemmEx (7.3x).** Replaced `dequant_to_f32` + `cublasSgemm` with `dequant_to_f16` + `cublasGemmEx` (FP16 inputs, FP32 accumulation). Uses tensor cores. Also replaced the custom `batched_gated_attention` kernel (which had O(M²) redundant KV cache reads) with `cublasGemmStridedBatchedEx` for QK^T and Score×V matmuls plus a custom `causal_softmax_inplace` kernel.
 
-**FP16 tensor cores (+35%).** Replaced `dequant_to_f32` + `cublasSgemm` with `dequant_to_f16` + `cublasGemmEx` (FP16 inputs, FP32 compute). This uses tensor cores and halves the dequant buffer size. Qwen3-8B prefill improved from 456 to 616 tok/s (+35%). The dequant buffer write is still the bottleneck.
+**FP16 weight cache (49% on warm prefills).** Persistent `Dictionary<DevicePtr, CudaDeviceMemory>` caches dequantized FP16 weights. First prefill populates the cache; subsequent prefills skip dequant entirely. VRAM-aware allocation with 512 MB headroom via `cuMemGetInfo`.
 
-**TF32 math mode (+9%).** Enabled `CUBLAS_TF32_TENSOR_OP_MATH` for any FP32 SGEMM fallback paths. Small additional gain on TinyLlama (2312 → 2516 tok/s).
+**FP16 activation cache.** Avoids redundant FP32→FP16 conversion when the same activation feeds multiple projections (Q/K/V share normOut, gate/up share normOut). Keyed by source DevicePtr + size.
 
-**Fused row-based kernel (failed, 2.5-3.6× slower).** Extended the M=1 matmul kernel with a `grid.y` batch dimension — one block per (output_neuron, input_row). Expected L2 cache reuse across rows. Result: 171 vs 616 tok/s on Qwen3-8B. The grid was too large (N/2 × M blocks), each block did an independent K reduction with no tile-level weight reuse. cuBLAS's tensor core tiling is fundamentally better.
+**Batched embedding kernel.** Single `batched_embedding_q8_0` kernel replaces M sequential `embedding_lookup` + `CopyTensorSlice` calls. Processes all M token embeddings in one launch.
 
-**Persistent FP16 weight cache (failed, OOM on 8B+).** Lazily allocated a persistent FP16 copy of each weight tensor to eliminate per-prefill dequant. TinyLlama (3 GB total) worked, but Qwen3-8B needed 23 GB (Q8_0 + FP16) for 16 GB VRAM — caused GPU memory thrashing at 20 tok/s. Also useless for single-prefill benchmarks since each weight is used exactly once per forward pass. Additionally, `cuMemGetInfo` for budget checks synchronizes the GPU pipeline.
+**Batched DeltaNet projections.** For DeltaNet hybrid models, the 5 linear projections (QKV, Alpha, Beta, Gate, Out) are batched for all M tokens. Only the sequential conv1d and state update remain per-token. Improves Qwen3.5-9B prefill from 197 to 315 tok/s.
 
-**Tiled fused dequant-GEMM (failed, 40% slower).** Proper tiled kernel (BM=64, BN=64, BK=32) that reads Q8_0 blocks directly into shared memory and computes the GEMM without any intermediate buffer. Eliminates the bandwidth overhead entirely. Result: 373 vs 616 tok/s on Qwen3-8B. The kernel uses scalar FP32 multiply-adds which can't compete with cuBLAS's `wmma::mma_sync` tensor core intrinsics — ~10-50× less compute throughput.
+**SwiGLU Q8_1 overflow fix (critical).** The fused `swiglu_q8_1` kernel wrote Q8_1 data to `_q8_1Scratch` for ALL M×N elements during batched FFN, but the scratch buffer was sized for single-token only. This caused GPU memory corruption and garbage output from all batched prefill since it was first enabled. Fixed by guarding the fused path with `n <= _q8_1ScratchK`.
 
-**Stream pipelining (analyzed, not implemented).** Overlap dequant of weight N+1 with GEMM of weight N using dual streams. Analysis showed both operations are bandwidth-bound at typical M (40-200), competing for the same memory bus. Overlap provides no benefit when the bottleneck is shared bandwidth, not compute.
+### Approaches That Didn't Help
 
-### What Would Close the Gap
+**TF32 math mode.** `CUBLAS_TF32_TENSOR_OP_MATH` and `CUBLAS_COMPUTE_32F_FAST_16F` — no measurable improvement (cuBLAS already uses tensor cores with default settings for FP16 GemmEx).
 
-The remaining path is a **fused dequant-GEMM kernel using `wmma` tensor core intrinsics**: read Q8_0 blocks, dequant to FP16 in shared memory, and compute the matrix multiply with `wmma::mma_sync` or `mma.m16n8k16` PTX instructions. This combines the bandwidth savings of the tiled kernel (read Q8_0 once, no intermediate buffer) with the compute throughput of tensor cores (matching cuBLAS). This is approximately what llama.cpp's CUDA backend does.
+**Fused gate+up FFN.** Concatenated FfnGate and FfnUp FP16 weights into a single [2N×K] matrix for one GemmEx instead of two. The D2D memcpy overhead to build the fused weight negated the saved GemmEx. Even with persistent fused weight caching, cuBLAS handles the larger matrix at similar throughput.
+
+**Pointer-based batched GEMM for attention.** `cublasGemmBatchedEx` (array of pointers) to process all 32 heads in one call instead of 8 strided batched calls. Slower than the strided approach due to H2D pointer upload overhead.
+
+### Remaining Gap
+
+The 2.5x gap to llama.cpp is from: per-call cuBLAS overhead across ~400 launches per prefill, materializing the full M×M attention score matrix (flash attention avoids this), and no CUDA graph capture for the prefill pass. Closing this requires a fused dequant-GEMM kernel using `wmma` tensor core intrinsics or flash attention.
 
 ## Reproducibility
 
