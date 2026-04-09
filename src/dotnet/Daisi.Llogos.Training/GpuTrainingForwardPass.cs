@@ -367,58 +367,98 @@ public sealed class GpuTrainingForwardPass : ITrainingForwardPass
 
         var hiddenBuf = Pool("hidden", T * H);
 
+        // ── Phase 1: Batch all linear projections for T tokens at once ──
+        bool useBatchedDeltaNet = true;
+        if (!useBatchedDeltaNet)
+        {
+            // Sequential fallback
+            for (int t = 0; t < T; t++)
+            {
+                _gpu.CopyTensorSlice(normOut1, 0, saved.NormOut!, t * H, H);
+                _gpu.MatMul(qkvBuf, normOut1, GpuWeight(dnw.AttnQkv), 1, H, qkvDim);
+                _gpu.CausalConv1d(qkvBuf, convBuf, GpuWeight(dnw.SsmConv1d), convChannels, convKernel);
+                _gpu.SiLUInPlace(qkvBuf);
+                if (keyDim == valueDim) _gpu.SplitQKV(ssmQ, ssmK, ssmV, qkvBuf, keyDim);
+                else _gpu.SplitUnequalQKV(ssmQ, ssmK, ssmV, qkvBuf, keyDim, valueDim);
+                _gpu.L2NormGroups(ssmQ, numKHeads, headDim);
+                _gpu.L2NormGroups(ssmK, numKHeads, headDim);
+                if (repeatFactor > 1) { _gpu.RepeatTile(ssmQ, numKHeads, headDim, repeatFactor); _gpu.RepeatTile(ssmK, numKHeads, headDim, repeatFactor); }
+                _gpu.MatMul(ssmAlpha, normOut1, GpuWeight(dnw.SsmAlpha), 1, H, numVHeads);
+                _gpu.MatMul(ssmBeta, normOut1, GpuWeight(dnw.SsmBeta), 1, H, numVHeads);
+                _gpu.ComputeDecayBeta(ssmDecay, ssmBetaVal, ssmAlpha, ssmBeta, GpuWeight(dnw.SsmA), GpuWeight(dnw.SsmDtBias), numVHeads);
+                _gpu.DeltaNetStep(ssmOutput, ssmQ, ssmK, ssmV, state, ssmDecay, ssmBetaVal, GpuWeight(dnw.SsmNorm), numVHeads, headDim, scale, _config.NormEps);
+                _gpu.MatMul(ssmGate, normOut1, GpuWeight(dnw.AttnGate), 1, H, valueDim);
+                _gpu.SiLUGate(ssmOutput, ssmOutput, ssmGate);
+                _gpu.MatMul(hidden1, ssmOutput, GpuWeight(dnw.SsmOut), 1, valueDim, H);
+                _gpu.CopyTensorSlice(hiddenBuf, t * H, hidden1, 0, H);
+            }
+            saved.IsDeltaNet = true;
+            return;
+        }
+        var batchQkv = Pool("delta.batch_qkv", T * qkvDim);
+        var batchAlpha = Pool("delta.batch_alpha", T * numVHeads);
+        var batchBeta = Pool("delta.batch_beta", T * numVHeads);
+        var batchGate = Pool("delta.batch_gate", T * valueDim);
+
+        _gpu.MatMul(batchQkv, saved.NormOut!, GpuWeight(dnw.AttnQkv), T, H, qkvDim);
+        _gpu.MatMul(batchAlpha, saved.NormOut!, GpuWeight(dnw.SsmAlpha), T, H, numVHeads);
+        _gpu.MatMul(batchBeta, saved.NormOut!, GpuWeight(dnw.SsmBeta), T, H, numVHeads);
+        _gpu.MatMul(batchGate, saved.NormOut!, GpuWeight(dnw.AttnGate), T, H, valueDim);
+
+        // ── Phase 2: Sequential per-token processing (conv1d + state update) ──
+        var batchOutput = Pool("delta.batch_out", T * valueDim);
+
         for (int t = 0; t < T; t++)
         {
-            _gpu.CopyTensorSlice(normOut1, 0, saved.NormOut!, t * H, H);
+            // Extract pre-computed QKV for token t
+            _gpu.CopyTensorSlice(qkvBuf, 0, batchQkv, t * qkvDim, qkvDim);
 
-            // Step 1: QKV projection (use F32 weights to avoid Q8_0 dp4a alignment issues for M=1)
-            _gpu.MatMul(qkvBuf, normOut1, GpuWeight(dnw.AttnQkv), 1, H, qkvDim);
-
-            // Step 2: CausalConv1d
+            // CausalConv1d (state-dependent)
             _gpu.CausalConv1d(qkvBuf, convBuf, GpuWeight(dnw.SsmConv1d), convChannels, convKernel);
 
-            // Step 3: SiLU
+            // SiLU
             _gpu.SiLUInPlace(qkvBuf);
 
-            // Step 4: Split QKV
+            // Split QKV
             if (keyDim == valueDim)
                 _gpu.SplitQKV(ssmQ, ssmK, ssmV, qkvBuf, keyDim);
             else
                 _gpu.SplitUnequalQKV(ssmQ, ssmK, ssmV, qkvBuf, keyDim, valueDim);
 
-            // Step 5: L2 norm
+            // L2 norm
             _gpu.L2NormGroups(ssmQ, numKHeads, headDim);
             _gpu.L2NormGroups(ssmK, numKHeads, headDim);
 
-            // Step 6: Repeat-tile
+            // Repeat-tile
             if (repeatFactor > 1)
             {
                 _gpu.RepeatTile(ssmQ, numKHeads, headDim, repeatFactor);
                 _gpu.RepeatTile(ssmK, numKHeads, headDim, repeatFactor);
             }
 
-            // Step 7: Alpha/Beta projections (F32 weights for M=1)
-            _gpu.MatMul(ssmAlpha, normOut1, GpuWeight(dnw.SsmAlpha), 1, H, numVHeads);
-            _gpu.MatMul(ssmBeta, normOut1, GpuWeight(dnw.SsmBeta), 1, H, numVHeads);
+            // Extract pre-computed alpha/beta
+            _gpu.CopyTensorSlice(ssmAlpha, 0, batchAlpha, t * numVHeads, numVHeads);
+            _gpu.CopyTensorSlice(ssmBeta, 0, batchBeta, t * numVHeads, numVHeads);
 
-            // Step 8: Compute decay and beta values
+            // Compute decay and beta values
             _gpu.ComputeDecayBeta(ssmDecay, ssmBetaVal, ssmAlpha, ssmBeta,
                 GpuWeight(dnw.SsmA), GpuWeight(dnw.SsmDtBias), numVHeads);
 
-            // Step 9: DeltaNet state update + output
+            // DeltaNet state update + output (state-dependent)
             _gpu.DeltaNetStep(ssmOutput, ssmQ, ssmK, ssmV,
                 state, ssmDecay, ssmBetaVal,
                 GpuWeight(dnw.SsmNorm), numVHeads, headDim, scale, _config.NormEps);
 
-            // Step 10: Gate + SiLU gate (F32 weight for M=1)
-            _gpu.MatMul(ssmGate, normOut1, GpuWeight(dnw.AttnGate), 1, H, valueDim);
+            // Extract pre-computed gate, apply SiLU gate
+            _gpu.CopyTensorSlice(ssmGate, 0, batchGate, t * valueDim, valueDim);
             _gpu.SiLUGate(ssmOutput, ssmOutput, ssmGate);
 
-            // Step 11: Output projection (F32 weight for M=1)
-            _gpu.MatMul(hidden1, ssmOutput, GpuWeight(dnw.SsmOut), 1, valueDim, H);
-
-            _gpu.CopyTensorSlice(hiddenBuf, t * H, hidden1, 0, H);
+            // Collect output for batched output projection
+            _gpu.CopyTensorSlice(batchOutput, t * valueDim, ssmOutput, 0, valueDim);
         }
+
+        // ── Phase 3: Batch output projection ──
+        _gpu.MatMul(hiddenBuf, batchOutput, GpuWeight(dnw.SsmOut), T, valueDim, H);
 
         saved.IsDeltaNet = true;
     }
