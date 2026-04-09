@@ -52,6 +52,15 @@ public static class ShardModelLoader
                     ? LoadTensorFromShard(outputPath, "output.weight", tensorInfoMap, backend, mmapHandles, remapper)
                     : LoadTensorFromShard(outputPath, "output.weight", tensorInfoMap, backend, mmapHandles))
                 : null;
+
+            // Tied embeddings: if output.weight is missing, load token embedding for output head
+            if (output == null && !includeEmbedding)
+            {
+                var embedPath = Path.Combine(shardDir, $"{baseName}.embed");
+                tokenEmbedding = remapper != null
+                    ? LoadTensorFromShard(embedPath, "token_embd.weight", tensorInfoMap, backend, mmapHandles, remapper)
+                    : LoadTensorFromShard(embedPath, "token_embd.weight", tensorInfoMap, backend, mmapHandles);
+            }
         }
         else
         {

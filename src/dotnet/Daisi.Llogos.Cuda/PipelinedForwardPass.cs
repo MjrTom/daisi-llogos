@@ -73,6 +73,7 @@ public sealed class PipelinedForwardPass : IForwardPass
             SwapWeights(weights);
             _forward.ForwardLayers(layer, layer + 1, position,
                 continuation: layer > 0, isFinal: layer == _config.NumLayers - 1);
+
         }
 
         var logits = new float[_config.VocabSize];
