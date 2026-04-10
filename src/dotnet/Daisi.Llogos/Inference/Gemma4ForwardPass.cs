@@ -93,6 +93,14 @@ public sealed class Gemma4ForwardPass : IDisposable
     private readonly ITensor? _pleScratchB;
     private readonly ITensor? _pleProjOutB;
 
+    // Per-layer repacked FFN weight handles returned by
+    // <see cref="IComputeBackend.RepackWeightForBatchedMatMul"/>. Populated at
+    // construction time; may be null when the backend doesn't support repacking.
+    // Used by the batched forward pass for M>1 prefill.
+    private readonly object?[]? _ffnGateRepacked;
+    private readonly object?[]? _ffnUpRepacked;
+    private readonly object?[]? _ffnDownRepacked;
+
     // FFN scratch
     private readonly ITensor _ffnGate;
     private readonly ITensor _ffnUp;
@@ -278,6 +286,21 @@ public sealed class Gemma4ForwardPass : IDisposable
             _vProjSwaB = _vProjB;
             _attnOutSwaB = _attnOutB;
         }
+
+        // Pre-compute repacked FFN weights for the batched prefill path. The
+        // backend returns an opaque handle (byte[] for CPU/Q4_0x4, null for
+        // backends with no fast path). Decode (M=1) continues to use the
+        // original tensors.
+        _ffnGateRepacked = new object?[config.NumLayers];
+        _ffnUpRepacked   = new object?[config.NumLayers];
+        _ffnDownRepacked = new object?[config.NumLayers];
+        for (int li = 0; li < config.NumLayers; li++)
+        {
+            var lw = (GemmaAttentionWeights)weights.Layers[li];
+            _ffnGateRepacked[li] = backend.RepackWeightForBatchedMatMul(lw.FfnGate);
+            _ffnUpRepacked[li]   = backend.RepackWeightForBatchedMatMul(lw.FfnUp);
+            _ffnDownRepacked[li] = backend.RepackWeightForBatchedMatMul(lw.FfnDown);
+        }
     }
 
     public void ResetState() => _kvCache.Reset();
@@ -421,10 +444,11 @@ public sealed class Gemma4ForwardPass : IDisposable
             if (prof) tRmsNorms += Stopwatch.GetTimestamp() - s;
 
             s = prof ? Stopwatch.GetTimestamp() : 0;
-            ProjectLinear(_ffnGateB, _normOutB, lw.FfnGate, M);
-            ProjectLinear(_ffnUpB,   _normOutB, lw.FfnUp,   M);
+            // Use the Q4_0x4 repacked path for FFN matmuls if available.
+            ProjectLinearFfn(_ffnGateB, _normOutB, lw.FfnGate, _ffnGateRepacked?[layer], M);
+            ProjectLinearFfn(_ffnUpB,   _normOutB, lw.FfnUp,   _ffnUpRepacked?[layer],   M);
             GeGLUBatch(_ffnGateB, _ffnUpB, M, IFF);
-            ProjectLinear(_hiddenB, _ffnGateB, lw.FfnDown, M);
+            ProjectLinearFfn(_hiddenB, _ffnGateB, lw.FfnDown, _ffnDownRepacked?[layer], M);
             if (prof) tFfnMm += Stopwatch.GetTimestamp() - s;
 
             s = prof ? Stopwatch.GetTimestamp() : 0;
@@ -785,6 +809,23 @@ public sealed class Gemma4ForwardPass : IDisposable
         int K = (int)weight.Dimensions[0];
         int N = (int)weight.Dimensions[1];
         _backend.MatMul(output, input, weight, batchM, K, N);
+    }
+
+    /// <summary>
+    /// Project an FFN matmul using the repacked backend path when available, else
+    /// fall through to the default <see cref="ProjectLinear"/>. Only exercised in
+    /// batched (M>1) mode — decode stays on the original tensors.
+    /// </summary>
+    private void ProjectLinearFfn(ITensor output, ITensor input, ITensor weight, object? repacked, int batchM)
+    {
+        if (repacked == null || batchM <= 1)
+        {
+            ProjectLinear(output, input, weight, batchM);
+            return;
+        }
+        int K = (int)weight.Dimensions[0];
+        int N = (int)weight.Dimensions[1];
+        _backend.MatMulRepacked(output, input, repacked, weight, batchM, K, N);
     }
 
     /// <summary>

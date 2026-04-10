@@ -35,6 +35,25 @@ public interface IComputeBackend : IDisposable
     void MatMul(ITensor output, ITensor a, ITensor b, int M, int K, int N);
 
     /// <summary>
+    /// Repack a weight tensor into a backend-specific layout optimised for
+    /// batched (M&gt;1) matmul. Returns an opaque object (or null if the backend
+    /// has no such optimisation). The caller passes the returned handle back to
+    /// <see cref="MatMulRepacked"/>. Lifetime of the repacked data is owned by
+    /// the caller; the backend must not reference the original tensor afterwards.
+    /// </summary>
+    object? RepackWeightForBatchedMatMul(ITensor weight) => null;
+
+    /// <summary>
+    /// Batched matmul using a previously-repacked weight handle. Default
+    /// implementation falls back to <see cref="MatMul"/> if the backend does
+    /// not implement the fast path.
+    /// </summary>
+    void MatMulRepacked(ITensor output, ITensor a, object repackedWeight, ITensor originalWeight, int M, int K, int N)
+    {
+        MatMul(output, a, originalWeight, M, K, N);
+    }
+
+    /// <summary>
     /// RMS normalization: output[i] = (input[i] / rms) * weight[i]
     /// where rms = sqrt(mean(input²) + eps).
     /// All tensors are 1D with the same element count.
