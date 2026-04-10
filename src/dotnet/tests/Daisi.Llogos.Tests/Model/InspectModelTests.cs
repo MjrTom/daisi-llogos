@@ -656,6 +656,196 @@ public class InspectModelTests
     }
 
     [Fact]
+    public void Q4_0x4_Micro_Bench_VsQ4_0()
+    {
+        var path = @"C:\GGUFS\gemma-4-E4B-it-Q4_0.gguf";
+        if (!File.Exists(path)) return;
+
+        using var stream = File.OpenRead(path);
+        var gguf = GgufFile.Read(stream);
+        var config = ModelConfig.FromGguf(gguf);
+
+        using var backend = new CpuBackend();
+        using var weights = MmapModelLoader.Load(gguf, path, backend, config);
+
+        // Use layer 0 FFN up: K=2560, N=10240
+        var layer0 = (Daisi.Llogos.Model.GemmaAttentionWeights)weights.Layers[0];
+        var w = layer0.FfnUp;
+        int K = (int)w.Dimensions[0];
+        int N = (int)w.Dimensions[1];
+
+        int M = 32;
+        var rng = new Random(42);
+        var aData = new float[M * K];
+        for (int i = 0; i < aData.Length; i++) aData[i] = (float)(rng.NextDouble() - 0.5);
+        var outBuf = new float[M * N];
+
+        // Prepare repacked weight
+        var srcBytes = ((Daisi.Llogos.Cpu.CpuTensor)w).RawData;
+        int blocksPerRow = K / 32;
+        int repackedBytes = (N / 4) * blocksPerRow * Daisi.Llogos.Cpu.MatMul.Q4_0x4TypeSize;
+        var repacked = new byte[repackedBytes];
+        Daisi.Llogos.Cpu.MatMul.RepackQ4_0ToQ4_0x4(srcBytes, repacked, N, blocksPerRow);
+
+        // Prepare raw Q4_0 bytes for direct call
+        var q4_0Bytes = srcBytes.ToArray();
+
+        // Warmup
+        for (int i = 0; i < 3; i++)
+        {
+            Daisi.Llogos.Cpu.MatMul.MultiplyQ4_0(outBuf, aData, q4_0Bytes, M, K, N);
+            Daisi.Llogos.Cpu.MatMul.MultiplyQ4_0x4(outBuf, aData, repacked, M, K, N);
+        }
+
+        // Time both paths
+        const int iters = 20;
+        var swOld = System.Diagnostics.Stopwatch.StartNew();
+        for (int i = 0; i < iters; i++)
+            Daisi.Llogos.Cpu.MatMul.MultiplyQ4_0(outBuf, aData, q4_0Bytes, M, K, N);
+        swOld.Stop();
+
+        var swNew = System.Diagnostics.Stopwatch.StartNew();
+        for (int i = 0; i < iters; i++)
+            Daisi.Llogos.Cpu.MatMul.MultiplyQ4_0x4(outBuf, aData, repacked, M, K, N);
+        swNew.Stop();
+
+        double oldMs = swOld.Elapsed.TotalMilliseconds / iters;
+        double newMs = swNew.Elapsed.TotalMilliseconds / iters;
+
+        System.IO.File.WriteAllText(@"C:\GGUFS\gemma-4-E4B-it-q4_0x4-bench.txt",
+            $"M={M}, K={K}, N={N}, iters={iters}\n" +
+            $"MultiplyQ4_0:   {oldMs:F2} ms/call\n" +
+            $"MultiplyQ4_0x4: {newMs:F2} ms/call\n" +
+            $"Speedup: {oldMs / newMs:F2}x\n");
+    }
+
+    [Fact]
+    public void Q4_0x4_RawDecode_MatchesOriginal()
+    {
+        // Construct synthetic Q4_0 weight: 4 rows × 1 block, with known values.
+        // Each block = 2 bytes FP16 scale + 16 bytes packed nibbles.
+        var src = new byte[4 * 18];
+        // Row 0 scale = 1.0, row 1 = 2.0, row 2 = 0.5, row 3 = -1.0
+        BitConverter.GetBytes((Half)1.0f).CopyTo(src, 0 * 18);
+        BitConverter.GetBytes((Half)2.0f).CopyTo(src, 1 * 18);
+        BitConverter.GetBytes((Half)0.5f).CopyTo(src, 2 * 18);
+        BitConverter.GetBytes((Half)(-1.0f)).CopyTo(src, 3 * 18);
+
+        // Nibbles: packed so each byte has low nibble = index, high nibble = index+16 (mod 16)
+        // That is, for byte i in [0..15], low_nibble = i, high_nibble = (i+16) & 0xF = i (wraps!)
+        // Let's use a distinctive pattern: low_nibble = i, high_nibble = 15 - i
+        for (int r = 0; r < 4; r++)
+        {
+            for (int i = 0; i < 16; i++)
+            {
+                byte lo = (byte)((r * 2 + i) & 0xF);      // vary by row
+                byte hi = (byte)((15 - i - r) & 0xF);
+                src[r * 18 + 2 + i] = (byte)(lo | (hi << 4));
+            }
+        }
+
+        // Repack
+        var dst = new byte[1 * 72];  // 1 group × 1 block × 72 bytes
+        Daisi.Llogos.Cpu.MatMul.RepackQ4_0ToQ4_0x4(src, dst, 4, 1);
+
+        // Check scales in repacked block
+        Assert.Equal((float)1.0f, (float)BitConverter.ToHalf(dst, 0));
+        Assert.Equal((float)2.0f, (float)BitConverter.ToHalf(dst, 2));
+        Assert.Equal((float)0.5f, (float)BitConverter.ToHalf(dst, 4));
+        Assert.Equal((float)(-1.0f), (float)BitConverter.ToHalf(dst, 6));
+
+        // Check that the packed nibble bytes in dst match the source.
+        // New layout: each row's 16 qs bytes contiguous at offset (8 + row*16).
+        for (int r = 0; r < 4; r++)
+        {
+            for (int i = 0; i < 16; i++)
+            {
+                byte srcByte = src[r * 18 + 2 + i];
+                byte dstByte = dst[8 + r * 16 + i];
+                Assert.True(srcByte == dstByte,
+                    $"Row {r} byte {i}: src={srcByte:X2} dst={dstByte:X2}");
+            }
+        }
+    }
+
+    [Fact]
+    public void Q4_0x4_Repack_And_Matmul_MatchesQ4_0()
+    {
+        // Use a real Q4_0 weight tensor from the Gemma 4 model for realistic coverage.
+        var path = @"C:\GGUFS\gemma-4-E4B-it-Q4_0.gguf";
+        if (!File.Exists(path)) return;
+
+        using var stream = File.OpenRead(path);
+        var gguf = GgufFile.Read(stream);
+        var config = ModelConfig.FromGguf(gguf);
+
+        using var backend = new CpuBackend();
+        using var weights = MmapModelLoader.Load(gguf, path, backend, config);
+
+        // Grab FFN up weight for layer 0 (Q4_0, K=2560, N=10240)
+        var layer0 = (Daisi.Llogos.Model.GemmaAttentionWeights)weights.Layers[0];
+        var w = layer0.FfnUp;
+        Assert.Equal(Daisi.Llogos.Gguf.GgmlType.Q4_0, w.Type);
+        int K = (int)w.Dimensions[0];
+        int N = (int)w.Dimensions[1];
+        Assert.Equal(0, N % 4);
+
+        // Random-ish activation
+        var rng = new Random(42);
+        int M = 8;
+        var aData = new float[M * K];
+        for (int i = 0; i < aData.Length; i++) aData[i] = (float)(rng.NextDouble() - 0.5);
+
+        // Reference: run MultiplyQ4_0 directly and capture outputs
+        var refOut = new float[M * N];
+        var aInput = backend.CreateTensor("act", Daisi.Llogos.Gguf.GgmlType.F32, new long[] { M * K });
+        aData.AsSpan().CopyTo(aInput.AsFloatSpan());
+        var outRef = backend.CreateTensor("out_ref", Daisi.Llogos.Gguf.GgmlType.F32, new long[] { M * N });
+        backend.MatMul(outRef, aInput, w, M, K, N);
+        outRef.AsFloatSpan().CopyTo(refOut);
+
+        // Repack the weight
+        var srcBytes = ((Daisi.Llogos.Cpu.CpuTensor)w).RawData;
+        int blocksPerRow = K / 32;
+        int repackedBytes = (N / 4) * blocksPerRow * Daisi.Llogos.Cpu.MatMul.Q4_0x4TypeSize;
+        var repacked = new byte[repackedBytes];
+        Daisi.Llogos.Cpu.MatMul.RepackQ4_0ToQ4_0x4(srcBytes, repacked, N, blocksPerRow);
+
+        // Run via MultiplyQ4_0x4
+        var newOut = new float[M * N];
+        Daisi.Llogos.Cpu.MatMul.MultiplyQ4_0x4(newOut, aData, repacked, M, K, N);
+
+        // Compare: expect bit-identical (both paths do the same int8 math with
+        // the same Q8_0-quantized activation)
+        int mismatches = 0;
+        float maxDiff = 0;
+        for (int i = 0; i < refOut.Length; i++)
+        {
+            float diff = MathF.Abs(refOut[i] - newOut[i]);
+            if (diff > 1e-3f)
+            {
+                if (mismatches < 10)
+                    System.Diagnostics.Debug.WriteLine($"  [{i}] ref={refOut[i]:F6} new={newOut[i]:F6} diff={diff:F6}");
+                mismatches++;
+            }
+            if (diff > maxDiff) maxDiff = diff;
+        }
+
+        System.IO.File.WriteAllText(@"C:\GGUFS\gemma-4-E4B-it-q4_0x4-check.txt",
+            $"M={M}, K={K}, N={N}\n" +
+            $"Max absolute diff: {maxDiff}\n" +
+            $"Mismatches (>1e-3): {mismatches} / {refOut.Length}\n" +
+            $"Ref[0]: {refOut[0]:F6}   New[0]: {newOut[0]:F6}\n" +
+            $"Ref[1]: {refOut[1]:F6}   New[1]: {newOut[1]:F6}\n" +
+            $"Ref[N-1]: {refOut[N - 1]:F6}   New[N-1]: {newOut[N - 1]:F6}\n");
+
+        aInput.Dispose();
+        outRef.Dispose();
+
+        Assert.True(maxDiff < 1e-2f, $"Q4_0x4 matmul differs from Q4_0: max diff = {maxDiff}");
+    }
+
+    [Fact]
     public void Gemma4_Q4_0_BenchBatchedPrefill_ThreadSweep()
     {
         var path = @"C:\GGUFS\gemma-4-E4B-it-Q4_0.gguf";
@@ -736,7 +926,7 @@ public class InspectModelTests
         using var weights = MmapModelLoader.Load(gguf, path, backend, config);
 
         // Different batch sizes to see how speedup scales
-        var batchSizes = new[] { 32 };
+        var batchSizes = new[] { 1, 4, 8, 16, 32 };
         var lines = new List<string>
         {
             "Gemma 4 Q4_0 batched prefill sweep + profile:",

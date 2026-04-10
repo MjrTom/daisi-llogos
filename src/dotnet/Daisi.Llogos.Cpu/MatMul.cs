@@ -10,13 +10,23 @@ namespace Daisi.Llogos.Cpu;
 /// b is always [N×K] (GGUF convention: each of N output rows has K input weights).
 /// output[i,j] = dot(a[i,:], b[j,:])
 /// </summary>
-internal static class MatMul
+public static class MatMul
 {
     private const int Q8_0BlockSize = 32;
     private const int Q8_0TypeSize = 34;
 
     private const int Q4_0BlockSize = 32;
     private const int Q4_0TypeSize = 18;
+
+    // Q4_0x4: 4 Q4_0 rows interleaved in 8-byte stripes, XOR 0x88 pre-applied.
+    //   8 bytes  - 4 × FP16 scales (one per interleaved row)
+    //   64 bytes - 8-byte stripes: [r0 qs[0..7] | r1 qs[0..7] | r2 qs[0..7] | r3 qs[0..7]
+    //                              | r0 qs[8..15] | r1 qs[8..15] | r2 qs[8..15] | r3 qs[8..15]]
+    // 72 bytes per block, covering 4 rows × 32 values = 128 dequantized outputs.
+    // Matches llama.cpp's block_q4_0x4 with blck_size_interleave=8.
+    public const int Q4_0x4BlockSize = 32;  // block size per ROW (same as Q4_0)
+    public const int Q4_0x4TypeSize = 72;   // bytes per (4 rows × 1 block)
+    public const int Q4_0x4RowsPerGroup = 4;
 
     private const int Q4_KSuperBlockSize = 256;
     private const int Q4_KTypeSize = 144;
@@ -469,6 +479,310 @@ internal static class MatMul
         outPtr[3 * outStride + 1] = Vector256.Sum(c31);
         outPtr[3 * outStride + 2] = Vector256.Sum(c32);
         outPtr[3 * outStride + 3] = Vector256.Sum(c33);
+    }
+
+    // ── Q4_0x4 repacked format ──────────────────────────────────────────────
+
+    /// <summary>
+    /// Repack a Q4_0 weight tensor into the Q4_0x4 layout, grouping 4 rows at a time.
+    /// Input <paramref name="src"/> is the Q4_0 weight bytes of shape
+    /// [N rows × blocksPerRow × 18 bytes]. Output <paramref name="dst"/> is
+    /// [(N/4) groups × blocksPerRow × 72 bytes]. N must be divisible by 4.
+    ///
+    /// Layout of one output block (72 bytes):
+    ///   bytes 0..7:   4 × FP16 scales, one per row (little-endian)
+    ///   bytes 8..23:  row 0's qs[0..15]  (contiguous 16 bytes)
+    ///   bytes 24..39: row 1's qs[0..15]
+    ///   bytes 40..55: row 2's qs[0..15]
+    ///   bytes 56..71: row 3's qs[0..15]
+    ///
+    /// The rows are stored contiguously within the block so each row's 16-byte
+    /// nibble data can be loaded with a single <c>Sse2.LoadVector128</c>. The
+    /// benefit vs the non-repacked format is prefetcher-friendly access to 4
+    /// adjacent rows and 4 scales packed into one 72-byte struct.
+    /// </summary>
+    public static unsafe void RepackQ4_0ToQ4_0x4(
+        ReadOnlySpan<byte> src, Span<byte> dst, int N, int blocksPerRow)
+    {
+        if ((N & 3) != 0)
+            throw new ArgumentException($"N must be divisible by 4 for Q4_0x4 repack, got N={N}");
+        int groups = N / 4;
+        int srcRowBytes = blocksPerRow * Q4_0TypeSize;
+
+        fixed (byte* srcPtr = src)
+        fixed (byte* dstPtr = dst)
+        {
+            for (int g = 0; g < groups; g++)
+            {
+                byte* srcR0 = srcPtr + (g * 4 + 0) * srcRowBytes;
+                byte* srcR1 = srcPtr + (g * 4 + 1) * srcRowBytes;
+                byte* srcR2 = srcPtr + (g * 4 + 2) * srcRowBytes;
+                byte* srcR3 = srcPtr + (g * 4 + 3) * srcRowBytes;
+                byte* dstG  = dstPtr + g * blocksPerRow * Q4_0x4TypeSize;
+
+                for (int bi = 0; bi < blocksPerRow; bi++)
+                {
+                    byte* dstBlk = dstG + bi * Q4_0x4TypeSize;
+                    byte* s0 = srcR0 + bi * Q4_0TypeSize;
+                    byte* s1 = srcR1 + bi * Q4_0TypeSize;
+                    byte* s2 = srcR2 + bi * Q4_0TypeSize;
+                    byte* s3 = srcR3 + bi * Q4_0TypeSize;
+
+                    // Scales (bytes 0..7)
+                    *(ushort*)(dstBlk + 0) = *(ushort*)s0;
+                    *(ushort*)(dstBlk + 2) = *(ushort*)s1;
+                    *(ushort*)(dstBlk + 4) = *(ushort*)s2;
+                    *(ushort*)(dstBlk + 6) = *(ushort*)s3;
+
+                    // Each row's 16 qs bytes contiguous — starts at (s_r + 2) in Q4_0.
+                    *(ulong*)(dstBlk +  8) = *(ulong*)(s0 + 2);
+                    *(ulong*)(dstBlk + 16) = *(ulong*)(s0 + 10);
+                    *(ulong*)(dstBlk + 24) = *(ulong*)(s1 + 2);
+                    *(ulong*)(dstBlk + 32) = *(ulong*)(s1 + 10);
+                    *(ulong*)(dstBlk + 40) = *(ulong*)(s2 + 2);
+                    *(ulong*)(dstBlk + 48) = *(ulong*)(s2 + 10);
+                    *(ulong*)(dstBlk + 56) = *(ulong*)(s3 + 2);
+                    *(ulong*)(dstBlk + 64) = *(ulong*)(s3 + 10);
+                }
+            }
+        }
+    }
+
+    /// <summary>
+    /// FP32 × Q4_0x4 fused matmul. b is the repacked weight tensor with N/4
+    /// groups of blocksPerRow block_q4_0x4 structures. Activation is quantized
+    /// to Q8_0 on-the-fly (for M≥1). Each thread iteration processes all blocks
+    /// of one 4-row weight group against all M activations.
+    /// </summary>
+    public static unsafe void MultiplyQ4_0x4(
+        Span<float> output, ReadOnlySpan<float> a, ReadOnlySpan<byte> b, int M, int K, int N)
+    {
+        if ((N & 3) != 0)
+            throw new ArgumentException($"MultiplyQ4_0x4 needs N divisible by 4, got {N}");
+
+        int blocksPerRow = K / Q4_0BlockSize;
+        int q8BytesPerInput = blocksPerRow * Q8_0TypeSize;
+        int groupBytes = blocksPerRow * Q4_0x4TypeSize;
+        int groups = N / 4;
+
+        // Quantize all M activation rows once.
+        byte[] aQBufArr = System.Buffers.ArrayPool<byte>.Shared.Rent(M * q8BytesPerInput);
+        try
+        {
+            fixed (float* aFixedPtr = a)
+            fixed (byte* bFixedPtr = b)
+            fixed (float* oFixedPtr = output)
+            fixed (byte* aQFixedPtr = aQBufArr)
+            {
+                for (int i = 0; i < M; i++)
+                    QuantizeRowQ8_0(aFixedPtr + i * K, aQFixedPtr + i * q8BytesPerInput, K);
+
+                nint aQBase = (nint)aQFixedPtr;
+                nint bBase = (nint)bFixedPtr;
+                nint oBase = (nint)oFixedPtr;
+                int mCap = M;
+                int blkCap = blocksPerRow;
+                int groupBytesCap = groupBytes;
+                int q8StrideCap = q8BytesPerInput;
+                int nCap = N;
+
+                // Parallelise over weight 4-row groups.
+                if (groups >= ParallelThreshold)
+                {
+                    Parallel.For(0, groups, CpuThreading.Options, g =>
+                    {
+                        byte* bGroup = (byte*)bBase + g * groupBytesCap;
+                        int jBase = g * 4;
+                        // Process all M activations against this 4-row group.
+                        DotQ4_0x4_Mx4Avx2(
+                            (byte*)aQBase, bGroup, blkCap, mCap, q8StrideCap,
+                            (float*)oBase + jBase, nCap);
+                    });
+                }
+                else
+                {
+                    for (int g = 0; g < groups; g++)
+                    {
+                        byte* bGroup = bFixedPtr + g * groupBytes;
+                        int jBase = g * 4;
+                        DotQ4_0x4_Mx4Avx2(
+                            aQFixedPtr, bGroup, blocksPerRow, M, q8BytesPerInput,
+                            oFixedPtr + jBase, N);
+                    }
+                }
+            }
+        }
+        finally
+        {
+            System.Buffers.ArrayPool<byte>.Shared.Return(aQBufArr);
+        }
+    }
+
+    /// <summary>
+    /// Inner kernel: one 4-row weight group × M activation rows. Processes
+    /// M in chunks of 2 (8 accumulators per chunk — fits in YMM registers).
+    /// For each weight block, reads 4 rows' data in one 72-byte block.
+    /// </summary>
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    private static unsafe void DotQ4_0x4_Mx4Avx2(
+        byte* aQ, byte* bGroup, int blockCount, int M, int aQStride,
+        float* outPtr, int outStride)
+    {
+        int mBase = 0;
+        while (mBase + 2 <= M)
+        {
+            // Advance outPtr by mBase*outStride so the 2x4 tile writes into the
+            // correct output rows (it writes to outPtr[0..1 * outStride + 0..3]).
+            DotQ4_0x4_2x4Tile(aQ, bGroup, blockCount, mBase, aQStride,
+                outPtr + mBase * outStride, outStride);
+            mBase += 2;
+        }
+        if (mBase < M)
+            DotQ4_0x4_1x4Tile(aQ, bGroup, blockCount, mBase, aQStride,
+                outPtr + mBase * outStride, outStride);
+    }
+
+    /// <summary>
+    /// 2M × 4N tile against a Q4_0x4 weight group. 8 accumulators (c[2][4]).
+    /// </summary>
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    private static unsafe void DotQ4_0x4_2x4Tile(
+        byte* aQ, byte* bGroup, int blockCount, int mBase, int aQStride,
+        float* outPtr, int outStride)
+    {
+        var mask0x0F = Vector256.Create((byte)0x0F);
+        var offset8 = Vector256.Create((sbyte)8);
+        var ones = Vector256.Create((short)1);
+
+        var c00 = Vector256<float>.Zero; var c01 = Vector256<float>.Zero;
+        var c02 = Vector256<float>.Zero; var c03 = Vector256<float>.Zero;
+        var c10 = Vector256<float>.Zero; var c11 = Vector256<float>.Zero;
+        var c12 = Vector256<float>.Zero; var c13 = Vector256<float>.Zero;
+
+        byte* a0 = aQ + (mBase + 0) * aQStride;
+        byte* a1 = aQ + (mBase + 1) * aQStride;
+
+        for (int bi = 0; bi < blockCount; bi++)
+        {
+            byte* bBlk = bGroup + bi * Q4_0x4TypeSize;
+
+            float bs0 = (float)Unsafe.ReadUnaligned<Half>(bBlk + 0);
+            float bs1 = (float)Unsafe.ReadUnaligned<Half>(bBlk + 2);
+            float bs2 = (float)Unsafe.ReadUnaligned<Half>(bBlk + 4);
+            float bs3 = (float)Unsafe.ReadUnaligned<Half>(bBlk + 6);
+
+            // Inline decode of 4 rows — each row's 16 bytes at offset (8 + row*16).
+            // JIT sometimes refuses to inline the DecodeQ4_0x4Row helper across the
+            // 4 calls so we duplicate it here.
+            var p0 = Sse2.LoadVector128(bBlk + 8);
+            var p1 = Sse2.LoadVector128(bBlk + 24);
+            var p2 = Sse2.LoadVector128(bBlk + 40);
+            var p3 = Sse2.LoadVector128(bBlk + 56);
+
+            var p0hi = Sse2.ShiftRightLogical(p0.AsUInt16(), 4).AsByte();
+            var p1hi = Sse2.ShiftRightLogical(p1.AsUInt16(), 4).AsByte();
+            var p2hi = Sse2.ShiftRightLogical(p2.AsUInt16(), 4).AsByte();
+            var p3hi = Sse2.ShiftRightLogical(p3.AsUInt16(), 4).AsByte();
+
+            var qx0 = Avx2.Subtract(Avx2.And(Vector256.Create(p0, p0hi), mask0x0F).AsSByte(), offset8);
+            var qx1 = Avx2.Subtract(Avx2.And(Vector256.Create(p1, p1hi), mask0x0F).AsSByte(), offset8);
+            var qx2 = Avx2.Subtract(Avx2.And(Vector256.Create(p2, p2hi), mask0x0F).AsSByte(), offset8);
+            var qx3 = Avx2.Subtract(Avx2.And(Vector256.Create(p3, p3hi), mask0x0F).AsSByte(), offset8);
+
+            var ax0 = Avx2.Sign(qx0, qx0).AsByte();
+            var ax1 = Avx2.Sign(qx1, qx1).AsByte();
+            var ax2 = Avx2.Sign(qx2, qx2).AsByte();
+            var ax3 = Avx2.Sign(qx3, qx3).AsByte();
+
+            // Load 2 activation blocks
+            int aOff = bi * Q8_0TypeSize;
+            float as0 = (float)Unsafe.ReadUnaligned<Half>(a0 + aOff);
+            float as1 = (float)Unsafe.ReadUnaligned<Half>(a1 + aOff);
+            var qy0 = Avx.LoadVector256((sbyte*)(a0 + aOff + 2));
+            var qy1 = Avx.LoadVector256((sbyte*)(a1 + aOff + 2));
+
+            // 8 int8 dot products — 2 M rows × 4 N rows
+            c00 = FusedDot4x4(ax0, qy0, qx0, as0 * bs0, c00, ones);
+            c01 = FusedDot4x4(ax1, qy0, qx1, as0 * bs1, c01, ones);
+            c02 = FusedDot4x4(ax2, qy0, qx2, as0 * bs2, c02, ones);
+            c03 = FusedDot4x4(ax3, qy0, qx3, as0 * bs3, c03, ones);
+            c10 = FusedDot4x4(ax0, qy1, qx0, as1 * bs0, c10, ones);
+            c11 = FusedDot4x4(ax1, qy1, qx1, as1 * bs1, c11, ones);
+            c12 = FusedDot4x4(ax2, qy1, qx2, as1 * bs2, c12, ones);
+            c13 = FusedDot4x4(ax3, qy1, qx3, as1 * bs3, c13, ones);
+        }
+
+        outPtr[0 * outStride + 0] = Vector256.Sum(c00);
+        outPtr[0 * outStride + 1] = Vector256.Sum(c01);
+        outPtr[0 * outStride + 2] = Vector256.Sum(c02);
+        outPtr[0 * outStride + 3] = Vector256.Sum(c03);
+        outPtr[1 * outStride + 0] = Vector256.Sum(c10);
+        outPtr[1 * outStride + 1] = Vector256.Sum(c11);
+        outPtr[1 * outStride + 2] = Vector256.Sum(c12);
+        outPtr[1 * outStride + 3] = Vector256.Sum(c13);
+    }
+
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    private static unsafe void DotQ4_0x4_1x4Tile(
+        byte* aQ, byte* bGroup, int blockCount, int mBase, int aQStride,
+        float* outPtr, int outStride)
+    {
+        var mask0x0F = Vector256.Create((byte)0x0F);
+        var offset8 = Vector256.Create((sbyte)8);
+        var ones = Vector256.Create((short)1);
+        var c0 = Vector256<float>.Zero; var c1 = Vector256<float>.Zero;
+        var c2 = Vector256<float>.Zero; var c3 = Vector256<float>.Zero;
+
+        byte* a0 = aQ + mBase * aQStride;
+
+        for (int bi = 0; bi < blockCount; bi++)
+        {
+            byte* bBlk = bGroup + bi * Q4_0x4TypeSize;
+            float bs0 = (float)Unsafe.ReadUnaligned<Half>(bBlk + 0);
+            float bs1 = (float)Unsafe.ReadUnaligned<Half>(bBlk + 2);
+            float bs2 = (float)Unsafe.ReadUnaligned<Half>(bBlk + 4);
+            float bs3 = (float)Unsafe.ReadUnaligned<Half>(bBlk + 6);
+
+            var qx0 = DecodeQ4_0x4Row(bBlk, 0, mask0x0F, offset8);
+            var qx1 = DecodeQ4_0x4Row(bBlk, 1, mask0x0F, offset8);
+            var qx2 = DecodeQ4_0x4Row(bBlk, 2, mask0x0F, offset8);
+            var qx3 = DecodeQ4_0x4Row(bBlk, 3, mask0x0F, offset8);
+            var ax0 = Avx2.Sign(qx0, qx0).AsByte();
+            var ax1 = Avx2.Sign(qx1, qx1).AsByte();
+            var ax2 = Avx2.Sign(qx2, qx2).AsByte();
+            var ax3 = Avx2.Sign(qx3, qx3).AsByte();
+
+            int aOff = bi * Q8_0TypeSize;
+            float as0 = (float)Unsafe.ReadUnaligned<Half>(a0 + aOff);
+            var qy0 = Avx.LoadVector256((sbyte*)(a0 + aOff + 2));
+
+            c0 = FusedDot4x4(ax0, qy0, qx0, as0 * bs0, c0, ones);
+            c1 = FusedDot4x4(ax1, qy0, qx1, as0 * bs1, c1, ones);
+            c2 = FusedDot4x4(ax2, qy0, qx2, as0 * bs2, c2, ones);
+            c3 = FusedDot4x4(ax3, qy0, qx3, as0 * bs3, c3, ones);
+        }
+
+        outPtr[0] = Vector256.Sum(c0);
+        outPtr[1] = Vector256.Sum(c1);
+        outPtr[2] = Vector256.Sum(c2);
+        outPtr[3] = Vector256.Sum(c3);
+    }
+
+    /// <summary>
+    /// Decode one row's 32 int8 values from a repacked Q4_0x4 block. Each row's
+    /// 16 packed nibble bytes are contiguous at offset (8 + row * 16) within
+    /// the block, so we can do a single 16-byte SSE load.
+    /// </summary>
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    private static unsafe Vector256<sbyte> DecodeQ4_0x4Row(
+        byte* bBlk, int row,
+        Vector256<byte> mask0x0F, Vector256<sbyte> offset8)
+    {
+        var packed = Sse2.LoadVector128(bBlk + 8 + row * 16);
+        var packedHi = Sse2.ShiftRightLogical(packed.AsUInt16(), 4).AsByte();
+        var qx = Vector256.Create(packed, packedHi);
+        var qxMasked = Avx2.And(qx, mask0x0F);
+        return Avx2.Subtract(qxMasked.AsSByte(), offset8);
     }
 
     /// <summary>
