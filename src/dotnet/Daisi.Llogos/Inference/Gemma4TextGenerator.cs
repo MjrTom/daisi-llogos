@@ -36,8 +36,17 @@ public sealed class Gemma4TextGenerator
 
         var prefillSw = Stopwatch.StartNew();
         ReadOnlySpan<float> logits = default;
-        for (int i = 0; i < promptIds.Length; i++)
-            logits = _forward.Forward(promptIds[i], i);
+
+        // Prefill in batches — reuses weight loads across M tokens in each dense matmul.
+        // MaxBatch=64 matches the Gemma4ForwardPass default maxBatchSize.
+        const int MaxBatch = 64;
+        int pos = 0;
+        while (pos < promptIds.Length)
+        {
+            int take = Math.Min(MaxBatch, promptIds.Length - pos);
+            logits = _forward.ForwardBatch(promptIds.AsSpan(pos, take), pos);
+            pos += take;
+        }
         prefillSw.Stop();
 
         int position = promptIds.Length;

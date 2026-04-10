@@ -556,6 +556,241 @@ public class InspectModelTests
         File.WriteAllLines(@"C:\GGUFS\gemma-4-E4B-it-greedy.txt", report);
     }
 
+    [Fact]
+    public void Gemma4_Q4_0_ForwardBatch_MatchesSequential()
+    {
+        var path = @"C:\GGUFS\gemma-4-E4B-it-Q4_0.gguf";
+        if (!File.Exists(path)) return;
+
+        using var stream = File.OpenRead(path);
+        var gguf = GgufFile.Read(stream);
+        var config = ModelConfig.FromGguf(gguf);
+        var tokenizer = TokenizerFactory.FromGguf(gguf);
+
+        using var backend = new CpuBackend();
+        using var weights = MmapModelLoader.Load(gguf, path, backend, config);
+
+        // Sequential: run Forward(i) for each prompt token
+        using var kvSeq = new Gemma4KvCache(backend, config, maxSeqLen: 256);
+        using var forwardSeq = new Gemma4ForwardPass(backend, config, weights, kvSeq);
+
+        string prompt = "The capital of France is";
+        var encoded = tokenizer.Encode(prompt);
+        var promptIds = new int[encoded.Length + 1];
+        promptIds[0] = tokenizer.Vocabulary.BosTokenId;
+        Array.Copy(encoded, 0, promptIds, 1, encoded.Length);
+
+        var seqSw = System.Diagnostics.Stopwatch.StartNew();
+        ReadOnlySpan<float> seqLogits = default;
+        for (int i = 0; i < promptIds.Length; i++)
+            seqLogits = forwardSeq.Forward(promptIds[i], i);
+        seqSw.Stop();
+        var seqTop = ArgMax(seqLogits);
+        var seqLogitsCopy = seqLogits.ToArray();
+
+        // Batched: run ForwardBatch(all, 0)
+        using var kvBat = new Gemma4KvCache(backend, config, maxSeqLen: 256);
+        using var forwardBat = new Gemma4ForwardPass(backend, config, weights, kvBat);
+
+        var batSw = System.Diagnostics.Stopwatch.StartNew();
+        var batLogits = forwardBat.ForwardBatch(promptIds, 0);
+        batSw.Stop();
+        var batTop = ArgMax(batLogits);
+
+        // Compare: top-1 token must match, top logits should match to 4 decimal places
+        var report = new List<string>
+        {
+            $"Prompt: \"{prompt}\" ({promptIds.Length} tokens after BOS)",
+            "",
+            $"Sequential ({promptIds.Length} single-token Forward calls):",
+            $"  Time: {seqSw.ElapsedMilliseconds} ms",
+            $"  Top token: {seqTop} '{tokenizer.Decode(new[] { seqTop })}' logit={seqLogitsCopy[seqTop]:F4}",
+            "",
+            $"Batched (1 ForwardBatch call):",
+            $"  Time: {batSw.ElapsedMilliseconds} ms",
+            $"  Top token: {batTop} '{tokenizer.Decode(new[] { batTop })}' logit={batLogits[batTop]:F4}",
+            "",
+            $"Speedup: {(double)seqSw.ElapsedMilliseconds / batSw.ElapsedMilliseconds:F2}x",
+            "",
+            "Top-5 logit comparison:",
+        };
+
+        // Report top-5 of both
+        var seqIdx = TopK(seqLogitsCopy, 5);
+        var batIdx = TopK(batLogits.ToArray(), 5);
+        report.Add("  Sequential top-5:");
+        foreach (var i in seqIdx)
+            report.Add($"    {i,7} '{tokenizer.Decode(new[] { i })}' logit={seqLogitsCopy[i]:F4}");
+        report.Add("  Batched top-5:");
+        foreach (var i in batIdx)
+            report.Add($"    {i,7} '{tokenizer.Decode(new[] { i })}' logit={batLogits[i]:F4}");
+
+        File.WriteAllLines(@"C:\GGUFS\gemma-4-E4B-it-batch-compare.txt", report);
+
+        // Correctness: top token must match
+        Assert.Equal(seqTop, batTop);
+    }
+
+    private static int ArgMax(ReadOnlySpan<float> v)
+    {
+        int best = 0; float bestVal = v[0];
+        for (int i = 1; i < v.Length; i++)
+            if (v[i] > bestVal) { bestVal = v[i]; best = i; }
+        return best;
+    }
+
+    private static int[] TopK(float[] v, int k)
+    {
+        var idx = new int[v.Length];
+        for (int i = 0; i < idx.Length; i++) idx[i] = i;
+        Array.Sort(idx, (a, b) => v[b].CompareTo(v[a]));
+        return idx.AsSpan(0, k).ToArray();
+    }
+
+    [Fact]
+    public void Gemma4_Q4_0_ProfileDecode()
+    {
+        var path = @"C:\GGUFS\gemma-4-E4B-it-Q4_0.gguf";
+        if (!File.Exists(path)) return;
+        RunProfileDecode(path, Daisi.Llogos.Cpu.CpuThreading.ThreadCount);
+    }
+
+    [Fact]
+    public void Gemma4_Q4_0_BenchBatchedPrefill()
+    {
+        var path = @"C:\GGUFS\gemma-4-E4B-it-Q4_0.gguf";
+        if (!File.Exists(path)) return;
+
+        using var stream = File.OpenRead(path);
+        var gguf = GgufFile.Read(stream);
+        var config = ModelConfig.FromGguf(gguf);
+
+        using var backend = new CpuBackend();
+        using var weights = MmapModelLoader.Load(gguf, path, backend, config);
+
+        // Different batch sizes to see how speedup scales
+        var batchSizes = new[] { 1, 2, 4, 8, 12, 16, 24, 32 };
+        var lines = new List<string>
+        {
+            "Gemma 4 Q4_0 batched prefill sweep + profile:",
+            "",
+        };
+
+        foreach (int M in batchSizes)
+        {
+            using var kvCache = new Gemma4KvCache(backend, config, maxSeqLen: 512);
+            using var forward = new Gemma4ForwardPass(backend, config, weights, kvCache, maxBatchSize: 32);
+
+            var ids = new int[M];
+            for (int i = 0; i < ids.Length; i++) ids[i] = 100 + i;
+
+            // Warmup (uses profiling internally but we reset after)
+            forward.ForwardBatch(ids, 0);
+            kvCache.Reset();
+
+            forward.EnableProfiling = true;
+            forward.ResetProfile();
+
+            var sw = System.Diagnostics.Stopwatch.StartNew();
+            forward.ForwardBatch(ids, 0);
+            sw.Stop();
+
+            forward.EnableProfiling = false;
+
+            double total = sw.Elapsed.TotalMilliseconds;
+            double tickMs = 1000.0 / System.Diagnostics.Stopwatch.Frequency;
+            lines.Add($"M={M}: total {total:F1} ms ({total / M:F2} ms/tok, {1000.0 * M / total:F2} tok/s)");
+            lines.Add($"  Embedding:    {forward.ProfileEmbTicks * tickMs,8:F2} ms");
+            lines.Add($"  PLE setup:    {forward.ProfilePleSetupTicks * tickMs,8:F2} ms");
+            lines.Add($"  Attn matmul:  {forward.ProfileAttnMatmulTicks * tickMs,8:F2} ms");
+            lines.Add($"  Attn other:   {forward.ProfileAttnOtherTicks * tickMs,8:F2} ms");
+            lines.Add($"  FFN matmul:   {forward.ProfileFfnMatmulTicks * tickMs,8:F2} ms");
+            lines.Add($"  FFN other:    {forward.ProfileFfnOtherTicks * tickMs,8:F2} ms");
+            lines.Add($"  Norm:         {forward.ProfileNormTicks * tickMs,8:F2} ms");
+            lines.Add($"  PLE block:    {forward.ProfilePleBlockTicks * tickMs,8:F2} ms");
+            lines.Add($"  lm_head:      {forward.ProfileLmHeadTicks * tickMs,8:F2} ms");
+            lines.Add("");
+        }
+
+        File.WriteAllLines(@"C:\GGUFS\gemma-4-E4B-it-batch-sweep.txt", lines);
+    }
+
+    private static void RunProfileDecode(string path, int threadTag)
+    {
+        using var stream = File.OpenRead(path);
+        var gguf = GgufFile.Read(stream);
+        var config = ModelConfig.FromGguf(gguf);
+        var tokenizer = TokenizerFactory.FromGguf(gguf);
+
+        using var backend = new CpuBackend();
+        using var weights = MmapModelLoader.Load(gguf, path, backend, config);
+        using var kvCache = new Gemma4KvCache(backend, config, maxSeqLen: 256);
+        using var forward = new Gemma4ForwardPass(backend, config, weights, kvCache);
+
+        // Prefill a short prompt first (no profiling — warm caches)
+        string prompt = "The capital of France is";
+        var encoded = tokenizer.Encode(prompt);
+        var promptIds = new int[encoded.Length + 1];
+        promptIds[0] = tokenizer.Vocabulary.BosTokenId;
+        Array.Copy(encoded, 0, promptIds, 1, encoded.Length);
+
+        ReadOnlySpan<float> logits = default;
+        for (int i = 0; i < promptIds.Length; i++)
+            logits = forward.Forward(promptIds[i], i);
+
+        // Profile the next 10 decode steps
+        forward.EnableProfiling = true;
+        forward.ResetProfile();
+
+        int position = promptIds.Length;
+        var totalSw = System.Diagnostics.Stopwatch.StartNew();
+        for (int t = 0; t < 10; t++)
+        {
+            int argmax = 0;
+            float bestVal = logits[0];
+            for (int i = 1; i < logits.Length; i++)
+                if (logits[i] > bestVal) { bestVal = logits[i]; argmax = i; }
+
+            logits = forward.Forward(argmax, position);
+            position++;
+        }
+        totalSw.Stop();
+        forward.EnableProfiling = false;
+
+        double tickToMs = 1000.0 / System.Diagnostics.Stopwatch.Frequency;
+        double total = totalSw.Elapsed.TotalMilliseconds;
+        double embMs = forward.ProfileEmbTicks * tickToMs;
+        double pleSetupMs = forward.ProfilePleSetupTicks * tickToMs;
+        double attnMmMs = forward.ProfileAttnMatmulTicks * tickToMs;
+        double attnOtMs = forward.ProfileAttnOtherTicks * tickToMs;
+        double ffnMmMs = forward.ProfileFfnMatmulTicks * tickToMs;
+        double ffnOtMs = forward.ProfileFfnOtherTicks * tickToMs;
+        double normMs = forward.ProfileNormTicks * tickToMs;
+        double pleBlMs = forward.ProfilePleBlockTicks * tickToMs;
+        double lmHeadMs = forward.ProfileLmHeadTicks * tickToMs;
+        double accounted = embMs + pleSetupMs + attnMmMs + attnOtMs + ffnMmMs + ffnOtMs + normMs + pleBlMs + lmHeadMs;
+        double unaccounted = total - accounted;
+
+        var lines = new List<string>
+        {
+            $"Gemma 4 Q4_0 — decode profile (threads={threadTag}, 10 steps, total {total:F1} ms, {10000.0 / total:F2} tok/s):",
+            "",
+            $"  Embedding lookup+scale   : {embMs,8:F2} ms  ({embMs / total * 100,5:F1}%)",
+            $"  PLE setup (per token)    : {pleSetupMs,8:F2} ms  ({pleSetupMs / total * 100,5:F1}%)",
+            $"  Attention matmul (Q/K/V/O): {attnMmMs,8:F2} ms  ({attnMmMs / total * 100,5:F1}%)",
+            $"  Attention other (RoPE/sm): {attnOtMs,8:F2} ms  ({attnOtMs / total * 100,5:F1}%)",
+            $"  FFN matmul (gate/up/down): {ffnMmMs,8:F2} ms  ({ffnMmMs / total * 100,5:F1}%)",
+            $"  FFN other (GeGLU)        : {ffnOtMs,8:F2} ms  ({ffnOtMs / total * 100,5:F1}%)",
+            $"  RmsNorm (5 per layer)    : {normMs,8:F2} ms  ({normMs / total * 100,5:F1}%)",
+            $"  PLE block (per layer)    : {pleBlMs,8:F2} ms  ({pleBlMs / total * 100,5:F1}%)",
+            $"  lm_head + final norm     : {lmHeadMs,8:F2} ms  ({lmHeadMs / total * 100,5:F1}%)",
+            $"  (unaccounted)            : {unaccounted,8:F2} ms  ({unaccounted / total * 100,5:F1}%)",
+            "",
+            $"Per-token breakdown (ms): {total / 10:F2} ms/tok",
+        };
+        File.WriteAllLines(@"C:\GGUFS\gemma-4-E4B-it-profile.txt", lines);
+    }
+
     private static string FormatMetadataValue(GgufMetadataKv kv)
     {
         // Strings, numbers, bools — direct ToString.

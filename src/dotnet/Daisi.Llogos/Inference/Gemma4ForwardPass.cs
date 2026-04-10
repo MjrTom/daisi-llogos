@@ -1,3 +1,4 @@
+using System.Diagnostics;
 using Daisi.Llogos.Gguf;
 using Daisi.Llogos.Model;
 
@@ -27,6 +28,7 @@ public sealed class Gemma4ForwardPass : IDisposable
     private readonly ModelConfig _config;
     private readonly ModelWeights _weights;
     private readonly Gemma4KvCache _kvCache;
+    private readonly int _maxBatch;
 
     // ── Scratch buffers (sized for the FULL-attention head dim — sliding layers
     //    use a prefix of these buffers since their dim is smaller). ────────────
@@ -53,6 +55,42 @@ public sealed class Gemma4ForwardPass : IDisposable
     private readonly ITensor _vProjSwa;
     private readonly ITensor _qGateSwa;
     private readonly ITensor _attnOutSwa;
+
+    // Single-row scratch tensors used by the per-token attention loop when running
+    // in batched mode. Row m of the batched Q/K/V/attnOut is copied in/out of these
+    // between batched projections and attention. These share memory with the
+    // single-token decode scratch (same size) — they're only used inside
+    // ForwardBatch and ForwardBatch never runs concurrently with Forward.
+    private readonly ITensor _qSingle;
+    private readonly ITensor _kSingle;
+    private readonly ITensor _vSingle;
+    private readonly ITensor _qGateSingle;
+    private readonly ITensor _attnOutSingle;
+    private readonly ITensor _qSingleSwa;
+    private readonly ITensor _kSingleSwa;
+    private readonly ITensor _vSingleSwa;
+    private readonly ITensor _qGateSingleSwa;
+    private readonly ITensor _attnOutSingleSwa;
+
+    // Batched scratch buffers — sized [maxBatch × dim] row-major. Only used by
+    // ForwardBatch. Keeping them separate from the decode scratch means the M=1
+    // path is bit-identical to pre-batch (every op still runs against a
+    // single-row tensor).
+    private readonly ITensor _hiddenB;
+    private readonly ITensor _residualB;
+    private readonly ITensor _normOutB;
+    private readonly ITensor _qProjB;
+    private readonly ITensor _kProjB;
+    private readonly ITensor _vProjB;
+    private readonly ITensor _attnOutB;
+    private readonly ITensor _qProjSwaB;
+    private readonly ITensor _kProjSwaB;
+    private readonly ITensor _vProjSwaB;
+    private readonly ITensor _attnOutSwaB;
+    private readonly ITensor _ffnGateB;
+    private readonly ITensor _ffnUpB;
+    private readonly ITensor? _pleGateB;
+    private readonly ITensor? _pleScratchB;
 
     // FFN scratch
     private readonly ITensor _ffnGate;
@@ -89,13 +127,41 @@ public sealed class Gemma4ForwardPass : IDisposable
     /// <summary>Debug: disable RoPE entirely (positions ignored).</summary>
     public bool DebugDisableRope { get; set; }
 
-    public Gemma4ForwardPass(IComputeBackend backend, ModelConfig config, ModelWeights weights, Gemma4KvCache kvCache)
+    /// <summary>When true, Forward() accumulates per-section timings into the Profile* properties.</summary>
+    public bool EnableProfiling { get; set; }
+
+    public long ProfileEmbTicks;
+    public long ProfilePleSetupTicks;
+    public long ProfileAttnMatmulTicks;
+    public long ProfileAttnOtherTicks;  // RoPE, kvwrite, softmax, qk-norm, v-norm
+    public long ProfileFfnMatmulTicks;
+    public long ProfileFfnOtherTicks;   // GeGLU activation
+    public long ProfileNormTicks;
+    public long ProfilePleBlockTicks;
+    public long ProfileLmHeadTicks;
+
+    public void ResetProfile()
+    {
+        ProfileEmbTicks = 0;
+        ProfilePleSetupTicks = 0;
+        ProfileAttnMatmulTicks = 0;
+        ProfileAttnOtherTicks = 0;
+        ProfileFfnMatmulTicks = 0;
+        ProfileFfnOtherTicks = 0;
+        ProfileNormTicks = 0;
+        ProfilePleBlockTicks = 0;
+        ProfileLmHeadTicks = 0;
+    }
+
+    public Gemma4ForwardPass(IComputeBackend backend, ModelConfig config, ModelWeights weights, Gemma4KvCache kvCache, int maxBatchSize = 64)
     {
         _backend = backend;
         _config = config;
         _weights = weights;
         _kvCache = kvCache;
+        _maxBatch = Math.Max(1, maxBatchSize);
 
+        // Single-token scratch (decode path) — unchanged.
         _hidden   = CreateF32("g4_hidden", config.HiddenDim);
         _residual = CreateF32("g4_residual", config.HiddenDim);
         _normOut  = CreateF32("g4_normOut", config.HiddenDim);
@@ -109,16 +175,22 @@ public sealed class Gemma4ForwardPass : IDisposable
         int kSwa  = config.KeyLengthSwa;    // sliding head dim (256 for E4B-it)
         int vSwa  = config.ValueLengthSwa;
 
-        // Full-attention scratch
+        // Full-attention scratch (single-token, for decode path)
         _qProj   = CreateF32("g4_q_full", numH   * kFull);
         _kProj   = CreateF32("g4_k_full", numKvH * kFull);
         _vProj   = CreateF32("g4_v_full", numKvH * vFull);
         _qGate   = CreateF32("g4_qg_full", numH * kFull);
         _attnOut = CreateF32("g4_ao_full", numH * vFull);
-        backend.FillTensor(_qGate, 88.0f); // sigmoid(88) ≈ 1.0 → ungated path
+        backend.FillTensor(_qGate, 88.0f);
 
-        // Sliding-attention scratch (smaller, used by SWA layers).
-        // If the model has no sliding layers, kSwa == 0 — just point to the full ones.
+        // Single-row scratch tensors — re-used for the per-token attention loop
+        // inside ForwardBatch (they share the same size as the decode scratch).
+        _qSingle = _qProj;
+        _kSingle = _kProj;
+        _vSingle = _vProj;
+        _qGateSingle = _qGate;
+        _attnOutSingle = _attnOut;
+
         if (kSwa > 0)
         {
             _qProjSwa   = CreateF32("g4_q_swa", numH   * kSwa);
@@ -127,6 +199,12 @@ public sealed class Gemma4ForwardPass : IDisposable
             _qGateSwa   = CreateF32("g4_qg_swa", numH * kSwa);
             _attnOutSwa = CreateF32("g4_ao_swa", numH * vSwa);
             backend.FillTensor(_qGateSwa, 88.0f);
+
+            _qSingleSwa = _qProjSwa;
+            _kSingleSwa = _kProjSwa;
+            _vSingleSwa = _vProjSwa;
+            _qGateSingleSwa = _qGateSwa;
+            _attnOutSingleSwa = _attnOutSwa;
         }
         else
         {
@@ -135,24 +213,61 @@ public sealed class Gemma4ForwardPass : IDisposable
             _vProjSwa = _vProj;
             _qGateSwa = _qGate;
             _attnOutSwa = _attnOut;
+
+            _qSingleSwa = _qSingle;
+            _kSingleSwa = _kSingle;
+            _vSingleSwa = _vSingle;
+            _qGateSingleSwa = _qGateSingle;
+            _attnOutSingleSwa = _attnOutSingle;
         }
 
         _ffnGate = CreateF32("g4_ffn_gate", config.IntermediateDim);
         _ffnUp   = CreateF32("g4_ffn_up",   config.IntermediateDim);
 
-        // PLE scratch — only if the model has per-layer embeddings.
         _hasPle = config.PerLayerInputDim > 0
             && weights.PerLayerTokenEmbd != null
             && weights.PerLayerModelProj != null
             && weights.PerLayerProjNorm != null;
         if (_hasPle)
         {
-            int pleTotal = config.PerLayerInputDim * config.NumLayers; // 256 × 42 = 10752
+            int pleTotal = config.PerLayerInputDim * config.NumLayers;
             _pleBase    = CreateF32("g4_ple_base",    pleTotal);
             _pleProjOut = CreateF32("g4_ple_proj",    pleTotal);
             _pleSlice   = CreateF32("g4_ple_slice",   config.PerLayerInputDim);
             _pleGate    = CreateF32("g4_ple_gate",    config.PerLayerInputDim);
             _pleScratch = CreateF32("g4_ple_scratch", config.HiddenDim);
+        }
+
+        // Batched scratch buffers — allocated separately and only used by ForwardBatch.
+        // Keeping them separate means the decode (M=1) path is bit-identical to pre-batch.
+        int mb = _maxBatch;
+        _hiddenB   = CreateF32("g4b_hidden",   mb * config.HiddenDim);
+        _residualB = CreateF32("g4b_residual", mb * config.HiddenDim);
+        _normOutB  = CreateF32("g4b_normOut",  mb * config.HiddenDim);
+        _qProjB    = CreateF32("g4b_q_full",   mb * numH   * kFull);
+        _kProjB    = CreateF32("g4b_k_full",   mb * numKvH * kFull);
+        _vProjB    = CreateF32("g4b_v_full",   mb * numKvH * vFull);
+        _attnOutB  = CreateF32("g4b_ao_full",  mb * numH * vFull);
+        _ffnGateB  = CreateF32("g4b_ffn_gate", mb * config.IntermediateDim);
+        _ffnUpB    = CreateF32("g4b_ffn_up",   mb * config.IntermediateDim);
+        if (_hasPle)
+        {
+            _pleGateB    = CreateF32("g4b_ple_gate",    mb * config.PerLayerInputDim);
+            _pleScratchB = CreateF32("g4b_ple_scratch", mb * config.HiddenDim);
+        }
+        if (kSwa > 0)
+        {
+            _qProjSwaB   = CreateF32("g4b_q_swa",  mb * numH * kSwa);
+            _kProjSwaB   = CreateF32("g4b_k_swa",  mb * numKvH * kSwa);
+            _vProjSwaB   = CreateF32("g4b_v_swa",  mb * numKvH * vSwa);
+            _attnOutSwaB = CreateF32("g4b_ao_swa", mb * numH * vSwa);
+        }
+        else
+        {
+            _qProjSwaB = _qProjB;
+            _kProjSwaB = _kProjB;
+            _vProjSwaB = _vProjB;
+            _attnOutSwaB = _attnOutB;
         }
     }
 
@@ -163,6 +278,8 @@ public sealed class Gemma4ForwardPass : IDisposable
     {
         ForwardTransformer(tokenId, position);
 
+        long t0 = EnableProfiling ? Stopwatch.GetTimestamp() : 0;
+
         // Final RmsNorm + lm_head
         _backend.RmsNorm(_normOut, _hidden, _weights.OutputNorm, _config.NormEps);
         ProjectLinear(_logits, _normOut, _weights.OutputWeight);
@@ -172,21 +289,202 @@ public sealed class Gemma4ForwardPass : IDisposable
             _backend.LogitSoftcap(_logits, _config.FinalLogitSoftcap);
 
         _logits.DequantizeTo(_logitsBuffer);
+
+        if (EnableProfiling)
+            ProfileLmHeadTicks += Stopwatch.GetTimestamp() - t0;
+
         return _logitsBuffer;
     }
 
     public void ForwardHidden(int tokenId, int position) => ForwardTransformer(tokenId, position);
 
+    /// <summary>
+    /// Batched forward pass for prefill. Processes up to <see cref="_maxBatch"/>
+    /// tokens in one shot, reusing weight loads across all M rows in the dense
+    /// matmul ops (Q/K/V/O projections, FFN gate/up/down, PLE projections).
+    /// Per-token attention is still done in a loop inside the layer — the win
+    /// comes from amortising weight memory reads.
+    ///
+    /// Returns the logits for the LAST token in the batch only (prefill just
+    /// needs the final position's distribution to sample the first decode token).
+    /// </summary>
+    public ReadOnlySpan<float> ForwardBatch(ReadOnlySpan<int> tokenIds, int startPosition)
+    {
+        int M = tokenIds.Length;
+        if (M <= 0) return ReadOnlySpan<float>.Empty;
+        if (M == 1) return Forward(tokenIds[0], startPosition);
+        if (M > _maxBatch)
+            throw new ArgumentException($"batch size {M} > maxBatch {_maxBatch}");
+
+        int D = _config.HiddenDim;
+        int IFF = _config.IntermediateDim;
+
+        // Per-section profiling for batched path (cheap: 8 Stopwatch.GetTimestamp calls per layer)
+        long tPleSetup = 0, tRmsNorms = 0, tAttnMm = 0, tAttnLoop = 0, tFfnMm = 0, tPleBlock = 0, tLmHead = 0;
+        bool prof = EnableProfiling;
+        long s;
+
+        // 1. Embed all M tokens into _hiddenB (row-by-row; lookup is memcpy-fast)
+        var hiddenBSpan = _hiddenB.AsFloatSpan();
+        for (int i = 0; i < M; i++)
+        {
+            _backend.EmbeddingLookup(_hidden, _weights.TokenEmbedding, tokenIds[i]);
+            if (!DebugDisableEmbeddingScale)
+                _backend.ScaleInPlace(_hidden, MathF.Sqrt(D));
+            _hidden.AsFloatSpan().CopyTo(hiddenBSpan.Slice(i * D, D));
+        }
+
+        // 2. PLE setup for all M tokens (per-token, runs M times)
+        // TODO(perf): batch the PerLayerModelProj matmul across all M tokens.
+        var pleBasePerToken = _hasPle ? new float[M * _config.PerLayerInputDim * _config.NumLayers] : null;
+        if (_hasPle && !DebugDisablePle)
+        {
+            s = prof ? Stopwatch.GetTimestamp() : 0;
+            int pleTotal = _config.PerLayerInputDim * _config.NumLayers;
+            for (int i = 0; i < M; i++)
+            {
+                hiddenBSpan.Slice(i * D, D).CopyTo(_hidden.AsFloatSpan());
+                SetupPerLayerEmbeddings(tokenIds[i]);
+                _pleBase!.AsFloatSpan().CopyTo(pleBasePerToken.AsSpan().Slice(i * pleTotal, pleTotal));
+            }
+            if (prof) tPleSetup = Stopwatch.GetTimestamp() - s;
+        }
+
+        // 3. Transformer layers — all matmuls batched, attention is per-token inside.
+        for (int layer = 0; layer < _config.NumLayers; layer++)
+        {
+            var lw = (GemmaAttentionWeights)_weights.Layers[layer];
+
+            s = prof ? Stopwatch.GetTimestamp() : 0;
+            for (int i = 0; i < M; i++)
+                RmsNormRow(_normOutB, _hiddenB, lw.AttnNorm, i, D);
+            _hiddenB.AsFloatSpan().Slice(0, M * D).CopyTo(_residualB.AsFloatSpan());
+            if (prof) tRmsNorms += Stopwatch.GetTimestamp() - s;
+
+            s = prof ? Stopwatch.GetTimestamp() : 0;
+            ForwardAttentionBatched(lw, layer, startPosition, M);
+            if (prof) tAttnLoop += Stopwatch.GetTimestamp() - s;
+
+            s = prof ? Stopwatch.GetTimestamp() : 0;
+            for (int i = 0; i < M; i++)
+            {
+                RmsNormRow(_normOutB, _hiddenB, lw.PostAttnNorm, i, D);
+                ElementAddRow(_hiddenB, _normOutB, _residualB, i, D);
+            }
+            _hiddenB.AsFloatSpan().Slice(0, M * D).CopyTo(_residualB.AsFloatSpan());
+            for (int i = 0; i < M; i++)
+                RmsNormRow(_normOutB, _hiddenB, lw.FfnNorm, i, D);
+            if (prof) tRmsNorms += Stopwatch.GetTimestamp() - s;
+
+            s = prof ? Stopwatch.GetTimestamp() : 0;
+            ProjectLinear(_ffnGateB, _normOutB, lw.FfnGate, M);
+            ProjectLinear(_ffnUpB,   _normOutB, lw.FfnUp,   M);
+            GeGLUBatch(_ffnGateB, _ffnUpB, M, IFF);
+            ProjectLinear(_hiddenB, _ffnGateB, lw.FfnDown, M);
+            if (prof) tFfnMm += Stopwatch.GetTimestamp() - s;
+
+            s = prof ? Stopwatch.GetTimestamp() : 0;
+            for (int i = 0; i < M; i++)
+            {
+                RmsNormRow(_normOutB, _hiddenB, lw.PostFfnNorm, i, D);
+                ElementAddRow(_hiddenB, _normOutB, _residualB, i, D);
+            }
+            if (prof) tRmsNorms += Stopwatch.GetTimestamp() - s;
+
+            // PLE block — batched for the 2 matmuls, per-row for norm/mul/add.
+            if (_hasPle && !DebugDisablePle && lw.PerLayerInpGate != null && lw.PerLayerProj != null && lw.PerLayerPostNorm != null)
+            {
+                s = prof ? Stopwatch.GetTimestamp() : 0;
+                int nEmbdPerLayer = _config.PerLayerInputDim;
+                int pleTotal = nEmbdPerLayer * _config.NumLayers;
+
+                _hiddenB.AsFloatSpan().Slice(0, M * D).CopyTo(_residualB.AsFloatSpan());
+                ProjectLinear(_pleGateB!, _hiddenB, lw.PerLayerInpGate!, M);
+                _backend.GeluTanh(_pleGateB!, _pleGateB!);
+
+                var pleGateBSpan = _pleGateB!.AsFloatSpan();
+                for (int i = 0; i < M; i++)
+                {
+                    var slice = pleBasePerToken.AsSpan().Slice(
+                        i * pleTotal + layer * nEmbdPerLayer, nEmbdPerLayer);
+                    var gateRow = pleGateBSpan.Slice(i * nEmbdPerLayer, nEmbdPerLayer);
+                    for (int k = 0; k < nEmbdPerLayer; k++) gateRow[k] *= slice[k];
+                }
+
+                ProjectLinear(_pleScratchB!, _pleGateB!, lw.PerLayerProj!, M);
+                for (int i = 0; i < M; i++)
+                {
+                    RmsNormRow(_pleScratchB!, _pleScratchB!, lw.PerLayerPostNorm!, i, D);
+                    ElementAddRow(_hiddenB, _residualB, _pleScratchB!, i, D);
+                }
+                if (prof) tPleBlock += Stopwatch.GetTimestamp() - s;
+            }
+
+            // Per-layer scalar output multiplier
+            if (lw.LayerOutScale != null && !DebugDisableLayerOutScale)
+            {
+                var scaleSpan = lw.LayerOutScale.AsFloatSpan();
+                if (scaleSpan.Length > 0)
+                {
+                    float scale = scaleSpan[0];
+                    var h = _hiddenB.AsFloatSpan().Slice(0, M * D);
+                    for (int k = 0; k < h.Length; k++) h[k] *= scale;
+                }
+            }
+        }
+
+        // 4. Final norm + lm_head — only for the LAST token (row M-1).
+        s = prof ? Stopwatch.GetTimestamp() : 0;
+        hiddenBSpan.Slice((M - 1) * D, D).CopyTo(_hidden.AsFloatSpan());
+
+        _backend.RmsNorm(_normOut, _hidden, _weights.OutputNorm, _config.NormEps);
+        ProjectLinear(_logits, _normOut, _weights.OutputWeight);
+
+        if (_config.FinalLogitSoftcap > 0 && !DebugDisableLogitSoftcap)
+            _backend.LogitSoftcap(_logits, _config.FinalLogitSoftcap);
+
+        _logits.DequantizeTo(_logitsBuffer);
+        if (prof) tLmHead = Stopwatch.GetTimestamp() - s;
+
+        if (prof)
+        {
+            ProfilePleSetupTicks += tPleSetup;
+            ProfileNormTicks += tRmsNorms;
+            ProfileAttnMatmulTicks += tAttnLoop;  // attention loop includes batched Q/K/V/O matmuls
+            ProfileFfnMatmulTicks += tFfnMm;
+            ProfilePleBlockTicks += tPleBlock;
+            ProfileLmHeadTicks += tLmHead;
+        }
+
+        return _logitsBuffer;
+    }
+
+    private unsafe void GeGLUBatch(ITensor gate, ITensor up, int batchM, int dim)
+    {
+        // Run GeGLU over each of the M rows — the op is elementwise so it's safe
+        // to call once on the whole M*dim span since both inputs are contiguous.
+        _backend.GeGLU(gate, gate, up);  // op processes the whole tensor
+    }
+
     private void ForwardTransformer(int tokenId, int position)
     {
+        bool prof = EnableProfiling;
+        long t;
+
         // 1. Embedding lookup + sqrt(hidden_dim) scale
+        long tEmb = prof ? Stopwatch.GetTimestamp() : 0;
         _backend.EmbeddingLookup(_hidden, _weights.TokenEmbedding, tokenId);
         if (!DebugDisableEmbeddingScale)
             _backend.ScaleInPlace(_hidden, MathF.Sqrt(_config.HiddenDim));
+        if (prof) ProfileEmbTicks += Stopwatch.GetTimestamp() - tEmb;
 
         // 2. Per-Layer-Embedding setup (once per token, before the layer loop)
         if (_hasPle && !DebugDisablePle)
+        {
+            t = prof ? Stopwatch.GetTimestamp() : 0;
             SetupPerLayerEmbeddings(tokenId);
+            if (prof) ProfilePleSetupTicks += Stopwatch.GetTimestamp() - t;
+        }
 
         // 3. Transformer layers
         for (int layer = 0; layer < _config.NumLayers; layer++)
@@ -194,7 +492,9 @@ public sealed class Gemma4ForwardPass : IDisposable
             var lw = (GemmaAttentionWeights)_weights.Layers[layer];
 
             // ── Pre-attention norm ──────────────────────────────────────────
+            t = prof ? Stopwatch.GetTimestamp() : 0;
             _backend.RmsNorm(_normOut, _hidden, lw.AttnNorm, _config.NormEps);
+            if (prof) ProfileNormTicks += Stopwatch.GetTimestamp() - t;
 
             // Save residual (the value of inpL going into this layer's attention)
             _backend.CopyTensor(_residual, _hidden);
@@ -203,36 +503,47 @@ public sealed class Gemma4ForwardPass : IDisposable
             ForwardAttention(lw, layer, position);
 
             // ── Post-attention norm + residual add ──────────────────────────
-            // _hidden currently holds Wo·attn_output. Apply post-attn norm in place,
-            // then add the saved residual (= inpL).
+            t = prof ? Stopwatch.GetTimestamp() : 0;
             _backend.RmsNorm(_normOut, _hidden, lw.PostAttnNorm, _config.NormEps);
             _backend.ElementAdd(_hidden, _normOut, _residual);
-
-            // From here _hidden = attn_out (= post-norm(attn) + inpL)
+            if (prof) ProfileNormTicks += Stopwatch.GetTimestamp() - t;
 
             // ── Pre-FFN norm + GeGLU FFN ────────────────────────────────────
-            _backend.CopyTensor(_residual, _hidden); // save attn_out for residual
+            _backend.CopyTensor(_residual, _hidden);
+            t = prof ? Stopwatch.GetTimestamp() : 0;
             _backend.RmsNorm(_normOut, _hidden, lw.FfnNorm, _config.NormEps);
+            if (prof) ProfileNormTicks += Stopwatch.GetTimestamp() - t;
 
+            t = prof ? Stopwatch.GetTimestamp() : 0;
             ProjectLinear(_ffnGate, _normOut, lw.FfnGate);
             ProjectLinear(_ffnUp,   _normOut, lw.FfnUp);
+            if (prof) ProfileFfnMatmulTicks += Stopwatch.GetTimestamp() - t;
+
+            t = prof ? Stopwatch.GetTimestamp() : 0;
             _backend.GeGLU(_ffnGate, _ffnGate, _ffnUp);
+            if (prof) ProfileFfnOtherTicks += Stopwatch.GetTimestamp() - t;
+
+            t = prof ? Stopwatch.GetTimestamp() : 0;
             ProjectLinear(_hidden, _ffnGate, lw.FfnDown);
+            if (prof) ProfileFfnMatmulTicks += Stopwatch.GetTimestamp() - t;
 
             // ── Post-FFN norm + residual add ────────────────────────────────
+            t = prof ? Stopwatch.GetTimestamp() : 0;
             _backend.RmsNorm(_normOut, _hidden, lw.PostFfnNorm, _config.NormEps);
             _backend.ElementAdd(_hidden, _normOut, _residual);
+            if (prof) ProfileNormTicks += Stopwatch.GetTimestamp() - t;
 
-            // ── Per-Layer Embedding block (Gemma 3n / Gemma 4 PLE) ──────────
+            // ── Per-Layer Embedding block ───────────────────────────────────
             if (_hasPle && !DebugDisablePle && lw.PerLayerInpGate != null && lw.PerLayerProj != null && lw.PerLayerPostNorm != null)
             {
+                t = prof ? Stopwatch.GetTimestamp() : 0;
                 ApplyPerLayerEmbedding(lw, layer);
+                if (prof) ProfilePleBlockTicks += Stopwatch.GetTimestamp() - t;
             }
 
             // ── Per-layer scalar output multiplier ──────────────────────────
             if (lw.LayerOutScale != null && !DebugDisableLayerOutScale)
             {
-                // LayerOutScale is shape [1] — broadcast multiply
                 var scaleSpan = lw.LayerOutScale.AsFloatSpan();
                 if (scaleSpan.Length > 0)
                     _backend.ScaleInPlace(_hidden, scaleSpan[0]);
@@ -274,17 +585,24 @@ public sealed class Gemma4ForwardPass : IDisposable
         var qGate   = isSwa ? _qGateSwa   : _qGate;
         var attnOut = isSwa ? _attnOutSwa : _attnOut;
 
+        bool prof = EnableProfiling;
+        long t = prof ? Stopwatch.GetTimestamp() : 0;
+
         // ── Q projection (always) ───────────────────────────────────────────
         ProjectLinear(qProj, _normOut, w.AttnQ);
+        if (prof) { ProfileAttnMatmulTicks += Stopwatch.GetTimestamp() - t; t = Stopwatch.GetTimestamp(); }
 
         if (!DebugDisableQkNorm)
             _backend.PerHeadRmsNorm(qProj, w.AttnQNorm, numH, headDim, _config.NormEps);
+        if (prof) { ProfileAttnOtherTicks += Stopwatch.GetTimestamp() - t; }
 
         if (hasKv)
         {
             // ── K/V projections ─────────────────────────────────────────────
+            t = prof ? Stopwatch.GetTimestamp() : 0;
             ProjectLinear(kProj, _normOut, w.AttnK);
             ProjectLinear(vProj, _normOut, w.AttnV);
+            if (prof) { ProfileAttnMatmulTicks += Stopwatch.GetTimestamp() - t; t = Stopwatch.GetTimestamp(); }
 
             if (!DebugDisableQkNorm)
                 _backend.PerHeadRmsNorm(kProj, w.AttnKNorm, numKvH, headDim, _config.NormEps);
@@ -292,8 +610,6 @@ public sealed class Gemma4ForwardPass : IDisposable
                 _backend.PerHeadRmsNormUnit(vProj, numKvH, valDim, _config.NormEps);
 
             // ── RoPE (Q and K together) ─────────────────────────────────────
-            // Gemma 4 uses NEOX-style RoPE. Full-attention layers also apply
-            // proportional RoPE via the precomputed rope_freqs table.
             if (!DebugDisableRope)
             {
                 if (isSwa || w.RopeFreqs == null)
@@ -304,12 +620,14 @@ public sealed class Gemma4ForwardPass : IDisposable
 
             // Write K/V to THIS layer's cache
             _kvCache.Write(_backend, layer, position, kProj, vProj);
+            if (prof) { ProfileAttnOtherTicks += Stopwatch.GetTimestamp() - t; }
         }
         else
         {
             // Shared-KV layer: no new K/V; rotate Q only. kProj is used as an
             // ignored scratch buffer (RoPE rotates it in place but we never read
             // the result — attention reads the source layer's cache instead).
+            t = prof ? Stopwatch.GetTimestamp() : 0;
             if (!DebugDisableRope)
             {
                 if (isSwa || w.RopeFreqs == null)
@@ -317,9 +635,11 @@ public sealed class Gemma4ForwardPass : IDisposable
                 else
                     _backend.RoPENeoxWithFreqFactors(qProj, kProj, headDim, ropeDim, position, ropeTheta, w.RopeFreqs);
             }
+            if (prof) { ProfileAttnOtherTicks += Stopwatch.GetTimestamp() - t; }
         }
 
         // ── Attention (reads sourceLayer's cache, which == layer when hasKv) ─
+        t = prof ? Stopwatch.GetTimestamp() : 0;
         int seqLen = _kvCache.LayerSeqLen(sourceLayer);
         var kCacheT = _kvCache.GetKCacheTensor(sourceLayer);
         var vCacheT = _kvCache.GetVCacheTensor(sourceLayer);
@@ -327,10 +647,12 @@ public sealed class Gemma4ForwardPass : IDisposable
 
         _backend.GatedAttention(attnOut, qProj, qGate, kCacheT, vCacheT,
             numH, numKvH, headDim, valDim, cap, seqLen, attentionScale);
+        if (prof) { ProfileAttnOtherTicks += Stopwatch.GetTimestamp() - t; t = Stopwatch.GetTimestamp(); }
 
         // ── Output projection ───────────────────────────────────────────────
         // attn_output weight shape: [num_heads * head_dim, hidden_dim]
         ProjectLinear(_hidden, attnOut, w.AttnO);
+        if (prof) { ProfileAttnMatmulTicks += Stopwatch.GetTimestamp() - t; }
     }
 
     /// <summary>
@@ -414,6 +736,162 @@ public sealed class Gemma4ForwardPass : IDisposable
         _backend.MatMul(output, input, weight, 1, K, N);
     }
 
+    private void ProjectLinear(ITensor output, ITensor input, ITensor weight, int batchM)
+    {
+        int K = (int)weight.Dimensions[0];
+        int N = (int)weight.Dimensions[1];
+        _backend.MatMul(output, input, weight, batchM, K, N);
+    }
+
+    /// <summary>
+    /// RmsNorm applied to row <paramref name="row"/> of a batched activation
+    /// buffer. <paramref name="dest"/> and <paramref name="src"/> are both
+    /// [maxBatch × dim] row-major; writes dest[row, :] = norm(src[row, :]) * weight.
+    /// </summary>
+    private unsafe void RmsNormRow(ITensor dest, ITensor src, ITensor weight, int row, int dim)
+    {
+        var srcSpan = src.AsFloatSpan().Slice(row * dim, dim);
+        var dstSpan = dest.AsFloatSpan().Slice(row * dim, dim);
+        var wSpan = weight.AsFloatSpan();
+
+        // Compute mean-square
+        double sumSq = 0;
+        for (int i = 0; i < dim; i++) sumSq += srcSpan[i] * srcSpan[i];
+        float invRms = (float)(1.0 / Math.Sqrt(sumSq / dim + _config.NormEps));
+
+        // Apply: dst = src * invRms * weight
+        for (int i = 0; i < dim; i++)
+            dstSpan[i] = srcSpan[i] * invRms * wSpan[i];
+    }
+
+    private void ElementAddRow(ITensor dest, ITensor a, ITensor b, int row, int dim)
+    {
+        var aSpan = a.AsFloatSpan().Slice(row * dim, dim);
+        var bSpan = b.AsFloatSpan().Slice(row * dim, dim);
+        var dSpan = dest.AsFloatSpan().Slice(row * dim, dim);
+        for (int i = 0; i < dim; i++) dSpan[i] = aSpan[i] + bSpan[i];
+    }
+
+    /// <summary>
+    /// Batched attention for one layer. Does the Q/K/V/O projections as batched
+    /// matmuls over M rows, but loops per-token for the actual attention step
+    /// (per-head norm, RoPE, KV cache write, softmax × V). Copy-in / copy-out
+    /// between the batched Q/K/V buffers and the single-row decode scratch
+    /// reuses the existing single-token ops without needing offset params.
+    /// </summary>
+    private void ForwardAttentionBatched(GemmaAttentionWeights w, int layer, int startPosition, int batchM)
+    {
+        bool isSwa = _config.IsSlidingLayer(layer);
+        bool hasKv = _config.HasKv(layer);
+        int numH = _config.NumHeads;
+        int numKvH = _config.NumKvHeads;
+        int headDim = _config.LayerKeyLength(layer);
+        int valDim  = _config.LayerValueLength(layer);
+        int ropeDim = _config.LayerRopeDim(layer);
+        float ropeTheta = _config.LayerRopeTheta(layer);
+        const float attentionScale = 1.0f;
+
+        int sourceLayer = hasKv ? layer
+            : (_config.NumLayerKvFromStart - (isSwa ? 2 : 1));
+
+        // Batched tensors for this layer's head dim
+        var qProjB = isSwa ? _qProjSwaB : _qProjB;
+        var kProjB = isSwa ? _kProjSwaB : _kProjB;
+        var vProjB = isSwa ? _vProjSwaB : _vProjB;
+        var attnOutB = isSwa ? _attnOutSwaB : _attnOutB;
+
+        // Single-row scratch (reuses the decode buffers)
+        var qSingle = isSwa ? _qSingleSwa : _qSingle;
+        var kSingle = isSwa ? _kSingleSwa : _kSingle;
+        var vSingle = isSwa ? _vSingleSwa : _vSingle;
+        var qGateSingle = isSwa ? _qGateSingleSwa : _qGateSingle;
+        var attnOutSingle = isSwa ? _attnOutSingleSwa : _attnOutSingle;
+
+        int qRowSize = numH * headDim;
+        int kRowSize = numKvH * headDim;
+        int vRowSize = numKvH * valDim;
+        int oRowSize = numH * valDim;
+
+        // ── Batched Q projection (reads batchM rows from _normOutB) ─────────
+        ProjectLinear(qProjB, _normOutB, w.AttnQ, batchM);
+
+        // ── Batched K/V projections (has_kv layers only) ────────────────────
+        if (hasKv)
+        {
+            ProjectLinear(kProjB, _normOutB, w.AttnK, batchM);
+            ProjectLinear(vProjB, _normOutB, w.AttnV, batchM);
+        }
+
+        // ── Per-token attention loop ────────────────────────────────────────
+        var qProjBSpan = qProjB.AsFloatSpan();
+        var kProjBSpan = kProjB.AsFloatSpan();
+        var vProjBSpan = vProjB.AsFloatSpan();
+        var attnOutBSpan = attnOutB.AsFloatSpan();
+        var qSingleSpan = qSingle.AsFloatSpan();
+        var kSingleSpan = kSingle.AsFloatSpan();
+        var vSingleSpan = vSingle.AsFloatSpan();
+        var attnOutSingleSpan = attnOutSingle.AsFloatSpan();
+
+        for (int i = 0; i < batchM; i++)
+        {
+            int pos = startPosition + i;
+
+            // Copy row i of Q into single-row scratch
+            qProjBSpan.Slice(i * qRowSize, qRowSize).CopyTo(qSingleSpan);
+
+            if (!DebugDisableQkNorm)
+                _backend.PerHeadRmsNorm(qSingle, w.AttnQNorm, numH, headDim, _config.NormEps);
+
+            if (hasKv)
+            {
+                kProjBSpan.Slice(i * kRowSize, kRowSize).CopyTo(kSingleSpan);
+                vProjBSpan.Slice(i * vRowSize, vRowSize).CopyTo(vSingleSpan);
+
+                if (!DebugDisableQkNorm)
+                    _backend.PerHeadRmsNorm(kSingle, w.AttnKNorm, numKvH, headDim, _config.NormEps);
+                if (!DebugDisableVNorm)
+                    _backend.PerHeadRmsNormUnit(vSingle, numKvH, valDim, _config.NormEps);
+
+                if (!DebugDisableRope)
+                {
+                    if (isSwa || w.RopeFreqs == null)
+                        _backend.RoPENeox(qSingle, kSingle, headDim, ropeDim, pos, ropeTheta);
+                    else
+                        _backend.RoPENeoxWithFreqFactors(qSingle, kSingle, headDim, ropeDim, pos, ropeTheta, w.RopeFreqs);
+                }
+
+                _kvCache.Write(_backend, layer, pos, kSingle, vSingle);
+            }
+            else
+            {
+                // Shared-KV: RoPE on Q only. kSingle is a throwaway buffer.
+                if (!DebugDisableRope)
+                {
+                    if (isSwa || w.RopeFreqs == null)
+                        _backend.RoPENeox(qSingle, kSingle, headDim, ropeDim, pos, ropeTheta);
+                    else
+                        _backend.RoPENeoxWithFreqFactors(qSingle, kSingle, headDim, ropeDim, pos, ropeTheta, w.RopeFreqs);
+                }
+            }
+
+            // Attention reads source layer's cache (just written for this token).
+            int seqLen = _kvCache.LayerSeqLen(sourceLayer);
+            var kCacheT = _kvCache.GetKCacheTensor(sourceLayer);
+            var vCacheT = _kvCache.GetVCacheTensor(sourceLayer);
+            int cap = _kvCache.LayerCapacity(sourceLayer);
+
+            _backend.GatedAttention(attnOutSingle, qSingle, qGateSingle, kCacheT, vCacheT,
+                numH, numKvH, headDim, valDim, cap, seqLen, attentionScale);
+
+            // Copy attnOutSingle back to row i of attnOutB
+            attnOutSingleSpan.Slice(0, oRowSize).CopyTo(attnOutBSpan.Slice(i * oRowSize, oRowSize));
+        }
+
+        // ── Batched output projection ───────────────────────────────────────
+        ProjectLinear(_hiddenB, attnOutB, w.AttnO, batchM);
+    }
+
+
     private ITensor CreateF32(string name, int size) =>
         _backend.CreateTensor(name, GgmlType.F32, [(long)size]);
 
@@ -443,5 +921,24 @@ public sealed class Gemma4ForwardPass : IDisposable
         _pleSlice?.Dispose();
         _pleGate?.Dispose();
         _pleScratch?.Dispose();
+
+        _hiddenB.Dispose();
+        _residualB.Dispose();
+        _normOutB.Dispose();
+        _qProjB.Dispose();
+        _kProjB.Dispose();
+        _vProjB.Dispose();
+        _attnOutB.Dispose();
+        _ffnGateB.Dispose();
+        _ffnUpB.Dispose();
+        _pleGateB?.Dispose();
+        _pleScratchB?.Dispose();
+        if (_qProjSwaB != _qProjB)
+        {
+            _qProjSwaB.Dispose();
+            _kProjSwaB.Dispose();
+            _vProjSwaB.Dispose();
+            _attnOutSwaB.Dispose();
+        }
     }
 }
