@@ -745,8 +745,8 @@ public sealed class Gemma4ForwardPass : IDisposable
 
     /// <summary>
     /// RmsNorm applied to row <paramref name="row"/> of a batched activation
-    /// buffer. <paramref name="dest"/> and <paramref name="src"/> are both
-    /// [maxBatch × dim] row-major; writes dest[row, :] = norm(src[row, :]) * weight.
+    /// buffer. Vectorized with <see cref="System.Numerics.Vector{T}"/> for the
+    /// sum-of-squares reduction and the final scale-and-multiply pass.
     /// </summary>
     private unsafe void RmsNormRow(ITensor dest, ITensor src, ITensor weight, int row, int dim)
     {
@@ -754,22 +754,50 @@ public sealed class Gemma4ForwardPass : IDisposable
         var dstSpan = dest.AsFloatSpan().Slice(row * dim, dim);
         var wSpan = weight.AsFloatSpan();
 
-        // Compute mean-square
-        double sumSq = 0;
-        for (int i = 0; i < dim; i++) sumSq += srcSpan[i] * srcSpan[i];
-        float invRms = (float)(1.0 / Math.Sqrt(sumSq / dim + _config.NormEps));
+        // Sum of squares, vectorized
+        int vlen = System.Numerics.Vector<float>.Count;
+        var accV = System.Numerics.Vector<float>.Zero;
+        int i = 0;
+        for (; i + vlen <= dim; i += vlen)
+        {
+            var sv = new System.Numerics.Vector<float>(srcSpan.Slice(i, vlen));
+            accV += sv * sv;
+        }
+        float sumSq = System.Numerics.Vector.Sum(accV);
+        for (; i < dim; i++) sumSq += srcSpan[i] * srcSpan[i];
 
-        // Apply: dst = src * invRms * weight
-        for (int i = 0; i < dim; i++)
-            dstSpan[i] = srcSpan[i] * invRms * wSpan[i];
+        float invRms = 1.0f / MathF.Sqrt(sumSq / dim + _config.NormEps);
+        var invRmsV = new System.Numerics.Vector<float>(invRms);
+
+        // dst = src * invRms * weight
+        i = 0;
+        for (; i + vlen <= dim; i += vlen)
+        {
+            var sv = new System.Numerics.Vector<float>(srcSpan.Slice(i, vlen));
+            var wv = new System.Numerics.Vector<float>(wSpan.Slice(i, vlen));
+            (sv * invRmsV * wv).CopyTo(dstSpan.Slice(i, vlen));
+        }
+        for (; i < dim; i++) dstSpan[i] = srcSpan[i] * invRms * wSpan[i];
     }
 
+    /// <summary>
+    /// Vectorized dest[row] = a[row] + b[row].
+    /// </summary>
     private void ElementAddRow(ITensor dest, ITensor a, ITensor b, int row, int dim)
     {
         var aSpan = a.AsFloatSpan().Slice(row * dim, dim);
         var bSpan = b.AsFloatSpan().Slice(row * dim, dim);
         var dSpan = dest.AsFloatSpan().Slice(row * dim, dim);
-        for (int i = 0; i < dim; i++) dSpan[i] = aSpan[i] + bSpan[i];
+
+        int vlen = System.Numerics.Vector<float>.Count;
+        int i = 0;
+        for (; i + vlen <= dim; i += vlen)
+        {
+            var av = new System.Numerics.Vector<float>(aSpan.Slice(i, vlen));
+            var bv = new System.Numerics.Vector<float>(bSpan.Slice(i, vlen));
+            (av + bv).CopyTo(dSpan.Slice(i, vlen));
+        }
+        for (; i < dim; i++) dSpan[i] = aSpan[i] + bSpan[i];
     }
 
     /// <summary>
