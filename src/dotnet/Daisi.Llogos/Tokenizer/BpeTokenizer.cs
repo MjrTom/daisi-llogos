@@ -13,7 +13,11 @@ public sealed partial class BpeTokenizer
     private readonly Vocabulary _vocab;
     private readonly MergeTable _merges;
     private readonly bool _useByteEncoding;
+    private readonly bool _useSentencePiece;
     private readonly Regex _preTokenizePattern;
+
+    /// <summary>SentencePiece "lower one eighth block" — used as the in-vocab space marker.</summary>
+    private const char SpmSpaceMarker = '\u2581';
 
     // GPT-2 byte-to-token mapping (only used when _useByteEncoding is true)
     private static readonly string[] ByteToUnicodeTable = BuildByteToUnicode();
@@ -22,11 +26,12 @@ public sealed partial class BpeTokenizer
     // Special tokens that should be matched as whole strings (e.g. <|im_start|>, <|endoftext|>)
     private readonly List<(string token, int id)> _specialTokens = new();
 
-    public BpeTokenizer(Vocabulary vocab, MergeTable merges, bool useByteEncoding = false)
+    public BpeTokenizer(Vocabulary vocab, MergeTable merges, bool useByteEncoding = false, bool useSentencePiece = false)
     {
         _vocab = vocab;
         _merges = merges;
         _useByteEncoding = useByteEncoding;
+        _useSentencePiece = useSentencePiece;
         _preTokenizePattern = PreTokenizeRegex();
 
         // Build special token list from vocabulary (tokens matching <|...|> or <...> patterns)
@@ -69,6 +74,24 @@ public sealed partial class BpeTokenizer
                 continue;
             }
 
+            if (_useSentencePiece)
+            {
+                // SentencePiece (Gemma, Llama): replace ASCII spaces with U+2581 ('▁'),
+                // skip the GPT-2 regex pre-tokenization (which would split on spaces and
+                // prevent in-word merges), and BPE-encode the entire segment as one chunk.
+                var spmText = SentencePiecePreprocess(segment);
+                if (spmText.Length == 0) continue;
+                var symbols = DirectEncodeChunk(spmText);
+                if (symbols.Count == 0) continue;
+                ApplyMerges(symbols);
+                foreach (var symbol in symbols)
+                {
+                    int id = _vocab.TokenToId(symbol);
+                    if (id >= 0) result.Add(id);
+                }
+                continue;
+            }
+
             // Regular BPE encoding for non-special text
             var matches = _preTokenizePattern.Matches(segment);
             foreach (Match match in matches)
@@ -89,6 +112,20 @@ public sealed partial class BpeTokenizer
         }
 
         return result.ToArray();
+    }
+
+    /// <summary>
+    /// SentencePiece preprocessing: replace each ASCII space with U+2581 ('▁').
+    /// This is the convention SPM-trained models (Gemma, Llama) use to represent
+    /// word boundaries inside the vocabulary.
+    /// </summary>
+    private static string SentencePiecePreprocess(string text)
+    {
+        if (text.Length == 0) return text;
+        var sb = new StringBuilder(text.Length);
+        foreach (var ch in text)
+            sb.Append(ch == ' ' ? SpmSpaceMarker : ch);
+        return sb.ToString();
     }
 
     /// <summary>

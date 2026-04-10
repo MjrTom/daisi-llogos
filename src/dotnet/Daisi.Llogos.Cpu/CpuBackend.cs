@@ -198,6 +198,68 @@ public sealed class CpuBackend : IComputeBackend
     }
 
     /// <inheritdoc />
+    public void RoPEWithFreqFactors(ITensor q, ITensor k, int headDim, int ropeDim,
+        int positionOffset, float ropeTheta, ITensor? freqFactors)
+    {
+        if (freqFactors == null)
+        {
+            RoPE(q, k, headDim, ropeDim, positionOffset, ropeTheta);
+            return;
+        }
+
+        var qSpan = ((CpuTensor)q).AsFloatSpan();
+        var kSpan = ((CpuTensor)k).AsFloatSpan();
+        int effectiveRopeDim = ropeDim > 0 ? ropeDim : headDim;
+        var factors = ResolveFreqFactors(freqFactors, effectiveRopeDim);
+        Cpu.Rope.ApplyWithFreqFactors(qSpan, kSpan, headDim, effectiveRopeDim, positionOffset, ropeTheta, factors);
+    }
+
+    /// <inheritdoc />
+    public void RoPENeox(ITensor q, ITensor k, int headDim, int ropeDim, int positionOffset, float ropeTheta)
+    {
+        var qSpan = ((CpuTensor)q).AsFloatSpan();
+        var kSpan = ((CpuTensor)k).AsFloatSpan();
+        int effectiveRopeDim = ropeDim > 0 ? ropeDim : headDim;
+        Cpu.Rope.ApplyNeox(qSpan, kSpan, headDim, effectiveRopeDim, positionOffset, ropeTheta);
+    }
+
+    /// <inheritdoc />
+    public void RoPENeoxWithFreqFactors(ITensor q, ITensor k, int headDim, int ropeDim,
+        int positionOffset, float ropeTheta, ITensor? freqFactors)
+    {
+        if (freqFactors == null)
+        {
+            RoPENeox(q, k, headDim, ropeDim, positionOffset, ropeTheta);
+            return;
+        }
+        var qSpan = ((CpuTensor)q).AsFloatSpan();
+        var kSpan = ((CpuTensor)k).AsFloatSpan();
+        int effectiveRopeDim = ropeDim > 0 ? ropeDim : headDim;
+        var factors = ResolveFreqFactors(freqFactors, effectiveRopeDim);
+        Cpu.Rope.ApplyNeoxWithFreqFactors(qSpan, kSpan, headDim, effectiveRopeDim, positionOffset, ropeTheta, factors);
+    }
+
+    private static float[] ResolveFreqFactors(ITensor freqFactors, int effectiveRopeDim)
+    {
+        int halfDim = effectiveRopeDim / 2;
+        var factors = new float[halfDim];
+        if (freqFactors.Type == GgmlType.F32 && freqFactors.ElementCount >= halfDim)
+        {
+            var src = ((CpuTensor)freqFactors).AsFloatSpan();
+            src.Slice(0, halfDim).CopyTo(factors);
+        }
+        else
+        {
+            var tmp = new float[freqFactors.ElementCount];
+            freqFactors.DequantizeTo(tmp);
+            int n = Math.Min(halfDim, tmp.Length);
+            for (int i = 0; i < n; i++) factors[i] = tmp[i];
+            for (int i = n; i < halfDim; i++) factors[i] = 1.0f;
+        }
+        return factors;
+    }
+
+    /// <inheritdoc />
     public void ElementMul(ITensor output, ITensor a, ITensor b)
     {
         var o = ((CpuTensor)output).AsFloatSpan();
