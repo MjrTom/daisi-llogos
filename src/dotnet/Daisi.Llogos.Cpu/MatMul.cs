@@ -117,8 +117,6 @@ internal static class MatMul
         int bytesPerRow = blocksPerRow * Q4_0TypeSize;
         int q8BytesPerInput = blocksPerRow * Q8_0TypeSize;
 
-        // Rent a heap buffer for M quantized activations — M=64 × K=2560 ~ 175 KB,
-        // too big for the stack.
         byte[] aQBufArr = System.Buffers.ArrayPool<byte>.Shared.Rent(M * q8BytesPerInput);
         try
         {
@@ -127,7 +125,6 @@ internal static class MatMul
             fixed (float* oFixedPtr = output)
             fixed (byte* aQFixedPtr = aQBufArr)
             {
-                // Quantize all M activation rows up-front.
                 for (int i = 0; i < M; i++)
                     QuantizeRowQ8_0(aFixedPtr + i * K, aQFixedPtr + i * q8BytesPerInput, K);
 
@@ -140,22 +137,111 @@ internal static class MatMul
                 int q8StrideCap = q8BytesPerInput;
                 int nCap = N;
 
-                if (N >= ParallelThreshold)
+                // 2M × 4N tiled gemm: process the output matrix in 2-row × 4-col tiles.
+                // 8 accumulators fit in YMM registers alongside weight decode + activation
+                // loads without spilling. Both activation (×4) and weight (×2) loads are
+                // reused across the 8 output cells in each tile. Parallelism is at the
+                // tile level (2-M × 4-N granularity) for better load balance than N-row.
+                int mTiles = M / 2;
+                int mTail = M % 2;
+                int nTiles = N / 4;
+                int nTail = N % 4;
+
+                // Main body: mTiles × nTiles 2×4 register tiles. Parallelise over
+                // N-tile STRIPES (whole M column × 4-N column chunk), not individual
+                // tiles — this reduces the Parallel.For dispatch count from ~40k to
+                // ~2.5k for typical FFN dims, and each thread processes contiguous
+                // weight rows so L2/L1 locality is preserved across tiles in its chunk.
+                int totalMainNTiles = nTiles;
+                if (totalMainNTiles > 0 && mTiles > 0)
                 {
-                    Parallel.For(0, N, CpuThreading.Options, j =>
+                    if (totalMainNTiles >= ParallelThreshold)
                     {
-                        byte* bRow = (byte*)bBase + j * bprCap;
-                        DotQ4_0Q8_0BatchedAvx2((byte*)aQBase, bRow, blkCap, mCap, q8StrideCap,
-                            (float*)oBase + j, nCap);
-                    });
+                        Parallel.For(0, totalMainNTiles, CpuThreading.Options, nTile =>
+                        {
+                            int jBase = nTile * 4;
+                            // Process all M rows for this 4-N stripe
+                            for (int mTile = 0; mTile < mTiles; mTile++)
+                            {
+                                int mBase = mTile * 2;
+                                DotQ4_0Q8_0Tile2x4Avx2(
+                                    (byte*)aQBase, (byte*)bBase, blkCap,
+                                    q8StrideCap, bprCap,
+                                    mBase, jBase,
+                                    (float*)oBase + mBase * nCap + jBase, nCap);
+                            }
+                        });
+                    }
+                    else
+                    {
+                        for (int mTile = 0; mTile < mTiles; mTile++)
+                        for (int nTile = 0; nTile < nTiles; nTile++)
+                        {
+                            int mBase = mTile * 2;
+                            int jBase = nTile * 4;
+                            DotQ4_0Q8_0Tile2x4Avx2(
+                                aQFixedPtr, bFixedPtr, blocksPerRow,
+                                q8BytesPerInput, bytesPerRow,
+                                mBase, jBase,
+                                oFixedPtr + mBase * N + jBase, N);
+                        }
+                    }
                 }
-                else
+
+                // N-tail for already-tiled M rows: remaining N columns (N % 4) processed
+                // with the single-N-row batched helper (which itself tiles over M).
+                if (nTail > 0 && mTiles > 0)
                 {
-                    for (int j = 0; j < N; j++)
+                    int mMain = mTiles * 2;
+                    int jStart = nTiles * 4;
+                    nint aQBase2 = aQBase;
+                    nint bBase2 = bBase;
+                    nint oBase2 = oBase;
+                    int bprCap2 = bprCap;
+                    int blkCap2 = blkCap;
+                    int q8Stride2 = q8StrideCap;
+                    int nCap2 = nCap;
+                    for (int j = jStart; j < N; j++)
                     {
-                        byte* bRow = (byte*)bFixedPtr + j * bytesPerRow;
-                        DotQ4_0Q8_0BatchedAvx2(aQFixedPtr, bRow, blocksPerRow, M, q8BytesPerInput,
-                            oFixedPtr + j, N);
+                        byte* bRow = (byte*)bBase2 + j * bprCap2;
+                        // Pass mMain activations, process one N-row at a time.
+                        DotQ4_0Q8_0BatchedAvx2((byte*)aQBase2, bRow, blkCap2, mMain, q8Stride2,
+                            (float*)oBase2 + j, nCap2);
+                    }
+                }
+
+                // M-tail: rows with index >= mTiles*2 (M % 2 rows). Use the old batched
+                // helper — it handles small M via its 4-wide tile + tail.
+                if (mTail > 0)
+                {
+                    int mStart = mTiles * 2;
+                    byte* aQTail = aQFixedPtr + mStart * q8BytesPerInput;
+                    float* oTail = oFixedPtr + mStart * N;
+                    nint aQTailBase = (nint)aQTail;
+                    nint oTailBase = (nint)oTail;
+                    nint bBase2 = bBase;
+                    int bprCap2 = bprCap;
+                    int blkCap2 = blkCap;
+                    int q8Stride2 = q8StrideCap;
+                    int mTailCap = mTail;
+                    int nCap2 = nCap;
+                    if (N >= ParallelThreshold)
+                    {
+                        Parallel.For(0, N, CpuThreading.Options, j =>
+                        {
+                            byte* bRow = (byte*)bBase2 + j * bprCap2;
+                            DotQ4_0Q8_0BatchedAvx2((byte*)aQTailBase, bRow, blkCap2, mTailCap, q8Stride2,
+                                (float*)oTailBase + j, nCap2);
+                        });
+                    }
+                    else
+                    {
+                        for (int j = 0; j < N; j++)
+                        {
+                            byte* bRow = bFixedPtr + j * bytesPerRow;
+                            DotQ4_0Q8_0BatchedAvx2(aQTail, bRow, blocksPerRow, mTail, q8BytesPerInput,
+                                oTail + j, N);
+                        }
                     }
                 }
             }
@@ -192,6 +278,229 @@ internal static class MatMul
             DotQ4_0Q8_0BatchedTail(aQ, bQ4, blockCount, mBase, M - mBase, aQStride, outPtr, outStride);
     }
 
+
+    /// <summary>
+    /// 2M × 4N tile kernel: 8 accumulators fit cleanly in ymm0..ymm7 alongside
+    /// weight decode state (~6 regs) and activation loads (2 regs). The 4×4 variant
+    /// exhausts the 16 YMM registers and the JIT spills. 2×4 keeps everything in
+    /// registers and still reuses both weight and activation loads across the tile.
+    /// </summary>
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    private static unsafe void DotQ4_0Q8_0Tile2x4Avx2(
+        byte* aQ, byte* bQ4, int blockCount,
+        int aQStride, int bQStride,
+        int mBase, int jBase,
+        float* outPtr, int outStride)
+    {
+        var mask0x0F = Vector256.Create((byte)0x0F);
+        var offset8 = Vector256.Create((sbyte)8);
+        var ones = Vector256.Create((short)1);
+
+        // 8 output accumulators — [M_row][N_col] for M×N = 2×4
+        var c00 = Vector256<float>.Zero; var c01 = Vector256<float>.Zero;
+        var c02 = Vector256<float>.Zero; var c03 = Vector256<float>.Zero;
+        var c10 = Vector256<float>.Zero; var c11 = Vector256<float>.Zero;
+        var c12 = Vector256<float>.Zero; var c13 = Vector256<float>.Zero;
+
+        byte* a0 = aQ + (mBase + 0) * aQStride;
+        byte* a1 = aQ + (mBase + 1) * aQStride;
+
+        byte* b0 = bQ4 + (jBase + 0) * bQStride;
+        byte* b1 = bQ4 + (jBase + 1) * bQStride;
+        byte* b2 = bQ4 + (jBase + 2) * bQStride;
+        byte* b3 = bQ4 + (jBase + 3) * bQStride;
+
+        for (int bi = 0; bi < blockCount; bi++)
+        {
+            int aOff = bi * Q8_0TypeSize;
+            int bOff = bi * Q4_0TypeSize;
+
+            float bs0 = (float)Unsafe.ReadUnaligned<Half>(b0 + bOff);
+            float bs1 = (float)Unsafe.ReadUnaligned<Half>(b1 + bOff);
+            float bs2 = (float)Unsafe.ReadUnaligned<Half>(b2 + bOff);
+            float bs3 = (float)Unsafe.ReadUnaligned<Half>(b3 + bOff);
+
+            var qxs0 = DecodeQ4_0Block(b0 + bOff + 2, mask0x0F, offset8);
+            var qxs1 = DecodeQ4_0Block(b1 + bOff + 2, mask0x0F, offset8);
+            var qxs2 = DecodeQ4_0Block(b2 + bOff + 2, mask0x0F, offset8);
+            var qxs3 = DecodeQ4_0Block(b3 + bOff + 2, mask0x0F, offset8);
+
+            var ax0 = Avx2.Sign(qxs0, qxs0).AsByte();
+            var ax1 = Avx2.Sign(qxs1, qxs1).AsByte();
+            var ax2 = Avx2.Sign(qxs2, qxs2).AsByte();
+            var ax3 = Avx2.Sign(qxs3, qxs3).AsByte();
+
+            float as0 = (float)Unsafe.ReadUnaligned<Half>(a0 + aOff);
+            float as1 = (float)Unsafe.ReadUnaligned<Half>(a1 + aOff);
+
+            var qy0 = Avx.LoadVector256((sbyte*)(a0 + aOff + 2));
+            var qy1 = Avx.LoadVector256((sbyte*)(a1 + aOff + 2));
+
+            // 8 fused int8 dot products — 2 M rows × 4 N rows
+            c00 = FusedDot4x4(ax0, qy0, qxs0, as0 * bs0, c00, ones);
+            c01 = FusedDot4x4(ax1, qy0, qxs1, as0 * bs1, c01, ones);
+            c02 = FusedDot4x4(ax2, qy0, qxs2, as0 * bs2, c02, ones);
+            c03 = FusedDot4x4(ax3, qy0, qxs3, as0 * bs3, c03, ones);
+
+            c10 = FusedDot4x4(ax0, qy1, qxs0, as1 * bs0, c10, ones);
+            c11 = FusedDot4x4(ax1, qy1, qxs1, as1 * bs1, c11, ones);
+            c12 = FusedDot4x4(ax2, qy1, qxs2, as1 * bs2, c12, ones);
+            c13 = FusedDot4x4(ax3, qy1, qxs3, as1 * bs3, c13, ones);
+        }
+
+        outPtr[0 * outStride + 0] = Vector256.Sum(c00);
+        outPtr[0 * outStride + 1] = Vector256.Sum(c01);
+        outPtr[0 * outStride + 2] = Vector256.Sum(c02);
+        outPtr[0 * outStride + 3] = Vector256.Sum(c03);
+        outPtr[1 * outStride + 0] = Vector256.Sum(c10);
+        outPtr[1 * outStride + 1] = Vector256.Sum(c11);
+        outPtr[1 * outStride + 2] = Vector256.Sum(c12);
+        outPtr[1 * outStride + 3] = Vector256.Sum(c13);
+    }
+
+    /// <summary>
+    /// 4M × 4N tile kernel (may spill — kept for comparison).
+    /// </summary>
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    private static unsafe void DotQ4_0Q8_0Tile4x4Avx2(
+        byte* aQ, byte* bQ4, int blockCount,
+        int aQStride, int bQStride,
+        int mBase, int jBase,
+        float* outPtr, int outStride)
+    {
+        var mask0x0F = Vector256.Create((byte)0x0F);
+        var offset8 = Vector256.Create((sbyte)8);
+        var ones = Vector256.Create((short)1);
+
+        // 16 output accumulators — [M_row][N_col]. JIT keeps these in ymm0..ymm15.
+        var c00 = Vector256<float>.Zero; var c01 = Vector256<float>.Zero;
+        var c02 = Vector256<float>.Zero; var c03 = Vector256<float>.Zero;
+        var c10 = Vector256<float>.Zero; var c11 = Vector256<float>.Zero;
+        var c12 = Vector256<float>.Zero; var c13 = Vector256<float>.Zero;
+        var c20 = Vector256<float>.Zero; var c21 = Vector256<float>.Zero;
+        var c22 = Vector256<float>.Zero; var c23 = Vector256<float>.Zero;
+        var c30 = Vector256<float>.Zero; var c31 = Vector256<float>.Zero;
+        var c32 = Vector256<float>.Zero; var c33 = Vector256<float>.Zero;
+
+        byte* a0 = aQ + (mBase + 0) * aQStride;
+        byte* a1 = aQ + (mBase + 1) * aQStride;
+        byte* a2 = aQ + (mBase + 2) * aQStride;
+        byte* a3 = aQ + (mBase + 3) * aQStride;
+
+        byte* b0 = bQ4 + (jBase + 0) * bQStride;
+        byte* b1 = bQ4 + (jBase + 1) * bQStride;
+        byte* b2 = bQ4 + (jBase + 2) * bQStride;
+        byte* b3 = bQ4 + (jBase + 3) * bQStride;
+
+        for (int bi = 0; bi < blockCount; bi++)
+        {
+            int aOff = bi * Q8_0TypeSize;
+            int bOff = bi * Q4_0TypeSize;
+
+            // ── Decode the 4 weight blocks (one per N-row) ─────────────────
+            // Each decode: load 16 nibble bytes → expand to 32 signed int8 [-8..7].
+            // The |qx| magnitude (ax) is what gets fed to maddubs_epi16.
+            float bs0 = (float)Unsafe.ReadUnaligned<Half>(b0 + bOff);
+            float bs1 = (float)Unsafe.ReadUnaligned<Half>(b1 + bOff);
+            float bs2 = (float)Unsafe.ReadUnaligned<Half>(b2 + bOff);
+            float bs3 = (float)Unsafe.ReadUnaligned<Half>(b3 + bOff);
+
+            var qxs0 = DecodeQ4_0Block(b0 + bOff + 2, mask0x0F, offset8);
+            var qxs1 = DecodeQ4_0Block(b1 + bOff + 2, mask0x0F, offset8);
+            var qxs2 = DecodeQ4_0Block(b2 + bOff + 2, mask0x0F, offset8);
+            var qxs3 = DecodeQ4_0Block(b3 + bOff + 2, mask0x0F, offset8);
+
+            var ax0 = Avx2.Sign(qxs0, qxs0).AsByte();  // |qx[0]|
+            var ax1 = Avx2.Sign(qxs1, qxs1).AsByte();
+            var ax2 = Avx2.Sign(qxs2, qxs2).AsByte();
+            var ax3 = Avx2.Sign(qxs3, qxs3).AsByte();
+
+            // ── Load 4 activation blocks (one per M-row) ───────────────────
+            float as0 = (float)Unsafe.ReadUnaligned<Half>(a0 + aOff);
+            float as1 = (float)Unsafe.ReadUnaligned<Half>(a1 + aOff);
+            float as2 = (float)Unsafe.ReadUnaligned<Half>(a2 + aOff);
+            float as3 = (float)Unsafe.ReadUnaligned<Half>(a3 + aOff);
+
+            var qy0 = Avx.LoadVector256((sbyte*)(a0 + aOff + 2));
+            var qy1 = Avx.LoadVector256((sbyte*)(a1 + aOff + 2));
+            var qy2 = Avx.LoadVector256((sbyte*)(a2 + aOff + 2));
+            var qy3 = Avx.LoadVector256((sbyte*)(a3 + aOff + 2));
+
+            // ── 16 fused int8 dot products ─────────────────────────────────
+            // For each (i, j) ∈ {0..3}²:
+            //   sy = sign(qy_i, qxs_j)
+            //   dot = madd(maddubs(ax_j, sy), ones) → 8 int32
+            //   cij += (as_i * bs_j) * convert(dot)
+            c00 = FusedDot4x4(ax0, qy0, qxs0, as0 * bs0, c00, ones);
+            c01 = FusedDot4x4(ax1, qy0, qxs1, as0 * bs1, c01, ones);
+            c02 = FusedDot4x4(ax2, qy0, qxs2, as0 * bs2, c02, ones);
+            c03 = FusedDot4x4(ax3, qy0, qxs3, as0 * bs3, c03, ones);
+
+            c10 = FusedDot4x4(ax0, qy1, qxs0, as1 * bs0, c10, ones);
+            c11 = FusedDot4x4(ax1, qy1, qxs1, as1 * bs1, c11, ones);
+            c12 = FusedDot4x4(ax2, qy1, qxs2, as1 * bs2, c12, ones);
+            c13 = FusedDot4x4(ax3, qy1, qxs3, as1 * bs3, c13, ones);
+
+            c20 = FusedDot4x4(ax0, qy2, qxs0, as2 * bs0, c20, ones);
+            c21 = FusedDot4x4(ax1, qy2, qxs1, as2 * bs1, c21, ones);
+            c22 = FusedDot4x4(ax2, qy2, qxs2, as2 * bs2, c22, ones);
+            c23 = FusedDot4x4(ax3, qy2, qxs3, as2 * bs3, c23, ones);
+
+            c30 = FusedDot4x4(ax0, qy3, qxs0, as3 * bs0, c30, ones);
+            c31 = FusedDot4x4(ax1, qy3, qxs1, as3 * bs1, c31, ones);
+            c32 = FusedDot4x4(ax2, qy3, qxs2, as3 * bs2, c32, ones);
+            c33 = FusedDot4x4(ax3, qy3, qxs3, as3 * bs3, c33, ones);
+        }
+
+        // ── Store 16 output cells ──────────────────────────────────────────
+        outPtr[0 * outStride + 0] = Vector256.Sum(c00);
+        outPtr[0 * outStride + 1] = Vector256.Sum(c01);
+        outPtr[0 * outStride + 2] = Vector256.Sum(c02);
+        outPtr[0 * outStride + 3] = Vector256.Sum(c03);
+        outPtr[1 * outStride + 0] = Vector256.Sum(c10);
+        outPtr[1 * outStride + 1] = Vector256.Sum(c11);
+        outPtr[1 * outStride + 2] = Vector256.Sum(c12);
+        outPtr[1 * outStride + 3] = Vector256.Sum(c13);
+        outPtr[2 * outStride + 0] = Vector256.Sum(c20);
+        outPtr[2 * outStride + 1] = Vector256.Sum(c21);
+        outPtr[2 * outStride + 2] = Vector256.Sum(c22);
+        outPtr[2 * outStride + 3] = Vector256.Sum(c23);
+        outPtr[3 * outStride + 0] = Vector256.Sum(c30);
+        outPtr[3 * outStride + 1] = Vector256.Sum(c31);
+        outPtr[3 * outStride + 2] = Vector256.Sum(c32);
+        outPtr[3 * outStride + 3] = Vector256.Sum(c33);
+    }
+
+    /// <summary>
+    /// Decode one Q4_0 block (16 packed nibble bytes at <paramref name="nibbles"/>)
+    /// into 32 signed int8 values in [-8..7].
+    /// </summary>
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    private static unsafe Vector256<sbyte> DecodeQ4_0Block(byte* nibbles, Vector256<byte> mask0x0F, Vector256<sbyte> offset8)
+    {
+        var lo128 = Sse2.LoadVector128(nibbles);
+        var hi128 = Sse2.ShiftRightLogical(lo128.AsUInt16(), 4).AsByte();
+        var qx = Vector256.Create(lo128, hi128);
+        var qxMasked = Avx2.And(qx, mask0x0F);
+        return Avx2.Subtract(qxMasked.AsSByte(), offset8);
+    }
+
+    /// <summary>
+    /// One int8 × int8 dot product with the sign-trick, scaled by <paramref name="combinedScale"/>
+    /// (= aScale × bScale) and accumulated into <paramref name="acc"/>.
+    /// </summary>
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    private static Vector256<float> FusedDot4x4(
+        Vector256<byte> ax, Vector256<sbyte> qy, Vector256<sbyte> qxSigned,
+        float combinedScale, Vector256<float> acc, Vector256<short> ones)
+    {
+        var sy = Avx2.Sign(qy, qxSigned);
+        var dot16 = Avx2.MultiplyAddAdjacent(ax, sy);
+        var dot32 = Avx2.MultiplyAddAdjacent(dot16, ones);
+        var dotF = Avx.ConvertToVector256Single(dot32);
+        var vD = Vector256.Create(combinedScale);
+        return Fma.MultiplyAdd(dotF, vD, acc);
+    }
 
     /// <summary>
     /// Inner 4×1 tile: 4 activation rows × 1 weight row. Accumulators stay in registers.

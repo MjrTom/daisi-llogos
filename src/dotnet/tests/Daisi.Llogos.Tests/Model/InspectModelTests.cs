@@ -656,6 +656,73 @@ public class InspectModelTests
     }
 
     [Fact]
+    public void Gemma4_Q4_0_BenchBatchedPrefill_ThreadSweep()
+    {
+        var path = @"C:\GGUFS\gemma-4-E4B-it-Q4_0.gguf";
+        if (!File.Exists(path)) return;
+
+        using var stream = File.OpenRead(path);
+        var gguf = GgufFile.Read(stream);
+        var config = ModelConfig.FromGguf(gguf);
+
+        using var backend = new CpuBackend();
+        using var weights = MmapModelLoader.Load(gguf, path, backend, config);
+
+        int originalThreads = Daisi.Llogos.Cpu.CpuThreading.ThreadCount;
+        var threadCounts = new[] { 1, 2, 4, 8, 16, 22 };
+        const int M = 32;
+
+        var lines = new List<string>
+        {
+            "Gemma 4 Q4_0 M=32 prefill vs thread count:",
+            "",
+            "threads | ms/tok | tok/s | FFN ms | speedup vs 1-thread"
+        };
+
+        double baselineMs = 0;
+        try
+        {
+            foreach (int tc in threadCounts)
+            {
+                Daisi.Llogos.Cpu.CpuThreading.ThreadCount = tc;
+
+                using var kvCache = new Gemma4KvCache(backend, config, maxSeqLen: 256);
+                using var forward = new Gemma4ForwardPass(backend, config, weights, kvCache, maxBatchSize: 32);
+                var ids = new int[M];
+                for (int i = 0; i < ids.Length; i++) ids[i] = 100 + i;
+
+                // Warm up twice
+                forward.ForwardBatch(ids, 0);
+                kvCache.Reset();
+                forward.ForwardBatch(ids, 0);
+                kvCache.Reset();
+
+                forward.EnableProfiling = true;
+                forward.ResetProfile();
+
+                var sw = System.Diagnostics.Stopwatch.StartNew();
+                forward.ForwardBatch(ids, 0);
+                sw.Stop();
+
+                double total = sw.Elapsed.TotalMilliseconds;
+                double tickMs = 1000.0 / System.Diagnostics.Stopwatch.Frequency;
+                double ffnMs = forward.ProfileFfnMatmulTicks * tickMs;
+
+                if (tc == 1) baselineMs = total;
+                double speedup = baselineMs / total;
+
+                lines.Add($"{tc,7} | {total / M,6:F2} | {1000.0 * M / total,5:F1} | {ffnMs,6:F1} | {speedup,6:F2}x");
+            }
+        }
+        finally
+        {
+            Daisi.Llogos.Cpu.CpuThreading.ThreadCount = originalThreads;
+        }
+
+        File.WriteAllLines(@"C:\GGUFS\gemma-4-E4B-it-thread-sweep.txt", lines);
+    }
+
+    [Fact]
     public void Gemma4_Q4_0_BenchBatchedPrefill()
     {
         var path = @"C:\GGUFS\gemma-4-E4B-it-Q4_0.gguf";
@@ -669,7 +736,7 @@ public class InspectModelTests
         using var weights = MmapModelLoader.Load(gguf, path, backend, config);
 
         // Different batch sizes to see how speedup scales
-        var batchSizes = new[] { 1, 4, 8, 16, 32 };
+        var batchSizes = new[] { 32 };
         var lines = new List<string>
         {
             "Gemma 4 Q4_0 batched prefill sweep + profile:",
