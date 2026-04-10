@@ -669,7 +669,7 @@ public class InspectModelTests
         using var weights = MmapModelLoader.Load(gguf, path, backend, config);
 
         // Different batch sizes to see how speedup scales
-        var batchSizes = new[] { 1, 2, 4, 8, 12, 16, 24, 32 };
+        var batchSizes = new[] { 1, 4, 8, 16, 32 };
         var lines = new List<string>
         {
             "Gemma 4 Q4_0 batched prefill sweep + profile:",
@@ -684,7 +684,9 @@ public class InspectModelTests
             var ids = new int[M];
             for (int i = 0; i < ids.Length; i++) ids[i] = 100 + i;
 
-            // Warmup (uses profiling internally but we reset after)
+            // Warmup twice to make sure tiered JIT has kicked in
+            forward.ForwardBatch(ids, 0);
+            kvCache.Reset();
             forward.ForwardBatch(ids, 0);
             kvCache.Reset();
 
@@ -700,15 +702,17 @@ public class InspectModelTests
             double total = sw.Elapsed.TotalMilliseconds;
             double tickMs = 1000.0 / System.Diagnostics.Stopwatch.Frequency;
             lines.Add($"M={M}: total {total:F1} ms ({total / M:F2} ms/tok, {1000.0 * M / total:F2} tok/s)");
-            lines.Add($"  Embedding:    {forward.ProfileEmbTicks * tickMs,8:F2} ms");
-            lines.Add($"  PLE setup:    {forward.ProfilePleSetupTicks * tickMs,8:F2} ms");
-            lines.Add($"  Attn matmul:  {forward.ProfileAttnMatmulTicks * tickMs,8:F2} ms");
-            lines.Add($"  Attn other:   {forward.ProfileAttnOtherTicks * tickMs,8:F2} ms");
-            lines.Add($"  FFN matmul:   {forward.ProfileFfnMatmulTicks * tickMs,8:F2} ms");
-            lines.Add($"  FFN other:    {forward.ProfileFfnOtherTicks * tickMs,8:F2} ms");
-            lines.Add($"  Norm:         {forward.ProfileNormTicks * tickMs,8:F2} ms");
-            lines.Add($"  PLE block:    {forward.ProfilePleBlockTicks * tickMs,8:F2} ms");
-            lines.Add($"  lm_head:      {forward.ProfileLmHeadTicks * tickMs,8:F2} ms");
+            lines.Add($"  Embedding:      {forward.ProfileEmbTicks * tickMs,8:F2} ms");
+            lines.Add($"  PLE setup:      {forward.ProfilePleSetupTicks * tickMs,8:F2} ms");
+            lines.Add($"  Attn total:     {forward.ProfileAttnMatmulTicks * tickMs,8:F2} ms");
+            lines.Add($"    Q/K/V proj:   {forward.ProfileBAttnQkvProjTicks * tickMs,8:F2} ms");
+            lines.Add($"    per-tok loop: {forward.ProfileBAttnPerTokLoopTicks * tickMs,8:F2} ms");
+            lines.Add($"    batched attn: {forward.ProfileBAttnBatchedTicks * tickMs,8:F2} ms");
+            lines.Add($"    O proj:       {forward.ProfileBAttnOProjTicks * tickMs,8:F2} ms");
+            lines.Add($"  FFN matmul:     {forward.ProfileFfnMatmulTicks * tickMs,8:F2} ms");
+            lines.Add($"  Norm:           {forward.ProfileNormTicks * tickMs,8:F2} ms");
+            lines.Add($"  PLE block:      {forward.ProfilePleBlockTicks * tickMs,8:F2} ms");
+            lines.Add($"  lm_head:        {forward.ProfileLmHeadTicks * tickMs,8:F2} ms");
             lines.Add("");
         }
 
