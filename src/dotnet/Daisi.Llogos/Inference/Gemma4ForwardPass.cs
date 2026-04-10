@@ -774,10 +774,11 @@ public sealed class Gemma4ForwardPass : IDisposable
 
     /// <summary>
     /// Batched attention for one layer. Does the Q/K/V/O projections as batched
-    /// matmuls over M rows, but loops per-token for the actual attention step
-    /// (per-head norm, RoPE, KV cache write, softmax × V). Copy-in / copy-out
-    /// between the batched Q/K/V buffers and the single-row decode scratch
-    /// reuses the existing single-token ops without needing offset params.
+    /// matmuls over M rows, loops per-token for the norms/RoPE/cache writes (which
+    /// need per-token positions), then runs a single BATCHED causal attention
+    /// call that processes all M queries against the shared K/V cache. Parallel
+    /// work is distributed across (M × numH) independent (query, head) pairs, so
+    /// 22 threads get ~12 tasks each at M=32.
     /// </summary>
     private void ForwardAttentionBatched(GemmaAttentionWeights w, int layer, int startPosition, int batchM)
     {
@@ -832,11 +833,13 @@ public sealed class Gemma4ForwardPass : IDisposable
         var vSingleSpan = vSingle.AsFloatSpan();
         var attnOutSingleSpan = attnOutSingle.AsFloatSpan();
 
+        // First pass: per-token norms, RoPE, and KV cache writes. We need per-token
+        // positions here, so we still loop. RoPE'd Q is copied back into qProjB so
+        // the batched attention step can read all M queries at once.
         for (int i = 0; i < batchM; i++)
         {
             int pos = startPosition + i;
 
-            // Copy row i of Q into single-row scratch
             qProjBSpan.Slice(i * qRowSize, qRowSize).CopyTo(qSingleSpan);
 
             if (!DebugDisableQkNorm)
@@ -864,7 +867,6 @@ public sealed class Gemma4ForwardPass : IDisposable
             }
             else
             {
-                // Shared-KV: RoPE on Q only. kSingle is a throwaway buffer.
                 if (!DebugDisableRope)
                 {
                     if (isSwa || w.RopeFreqs == null)
@@ -874,21 +876,140 @@ public sealed class Gemma4ForwardPass : IDisposable
                 }
             }
 
-            // Attention reads source layer's cache (just written for this token).
-            int seqLen = _kvCache.LayerSeqLen(sourceLayer);
-            var kCacheT = _kvCache.GetKCacheTensor(sourceLayer);
-            var vCacheT = _kvCache.GetVCacheTensor(sourceLayer);
-            int cap = _kvCache.LayerCapacity(sourceLayer);
-
-            _backend.GatedAttention(attnOutSingle, qSingle, qGateSingle, kCacheT, vCacheT,
-                numH, numKvH, headDim, valDim, cap, seqLen, attentionScale);
-
-            // Copy attnOutSingle back to row i of attnOutB
-            attnOutSingleSpan.Slice(0, oRowSize).CopyTo(attnOutBSpan.Slice(i * oRowSize, oRowSize));
+            // Write RoPE'd Q back into qProjB[i, :] for the batched attention step.
+            qSingleSpan.Slice(0, qRowSize).CopyTo(qProjBSpan.Slice(i * qRowSize, qRowSize));
         }
+
+        // Second pass: single batched causal attention over all M queries against
+        // the shared source-layer cache. 256 independent (query, head) tasks at M=32.
+        var kCacheT2 = _kvCache.GetKCacheTensor(sourceLayer);
+        var vCacheT2 = _kvCache.GetVCacheTensor(sourceLayer);
+        int cap2 = _kvCache.LayerCapacity(sourceLayer);
+
+        BatchedCausalAttention(
+            attnOutB, qProjB, kCacheT2, vCacheT2,
+            batchM, numH, numKvH, headDim, valDim,
+            cap2, startPosition, attentionScale);
 
         // ── Batched output projection ───────────────────────────────────────
         ProjectLinear(_hiddenB, attnOutB, w.AttnO, batchM);
+    }
+
+    /// <summary>
+    /// Batched causal attention: for each (query m, head h) pair run a tiled
+    /// online softmax against the K/V cache, restricted to positions
+    /// &lt;= <paramref name="startPosition"/> + m.
+    ///
+    /// Cache layout (matching <see cref="Daisi.Llogos.Cpu.CpuBackend.KvCacheWrite"/>):
+    /// K is <c>[nKvHeads * cap * keyLength]</c> head-major, V same with valueLength.
+    /// GQA: query head h reads from kv head h / (numH / numKvH).
+    /// </summary>
+    private unsafe void BatchedCausalAttention(
+        ITensor attnOut, ITensor qAttn, ITensor kCache, ITensor vCache,
+        int M, int numH, int numKvH, int keyLength, int valueLength,
+        int cap, int startPosition, float scale)
+    {
+        int headsPerGroup = numH / numKvH;
+        int kHeadStride = cap * keyLength;
+        int vHeadStride = cap * valueLength;
+        int qRowSize = numH * keyLength;
+        int oRowSize = numH * valueLength;
+
+        // Pin the tensor spans so the parallel worker lambda can use nint-captured
+        // pointers (Span<float> can't cross the lambda boundary).
+        var qSpanTop = qAttn.AsFloatSpan();
+        var oSpanTop = attnOut.AsFloatSpan();
+        var kSpanTop = kCache.AsFloatSpan();
+        var vSpanTop = vCache.AsFloatSpan();
+
+        fixed (float* qFixed = qSpanTop)
+        fixed (float* oFixed = oSpanTop)
+        fixed (float* kFixed = kSpanTop)
+        fixed (float* vFixed = vSpanTop)
+        {
+            nint qBase = (nint)qFixed;
+            nint oBase = (nint)oFixed;
+            nint kBasePtr = (nint)kFixed;
+            nint vBasePtr = (nint)vFixed;
+            int totalTasks = M * numH;
+            int keyLen = keyLength;
+            int valLen = valueLength;
+            int startPos = startPosition;
+            float scaleCap = scale;
+            int hpg = headsPerGroup;
+            int khs = kHeadStride;
+            int vhs = vHeadStride;
+            int qrs = qRowSize;
+            int ors = oRowSize;
+
+            Parallel.For(0, totalTasks, idx =>
+            {
+                int m = idx / numH;
+                int h = idx % numH;
+                int kvHead = h / hpg;
+                int seqLen = startPos + m + 1;
+
+                float* q = (float*)qBase + m * qrs + h * keyLen;
+                float* o = (float*)oBase + m * ors + h * valLen;
+                float* kHead = (float*)kBasePtr + kvHead * khs;
+                float* vHead = (float*)vBasePtr + kvHead * vhs;
+
+                const int tileSize = 256;
+                Span<float> tileScores = stackalloc float[tileSize];
+
+                for (int d = 0; d < valLen; d++) o[d] = 0;
+
+                float runningMax = float.NegativeInfinity;
+                float runningSum = 0;
+
+                for (int tileStart = 0; tileStart < seqLen; tileStart += tileSize)
+                {
+                    int tileEnd = Math.Min(tileStart + tileSize, seqLen);
+                    int tileLen = tileEnd - tileStart;
+
+                    // Scores: q · k[p] * scale  for p in tile
+                    for (int t = 0; t < tileLen; t++)
+                    {
+                        int p = tileStart + t;
+                        float* kp = kHead + p * keyLen;
+                        float dot = 0;
+                        for (int d = 0; d < keyLen; d++)
+                            dot += q[d] * kp[d];
+                        tileScores[t] = dot * scaleCap;
+                    }
+
+                    float tileMax = float.NegativeInfinity;
+                    for (int t = 0; t < tileLen; t++)
+                        if (tileScores[t] > tileMax) tileMax = tileScores[t];
+
+                    float tileSum = 0;
+                    for (int t = 0; t < tileLen; t++)
+                    {
+                        tileScores[t] = MathF.Exp(tileScores[t] - tileMax);
+                        tileSum += tileScores[t];
+                    }
+
+                    float newMax = MathF.Max(runningMax, tileMax);
+                    float correctionOld = MathF.Exp(runningMax - newMax);
+                    float correctionNew = MathF.Exp(tileMax - newMax);
+
+                    for (int d = 0; d < valLen; d++)
+                    {
+                        float tileVal = 0;
+                        for (int t = 0; t < tileLen; t++)
+                            tileVal += tileScores[t] * vHead[(tileStart + t) * valLen + d];
+                        o[d] = o[d] * correctionOld + tileVal * correctionNew;
+                    }
+
+                    runningSum = runningSum * correctionOld + tileSum * correctionNew;
+                    runningMax = newMax;
+                }
+
+                float invSum = 1.0f / runningSum;
+                for (int d = 0; d < valLen; d++)
+                    o[d] *= invSum;
+            });
+        }
     }
 
 
