@@ -33,11 +33,26 @@ public static class MmapModelLoader
                 ? LoadTensorRemapped(gguf, basePtr, backend, tensorMap, "output.weight", remapper)
                 : TryLoadTensor(gguf, basePtr, backend, tensorMap, "output.weight");
 
+            // Gemma 4 PLE globals — loaded once and shared across all layers.
+            ITensor? perLayerTokenEmbd = null;
+            ITensor? perLayerModelProj = null;
+            ITensor? perLayerProjNorm = null;
+            ITensor? ropeFreqs = null;
+            if (config.IsGemma4)
+            {
+                perLayerTokenEmbd = TryLoadTensor(gguf, basePtr, backend, tensorMap, "per_layer_token_embd.weight");
+                perLayerModelProj = TryLoadTensor(gguf, basePtr, backend, tensorMap, "per_layer_model_proj.weight");
+                perLayerProjNorm  = TryLoadTensor(gguf, basePtr, backend, tensorMap, "per_layer_proj_norm.weight");
+                ropeFreqs         = TryLoadTensor(gguf, basePtr, backend, tensorMap, "rope_freqs.weight");
+            }
+
             var layers = new LayerWeights[config.NumLayers];
             for (int i = 0; i < config.NumLayers; i++)
             {
                 if (config.IsBitNet)
                     layers[i] = LoadBitNetLayer(gguf, basePtr, backend, tensorMap, i);
+                else if (config.IsGemma4)
+                    layers[i] = LoadGemma4Layer(gguf, basePtr, backend, tensorMap, i, ropeFreqs);
                 else if (config.IsStandardAttention(i))
                     layers[i] = LoadStandardAttentionLayer(gguf, basePtr, backend, tensorMap, i);
                 else
@@ -50,6 +65,10 @@ public static class MmapModelLoader
                 OutputNorm = outputNorm,
                 Output = output,
                 Layers = layers,
+                PerLayerTokenEmbd = perLayerTokenEmbd,
+                PerLayerModelProj = perLayerModelProj,
+                PerLayerProjNorm = perLayerProjNorm,
+                RopeFreqs = ropeFreqs,
             };
         }
         finally
@@ -102,6 +121,40 @@ public static class MmapModelLoader
             FfnGate = LoadTensor(gguf, basePtr, backend, tensorMap, $"blk.{i}.ffn_gate.weight"),
             FfnUp = LoadTensor(gguf, basePtr, backend, tensorMap, $"blk.{i}.ffn_up.weight"),
             FfnDown = LoadTensor(gguf, basePtr, backend, tensorMap, $"blk.{i}.ffn_down.weight"),
+        };
+    }
+
+    private static unsafe GemmaAttentionWeights LoadGemma4Layer(
+        GgufFile gguf, byte* basePtr, IComputeBackend backend,
+        Dictionary<string, GgufTensorInfo> tensorMap, int i, ITensor? sharedRopeFreqs)
+    {
+        return new GemmaAttentionWeights
+        {
+            // Pre/post norms (4 per layer for Gemma 4)
+            AttnNorm     = LoadTensor(gguf, basePtr, backend, tensorMap, $"blk.{i}.attn_norm.weight"),
+            PostAttnNorm = LoadTensor(gguf, basePtr, backend, tensorMap, $"blk.{i}.post_attention_norm.weight"),
+            FfnNorm      = LoadTensor(gguf, basePtr, backend, tensorMap, $"blk.{i}.ffn_norm.weight"),
+            PostFfnNorm  = LoadTensor(gguf, basePtr, backend, tensorMap, $"blk.{i}.post_ffw_norm.weight"),
+            // Attention projections — head dim differs per layer (sliding=256, full=512)
+            AttnQ        = LoadTensor(gguf, basePtr, backend, tensorMap, $"blk.{i}.attn_q.weight"),
+            AttnK        = LoadTensor(gguf, basePtr, backend, tensorMap, $"blk.{i}.attn_k.weight"),
+            AttnV        = LoadTensor(gguf, basePtr, backend, tensorMap, $"blk.{i}.attn_v.weight"),
+            AttnO        = LoadTensor(gguf, basePtr, backend, tensorMap, $"blk.{i}.attn_output.weight"),
+            // Per-head Q/K norms — stored as [head_dim] but typically a single broadcast scalar
+            AttnQNorm    = LoadTensor(gguf, basePtr, backend, tensorMap, $"blk.{i}.attn_q_norm.weight"),
+            AttnKNorm    = LoadTensor(gguf, basePtr, backend, tensorMap, $"blk.{i}.attn_k_norm.weight"),
+            // FFN (GeGLU — same shapes as SwiGLU)
+            FfnGate      = LoadTensor(gguf, basePtr, backend, tensorMap, $"blk.{i}.ffn_gate.weight"),
+            FfnUp        = LoadTensor(gguf, basePtr, backend, tensorMap, $"blk.{i}.ffn_up.weight"),
+            FfnDown      = LoadTensor(gguf, basePtr, backend, tensorMap, $"blk.{i}.ffn_down.weight"),
+            // Per-Layer Embedding (PLE) pieces — required when n_embd_per_layer > 0
+            PerLayerInpGate  = TryLoadTensor(gguf, basePtr, backend, tensorMap, $"blk.{i}.inp_gate.weight"),
+            PerLayerProj     = TryLoadTensor(gguf, basePtr, backend, tensorMap, $"blk.{i}.proj.weight"),
+            PerLayerPostNorm = TryLoadTensor(gguf, basePtr, backend, tensorMap, $"blk.{i}.post_norm.weight"),
+            // Per-layer scalar output multiplier — optional
+            LayerOutScale    = TryLoadTensor(gguf, basePtr, backend, tensorMap, $"blk.{i}.layer_output_scale.weight"),
+            // Full-attention layers reference the shared global rope_freqs tensor
+            RopeFreqs        = sharedRopeFreqs,
         };
     }
 

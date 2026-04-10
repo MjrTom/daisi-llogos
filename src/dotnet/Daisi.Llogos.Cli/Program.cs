@@ -52,6 +52,7 @@ IComputeBackend backend = options.Backend switch
 
 var tokenizer = TokenizerFactory.FromGguf(gguf);
 bool isBitNet = config.Architecture.StartsWith("bitnet", StringComparison.OrdinalIgnoreCase);
+bool isGemma4 = config.IsGemma4;
 
 if (isBitNet)
 {
@@ -65,6 +66,32 @@ if (isBitNet)
         $"({config.Architecture}, {config.NumLayers} layers, {config.HiddenDim}d, BitNet)");
 
     var generator = new BitNetTextGenerator(forward, tokenizer, options.Seed);
+    RunGeneration(generator.Generate, options);
+
+    forward.Dispose();
+    kvCache.Dispose();
+    weights.Dispose();
+}
+else if (isGemma4)
+{
+    // ── Gemma 4 path ────────────────────────────────────────────────────────
+    var weights = MmapModelLoader.Load(gguf, options.ModelPath!, backend, config);
+    var kvCache = new Gemma4KvCache(backend, config, maxSeqLen: options.MaxContext);
+    var forward = new Gemma4ForwardPass(backend, config, weights, kvCache);
+
+    loadSw.Stop();
+    int numFull = 0;
+    int numSwa = 0;
+    for (int i = 0; i < config.NumLayers; i++)
+    {
+        if (config.IsSlidingLayer(i)) numSwa++; else numFull++;
+    }
+    Console.Error.WriteLine($"Model loaded in {loadSw.Elapsed.TotalSeconds:F1}s " +
+        $"({config.Architecture}, {config.NumLayers} layers [{numSwa} SWA + {numFull} full], " +
+        $"{config.HiddenDim}d, PLE={config.PerLayerInputDim})");
+    Console.Error.WriteLine($"Backend: {backend.Name}, Max tokens: {options.MaxTokens}");
+
+    var generator = new Gemma4TextGenerator(forward, tokenizer, options.Seed);
     RunGeneration(generator.Generate, options);
 
     forward.Dispose();

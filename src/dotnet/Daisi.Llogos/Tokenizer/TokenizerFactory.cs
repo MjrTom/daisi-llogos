@@ -30,13 +30,17 @@ public static class TokenizerFactory
         var mergeTable = new MergeTable(merges);
 
         // Detect encoding mode from the tokenizer model type.
-        // GPT-2 models use byte-to-unicode mapping; others (e.g. SentencePiece) use direct UTF-8.
+        // GPT-2 models use byte-to-unicode mapping; SentencePiece-style models (gemma, llama)
+        // use direct UTF-8 with U+2581 ('▁') as the space marker.
         bool useByteEncoding = false;
+        bool useSentencePiece = false;
         var tokenizerModel = gguf.GetMetadataString("tokenizer.ggml.model");
         if (tokenizerModel == "gpt2")
             useByteEncoding = true;
+        else if (tokenizerModel == "gemma4" || tokenizerModel == "llama")
+            useSentencePiece = true;
 
-        return new BpeTokenizer(vocab, mergeTable, useByteEncoding);
+        return new BpeTokenizer(vocab, mergeTable, useByteEncoding, useSentencePiece);
     }
 
     private static int GetInt32OrDefault(GgufFile gguf, string key, int defaultValue)
