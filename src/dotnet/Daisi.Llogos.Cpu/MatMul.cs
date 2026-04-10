@@ -564,6 +564,13 @@ internal static class MatMul
     /// </summary>
     public static unsafe void MultiplyBF16(Span<float> output, ReadOnlySpan<float> a, ReadOnlySpan<byte> b, int M, int K, int N)
     {
+        if (M > 1)
+        {
+            MultiplyBF16_Batched(output, a, b, M, K, N);
+            return;
+        }
+
+        // M == 1 fast path (decode / PLE on single-token Forward)
         fixed (float* aFixedPtr = a)
         fixed (byte* bFixedPtr = b)
         fixed (float* oFixedPtr = output)
@@ -572,31 +579,141 @@ internal static class MatMul
             nint bBase = (nint)bFixedPtr;
             nint oBase = (nint)oFixedPtr;
 
-            for (int i = 0; i < M; i++)
-            {
-                float* aRow = (float*)aBase + i * K;
-                float* oRow = (float*)oBase + i * N;
+            float* aRow = (float*)aBase;
+            float* oRow = (float*)oBase;
 
-                if (N >= ParallelThreshold)
+            if (N >= ParallelThreshold)
+            {
+                nint bCapture = bBase;
+                int kCapture = K;
+                Parallel.For(0, N, CpuThreading.Options, j =>
                 {
-                    nint bCapture = bBase;
-                    int kCapture = K;
-                    Parallel.For(0, N, CpuThreading.Options, j =>
-                    {
-                        ushort* bRow = (ushort*)((byte*)bCapture + j * kCapture * 2);
-                        oRow[j] = DotBF16Ptr(aRow, bRow, kCapture);
-                    });
-                }
-                else
+                    ushort* bRow = (ushort*)((byte*)bCapture + j * kCapture * 2);
+                    oRow[j] = DotBF16Ptr(aRow, bRow, kCapture);
+                });
+            }
+            else
+            {
+                for (int j = 0; j < N; j++)
                 {
-                    for (int j = 0; j < N; j++)
-                    {
-                        ushort* bRow = (ushort*)((byte*)bBase + j * K * 2);
-                        oRow[j] = DotBF16Ptr(aRow, bRow, K);
-                    }
+                    ushort* bRow = (ushort*)((byte*)bBase + j * K * 2);
+                    oRow[j] = DotBF16Ptr(aRow, bRow, K);
                 }
             }
         }
+    }
+
+    /// <summary>
+    /// Batched BF16 matmul with weight reuse. For each weight row j, decode 8
+    /// BF16 lanes at a time and FMA into 4 activation accumulators. 4-wide
+    /// register tile keeps accumulators in YMM registers. Used by the batched
+    /// Gemma 4 forward pass's PLE setup (per_layer_model_proj: K=HiddenDim,
+    /// N=PerLayerInputDim × NumLayers).
+    /// </summary>
+    private static unsafe void MultiplyBF16_Batched(Span<float> output, ReadOnlySpan<float> a, ReadOnlySpan<byte> b, int M, int K, int N)
+    {
+        fixed (float* aFixedPtr = a)
+        fixed (byte* bFixedPtr = b)
+        fixed (float* oFixedPtr = output)
+        {
+            nint aBase = (nint)aFixedPtr;
+            nint bBase = (nint)bFixedPtr;
+            nint oBase = (nint)oFixedPtr;
+            int mCap = M;
+            int kCap = K;
+            int nCap = N;
+
+            if (N >= ParallelThreshold)
+            {
+                Parallel.For(0, N, CpuThreading.Options, j =>
+                {
+                    ushort* bRow = (ushort*)((byte*)bBase + j * kCap * 2);
+                    DotBF16BatchedAvx2((float*)aBase, bRow, kCap, mCap, (float*)oBase + j, nCap);
+                });
+            }
+            else
+            {
+                for (int j = 0; j < N; j++)
+                {
+                    ushort* bRow = (ushort*)((byte*)bFixedPtr + j * K * 2);
+                    DotBF16BatchedAvx2(aFixedPtr, bRow, K, M, oFixedPtr + j, N);
+                }
+            }
+        }
+    }
+
+    /// <summary>
+    /// Batched BF16 inner kernel: one weight row × M activation rows. Weight
+    /// values are loaded once per 8-lane chunk and FMA'd into 4-wide register
+    /// tiles of activation accumulators.
+    /// </summary>
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    private static unsafe void DotBF16BatchedAvx2(
+        float* aBase, ushort* bRow, int K, int M, float* outPtr, int outStride)
+    {
+        // Process M in tiles of 4 — 4 accumulators stay in YMM registers.
+        int mBase = 0;
+        while (mBase + 4 <= M)
+        {
+            DotBF16BatchedAvx2Tile4(aBase + mBase * K, aBase + (mBase + 1) * K,
+                aBase + (mBase + 2) * K, aBase + (mBase + 3) * K,
+                bRow, K, outPtr + mBase * outStride, outStride);
+            mBase += 4;
+        }
+        // Tail for remaining rows
+        for (; mBase < M; mBase++)
+            outPtr[mBase * outStride] = DotBF16Ptr(aBase + mBase * K, bRow, K);
+    }
+
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    private static unsafe void DotBF16BatchedAvx2Tile4(
+        float* a0, float* a1, float* a2, float* a3,
+        ushort* bRow, int K, float* outPtr, int outStride)
+    {
+        var acc0 = Vector256<float>.Zero;
+        var acc1 = Vector256<float>.Zero;
+        var acc2 = Vector256<float>.Zero;
+        var acc3 = Vector256<float>.Zero;
+        var mask16 = Vector256.Create(0x0000FFFFu);
+        int k = 0;
+
+        for (; k + 8 <= K; k += 8)
+        {
+            // Load 8 BF16 values → 8 FP32 via shift-left-16
+            var bf = Vector128.Load(bRow + k);                                        // 8 × uint16
+            var w = Avx2.ConvertToVector256Int32(bf.AsInt16()).AsUInt32();             // sign-extends
+            w = Avx2.And(w, mask16);                                                   // keep low 16 bits
+            var f = Avx2.ShiftLeftLogical(w, 16).AsSingle();                           // → FP32
+
+            var v0 = Avx.LoadVector256(a0 + k);
+            var v1 = Avx.LoadVector256(a1 + k);
+            var v2 = Avx.LoadVector256(a2 + k);
+            var v3 = Avx.LoadVector256(a3 + k);
+
+            acc0 = Fma.MultiplyAdd(v0, f, acc0);
+            acc1 = Fma.MultiplyAdd(v1, f, acc1);
+            acc2 = Fma.MultiplyAdd(v2, f, acc2);
+            acc3 = Fma.MultiplyAdd(v3, f, acc3);
+        }
+
+        float s0 = Vector256.Sum(acc0);
+        float s1 = Vector256.Sum(acc1);
+        float s2 = Vector256.Sum(acc2);
+        float s3 = Vector256.Sum(acc3);
+
+        for (; k < K; k++)
+        {
+            float fv = BitConverter.UInt32BitsToSingle(((uint)bRow[k]) << 16);
+            s0 += a0[k] * fv;
+            s1 += a1[k] * fv;
+            s2 += a2[k] * fv;
+            s3 += a3[k] * fv;
+        }
+
+        outPtr[0] = s0;
+        outPtr[outStride] = s1;
+        outPtr[outStride * 2] = s2;
+        outPtr[outStride * 3] = s3;
     }
 
     [MethodImpl(MethodImplOptions.AggressiveInlining)]

@@ -91,6 +91,7 @@ public sealed class Gemma4ForwardPass : IDisposable
     private readonly ITensor _ffnUpB;
     private readonly ITensor? _pleGateB;
     private readonly ITensor? _pleScratchB;
+    private readonly ITensor? _pleProjOutB;
 
     // FFN scratch
     private readonly ITensor _ffnGate;
@@ -139,6 +140,12 @@ public sealed class Gemma4ForwardPass : IDisposable
     public long ProfileNormTicks;
     public long ProfilePleBlockTicks;
     public long ProfileLmHeadTicks;
+
+    // Finer breakdown of the batched attention section
+    public long ProfileBAttnQkvProjTicks;      // batched Q/K/V projections
+    public long ProfileBAttnPerTokLoopTicks;   // norms + RoPE + cache writes (per-token loop)
+    public long ProfileBAttnBatchedTicks;      // BatchedCausalAttention call
+    public long ProfileBAttnOProjTicks;        // output projection
 
     public void ResetProfile()
     {
@@ -252,8 +259,10 @@ public sealed class Gemma4ForwardPass : IDisposable
         _ffnUpB    = CreateF32("g4b_ffn_up",   mb * config.IntermediateDim);
         if (_hasPle)
         {
+            int pleTotal = config.PerLayerInputDim * config.NumLayers;
             _pleGateB    = CreateF32("g4b_ple_gate",    mb * config.PerLayerInputDim);
             _pleScratchB = CreateF32("g4b_ple_scratch", mb * config.HiddenDim);
+            _pleProjOutB = CreateF32("g4b_ple_proj",    mb * pleTotal);
         }
         if (kSwa > 0)
         {
@@ -334,19 +343,54 @@ public sealed class Gemma4ForwardPass : IDisposable
             _hidden.AsFloatSpan().CopyTo(hiddenBSpan.Slice(i * D, D));
         }
 
-        // 2. PLE setup for all M tokens (per-token, runs M times)
-        // TODO(perf): batch the PerLayerModelProj matmul across all M tokens.
-        var pleBasePerToken = _hasPle ? new float[M * _config.PerLayerInputDim * _config.NumLayers] : null;
+        // 2. PLE setup — batched across all M tokens. The per_layer_model_proj
+        // BF16 matmul (K=HiddenDim, N=pleTotal) is the dominant cost at M>1, so
+        // we run it once with M=batch and reuse the weight. The token_embd lookup
+        // and the add/scale/norm steps stay per-token but are cheap.
+        float[]? pleBasePerToken = null;
         if (_hasPle && !DebugDisablePle)
         {
             s = prof ? Stopwatch.GetTimestamp() : 0;
-            int pleTotal = _config.PerLayerInputDim * _config.NumLayers;
+            int nEmbdPerLayer = _config.PerLayerInputDim;
+            int nLayer = _config.NumLayers;
+            int pleTotal = nEmbdPerLayer * nLayer;
+            pleBasePerToken = new float[M * pleTotal];
+
+            // Step 1: per-token token embedding lookup + scale into pleBasePerToken[i]
+            float embScale = MathF.Sqrt(nEmbdPerLayer);
             for (int i = 0; i < M; i++)
             {
-                hiddenBSpan.Slice(i * D, D).CopyTo(_hidden.AsFloatSpan());
-                SetupPerLayerEmbeddings(tokenIds[i]);
+                _backend.EmbeddingLookup(_pleBase!, _weights.PerLayerTokenEmbd!, tokenIds[i]);
+                _backend.ScaleInPlace(_pleBase!, embScale);
                 _pleBase!.AsFloatSpan().CopyTo(pleBasePerToken.AsSpan().Slice(i * pleTotal, pleTotal));
             }
+
+            // Step 2: BATCHED BF16 matmul. _hiddenB[M × HiddenDim] × PerLayerModelProj → _pleProjOutB[M × pleTotal]
+            // This single call replaces M single-row BF16 matmuls and gets full weight reuse.
+            ProjectLinear(_pleProjOutB!, _hiddenB, _weights.PerLayerModelProj!, M);
+
+            // Step 3: scale the whole M*pleTotal buffer by 1/sqrt(HiddenDim)
+            float projScale = 1.0f / MathF.Sqrt(D);
+            var projSpan = _pleProjOutB!.AsFloatSpan().Slice(0, M * pleTotal);
+            for (int i = 0; i < projSpan.Length; i++) projSpan[i] *= projScale;
+
+            // Step 4: per-token PerHeadRmsNorm on each [pleTotal] slice
+            // The existing op treats the input as [numHeads × headDim] — we want
+            // nLayer × nEmbdPerLayer. Call it per-token on slices.
+            for (int i = 0; i < M; i++)
+            {
+                // Copy slice to _pleProjOut, run norm, copy back
+                projSpan.Slice(i * pleTotal, pleTotal).CopyTo(_pleProjOut!.AsFloatSpan());
+                _backend.PerHeadRmsNorm(_pleProjOut!, _weights.PerLayerProjNorm!, nLayer, nEmbdPerLayer, _config.NormEps);
+                _pleProjOut!.AsFloatSpan().Slice(0, pleTotal).CopyTo(projSpan.Slice(i * pleTotal, pleTotal));
+            }
+
+            // Step 5: pleBasePerToken[i] = (pleBasePerToken[i] + pleProjOut[i]) * 1/sqrt(2)
+            float invSqrt2 = 1.0f / MathF.Sqrt(2.0f);
+            var baseSpan = pleBasePerToken.AsSpan();
+            for (int i = 0; i < baseSpan.Length; i++)
+                baseSpan[i] = (baseSpan[i] + projSpan[i]) * invSqrt2;
+
             if (prof) tPleSetup = Stopwatch.GetTimestamp() - s;
         }
 
@@ -840,6 +884,8 @@ public sealed class Gemma4ForwardPass : IDisposable
         int kRowSize = numKvH * headDim;
         int vRowSize = numKvH * valDim;
         int oRowSize = numH * valDim;
+        bool prof = EnableProfiling;
+        long ts = prof ? Stopwatch.GetTimestamp() : 0;
 
         // ── Batched Q projection (reads batchM rows from _normOutB) ─────────
         ProjectLinear(qProjB, _normOutB, w.AttnQ, batchM);
@@ -850,6 +896,7 @@ public sealed class Gemma4ForwardPass : IDisposable
             ProjectLinear(kProjB, _normOutB, w.AttnK, batchM);
             ProjectLinear(vProjB, _normOutB, w.AttnV, batchM);
         }
+        if (prof) { ProfileBAttnQkvProjTicks += Stopwatch.GetTimestamp() - ts; ts = Stopwatch.GetTimestamp(); }
 
         // ── Per-token attention loop ────────────────────────────────────────
         var qProjBSpan = qProjB.AsFloatSpan();
@@ -907,6 +954,7 @@ public sealed class Gemma4ForwardPass : IDisposable
             // Write RoPE'd Q back into qProjB[i, :] for the batched attention step.
             qSingleSpan.Slice(0, qRowSize).CopyTo(qProjBSpan.Slice(i * qRowSize, qRowSize));
         }
+        if (prof) { ProfileBAttnPerTokLoopTicks += Stopwatch.GetTimestamp() - ts; ts = Stopwatch.GetTimestamp(); }
 
         // Second pass: single batched causal attention over all M queries against
         // the shared source-layer cache. 256 independent (query, head) tasks at M=32.
@@ -918,9 +966,11 @@ public sealed class Gemma4ForwardPass : IDisposable
             attnOutB, qProjB, kCacheT2, vCacheT2,
             batchM, numH, numKvH, headDim, valDim,
             cap2, startPosition, attentionScale);
+        if (prof) { ProfileBAttnBatchedTicks += Stopwatch.GetTimestamp() - ts; ts = Stopwatch.GetTimestamp(); }
 
         // ── Batched output projection ───────────────────────────────────────
         ProjectLinear(_hiddenB, attnOutB, w.AttnO, batchM);
+        if (prof) { ProfileBAttnOProjTicks += Stopwatch.GetTimestamp() - ts; }
     }
 
     /// <summary>
@@ -1082,6 +1132,7 @@ public sealed class Gemma4ForwardPass : IDisposable
         _ffnUpB.Dispose();
         _pleGateB?.Dispose();
         _pleScratchB?.Dispose();
+        _pleProjOutB?.Dispose();
         if (_qProjSwaB != _qProjB)
         {
             _qProjSwaB.Dispose();
