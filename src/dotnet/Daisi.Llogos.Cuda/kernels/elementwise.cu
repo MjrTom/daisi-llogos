@@ -1494,4 +1494,208 @@ __global__ void dequant_to_f16(unsigned short* __restrict__ output,
     output[idx] = fp32_to_fp16(val);
 }
 
+// ── Gemma 4: GeLU (tanh approximation) ──────────────────────────────────────
+// gelu(x) = 0.5 * x * (1 + tanh(sqrt(2/π) * (x + 0.044715 * x³)))
+
+__global__ void gelu_tanh(float* output, const float* input, int n)
+{
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx < n)
+    {
+        float x = input[idx];
+        float inner = 0.7978845608028654f * (x + 0.044715f * x * x * x);
+        output[idx] = 0.5f * x * (1.0f + tanhf(inner));
+    }
+}
+
+// ── Gemma 4: Fused GeGLU ────────────────────────────────────────────────────
+// output[i] = gelu_tanh(gate[i]) * up[i]
+
+__global__ void geglu(float* output, const float* gate, const float* up, int n)
+{
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx < n)
+    {
+        float g = gate[idx];
+        float inner = 0.7978845608028654f * (g + 0.044715f * g * g * g);
+        output[idx] = (0.5f * g * (1.0f + tanhf(inner))) * up[idx];
+    }
+}
+
+// ── Gemma 4: Logit softcap ──────────────────────────────────────────────────
+// data[i] = cap * tanh(data[i] / cap)
+
+__global__ void logit_softcap(float* data, int n, float cap, float inv_cap)
+{
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx < n)
+        data[idx] = cap * tanhf(data[idx] * inv_cap);
+}
+
+// ── Gemma 4: NEOX-style RoPE ────────────────────────────────────────────────
+// Pairs are (head[i], head[i + ropeDim/2]) instead of interleaved (head[2i], head[2i+1]).
+// Each thread handles one pair.
+
+__global__ void rope_neox(float* q, float* k,
+                          int q_total, int k_total,
+                          int head_dim, int rope_dim,
+                          int position, float theta)
+{
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    int half_rope = rope_dim / 2;
+
+    // Process Q
+    if (idx < q_total / 2)
+    {
+        int head = idx / (head_dim / 2);
+        int pair = idx % (head_dim / 2);
+        if (pair < half_rope)
+        {
+            double freq = 1.0 / pow((double)theta, (double)(2 * pair) / (double)rope_dim);
+            double angle = (double)position * freq;
+            float cos_a = (float)cos(angle);
+            float sin_a = (float)sin(angle);
+
+            int i0 = head * head_dim + pair;              // first element
+            int i1 = head * head_dim + pair + half_rope;  // second element (half dim away)
+            float v0 = q[i0];
+            float v1 = q[i1];
+            q[i0] = v0 * cos_a - v1 * sin_a;
+            q[i1] = v0 * sin_a + v1 * cos_a;
+        }
+    }
+
+    // Process K
+    if (idx < k_total / 2)
+    {
+        int head = idx / (head_dim / 2);
+        int pair = idx % (head_dim / 2);
+        if (pair < half_rope)
+        {
+            double freq = 1.0 / pow((double)theta, (double)(2 * pair) / (double)rope_dim);
+            double angle = (double)position * freq;
+            float cos_a = (float)cos(angle);
+            float sin_a = (float)sin(angle);
+
+            int i0 = head * head_dim + pair;
+            int i1 = head * head_dim + pair + half_rope;
+            float v0 = k[i0];
+            float v1 = k[i1];
+            k[i0] = v0 * cos_a - v1 * sin_a;
+            k[i1] = v0 * sin_a + v1 * cos_a;
+        }
+    }
+}
+
+// ── Gemma 4: NEOX RoPE with frequency factors ──────────────────────────────
+// Same as rope_neox but each pair's base frequency is multiplied by
+// freqFactors[pair] (precomputed proportional RoPE table).
+
+__global__ void rope_neox_with_freq(float* q, float* k,
+                                     int q_total, int k_total,
+                                     int head_dim, int rope_dim,
+                                     int position, float theta,
+                                     const float* freq_factors)
+{
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    int half_rope = rope_dim / 2;
+
+    // Process Q
+    if (idx < q_total / 2)
+    {
+        int head = idx / (head_dim / 2);
+        int pair = idx % (head_dim / 2);
+        if (pair < half_rope)
+        {
+            double base_freq = 1.0 / pow((double)theta, (double)(2 * pair) / (double)rope_dim);
+            double freq = base_freq * (double)freq_factors[pair];
+            double angle = (double)position * freq;
+            float cos_a = (float)cos(angle);
+            float sin_a = (float)sin(angle);
+
+            int i0 = head * head_dim + pair;
+            int i1 = head * head_dim + pair + half_rope;
+            float v0 = q[i0];
+            float v1 = q[i1];
+            q[i0] = v0 * cos_a - v1 * sin_a;
+            q[i1] = v0 * sin_a + v1 * cos_a;
+        }
+    }
+
+    // Process K
+    if (idx < k_total / 2)
+    {
+        int head = idx / (head_dim / 2);
+        int pair = idx % (head_dim / 2);
+        if (pair < half_rope)
+        {
+            double base_freq = 1.0 / pow((double)theta, (double)(2 * pair) / (double)rope_dim);
+            double freq = base_freq * (double)freq_factors[pair];
+            double angle = (double)position * freq;
+            float cos_a = (float)cos(angle);
+            float sin_a = (float)sin(angle);
+
+            int i0 = head * head_dim + pair;
+            int i1 = head * head_dim + pair + half_rope;
+            float v0 = k[i0];
+            float v1 = k[i1];
+            k[i0] = v0 * cos_a - v1 * sin_a;
+            k[i1] = v0 * sin_a + v1 * cos_a;
+        }
+    }
+}
+
+// ── Gemma 4: Standard RoPE with frequency factors ──────────────────────────
+// Interleaved pairs (head[2i], head[2i+1]) with per-pair frequency multiplier.
+
+__global__ void rope_with_freq(float* q, float* k,
+                                int q_total, int k_total,
+                                int head_dim, int rope_dim,
+                                int position, float theta,
+                                const float* freq_factors)
+{
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    int half_rope = rope_dim / 2;
+
+    if (idx < q_total / 2)
+    {
+        int head = idx / (head_dim / 2);
+        int pair = idx % (head_dim / 2);
+        if (pair < half_rope)
+        {
+            double base_freq = 1.0 / pow((double)theta, (double)(2 * pair) / (double)rope_dim);
+            double freq = base_freq * (double)freq_factors[pair];
+            double angle = (double)position * freq;
+            float cos_a = (float)cos(angle);
+            float sin_a = (float)sin(angle);
+
+            int base_idx = head * head_dim + pair * 2;
+            float v0 = q[base_idx];
+            float v1 = q[base_idx + 1];
+            q[base_idx]     = v0 * cos_a - v1 * sin_a;
+            q[base_idx + 1] = v0 * sin_a + v1 * cos_a;
+        }
+    }
+
+    if (idx < k_total / 2)
+    {
+        int head = idx / (head_dim / 2);
+        int pair = idx % (head_dim / 2);
+        if (pair < half_rope)
+        {
+            double base_freq = 1.0 / pow((double)theta, (double)(2 * pair) / (double)rope_dim);
+            double freq = base_freq * (double)freq_factors[pair];
+            double angle = (double)position * freq;
+            float cos_a = (float)cos(angle);
+            float sin_a = (float)sin(angle);
+
+            int base_idx = head * head_dim + pair * 2;
+            float v0 = k[base_idx];
+            float v1 = k[base_idx + 1];
+            k[base_idx]     = v0 * cos_a - v1 * sin_a;
+            k[base_idx + 1] = v0 * sin_a + v1 * cos_a;
+        }
+    }
+}
+
 } // extern "C"

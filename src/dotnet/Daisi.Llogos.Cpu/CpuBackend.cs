@@ -735,6 +735,12 @@ public sealed class CpuBackend : IComputeBackend
     }
 
     /// <inheritdoc />
+    public void CopyTensorRegion(ITensor dst, ITensor src, int srcOffset, int count)
+    {
+        src.AsFloatSpan().Slice(srcOffset, count).CopyTo(dst.AsFloatSpan().Slice(0, count));
+    }
+
+    /// <inheritdoc />
     public ITensor CreateHostTensor(string name, GgmlType type, ReadOnlySpan<long> dimensions) =>
         CreateTensor(name, type, dimensions); // CPU tensors are already in host memory
 

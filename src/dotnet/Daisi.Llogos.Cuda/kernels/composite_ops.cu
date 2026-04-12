@@ -135,6 +135,42 @@ __global__ void per_head_rms_norm(float* data, const float* weight,
         data[base_idx + i] = data[base_idx + i] * inv_rms * weight[i];
 }
 
+// ── Per-head RMSNorm (unit — no learned weight) ─────────────────────────────
+// Same as per_head_rms_norm but without the weight multiplication.
+// data[h*hd + i] /= rms(head_h). Used for Gemma 4 V-projection normalization.
+
+__global__ void per_head_rms_norm_unit(float* data,
+                                       int numHeads, int headDim, float eps)
+{
+    extern __shared__ float sdata[];
+    int head = blockIdx.x;
+    int tid = threadIdx.x;
+    int stride = blockDim.x;
+    int base_idx = head * headDim;
+
+    float sum = 0.0f;
+    for (int i = tid; i < headDim; i += stride)
+    {
+        float val = data[base_idx + i];
+        sum += val * val;
+    }
+
+    sdata[tid] = sum;
+    __syncthreads();
+
+    for (int s = blockDim.x / 2; s > 0; s >>= 1)
+    {
+        if (tid < s)
+            sdata[tid] += sdata[tid + s];
+        __syncthreads();
+    }
+
+    float inv_rms = rsqrtf(sdata[0] / (float)headDim + eps);
+
+    for (int i = tid; i < headDim; i += stride)
+        data[base_idx + i] *= inv_rms;
+}
+
 // ── De-interleave Q ──────────────────────────────────────────────────────────
 // qFull layout: [q_h0(headDim), gate_h0(headDim), q_h1(headDim), gate_h1(headDim), ...]
 // qAttn: [q_h0, q_h1, ...], qGate: [gate_h0, gate_h1, ...]
