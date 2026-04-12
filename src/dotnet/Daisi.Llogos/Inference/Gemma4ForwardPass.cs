@@ -93,13 +93,19 @@ public sealed class Gemma4ForwardPass : IDisposable
     private readonly ITensor? _pleScratchB;
     private readonly ITensor? _pleProjOutB;
 
-    // Per-layer repacked FFN weight handles returned by
+    // Per-layer repacked weight handles returned by
     // <see cref="IComputeBackend.RepackWeightForBatchedMatMul"/>. Populated at
-    // construction time; may be null when the backend doesn't support repacking.
-    // Used by the batched forward pass for M>1 prefill.
+    // construction time; may be null when the backend doesn't support repacking
+    // or the source tensor isn't repackable. Used by both decode (M=1) and
+    // batched (M>1) paths since the Q4_0x4 kernel beats the Q4_0 default at every M.
     private readonly object?[]? _ffnGateRepacked;
     private readonly object?[]? _ffnUpRepacked;
     private readonly object?[]? _ffnDownRepacked;
+    private readonly object?[]? _attnQRepacked;
+    private readonly object?[]? _attnKRepacked;
+    private readonly object?[]? _attnVRepacked;
+    private readonly object?[]? _attnORepacked;
+    private readonly object? _outputWeightRepacked;
 
     // FFN scratch
     private readonly ITensor _ffnGate;
@@ -287,20 +293,32 @@ public sealed class Gemma4ForwardPass : IDisposable
             _attnOutSwaB = _attnOutB;
         }
 
-        // Pre-compute repacked FFN weights for the batched prefill path. The
-        // backend returns an opaque handle (byte[] for CPU/Q4_0x4, null for
-        // backends with no fast path). Decode (M=1) continues to use the
-        // original tensors.
+        // Pre-compute repacked weights for both prefill and decode. The backend
+        // returns an opaque handle (byte[] for CPU/Q4_0x4, null when the source
+        // type isn't supported). Pre-converting at load time also folds the
+        // FP16→FP32 scale conversion out of the inner loop.
         _ffnGateRepacked = new object?[config.NumLayers];
         _ffnUpRepacked   = new object?[config.NumLayers];
         _ffnDownRepacked = new object?[config.NumLayers];
+        _attnQRepacked   = new object?[config.NumLayers];
+        _attnKRepacked   = new object?[config.NumLayers];
+        _attnVRepacked   = new object?[config.NumLayers];
+        _attnORepacked   = new object?[config.NumLayers];
         for (int li = 0; li < config.NumLayers; li++)
         {
             var lw = (GemmaAttentionWeights)weights.Layers[li];
             _ffnGateRepacked[li] = backend.RepackWeightForBatchedMatMul(lw.FfnGate);
             _ffnUpRepacked[li]   = backend.RepackWeightForBatchedMatMul(lw.FfnUp);
             _ffnDownRepacked[li] = backend.RepackWeightForBatchedMatMul(lw.FfnDown);
+            _attnQRepacked[li]   = backend.RepackWeightForBatchedMatMul(lw.AttnQ);
+            _attnKRepacked[li]   = backend.RepackWeightForBatchedMatMul(lw.AttnK);
+            _attnVRepacked[li]   = backend.RepackWeightForBatchedMatMul(lw.AttnV);
+            _attnORepacked[li]   = backend.RepackWeightForBatchedMatMul(lw.AttnO);
         }
+
+        // lm_head: same Q4_0x4 fast path. Tied to embeddings in many models so
+        // RepackWeightForBatchedMatMul returns null when the source is e.g. F16/BF16.
+        _outputWeightRepacked = backend.RepackWeightForBatchedMatMul(weights.OutputWeight);
     }
 
     public void ResetState() => _kvCache.Reset();
@@ -314,7 +332,7 @@ public sealed class Gemma4ForwardPass : IDisposable
 
         // Final RmsNorm + lm_head
         _backend.RmsNorm(_normOut, _hidden, _weights.OutputNorm, _config.NormEps);
-        ProjectLinear(_logits, _normOut, _weights.OutputWeight);
+        ProjectLinearFfn(_logits, _normOut, _weights.OutputWeight, _outputWeightRepacked, 1);
 
         // Final logit softcap (Gemma 2/3/4 trait)
         if (_config.FinalLogitSoftcap > 0 && !DebugDisableLogitSoftcap)
@@ -506,7 +524,7 @@ public sealed class Gemma4ForwardPass : IDisposable
         hiddenBSpan.Slice((M - 1) * D, D).CopyTo(_hidden.AsFloatSpan());
 
         _backend.RmsNorm(_normOut, _hidden, _weights.OutputNorm, _config.NormEps);
-        ProjectLinear(_logits, _normOut, _weights.OutputWeight);
+        ProjectLinearFfn(_logits, _normOut, _weights.OutputWeight, _outputWeightRepacked, 1);
 
         if (_config.FinalLogitSoftcap > 0 && !DebugDisableLogitSoftcap)
             _backend.LogitSoftcap(_logits, _config.FinalLogitSoftcap);
@@ -583,8 +601,8 @@ public sealed class Gemma4ForwardPass : IDisposable
             if (prof) ProfileNormTicks += Stopwatch.GetTimestamp() - t;
 
             t = prof ? Stopwatch.GetTimestamp() : 0;
-            ProjectLinear(_ffnGate, _normOut, lw.FfnGate);
-            ProjectLinear(_ffnUp,   _normOut, lw.FfnUp);
+            ProjectLinearFfn(_ffnGate, _normOut, lw.FfnGate, _ffnGateRepacked?[layer], 1);
+            ProjectLinearFfn(_ffnUp,   _normOut, lw.FfnUp,   _ffnUpRepacked?[layer],   1);
             if (prof) ProfileFfnMatmulTicks += Stopwatch.GetTimestamp() - t;
 
             t = prof ? Stopwatch.GetTimestamp() : 0;
@@ -592,7 +610,7 @@ public sealed class Gemma4ForwardPass : IDisposable
             if (prof) ProfileFfnOtherTicks += Stopwatch.GetTimestamp() - t;
 
             t = prof ? Stopwatch.GetTimestamp() : 0;
-            ProjectLinear(_hidden, _ffnGate, lw.FfnDown);
+            ProjectLinearFfn(_hidden, _ffnGate, lw.FfnDown, _ffnDownRepacked?[layer], 1);
             if (prof) ProfileFfnMatmulTicks += Stopwatch.GetTimestamp() - t;
 
             // ── Post-FFN norm + residual add ────────────────────────────────
@@ -657,7 +675,7 @@ public sealed class Gemma4ForwardPass : IDisposable
         long t = prof ? Stopwatch.GetTimestamp() : 0;
 
         // ── Q projection (always) ───────────────────────────────────────────
-        ProjectLinear(qProj, _normOut, w.AttnQ);
+        ProjectLinearFfn(qProj, _normOut, w.AttnQ, _attnQRepacked?[layer], 1);
         if (prof) { ProfileAttnMatmulTicks += Stopwatch.GetTimestamp() - t; t = Stopwatch.GetTimestamp(); }
 
         if (!DebugDisableQkNorm)
@@ -668,8 +686,8 @@ public sealed class Gemma4ForwardPass : IDisposable
         {
             // ── K/V projections ─────────────────────────────────────────────
             t = prof ? Stopwatch.GetTimestamp() : 0;
-            ProjectLinear(kProj, _normOut, w.AttnK);
-            ProjectLinear(vProj, _normOut, w.AttnV);
+            ProjectLinearFfn(kProj, _normOut, w.AttnK, _attnKRepacked?[layer], 1);
+            ProjectLinearFfn(vProj, _normOut, w.AttnV, _attnVRepacked?[layer], 1);
             if (prof) { ProfileAttnMatmulTicks += Stopwatch.GetTimestamp() - t; t = Stopwatch.GetTimestamp(); }
 
             if (!DebugDisableQkNorm)
@@ -719,7 +737,7 @@ public sealed class Gemma4ForwardPass : IDisposable
 
         // ── Output projection ───────────────────────────────────────────────
         // attn_output weight shape: [num_heads * head_dim, hidden_dim]
-        ProjectLinear(_hidden, attnOut, w.AttnO);
+        ProjectLinearFfn(_hidden, attnOut, w.AttnO, _attnORepacked?[layer], 1);
         if (prof) { ProfileAttnMatmulTicks += Stopwatch.GetTimestamp() - t; }
     }
 
@@ -813,12 +831,13 @@ public sealed class Gemma4ForwardPass : IDisposable
 
     /// <summary>
     /// Project an FFN matmul using the repacked backend path when available, else
-    /// fall through to the default <see cref="ProjectLinear"/>. Only exercised in
-    /// batched (M>1) mode — decode stays on the original tensors.
+    /// fall through to the default <see cref="ProjectLinear"/>. The repacked
+    /// (Q4_0x4 / FP32 scales) path beats the original Q4_0 kernel even at M=1
+    /// per the micro-bench, so it's enabled for both decode and prefill.
     /// </summary>
     private void ProjectLinearFfn(ITensor output, ITensor input, ITensor weight, object? repacked, int batchM)
     {
-        if (repacked == null || batchM <= 1)
+        if (repacked == null)
         {
             ProjectLinear(output, input, weight, batchM);
             return;
@@ -929,13 +948,13 @@ public sealed class Gemma4ForwardPass : IDisposable
         long ts = prof ? Stopwatch.GetTimestamp() : 0;
 
         // ── Batched Q projection (reads batchM rows from _normOutB) ─────────
-        ProjectLinear(qProjB, _normOutB, w.AttnQ, batchM);
+        ProjectLinearFfn(qProjB, _normOutB, w.AttnQ, _attnQRepacked?[layer], batchM);
 
         // ── Batched K/V projections (has_kv layers only) ────────────────────
         if (hasKv)
         {
-            ProjectLinear(kProjB, _normOutB, w.AttnK, batchM);
-            ProjectLinear(vProjB, _normOutB, w.AttnV, batchM);
+            ProjectLinearFfn(kProjB, _normOutB, w.AttnK, _attnKRepacked?[layer], batchM);
+            ProjectLinearFfn(vProjB, _normOutB, w.AttnV, _attnVRepacked?[layer], batchM);
         }
         if (prof) { ProfileBAttnQkvProjTicks += Stopwatch.GetTimestamp() - ts; ts = Stopwatch.GetTimestamp(); }
 
@@ -1010,7 +1029,7 @@ public sealed class Gemma4ForwardPass : IDisposable
         if (prof) { ProfileBAttnBatchedTicks += Stopwatch.GetTimestamp() - ts; ts = Stopwatch.GetTimestamp(); }
 
         // ── Batched output projection ───────────────────────────────────────
-        ProjectLinear(_hiddenB, attnOutB, w.AttnO, batchM);
+        ProjectLinearFfn(_hiddenB, attnOutB, w.AttnO, _attnORepacked?[layer], batchM);
         if (prof) { ProfileBAttnOProjTicks += Stopwatch.GetTimestamp() - ts; }
     }
 

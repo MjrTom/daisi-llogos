@@ -15,17 +15,24 @@ public static class MatMul
     private const int Q8_0BlockSize = 32;
     private const int Q8_0TypeSize = 34;
 
+    // Q8_0_F32: same as Q8_0 but stores the scale as FP32 instead of FP16.
+    // Used by the Q4_0x4 fast path so the inner kernel never has to convert
+    // a Half→float per block. 4 byte FP32 scale + 32 byte int8 = 36 bytes.
+    private const int Q8_0F32TypeSize = 36;
+
     private const int Q4_0BlockSize = 32;
     private const int Q4_0TypeSize = 18;
 
-    // Q4_0x4: 4 Q4_0 rows interleaved in 8-byte stripes, XOR 0x88 pre-applied.
-    //   8 bytes  - 4 × FP16 scales (one per interleaved row)
-    //   64 bytes - 8-byte stripes: [r0 qs[0..7] | r1 qs[0..7] | r2 qs[0..7] | r3 qs[0..7]
-    //                              | r0 qs[8..15] | r1 qs[8..15] | r2 qs[8..15] | r3 qs[8..15]]
-    // 72 bytes per block, covering 4 rows × 32 values = 128 dequantized outputs.
-    // Matches llama.cpp's block_q4_0x4 with blck_size_interleave=8.
+    // Q4_0x4: 4 Q4_0 rows interleaved with FP32 scales pre-converted at repack time.
+    //   16 bytes - 4 × FP32 scales (one per interleaved row)
+    //   64 bytes - row-contiguous nibbles: [r0 qs[0..15] | r1 qs[0..15] | r2 qs[0..15] | r3 qs[0..15]]
+    // 80 bytes per block, covering 4 rows × 32 values = 128 dequantized outputs.
+    //
+    // Storing FP32 scales (vs FP16 in llama.cpp's block_q4_0x4) eliminates 4 scalar
+    // Half→float conversions per block in the inner tile. The +8 bytes/block is ~11%
+    // bigger on disk but it's a load-time repack so model files are unaffected.
     public const int Q4_0x4BlockSize = 32;  // block size per ROW (same as Q4_0)
-    public const int Q4_0x4TypeSize = 72;   // bytes per (4 rows × 1 block)
+    public const int Q4_0x4TypeSize = 80;   // bytes per (4 rows × 1 block)
     public const int Q4_0x4RowsPerGroup = 4;
 
     private const int Q4_KSuperBlockSize = 256;
@@ -528,21 +535,24 @@ public static class MatMul
                     byte* s2 = srcR2 + bi * Q4_0TypeSize;
                     byte* s3 = srcR3 + bi * Q4_0TypeSize;
 
-                    // Scales (bytes 0..7)
-                    *(ushort*)(dstBlk + 0) = *(ushort*)s0;
-                    *(ushort*)(dstBlk + 2) = *(ushort*)s1;
-                    *(ushort*)(dstBlk + 4) = *(ushort*)s2;
-                    *(ushort*)(dstBlk + 6) = *(ushort*)s3;
+                    // Scales: convert FP16→FP32 once at repack time and store as 4 floats
+                    // (bytes 0..15). The inner kernel can then load them with one
+                    // Sse.LoadVector128 and skip per-block Half→float conversion.
+                    *(float*)(dstBlk +  0) = (float)*(Half*)s0;
+                    *(float*)(dstBlk +  4) = (float)*(Half*)s1;
+                    *(float*)(dstBlk +  8) = (float)*(Half*)s2;
+                    *(float*)(dstBlk + 12) = (float)*(Half*)s3;
 
                     // Each row's 16 qs bytes contiguous — starts at (s_r + 2) in Q4_0.
-                    *(ulong*)(dstBlk +  8) = *(ulong*)(s0 + 2);
-                    *(ulong*)(dstBlk + 16) = *(ulong*)(s0 + 10);
-                    *(ulong*)(dstBlk + 24) = *(ulong*)(s1 + 2);
-                    *(ulong*)(dstBlk + 32) = *(ulong*)(s1 + 10);
-                    *(ulong*)(dstBlk + 40) = *(ulong*)(s2 + 2);
-                    *(ulong*)(dstBlk + 48) = *(ulong*)(s2 + 10);
-                    *(ulong*)(dstBlk + 56) = *(ulong*)(s3 + 2);
-                    *(ulong*)(dstBlk + 64) = *(ulong*)(s3 + 10);
+                    // Nibbles now begin at offset 16 (was 8) since scales are FP32.
+                    *(ulong*)(dstBlk + 16) = *(ulong*)(s0 + 2);
+                    *(ulong*)(dstBlk + 24) = *(ulong*)(s0 + 10);
+                    *(ulong*)(dstBlk + 32) = *(ulong*)(s1 + 2);
+                    *(ulong*)(dstBlk + 40) = *(ulong*)(s1 + 10);
+                    *(ulong*)(dstBlk + 48) = *(ulong*)(s2 + 2);
+                    *(ulong*)(dstBlk + 56) = *(ulong*)(s2 + 10);
+                    *(ulong*)(dstBlk + 64) = *(ulong*)(s3 + 2);
+                    *(ulong*)(dstBlk + 72) = *(ulong*)(s3 + 10);
                 }
             }
         }
@@ -561,7 +571,9 @@ public static class MatMul
             throw new ArgumentException($"MultiplyQ4_0x4 needs N divisible by 4, got {N}");
 
         int blocksPerRow = K / Q4_0BlockSize;
-        int q8BytesPerInput = blocksPerRow * Q8_0TypeSize;
+        // Use the FP32-scale activation format so the inner kernel never converts
+        // a Half→float per block.
+        int q8BytesPerInput = blocksPerRow * Q8_0F32TypeSize;
         int groupBytes = blocksPerRow * Q4_0x4TypeSize;
         int groups = N / 4;
 
@@ -575,7 +587,7 @@ public static class MatMul
             fixed (byte* aQFixedPtr = aQBufArr)
             {
                 for (int i = 0; i < M; i++)
-                    QuantizeRowQ8_0(aFixedPtr + i * K, aQFixedPtr + i * q8BytesPerInput, K);
+                    QuantizeRowQ8_0F32(aFixedPtr + i * K, aQFixedPtr + i * q8BytesPerInput, K);
 
                 nint aQBase = (nint)aQFixedPtr;
                 nint bBase = (nint)bFixedPtr;
@@ -628,13 +640,16 @@ public static class MatMul
         byte* aQ, byte* bGroup, int blockCount, int M, int aQStride,
         float* outPtr, int outStride)
     {
+        bool useVnni = AvxVnni.IsSupported;
         int mBase = 0;
         while (mBase + 2 <= M)
         {
-            // Advance outPtr by mBase*outStride so the 2x4 tile writes into the
-            // correct output rows (it writes to outPtr[0..1 * outStride + 0..3]).
-            DotQ4_0x4_2x4Tile(aQ, bGroup, blockCount, mBase, aQStride,
-                outPtr + mBase * outStride, outStride);
+            if (useVnni)
+                DotQ4_0x4_2x4TileVnni(aQ, bGroup, blockCount, mBase, aQStride,
+                    outPtr + mBase * outStride, outStride);
+            else
+                DotQ4_0x4_2x4Tile(aQ, bGroup, blockCount, mBase, aQStride,
+                    outPtr + mBase * outStride, outStride);
             mBase += 2;
         }
         if (mBase < M)
@@ -643,16 +658,19 @@ public static class MatMul
     }
 
     /// <summary>
-    /// 2M × 4N tile against a Q4_0x4 weight group. 8 accumulators (c[2][4]).
+    /// AVX-VNNI variant of the 2M × 4N tile: replaces the sign+maddubs+madd
+    /// sequence with a single <c>vpdpbusd</c> per dot. The 8 independent
+    /// accumulator cells (c00..c13) provide enough ILP to hide vpdpbusd's
+    /// 5-cycle latency — the short-chain pitfall from the single-row case
+    /// doesn't apply here.
     /// </summary>
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
-    private static unsafe void DotQ4_0x4_2x4Tile(
+    private static unsafe void DotQ4_0x4_2x4TileVnni(
         byte* aQ, byte* bGroup, int blockCount, int mBase, int aQStride,
         float* outPtr, int outStride)
     {
         var mask0x0F = Vector256.Create((byte)0x0F);
         var offset8 = Vector256.Create((sbyte)8);
-        var ones = Vector256.Create((short)1);
 
         var c00 = Vector256<float>.Zero; var c01 = Vector256<float>.Zero;
         var c02 = Vector256<float>.Zero; var c03 = Vector256<float>.Zero;
@@ -666,18 +684,125 @@ public static class MatMul
         {
             byte* bBlk = bGroup + bi * Q4_0x4TypeSize;
 
-            float bs0 = (float)Unsafe.ReadUnaligned<Half>(bBlk + 0);
-            float bs1 = (float)Unsafe.ReadUnaligned<Half>(bBlk + 2);
-            float bs2 = (float)Unsafe.ReadUnaligned<Half>(bBlk + 4);
-            float bs3 = (float)Unsafe.ReadUnaligned<Half>(bBlk + 6);
+            // 4 weight scales as one packed XMM load — pre-converted to FP32 at repack time.
+            var bs = Sse.LoadVector128((float*)bBlk);
 
-            // Inline decode of 4 rows — each row's 16 bytes at offset (8 + row*16).
-            // JIT sometimes refuses to inline the DecodeQ4_0x4Row helper across the
-            // 4 calls so we duplicate it here.
-            var p0 = Sse2.LoadVector128(bBlk + 8);
-            var p1 = Sse2.LoadVector128(bBlk + 24);
-            var p2 = Sse2.LoadVector128(bBlk + 40);
-            var p3 = Sse2.LoadVector128(bBlk + 56);
+            // Decode 4 weight rows (each row's 16 nibble bytes contiguous, offset 16+row*16)
+            var p0 = Sse2.LoadVector128(bBlk + 16);
+            var p1 = Sse2.LoadVector128(bBlk + 32);
+            var p2 = Sse2.LoadVector128(bBlk + 48);
+            var p3 = Sse2.LoadVector128(bBlk + 64);
+
+            var p0hi = Sse2.ShiftRightLogical(p0.AsUInt16(), 4).AsByte();
+            var p1hi = Sse2.ShiftRightLogical(p1.AsUInt16(), 4).AsByte();
+            var p2hi = Sse2.ShiftRightLogical(p2.AsUInt16(), 4).AsByte();
+            var p3hi = Sse2.ShiftRightLogical(p3.AsUInt16(), 4).AsByte();
+
+            var qx0 = Avx2.Subtract(Avx2.And(Vector256.Create(p0, p0hi), mask0x0F).AsSByte(), offset8);
+            var qx1 = Avx2.Subtract(Avx2.And(Vector256.Create(p1, p1hi), mask0x0F).AsSByte(), offset8);
+            var qx2 = Avx2.Subtract(Avx2.And(Vector256.Create(p2, p2hi), mask0x0F).AsSByte(), offset8);
+            var qx3 = Avx2.Subtract(Avx2.And(Vector256.Create(p3, p3hi), mask0x0F).AsSByte(), offset8);
+
+            var ax0 = Avx2.Sign(qx0, qx0).AsByte();  // |qx|
+            var ax1 = Avx2.Sign(qx1, qx1).AsByte();
+            var ax2 = Avx2.Sign(qx2, qx2).AsByte();
+            var ax3 = Avx2.Sign(qx3, qx3).AsByte();
+
+            // Activation: FP32 scale at offset 0, 32 int8 at offset 4. Stride is Q8_0F32TypeSize.
+            int aOff = bi * Q8_0F32TypeSize;
+            float as0 = *(float*)(a0 + aOff);
+            float as1 = *(float*)(a1 + aOff);
+            var qy0 = Avx.LoadVector256((sbyte*)(a0 + aOff + 4));
+            var qy1 = Avx.LoadVector256((sbyte*)(a1 + aOff + 4));
+
+            // Pre-multiply weight scales by each row's activation scale (1 vmulps each)
+            var bs_a0 = Sse.Multiply(bs, Vector128.Create(as0));
+            var bs_a1 = Sse.Multiply(bs, Vector128.Create(as1));
+
+            // Per cell: sign-trick the activation by the weight's sign, then
+            // vpdpbusd(|qx|, signed_qy) = int32 dot. Convert to float and FMA
+            // into the float accumulator scaled by aS * bS.
+            var sy00 = Avx2.Sign(qy0, qx0);
+            var sy01 = Avx2.Sign(qy0, qx1);
+            var sy02 = Avx2.Sign(qy0, qx2);
+            var sy03 = Avx2.Sign(qy0, qx3);
+            var sy10 = Avx2.Sign(qy1, qx0);
+            var sy11 = Avx2.Sign(qy1, qx1);
+            var sy12 = Avx2.Sign(qy1, qx2);
+            var sy13 = Avx2.Sign(qy1, qx3);
+
+            var d00 = AvxVnni.MultiplyWideningAndAdd(Vector256<int>.Zero, ax0, sy00);
+            var d01 = AvxVnni.MultiplyWideningAndAdd(Vector256<int>.Zero, ax1, sy01);
+            var d02 = AvxVnni.MultiplyWideningAndAdd(Vector256<int>.Zero, ax2, sy02);
+            var d03 = AvxVnni.MultiplyWideningAndAdd(Vector256<int>.Zero, ax3, sy03);
+            var d10 = AvxVnni.MultiplyWideningAndAdd(Vector256<int>.Zero, ax0, sy10);
+            var d11 = AvxVnni.MultiplyWideningAndAdd(Vector256<int>.Zero, ax1, sy11);
+            var d12 = AvxVnni.MultiplyWideningAndAdd(Vector256<int>.Zero, ax2, sy12);
+            var d13 = AvxVnni.MultiplyWideningAndAdd(Vector256<int>.Zero, ax3, sy13);
+
+            // Broadcast each lane of the pre-multiplied scale vector to a YMM
+            // (vbroadcastss + vshufps under the hood). The packed scale path
+            // replaces 8 scalar Half→float + 8 vbroadcastss with 1 vmulps + 8 broadcasts.
+            var s00 = Avx2.BroadcastScalarToVector256(bs_a0);
+            var s01 = Avx2.BroadcastScalarToVector256(Sse.Shuffle(bs_a0, bs_a0, 0x55));
+            var s02 = Avx2.BroadcastScalarToVector256(Sse.Shuffle(bs_a0, bs_a0, 0xAA));
+            var s03 = Avx2.BroadcastScalarToVector256(Sse.Shuffle(bs_a0, bs_a0, 0xFF));
+            var s10 = Avx2.BroadcastScalarToVector256(bs_a1);
+            var s11 = Avx2.BroadcastScalarToVector256(Sse.Shuffle(bs_a1, bs_a1, 0x55));
+            var s12 = Avx2.BroadcastScalarToVector256(Sse.Shuffle(bs_a1, bs_a1, 0xAA));
+            var s13 = Avx2.BroadcastScalarToVector256(Sse.Shuffle(bs_a1, bs_a1, 0xFF));
+
+            c00 = Fma.MultiplyAdd(Avx.ConvertToVector256Single(d00), s00, c00);
+            c01 = Fma.MultiplyAdd(Avx.ConvertToVector256Single(d01), s01, c01);
+            c02 = Fma.MultiplyAdd(Avx.ConvertToVector256Single(d02), s02, c02);
+            c03 = Fma.MultiplyAdd(Avx.ConvertToVector256Single(d03), s03, c03);
+            c10 = Fma.MultiplyAdd(Avx.ConvertToVector256Single(d10), s10, c10);
+            c11 = Fma.MultiplyAdd(Avx.ConvertToVector256Single(d11), s11, c11);
+            c12 = Fma.MultiplyAdd(Avx.ConvertToVector256Single(d12), s12, c12);
+            c13 = Fma.MultiplyAdd(Avx.ConvertToVector256Single(d13), s13, c13);
+        }
+
+        outPtr[0 * outStride + 0] = Vector256.Sum(c00);
+        outPtr[0 * outStride + 1] = Vector256.Sum(c01);
+        outPtr[0 * outStride + 2] = Vector256.Sum(c02);
+        outPtr[0 * outStride + 3] = Vector256.Sum(c03);
+        outPtr[1 * outStride + 0] = Vector256.Sum(c10);
+        outPtr[1 * outStride + 1] = Vector256.Sum(c11);
+        outPtr[1 * outStride + 2] = Vector256.Sum(c12);
+        outPtr[1 * outStride + 3] = Vector256.Sum(c13);
+    }
+
+    /// <summary>
+    /// 2M × 4N tile against a Q4_0x4 weight group. 8 accumulators (c[2][4]).
+    /// </summary>
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    private static unsafe void DotQ4_0x4_2x4Tile(
+        byte* aQ, byte* bGroup, int blockCount, int mBase, int aQStride,
+        float* outPtr, int outStride)
+    {
+        var mask0x0F = Vector256.Create((byte)0x0F);
+        var offset8 = Vector256.Create((sbyte)8);
+
+        var c00 = Vector256<float>.Zero; var c01 = Vector256<float>.Zero;
+        var c02 = Vector256<float>.Zero; var c03 = Vector256<float>.Zero;
+        var c10 = Vector256<float>.Zero; var c11 = Vector256<float>.Zero;
+        var c12 = Vector256<float>.Zero; var c13 = Vector256<float>.Zero;
+
+        byte* a0 = aQ + (mBase + 0) * aQStride;
+        byte* a1 = aQ + (mBase + 1) * aQStride;
+
+        for (int bi = 0; bi < blockCount; bi++)
+        {
+            byte* bBlk = bGroup + bi * Q4_0x4TypeSize;
+
+            // 4 weight scales as one packed XMM load — pre-converted to FP32 at repack time.
+            var bs = Sse.LoadVector128((float*)bBlk);
+
+            // Inline decode of 4 rows — each row's 16 bytes at offset (16 + row*16).
+            var p0 = Sse2.LoadVector128(bBlk + 16);
+            var p1 = Sse2.LoadVector128(bBlk + 32);
+            var p2 = Sse2.LoadVector128(bBlk + 48);
+            var p3 = Sse2.LoadVector128(bBlk + 64);
 
             var p0hi = Sse2.ShiftRightLogical(p0.AsUInt16(), 4).AsByte();
             var p1hi = Sse2.ShiftRightLogical(p1.AsUInt16(), 4).AsByte();
@@ -694,22 +819,36 @@ public static class MatMul
             var ax2 = Avx2.Sign(qx2, qx2).AsByte();
             var ax3 = Avx2.Sign(qx3, qx3).AsByte();
 
-            // Load 2 activation blocks
-            int aOff = bi * Q8_0TypeSize;
-            float as0 = (float)Unsafe.ReadUnaligned<Half>(a0 + aOff);
-            float as1 = (float)Unsafe.ReadUnaligned<Half>(a1 + aOff);
-            var qy0 = Avx.LoadVector256((sbyte*)(a0 + aOff + 2));
-            var qy1 = Avx.LoadVector256((sbyte*)(a1 + aOff + 2));
+            // Activation: FP32 scale at offset 0, 32 int8 at offset 4. Stride is Q8_0F32TypeSize.
+            int aOff = bi * Q8_0F32TypeSize;
+            float as0 = *(float*)(a0 + aOff);
+            float as1 = *(float*)(a1 + aOff);
+            var qy0 = Avx.LoadVector256((sbyte*)(a0 + aOff + 4));
+            var qy1 = Avx.LoadVector256((sbyte*)(a1 + aOff + 4));
 
-            // 8 int8 dot products — 2 M rows × 4 N rows
-            c00 = FusedDot4x4(ax0, qy0, qx0, as0 * bs0, c00, ones);
-            c01 = FusedDot4x4(ax1, qy0, qx1, as0 * bs1, c01, ones);
-            c02 = FusedDot4x4(ax2, qy0, qx2, as0 * bs2, c02, ones);
-            c03 = FusedDot4x4(ax3, qy0, qx3, as0 * bs3, c03, ones);
-            c10 = FusedDot4x4(ax0, qy1, qx0, as1 * bs0, c10, ones);
-            c11 = FusedDot4x4(ax1, qy1, qx1, as1 * bs1, c11, ones);
-            c12 = FusedDot4x4(ax2, qy1, qx2, as1 * bs2, c12, ones);
-            c13 = FusedDot4x4(ax3, qy1, qx3, as1 * bs3, c13, ones);
+            // Pre-multiply weight scales by each row's activation scale (1 vmulps each)
+            var bs_a0 = Sse.Multiply(bs, Vector128.Create(as0));
+            var bs_a1 = Sse.Multiply(bs, Vector128.Create(as1));
+
+            // Compute 8 int8 dots, then FMA with broadcast-from-packed scales.
+            // FusedDot4x4 returns the unscaled int32 dot summed into a Vector256<float>;
+            // pulling the FMA up here lets us reuse the bs_a0/bs_a1 lanes via vbroadcastss+vshufps.
+            c00 = FusedDot4x4(ax0, qy0, qx0, c00,
+                Avx2.BroadcastScalarToVector256(bs_a0));
+            c01 = FusedDot4x4(ax1, qy0, qx1, c01,
+                Avx2.BroadcastScalarToVector256(Sse.Shuffle(bs_a0, bs_a0, 0x55)));
+            c02 = FusedDot4x4(ax2, qy0, qx2, c02,
+                Avx2.BroadcastScalarToVector256(Sse.Shuffle(bs_a0, bs_a0, 0xAA)));
+            c03 = FusedDot4x4(ax3, qy0, qx3, c03,
+                Avx2.BroadcastScalarToVector256(Sse.Shuffle(bs_a0, bs_a0, 0xFF)));
+            c10 = FusedDot4x4(ax0, qy1, qx0, c10,
+                Avx2.BroadcastScalarToVector256(bs_a1));
+            c11 = FusedDot4x4(ax1, qy1, qx1, c11,
+                Avx2.BroadcastScalarToVector256(Sse.Shuffle(bs_a1, bs_a1, 0x55)));
+            c12 = FusedDot4x4(ax2, qy1, qx2, c12,
+                Avx2.BroadcastScalarToVector256(Sse.Shuffle(bs_a1, bs_a1, 0xAA)));
+            c13 = FusedDot4x4(ax3, qy1, qx3, c13,
+                Avx2.BroadcastScalarToVector256(Sse.Shuffle(bs_a1, bs_a1, 0xFF)));
         }
 
         outPtr[0 * outStride + 0] = Vector256.Sum(c00);
@@ -729,7 +868,6 @@ public static class MatMul
     {
         var mask0x0F = Vector256.Create((byte)0x0F);
         var offset8 = Vector256.Create((sbyte)8);
-        var ones = Vector256.Create((short)1);
         var c0 = Vector256<float>.Zero; var c1 = Vector256<float>.Zero;
         var c2 = Vector256<float>.Zero; var c3 = Vector256<float>.Zero;
 
@@ -738,10 +876,9 @@ public static class MatMul
         for (int bi = 0; bi < blockCount; bi++)
         {
             byte* bBlk = bGroup + bi * Q4_0x4TypeSize;
-            float bs0 = (float)Unsafe.ReadUnaligned<Half>(bBlk + 0);
-            float bs1 = (float)Unsafe.ReadUnaligned<Half>(bBlk + 2);
-            float bs2 = (float)Unsafe.ReadUnaligned<Half>(bBlk + 4);
-            float bs3 = (float)Unsafe.ReadUnaligned<Half>(bBlk + 6);
+
+            // 4 weight scales as one packed XMM load — pre-converted to FP32 at repack time.
+            var bs = Sse.LoadVector128((float*)bBlk);
 
             var qx0 = DecodeQ4_0x4Row(bBlk, 0, mask0x0F, offset8);
             var qx1 = DecodeQ4_0x4Row(bBlk, 1, mask0x0F, offset8);
@@ -752,14 +889,20 @@ public static class MatMul
             var ax2 = Avx2.Sign(qx2, qx2).AsByte();
             var ax3 = Avx2.Sign(qx3, qx3).AsByte();
 
-            int aOff = bi * Q8_0TypeSize;
-            float as0 = (float)Unsafe.ReadUnaligned<Half>(a0 + aOff);
-            var qy0 = Avx.LoadVector256((sbyte*)(a0 + aOff + 2));
+            int aOff = bi * Q8_0F32TypeSize;
+            float as0 = *(float*)(a0 + aOff);
+            var qy0 = Avx.LoadVector256((sbyte*)(a0 + aOff + 4));
 
-            c0 = FusedDot4x4(ax0, qy0, qx0, as0 * bs0, c0, ones);
-            c1 = FusedDot4x4(ax1, qy0, qx1, as0 * bs1, c1, ones);
-            c2 = FusedDot4x4(ax2, qy0, qx2, as0 * bs2, c2, ones);
-            c3 = FusedDot4x4(ax3, qy0, qx3, as0 * bs3, c3, ones);
+            var bs_a0 = Sse.Multiply(bs, Vector128.Create(as0));
+
+            c0 = FusedDot4x4(ax0, qy0, qx0, c0,
+                Avx2.BroadcastScalarToVector256(bs_a0));
+            c1 = FusedDot4x4(ax1, qy0, qx1, c1,
+                Avx2.BroadcastScalarToVector256(Sse.Shuffle(bs_a0, bs_a0, 0x55)));
+            c2 = FusedDot4x4(ax2, qy0, qx2, c2,
+                Avx2.BroadcastScalarToVector256(Sse.Shuffle(bs_a0, bs_a0, 0xAA)));
+            c3 = FusedDot4x4(ax3, qy0, qx3, c3,
+                Avx2.BroadcastScalarToVector256(Sse.Shuffle(bs_a0, bs_a0, 0xFF)));
         }
 
         outPtr[0] = Vector256.Sum(c0);
@@ -770,7 +913,7 @@ public static class MatMul
 
     /// <summary>
     /// Decode one row's 32 int8 values from a repacked Q4_0x4 block. Each row's
-    /// 16 packed nibble bytes are contiguous at offset (8 + row * 16) within
+    /// 16 packed nibble bytes are contiguous at offset (16 + row * 16) within
     /// the block, so we can do a single 16-byte SSE load.
     /// </summary>
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
@@ -778,7 +921,7 @@ public static class MatMul
         byte* bBlk, int row,
         Vector256<byte> mask0x0F, Vector256<sbyte> offset8)
     {
-        var packed = Sse2.LoadVector128(bBlk + 8 + row * 16);
+        var packed = Sse2.LoadVector128(bBlk + 16 + row * 16);
         var packedHi = Sse2.ShiftRightLogical(packed.AsUInt16(), 4).AsByte();
         var qx = Vector256.Create(packed, packedHi);
         var qxMasked = Avx2.And(qx, mask0x0F);
@@ -814,6 +957,25 @@ public static class MatMul
         var dotF = Avx.ConvertToVector256Single(dot32);
         var vD = Vector256.Create(combinedScale);
         return Fma.MultiplyAdd(dotF, vD, acc);
+    }
+
+    /// <summary>
+    /// FusedDot variant that takes a pre-broadcast YMM scale instead of a scalar.
+    /// Used by the Q4_0x4 tiles where the scale comes from a packed Vector128 of
+    /// pre-multiplied weight×activation scales — extracting individual lanes is
+    /// cheaper than recomputing the broadcast inside the helper.
+    /// </summary>
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    private static Vector256<float> FusedDot4x4(
+        Vector256<byte> ax, Vector256<sbyte> qy, Vector256<sbyte> qxSigned,
+        Vector256<float> acc, Vector256<float> scale)
+    {
+        var ones = Vector256.Create((short)1);
+        var sy = Avx2.Sign(qy, qxSigned);
+        var dot16 = Avx2.MultiplyAddAdjacent(ax, sy);
+        var dot32 = Avx2.MultiplyAddAdjacent(dot16, ones);
+        var dotF = Avx.ConvertToVector256Single(dot32);
+        return Fma.MultiplyAdd(dotF, scale, acc);
     }
 
     /// <summary>
@@ -926,6 +1088,79 @@ public static class MatMul
     /// Scale = max|a[i]| / 127, then q[i] = round(a[i] / scale).
     /// </summary>
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    /// <summary>
+    /// Like <see cref="QuantizeRowQ8_0"/> but writes the per-block scale as FP32
+    /// (4 bytes) instead of FP16 (2 bytes). Block size becomes 36 bytes. This format
+    /// pairs with the FP32-scale Q4_0x4 weight layout so the inner tile loop has
+    /// zero Half→float conversions.
+    /// </summary>
+    private static unsafe void QuantizeRowQ8_0F32(float* a, byte* aQ, int K)
+    {
+        int blockCount = K / Q8_0BlockSize;
+
+        for (int b = 0; b < blockCount; b++)
+        {
+            float* aBlk = a + b * Q8_0BlockSize;
+            byte* outBlk = aQ + b * Q8_0F32TypeSize;
+
+            if (Avx.IsSupported)
+            {
+                var absMask = Vector256.Create(0x7FFFFFFFu).AsSingle();
+                var maxAbs = Avx.And(Avx.LoadVector256(aBlk), absMask);
+                maxAbs = Avx.Max(maxAbs, Avx.And(Avx.LoadVector256(aBlk + 8), absMask));
+                maxAbs = Avx.Max(maxAbs, Avx.And(Avx.LoadVector256(aBlk + 16), absMask));
+                maxAbs = Avx.Max(maxAbs, Avx.And(Avx.LoadVector256(aBlk + 24), absMask));
+
+                var hi = maxAbs.GetUpper();
+                var lo = maxAbs.GetLower();
+                var m128 = Sse.Max(lo, hi);
+                m128 = Sse.Max(m128, Sse.Shuffle(m128, m128, 0b11_10_11_10));
+                m128 = Sse.Max(m128, Sse.Shuffle(m128, m128, 0b01_01_01_01));
+                float amax = m128.ToScalar();
+
+                float scale = amax / 127.0f;
+                float invScale = scale > 0 ? 1.0f / scale : 0;
+
+                *(float*)outBlk = scale;
+                sbyte* qPtr = (sbyte*)(outBlk + 4);
+
+                var vInvScale = Vector256.Create(invScale);
+
+                for (int k = 0; k < 4; k++)
+                {
+                    var v = Avx.LoadVector256(aBlk + k * 8);
+                    var scaled = Avx.Multiply(v, vInvScale);
+                    var rounded = Avx.RoundToNearestInteger(scaled);
+                    var ints = Avx.ConvertToVector256Int32(rounded);
+
+                    var loHalf = ints.GetLower();
+                    var hiHalf = ints.GetUpper();
+                    var shorts128 = Sse2.PackSignedSaturate(loHalf, hiHalf);
+                    var bytes128 = Sse2.PackSignedSaturate(shorts128, shorts128);
+                    long lane = bytes128.AsInt64().ToScalar();
+                    *(long*)(qPtr + k * 8) = lane;
+                }
+            }
+            else
+            {
+                float amax = 0;
+                for (int i = 0; i < Q8_0BlockSize; i++)
+                {
+                    float av = MathF.Abs(aBlk[i]);
+                    if (av > amax) amax = av;
+                }
+                float scale = amax / 127.0f;
+                float invScale = scale > 0 ? 1.0f / scale : 0;
+                *(float*)outBlk = scale;
+                sbyte* qPtr = (sbyte*)(outBlk + 4);
+                for (int i = 0; i < Q8_0BlockSize; i++)
+                {
+                    qPtr[i] = (sbyte)Math.Clamp((int)MathF.Round(aBlk[i] * invScale), -128, 127);
+                }
+            }
+        }
+    }
+
     private static unsafe void QuantizeRowQ8_0(float* a, byte* aQ, int K)
     {
         int blockCount = K / Q8_0BlockSize;
