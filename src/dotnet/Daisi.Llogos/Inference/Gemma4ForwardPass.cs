@@ -107,6 +107,10 @@ public sealed class Gemma4ForwardPass : IDisposable
     private readonly object?[]? _attnORepacked;
     private readonly object? _outputWeightRepacked;
 
+    // Pre-cached per-layer output scale values (read once at construction to avoid
+    // GPU→CPU sync barriers in the decode hot path).
+    private readonly float[]? _layerOutScales;
+
     // FFN scratch
     private readonly ITensor _ffnGate;
     private readonly ITensor _ffnUp;
@@ -319,6 +323,15 @@ public sealed class Gemma4ForwardPass : IDisposable
         // lm_head: same Q4_0x4 fast path. Tied to embeddings in many models so
         // RepackWeightForBatchedMatMul returns null when the source is e.g. F16/BF16.
         _outputWeightRepacked = backend.RepackWeightForBatchedMatMul(weights.OutputWeight);
+
+        // Pre-read per-layer output scales to avoid GPU→CPU sync in the decode loop.
+        _layerOutScales = new float[config.NumLayers];
+        for (int li = 0; li < config.NumLayers; li++)
+        {
+            var lw = (GemmaAttentionWeights)weights.Layers[li];
+            if (lw.LayerOutScale != null)
+                _layerOutScales[li] = ReadScalar(lw.LayerOutScale);
+        }
     }
 
     public void ResetState() => _kvCache.Reset();
@@ -507,12 +520,13 @@ public sealed class Gemma4ForwardPass : IDisposable
             }
 
             // Per-layer scalar output multiplier
-            if (lw.LayerOutScale != null && !DebugDisableLayerOutScale)
+            if (_layerOutScales != null && !DebugDisableLayerOutScale)
             {
-                var scaleSpan = lw.LayerOutScale.AsFloatSpan();
-                if (scaleSpan.Length > 0)
+                float scale = _layerOutScales[layer];
+                if (scale != 0)
                 {
-                    float scale = scaleSpan[0];
+                    // TODO: For batched GPU path, use a ScaleInPlace kernel on M*D elements.
+                    // For now the batched path only runs on CPU where AsFloatSpan works.
                     var h = _hiddenB.AsFloatSpan().Slice(0, M * D);
                     for (int k = 0; k < h.Length; k++) h[k] *= scale;
                 }
@@ -562,14 +576,14 @@ public sealed class Gemma4ForwardPass : IDisposable
         _backend.EmbeddingLookup(_hidden, _weights.TokenEmbedding, tokenId);
         if (!DebugDisableEmbeddingScale)
             _backend.ScaleInPlace(_hidden, MathF.Sqrt(_config.HiddenDim));
-        if (prof) ProfileEmbTicks += Stopwatch.GetTimestamp() - tEmb;
+        if (prof) { ProfileEmbTicks += Stopwatch.GetTimestamp() - tEmb; }
 
         // 2. Per-Layer-Embedding setup (once per token, before the layer loop)
         if (_hasPle && !DebugDisablePle)
         {
             t = prof ? Stopwatch.GetTimestamp() : 0;
             SetupPerLayerEmbeddings(tokenId);
-            if (prof) ProfilePleSetupTicks += Stopwatch.GetTimestamp() - t;
+            if (prof) { ProfilePleSetupTicks += Stopwatch.GetTimestamp() - t; }
         }
 
         // 3. Transformer layers
@@ -580,7 +594,7 @@ public sealed class Gemma4ForwardPass : IDisposable
             // ── Pre-attention norm ──────────────────────────────────────────
             t = prof ? Stopwatch.GetTimestamp() : 0;
             _backend.RmsNorm(_normOut, _hidden, lw.AttnNorm, _config.NormEps);
-            if (prof) ProfileNormTicks += Stopwatch.GetTimestamp() - t;
+            if (prof) { ProfileNormTicks += Stopwatch.GetTimestamp() - t; }
 
             // Save residual (the value of inpL going into this layer's attention)
             _backend.CopyTensor(_residual, _hidden);
@@ -592,49 +606,60 @@ public sealed class Gemma4ForwardPass : IDisposable
             t = prof ? Stopwatch.GetTimestamp() : 0;
             _backend.RmsNorm(_normOut, _hidden, lw.PostAttnNorm, _config.NormEps);
             _backend.ElementAdd(_hidden, _normOut, _residual);
-            if (prof) ProfileNormTicks += Stopwatch.GetTimestamp() - t;
+            if (prof) { ProfileNormTicks += Stopwatch.GetTimestamp() - t; }
 
             // ── Pre-FFN norm + GeGLU FFN ────────────────────────────────────
             _backend.CopyTensor(_residual, _hidden);
             t = prof ? Stopwatch.GetTimestamp() : 0;
             _backend.RmsNorm(_normOut, _hidden, lw.FfnNorm, _config.NormEps);
-            if (prof) ProfileNormTicks += Stopwatch.GetTimestamp() - t;
+            if (prof) { ProfileNormTicks += Stopwatch.GetTimestamp() - t; }
 
             t = prof ? Stopwatch.GetTimestamp() : 0;
             ProjectLinearFfn(_ffnGate, _normOut, lw.FfnGate, _ffnGateRepacked?[layer], 1);
             ProjectLinearFfn(_ffnUp,   _normOut, lw.FfnUp,   _ffnUpRepacked?[layer],   1);
-            if (prof) ProfileFfnMatmulTicks += Stopwatch.GetTimestamp() - t;
+            if (prof) { ProfileFfnMatmulTicks += Stopwatch.GetTimestamp() - t; }
 
             t = prof ? Stopwatch.GetTimestamp() : 0;
             _backend.GeGLU(_ffnGate, _ffnGate, _ffnUp);
-            if (prof) ProfileFfnOtherTicks += Stopwatch.GetTimestamp() - t;
+            if (prof) { ProfileFfnOtherTicks += Stopwatch.GetTimestamp() - t; }
 
             t = prof ? Stopwatch.GetTimestamp() : 0;
             ProjectLinearFfn(_hidden, _ffnGate, lw.FfnDown, _ffnDownRepacked?[layer], 1);
-            if (prof) ProfileFfnMatmulTicks += Stopwatch.GetTimestamp() - t;
+            if (prof) { ProfileFfnMatmulTicks += Stopwatch.GetTimestamp() - t; }
 
             // ── Post-FFN norm + residual add ────────────────────────────────
             t = prof ? Stopwatch.GetTimestamp() : 0;
             _backend.RmsNorm(_normOut, _hidden, lw.PostFfnNorm, _config.NormEps);
             _backend.ElementAdd(_hidden, _normOut, _residual);
-            if (prof) ProfileNormTicks += Stopwatch.GetTimestamp() - t;
+            if (prof) { ProfileNormTicks += Stopwatch.GetTimestamp() - t; }
 
             // ── Per-Layer Embedding block ───────────────────────────────────
             if (_hasPle && !DebugDisablePle && lw.PerLayerInpGate != null && lw.PerLayerProj != null && lw.PerLayerPostNorm != null)
             {
                 t = prof ? Stopwatch.GetTimestamp() : 0;
                 ApplyPerLayerEmbedding(lw, layer);
-                if (prof) ProfilePleBlockTicks += Stopwatch.GetTimestamp() - t;
+                if (prof) { ProfilePleBlockTicks += Stopwatch.GetTimestamp() - t; }
             }
 
             // ── Per-layer scalar output multiplier ──────────────────────────
-            if (lw.LayerOutScale != null && !DebugDisableLayerOutScale)
+            if (_layerOutScales != null && !DebugDisableLayerOutScale)
             {
-                var scaleSpan = lw.LayerOutScale.AsFloatSpan();
-                if (scaleSpan.Length > 0)
-                    _backend.ScaleInPlace(_hidden, scaleSpan[0]);
+                float scale = _layerOutScales[layer];
+                if (scale != 0)
+                    _backend.ScaleInPlace(_hidden, scale);
             }
         }
+    }
+
+    /// <summary>
+    /// Read a single float from a 1-element tensor. Works for both CPU and GPU
+    /// tensors (GPU path uses a small DtoH copy via DequantizeTo).
+    /// </summary>
+    private static float ReadScalar(ITensor t)
+    {
+        var buf = new float[t.ElementCount];
+        t.DequantizeTo(buf);
+        return buf[0];
     }
 
     /// <summary>
@@ -752,27 +777,32 @@ public sealed class Gemma4ForwardPass : IDisposable
     ///  3. ple_proj = RmsNorm(ple_proj, per_layer_proj_norm)   (per [256] slice)
     ///  4. ple_base = (ple_proj + ple_base) × (1/sqrt(2))
     /// </summary>
+    internal long _pleSetupEmbTicks, _pleSetupProjTicks, _pleSetupNormTicks;
+
     private void SetupPerLayerEmbeddings(int tokenId)
     {
         int nEmbdPerLayer = _config.PerLayerInputDim;
         int nLayer = _config.NumLayers;
         int total = nEmbdPerLayer * nLayer;
+        bool prof = EnableProfiling;
+        long s;
 
         // Step 1: lookup the per-layer token embedding row
-        // per_layer_token_embd shape: [nEmbdPerLayer*nLayer × vocab]
+        s = prof ? Stopwatch.GetTimestamp() : 0;
         _backend.EmbeddingLookup(_pleBase!, _weights.PerLayerTokenEmbd!, tokenId);
         _backend.ScaleInPlace(_pleBase!, MathF.Sqrt(nEmbdPerLayer));
+        if (prof) { _backend.Synchronize(); _pleSetupEmbTicks += Stopwatch.GetTimestamp() - s; }
 
-        // Step 2: project hidden through per_layer_model_proj
-        // per_layer_model_proj shape: [hidden_dim × (nEmbdPerLayer*nLayer)] (BF16)
-        // Output: [nEmbdPerLayer*nLayer]
+        // Step 2: project hidden through per_layer_model_proj (BF16)
+        s = prof ? Stopwatch.GetTimestamp() : 0;
         ProjectLinear(_pleProjOut!, _hidden, _weights.PerLayerModelProj!);
         _backend.ScaleInPlace(_pleProjOut!, 1.0f / MathF.Sqrt(_config.HiddenDim));
+        if (prof) { _backend.Synchronize(); _pleSetupProjTicks += Stopwatch.GetTimestamp() - s; }
 
-        // Step 3: RmsNorm each [nEmbdPerLayer] slice with per_layer_proj_norm.
-        // The norm weight has shape [nEmbdPerLayer]. Apply per "row" (each row = one layer's slice).
-        // Existing PerHeadRmsNorm fits the shape: numHeads=nLayer, headDim=nEmbdPerLayer.
+        // Step 3: RmsNorm each [nEmbdPerLayer] slice
+        s = prof ? Stopwatch.GetTimestamp() : 0;
         _backend.PerHeadRmsNorm(_pleProjOut!, _weights.PerLayerProjNorm!, nLayer, nEmbdPerLayer, _config.NormEps);
+        if (prof) { _backend.Synchronize(); _pleSetupNormTicks += Stopwatch.GetTimestamp() - s; }
 
         // Step 4: ple_base = (ple_proj + ple_base) × (1/sqrt(2))
         _backend.ElementAdd(_pleBase!, _pleProjOut!, _pleBase!);
@@ -798,9 +828,7 @@ public sealed class Gemma4ForwardPass : IDisposable
         _backend.GeluTanh(_pleGate!, _pleGate!);
 
         // 3. Slice the per-layer 256-vec out of _pleBase: pleBase[layer*256 : (layer+1)*256]
-        var pleBaseSpan = _pleBase!.AsFloatSpan();
-        var sliceSpan = _pleSlice!.AsFloatSpan();
-        pleBaseSpan.Slice(layer * nEmbdPerLayer, nEmbdPerLayer).CopyTo(sliceSpan);
+        _backend.CopyTensorRegion(_pleSlice!, _pleBase!, layer * nEmbdPerLayer, nEmbdPerLayer);
 
         // 4. cur = cur * pleSlice (element-wise)
         _backend.ElementMul(_pleGate!, _pleGate!, _pleSlice!);

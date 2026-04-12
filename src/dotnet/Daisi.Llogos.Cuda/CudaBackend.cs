@@ -962,6 +962,162 @@ public sealed class CudaBackend : IComputeBackend
     }
 
     /// <inheritdoc />
+    public unsafe void GeluTanh(ITensor output, ITensor input)
+    {
+        var outT = (CudaTensor)output;
+        var inT = (CudaTensor)input;
+        ulong outPtr = outT.DevicePtr;
+        ulong inPtr = inT.DevicePtr;
+        int n = (int)input.ElementCount;
+
+        var func = _elementwiseModule.GetFunction("gelu_tanh");
+        uint grid = (uint)((n + BlockSize - 1) / BlockSize);
+        nint* kArgs = stackalloc nint[3];
+        kArgs[0] = (nint)(&outPtr);
+        kArgs[1] = (nint)(&inPtr);
+        kArgs[2] = (nint)(&n);
+        _stream.Launch(func, grid, 1, 1, (uint)BlockSize, 1, 1, 0, kArgs);
+    }
+
+    /// <inheritdoc />
+    public unsafe void GeGLU(ITensor output, ITensor gate, ITensor up)
+    {
+        var outT = (CudaTensor)output;
+        var gateT = (CudaTensor)gate;
+        var upT = (CudaTensor)up;
+        ulong outPtr = outT.DevicePtr;
+        ulong gatePtr = gateT.DevicePtr;
+        ulong upPtr = upT.DevicePtr;
+        int n = (int)gate.ElementCount;
+
+        var func = _elementwiseModule.GetFunction("geglu");
+        uint grid = (uint)((n + BlockSize - 1) / BlockSize);
+        nint* kArgs = stackalloc nint[4];
+        kArgs[0] = (nint)(&outPtr);
+        kArgs[1] = (nint)(&gatePtr);
+        kArgs[2] = (nint)(&upPtr);
+        kArgs[3] = (nint)(&n);
+        _stream.Launch(func, grid, 1, 1, (uint)BlockSize, 1, 1, 0, kArgs);
+    }
+
+    /// <inheritdoc />
+    public unsafe void LogitSoftcap(ITensor data, float cap)
+    {
+        var dT = (CudaTensor)data;
+        ulong dPtr = dT.DevicePtr;
+        int n = (int)data.ElementCount;
+        float invCap = 1.0f / cap;
+
+        var func = _elementwiseModule.GetFunction("logit_softcap");
+        uint grid = (uint)((n + BlockSize - 1) / BlockSize);
+        nint* kArgs = stackalloc nint[4];
+        kArgs[0] = (nint)(&dPtr);
+        kArgs[1] = (nint)(&n);
+        kArgs[2] = (nint)(&cap);
+        kArgs[3] = (nint)(&invCap);
+        _stream.Launch(func, grid, 1, 1, (uint)BlockSize, 1, 1, 0, kArgs);
+    }
+
+    /// <inheritdoc />
+    public unsafe void RoPENeox(ITensor q, ITensor k, int headDim, int ropeDim, int positionOffset, float ropeTheta)
+    {
+        var qT = (CudaTensor)q;
+        var kT = (CudaTensor)k;
+        ulong qPtr = qT.DevicePtr;
+        ulong kPtr = kT.DevicePtr;
+        int qTotal = (int)q.ElementCount;
+        int kTotal = (int)k.ElementCount;
+        int effectiveRopeDim = ropeDim > 0 ? ropeDim : headDim;
+
+        var func = _elementwiseModule.GetFunction("rope_neox");
+        int maxPairs = Math.Max(qTotal, kTotal) / 2;
+        uint grid = (uint)((maxPairs + BlockSize - 1) / BlockSize);
+
+        nint* allArgs = stackalloc nint[8];
+        allArgs[0] = (nint)(&qPtr);
+        allArgs[1] = (nint)(&kPtr);
+        allArgs[2] = (nint)(&qTotal);
+        allArgs[3] = (nint)(&kTotal);
+        allArgs[4] = (nint)(&headDim);
+        allArgs[5] = (nint)(&effectiveRopeDim);
+        allArgs[6] = (nint)(&positionOffset);
+        allArgs[7] = (nint)(&ropeTheta);
+        _stream.Launch(func, grid, 1, 1, (uint)BlockSize, 1, 1, 0, allArgs);
+    }
+
+    /// <inheritdoc />
+    public unsafe void RoPENeoxWithFreqFactors(ITensor q, ITensor k, int headDim, int ropeDim,
+        int positionOffset, float ropeTheta, ITensor? freqFactors)
+    {
+        if (freqFactors == null)
+        {
+            RoPENeox(q, k, headDim, ropeDim, positionOffset, ropeTheta);
+            return;
+        }
+        var qT = (CudaTensor)q;
+        var kT = (CudaTensor)k;
+        var ffT = (CudaTensor)freqFactors;
+        ulong qPtr = qT.DevicePtr;
+        ulong kPtr = kT.DevicePtr;
+        ulong ffPtr = ffT.DevicePtr;
+        int qTotal = (int)q.ElementCount;
+        int kTotal = (int)k.ElementCount;
+        int effectiveRopeDim = ropeDim > 0 ? ropeDim : headDim;
+
+        var func = _elementwiseModule.GetFunction("rope_neox_with_freq");
+        int maxPairs = Math.Max(qTotal, kTotal) / 2;
+        uint grid = (uint)((maxPairs + BlockSize - 1) / BlockSize);
+
+        nint* allArgs = stackalloc nint[9];
+        allArgs[0] = (nint)(&qPtr);
+        allArgs[1] = (nint)(&kPtr);
+        allArgs[2] = (nint)(&qTotal);
+        allArgs[3] = (nint)(&kTotal);
+        allArgs[4] = (nint)(&headDim);
+        allArgs[5] = (nint)(&effectiveRopeDim);
+        allArgs[6] = (nint)(&positionOffset);
+        allArgs[7] = (nint)(&ropeTheta);
+        allArgs[8] = (nint)(&ffPtr);
+        _stream.Launch(func, grid, 1, 1, (uint)BlockSize, 1, 1, 0, allArgs);
+    }
+
+    /// <inheritdoc />
+    public unsafe void RoPEWithFreqFactors(ITensor q, ITensor k, int headDim, int ropeDim,
+        int positionOffset, float ropeTheta, ITensor? freqFactors)
+    {
+        if (freqFactors == null)
+        {
+            RoPE(q, k, headDim, ropeDim, positionOffset, ropeTheta);
+            return;
+        }
+        var qT = (CudaTensor)q;
+        var kT = (CudaTensor)k;
+        var ffT = (CudaTensor)freqFactors;
+        ulong qPtr = qT.DevicePtr;
+        ulong kPtr = kT.DevicePtr;
+        ulong ffPtr = ffT.DevicePtr;
+        int qTotal = (int)q.ElementCount;
+        int kTotal = (int)k.ElementCount;
+        int effectiveRopeDim = ropeDim > 0 ? ropeDim : headDim;
+
+        var func = _elementwiseModule.GetFunction("rope_with_freq");
+        int maxPairs = Math.Max(qTotal, kTotal) / 2;
+        uint grid = (uint)((maxPairs + BlockSize - 1) / BlockSize);
+
+        nint* allArgs = stackalloc nint[9];
+        allArgs[0] = (nint)(&qPtr);
+        allArgs[1] = (nint)(&kPtr);
+        allArgs[2] = (nint)(&qTotal);
+        allArgs[3] = (nint)(&kTotal);
+        allArgs[4] = (nint)(&headDim);
+        allArgs[5] = (nint)(&effectiveRopeDim);
+        allArgs[6] = (nint)(&positionOffset);
+        allArgs[7] = (nint)(&ropeTheta);
+        allArgs[8] = (nint)(&ffPtr);
+        _stream.Launch(func, grid, 1, 1, (uint)BlockSize, 1, 1, 0, allArgs);
+    }
+
+    /// <inheritdoc />
     public unsafe void RoPE(ITensor q, ITensor k, int headDim, int ropeDim, int positionOffset, float ropeTheta)
     {
         var qT = (CudaTensor)q;
@@ -1223,6 +1379,48 @@ public sealed class CudaBackend : IComputeBackend
         kArgs[4] = (nint)(&eps);
         _stream.Launch(func, (uint)numHeads, 1, 1, (uint)BlockSize, 1, 1, sharedMem, kArgs);
 
+    }
+
+    /// <inheritdoc />
+    public unsafe void PerHeadRmsNormUnit(ITensor data, int numHeads, int headDim, float eps)
+    {
+        var dT = (CudaTensor)data;
+        ulong dPtr = dT.DevicePtr;
+
+        var func = _compositeModule.GetFunction("per_head_rms_norm_unit");
+        uint sharedMem = (uint)(BlockSize * sizeof(float));
+        nint* kArgs = stackalloc nint[4];
+        kArgs[0] = (nint)(&dPtr);
+        kArgs[1] = (nint)(&numHeads);
+        kArgs[2] = (nint)(&headDim);
+        kArgs[3] = (nint)(&eps);
+        _stream.Launch(func, (uint)numHeads, 1, 1, (uint)BlockSize, 1, 1, sharedMem, kArgs);
+    }
+
+    /// <inheritdoc />
+    public unsafe void RmsNormUnit(ITensor output, ITensor input, float eps)
+    {
+        // RmsNormUnit is a single-head variant — use the per-head kernel with numHeads=1.
+        var outT = (CudaTensor)output;
+        var inT = (CudaTensor)input;
+        int n = (int)input.ElementCount;
+
+        // Copy input to output first if they're different tensors (kernel is in-place)
+        if (outT.DevicePtr != inT.DevicePtr)
+            CudaApi.Check(CudaApi.MemcpyDtoDAsync(outT.DevicePtr, inT.DevicePtr,
+                (ulong)input.ByteSize, _stream.Handle), "cuMemcpyDtoDAsync");
+
+        ulong dPtr = outT.DevicePtr;
+        int numHeads = 1;
+
+        var func = _compositeModule.GetFunction("per_head_rms_norm_unit");
+        uint sharedMem = (uint)(BlockSize * sizeof(float));
+        nint* kArgs = stackalloc nint[4];
+        kArgs[0] = (nint)(&dPtr);
+        kArgs[1] = (nint)(&numHeads);
+        kArgs[2] = (nint)(&n);
+        kArgs[3] = (nint)(&eps);
+        _stream.Launch(func, 1, 1, 1, (uint)BlockSize, 1, 1, sharedMem, kArgs);
     }
 
     /// <inheritdoc />
@@ -1740,16 +1938,31 @@ public sealed class CudaBackend : IComputeBackend
     {
         _stream.Synchronize();
 
-        var tableBytes = new byte[tableT.ByteSize];
-        tableT.Memory.CopyToHost(tableBytes);
+        // Download only the single row's bytes instead of the entire table.
+        // For Q5_K: 176 bytes / 256 elements → ~7 KB per row vs ~1.6 GB for the full table.
+        int blockSize = GgmlTypeInfo.BlockSize(tableT.Type);
+        int typeSize = GgmlTypeInfo.TypeSize(tableT.Type);
+        int blocksPerRow = hiddenDim / blockSize;
+        int rowBytes = blocksPerRow * typeSize;
+        long rowOffset = (long)tokenId * rowBytes;
 
+        var rowData = new byte[rowBytes];
+        fixed (byte* ptr = rowData)
+        {
+            CudaApi.Check(
+                CudaApi.MemcpyDtoH(ptr, tableT.DevicePtr + (ulong)rowOffset, (ulong)rowBytes),
+                "cuMemcpyDtoH (embedding row)");
+        }
+
+        // Dequantize one row on CPU
         using var cpuBackend = new Cpu.CpuBackend();
-        using var cpuTable = cpuBackend.LoadTensor("t", tableT.Type, tableT.Dimensions, tableBytes);
+        using var cpuRow = cpuBackend.LoadTensor("row", tableT.Type, [hiddenDim], rowData);
         using var cpuOut = cpuBackend.CreateTensor("out", GgmlType.F32, [hiddenDim]);
-        cpuBackend.EmbeddingLookup(cpuOut, cpuTable, tokenId);
 
-        var result = cpuOut.AsFloatSpan();
-        outT.UploadFrom(result);
+        // Single-row "embedding lookup" is just a dequantize — token 0 of a 1-row table
+        cpuRow.DequantizeTo(cpuOut.AsFloatSpan());
+
+        outT.UploadFrom(cpuOut.AsFloatSpan());
     }
 
     // Persistent argmax result buffer (avoid per-token CUDA alloc/dealloc)

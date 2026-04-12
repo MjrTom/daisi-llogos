@@ -1050,6 +1050,94 @@ public class InspectModelTests
         File.WriteAllLines(@"C:\GGUFS\gemma-4-E4B-it-profile.txt", lines);
     }
 
+    [Fact]
+    public void Gemma4_Q4_0_CudaDecode()
+    {
+        var path = @"C:\GGUFS\gemma-4-E4B-it-Q4_0.gguf";
+        if (!File.Exists(path)) return;
+
+        Daisi.Llogos.Cuda.CudaBackend cuda;
+        try { cuda = new Daisi.Llogos.Cuda.CudaBackend(); }
+        catch { return; }
+
+        using (cuda)
+        {
+            using var stream = File.OpenRead(path);
+            var gguf = GgufFile.Read(stream);
+            var config = ModelConfig.FromGguf(gguf);
+            var tokenizer = TokenizerFactory.FromGguf(gguf);
+
+            using var weights = MmapModelLoader.Load(gguf, path, cuda, config);
+            using var kvCache = new Gemma4KvCache(cuda, config, maxSeqLen: 256);
+            using var forward = new Gemma4ForwardPass(cuda, config, weights, kvCache);
+
+            string prompt = "The capital of France is";
+            var encoded = tokenizer.Encode(prompt);
+            var promptIds = new int[encoded.Length + 1];
+            promptIds[0] = tokenizer.Vocabulary.BosTokenId;
+            Array.Copy(encoded, 0, promptIds, 1, encoded.Length);
+
+            // Prefill
+            ReadOnlySpan<float> logits = default;
+            for (int i = 0; i < promptIds.Length; i++)
+                logits = forward.Forward(promptIds[i], i);
+
+            // Profile 10 decode tokens
+            int position = promptIds.Length;
+            forward.EnableProfiling = true;
+            forward.ResetProfile();
+
+            var sw = System.Diagnostics.Stopwatch.StartNew();
+            var tokens = new List<string>();
+            for (int t = 0; t < 10; t++)
+            {
+                int argmax = 0;
+                float best = logits[0];
+                for (int i = 1; i < logits.Length; i++)
+                    if (logits[i] > best) { best = logits[i]; argmax = i; }
+
+                tokens.Add(tokenizer.Decode(new[] { argmax }));
+                logits = forward.Forward(argmax, position);
+                position++;
+            }
+            sw.Stop();
+            forward.EnableProfiling = false;
+
+            double tickToMs = 1000.0 / System.Diagnostics.Stopwatch.Frequency;
+            double total = sw.Elapsed.TotalMilliseconds;
+
+            var pleType = weights.PerLayerTokenEmbd?.Type.ToString() ?? "null";
+            var lines = new List<string>
+            {
+                $"Gemma 4 Q4_0 CUDA decode — 10 tokens in {total:F1} ms ({10000.0 / total:F2} tok/s)",
+                $"PLE token_embd type: {pleType}",
+                $"Tokens: {string.Join("", tokens)}",
+                "",
+                $"  Embedding:        {forward.ProfileEmbTicks * tickToMs,8:F2} ms",
+                $"  PLE setup:        {forward.ProfilePleSetupTicks * tickToMs,8:F2} ms",
+                $"    PLE emb:        {forward._pleSetupEmbTicks * tickToMs,8:F2} ms",
+                $"    PLE proj:       {forward._pleSetupProjTicks * tickToMs,8:F2} ms",
+                $"    PLE norm:       {forward._pleSetupNormTicks * tickToMs,8:F2} ms",
+                $"  Attn matmul:      {forward.ProfileAttnMatmulTicks * tickToMs,8:F2} ms",
+                $"  Attn other:       {forward.ProfileAttnOtherTicks * tickToMs,8:F2} ms",
+                $"  FFN matmul:       {forward.ProfileFfnMatmulTicks * tickToMs,8:F2} ms",
+                $"  FFN other:        {forward.ProfileFfnOtherTicks * tickToMs,8:F2} ms",
+                $"  Norm:             {forward.ProfileNormTicks * tickToMs,8:F2} ms",
+                $"  PLE block:        {forward.ProfilePleBlockTicks * tickToMs,8:F2} ms",
+                $"  lm_head:          {forward.ProfileLmHeadTicks * tickToMs,8:F2} ms",
+            };
+            double accounted = (forward.ProfileEmbTicks + forward.ProfilePleSetupTicks +
+                forward.ProfileAttnMatmulTicks + forward.ProfileAttnOtherTicks +
+                forward.ProfileFfnMatmulTicks + forward.ProfileFfnOtherTicks +
+                forward.ProfileNormTicks + forward.ProfilePleBlockTicks +
+                forward.ProfileLmHeadTicks) * tickToMs;
+            lines.Add($"  (unaccounted):    {total - accounted,8:F2} ms");
+            lines.Add($"  Per-token: {total / 10:F2} ms/tok");
+
+            File.WriteAllLines(@"C:\GGUFS\gemma-4-cuda-decode.txt", lines);
+        }
+    }
+
     private static string FormatMetadataValue(GgufMetadataKv kv)
     {
         // Strings, numbers, bools — direct ToString.
