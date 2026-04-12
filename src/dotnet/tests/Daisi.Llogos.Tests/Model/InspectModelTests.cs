@@ -674,49 +674,47 @@ public class InspectModelTests
         int K = (int)w.Dimensions[0];
         int N = (int)w.Dimensions[1];
 
-        int M = 32;
-        var rng = new Random(42);
-        var aData = new float[M * K];
-        for (int i = 0; i < aData.Length; i++) aData[i] = (float)(rng.NextDouble() - 0.5);
-        var outBuf = new float[M * N];
-
-        // Prepare repacked weight
+        // Prepare repacked weight (once)
         var srcBytes = ((Daisi.Llogos.Cpu.CpuTensor)w).RawData;
         int blocksPerRow = K / 32;
         int repackedBytes = (N / 4) * blocksPerRow * Daisi.Llogos.Cpu.MatMul.Q4_0x4TypeSize;
         var repacked = new byte[repackedBytes];
         Daisi.Llogos.Cpu.MatMul.RepackQ4_0ToQ4_0x4(srcBytes, repacked, N, blocksPerRow);
-
-        // Prepare raw Q4_0 bytes for direct call
         var q4_0Bytes = srcBytes.ToArray();
 
-        // Warmup
-        for (int i = 0; i < 3; i++)
+        var lines = new List<string> { $"K={K}, N={N}", "" };
+        var rng = new Random(42);
+
+        foreach (int M in new[] { 1, 2, 4, 8, 16, 32 })
         {
-            Daisi.Llogos.Cpu.MatMul.MultiplyQ4_0(outBuf, aData, q4_0Bytes, M, K, N);
-            Daisi.Llogos.Cpu.MatMul.MultiplyQ4_0x4(outBuf, aData, repacked, M, K, N);
+            var aData = new float[M * K];
+            for (int i = 0; i < aData.Length; i++) aData[i] = (float)(rng.NextDouble() - 0.5);
+            var outBuf = new float[M * N];
+
+            // Warmup
+            for (int i = 0; i < 3; i++)
+            {
+                Daisi.Llogos.Cpu.MatMul.MultiplyQ4_0(outBuf, aData, q4_0Bytes, M, K, N);
+                Daisi.Llogos.Cpu.MatMul.MultiplyQ4_0x4(outBuf, aData, repacked, M, K, N);
+            }
+
+            int iters = M == 1 ? 200 : 30;
+            var swOld = System.Diagnostics.Stopwatch.StartNew();
+            for (int i = 0; i < iters; i++)
+                Daisi.Llogos.Cpu.MatMul.MultiplyQ4_0(outBuf, aData, q4_0Bytes, M, K, N);
+            swOld.Stop();
+
+            var swNew = System.Diagnostics.Stopwatch.StartNew();
+            for (int i = 0; i < iters; i++)
+                Daisi.Llogos.Cpu.MatMul.MultiplyQ4_0x4(outBuf, aData, repacked, M, K, N);
+            swNew.Stop();
+
+            double oldMs = swOld.Elapsed.TotalMilliseconds / iters;
+            double newMs = swNew.Elapsed.TotalMilliseconds / iters;
+            lines.Add($"M={M,2}: Q4_0={oldMs,7:F3} ms  Q4_0x4={newMs,7:F3} ms  speedup={oldMs / newMs:F2}x");
         }
 
-        // Time both paths
-        const int iters = 20;
-        var swOld = System.Diagnostics.Stopwatch.StartNew();
-        for (int i = 0; i < iters; i++)
-            Daisi.Llogos.Cpu.MatMul.MultiplyQ4_0(outBuf, aData, q4_0Bytes, M, K, N);
-        swOld.Stop();
-
-        var swNew = System.Diagnostics.Stopwatch.StartNew();
-        for (int i = 0; i < iters; i++)
-            Daisi.Llogos.Cpu.MatMul.MultiplyQ4_0x4(outBuf, aData, repacked, M, K, N);
-        swNew.Stop();
-
-        double oldMs = swOld.Elapsed.TotalMilliseconds / iters;
-        double newMs = swNew.Elapsed.TotalMilliseconds / iters;
-
-        System.IO.File.WriteAllText(@"C:\GGUFS\gemma-4-E4B-it-q4_0x4-bench.txt",
-            $"M={M}, K={K}, N={N}, iters={iters}\n" +
-            $"MultiplyQ4_0:   {oldMs:F2} ms/call\n" +
-            $"MultiplyQ4_0x4: {newMs:F2} ms/call\n" +
-            $"Speedup: {oldMs / newMs:F2}x\n");
+        System.IO.File.WriteAllLines(@"C:\GGUFS\gemma-4-E4B-it-q4_0x4-bench.txt", lines);
     }
 
     [Fact]
@@ -744,24 +742,24 @@ public class InspectModelTests
             }
         }
 
-        // Repack
-        var dst = new byte[1 * 72];  // 1 group × 1 block × 72 bytes
+        // Repack — new layout: 16 bytes FP32 scales + 64 bytes nibbles = 80 bytes
+        var dst = new byte[1 * Daisi.Llogos.Cpu.MatMul.Q4_0x4TypeSize];
         Daisi.Llogos.Cpu.MatMul.RepackQ4_0ToQ4_0x4(src, dst, 4, 1);
 
-        // Check scales in repacked block
-        Assert.Equal((float)1.0f, (float)BitConverter.ToHalf(dst, 0));
-        Assert.Equal((float)2.0f, (float)BitConverter.ToHalf(dst, 2));
-        Assert.Equal((float)0.5f, (float)BitConverter.ToHalf(dst, 4));
-        Assert.Equal((float)(-1.0f), (float)BitConverter.ToHalf(dst, 6));
+        // Check scales in repacked block — now stored as FP32 (4 floats at offset 0..15)
+        Assert.Equal(1.0f, BitConverter.ToSingle(dst, 0));
+        Assert.Equal(2.0f, BitConverter.ToSingle(dst, 4));
+        Assert.Equal(0.5f, BitConverter.ToSingle(dst, 8));
+        Assert.Equal(-1.0f, BitConverter.ToSingle(dst, 12));
 
         // Check that the packed nibble bytes in dst match the source.
-        // New layout: each row's 16 qs bytes contiguous at offset (8 + row*16).
+        // Layout: each row's 16 qs bytes contiguous at offset (16 + row*16).
         for (int r = 0; r < 4; r++)
         {
             for (int i = 0; i < 16; i++)
             {
                 byte srcByte = src[r * 18 + 2 + i];
-                byte dstByte = dst[8 + r * 16 + i];
+                byte dstByte = dst[16 + r * 16 + i];
                 Assert.True(srcByte == dstByte,
                     $"Row {r} byte {i}: src={srcByte:X2} dst={dstByte:X2}");
             }
