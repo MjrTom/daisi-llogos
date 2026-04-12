@@ -222,6 +222,9 @@ Each architecture page covers implementation approach, what worked and what didn
        +-- Qwen 3.5 ────── Hybrid: DeltaNet + gated attention
        |   (qwen35)        Qwen3.5-0.8B/4B/9B
        |
+       +-- Gemma 4 ──────── PLE, GeGLU, NEOX RoPE, sliding-window
+       |   (gemma4)         Gemma 4 E4B-it
+       |
        +-- BitNet ──────── Ternary weights (I2_S: {-1, 0, +1})
            (bitnet-b1.58)  BitNet b1.58
 ```
@@ -232,6 +235,7 @@ Each architecture page covers implementation approach, what worked and what didn
 | **Qwen 2/2.5** | Attention biases on Q/K/V | Qwen2.5-0.5B | [Details](docs/arch-qwen2.md) |
 | **Qwen 3** | Gated Q (DeInterleaveQ), per-head Q/K norms, thinking | Qwen3-8B, Bonsai-8B | [Details](docs/arch-qwen3.md) |
 | **Qwen 3.5** | Hybrid DeltaNet + standard attention | Qwen3.5-0.8B/4B/9B | [Details](docs/arch-qwen35.md) |
+| **Gemma 4** | Per-Layer Embeddings, GeGLU, NEOX RoPE, sliding-window attention | Gemma 4 E4B-it | [Details](docs/arch-gemma4.md) |
 | **BitNet** | Ternary I2_S weights, per-tensor scale | BitNet b1.58 | [Details](docs/arch-bitnet.md) |
 
 ### Benchmarks
@@ -248,8 +252,9 @@ Measured on AMD Ryzen 9 9900X + NVIDIA RTX 5080, 128 decode tokens, FP16 KV cach
 | Qwen3-8B Q4_K_M | **127** | 138 | **92%** | 54 |
 | Qwen3.5-9B Q8_0 | **88** | 84 | **105%** | 53 |
 | Qwen3.5-9B Q4_0 | 101 | 123 | 82% | 45 |
+| Gemma 4 E4B-it Q4_0 | 75 | — | — | — |
 
-**Exceeding llama.cpp** on 4 of 8 models across three architectures (DeltaNet, LLaMA, standard attention). Q4_K_M gap reduced from 10% to 8% via fused SwiGLU matmul, Q6_K kernel optimization, and cooperative dp4a kernels. See [Inference Optimization White Paper](docs/inference-optimization.md) for technical details.
+**Exceeding llama.cpp** on 4 of 8 models across four architectures (DeltaNet, Gemma 4, LLaMA, standard attention). Q4_K_M gap reduced from 10% to 8% via fused SwiGLU matmul, Q6_K kernel optimization, and cooperative dp4a kernels. See [Inference Optimization White Paper](docs/inference-optimization.md) for technical details.
 
 ### WebGPU Benchmarks
 
@@ -376,6 +381,7 @@ flowchart LR
 | [Arch: Qwen 2](docs/arch-qwen2.md) | Qwen 2/2.5 — attention biases, implementation notes |
 | [Arch: Qwen 3](docs/arch-qwen3.md) | Qwen 3 — gated Q, Bonsai 1-bit, kernel optimizations |
 | [Arch: Qwen 3.5](docs/arch-qwen35.md) | Qwen 3.5 — hybrid DeltaNet, training approach, lessons learned |
+| [Arch: Gemma 4](docs/arch-gemma4.md) | Gemma 4 — Per-Layer Embeddings, GeGLU, NEOX RoPE, sliding-window |
 | [Arch: BitNet](docs/arch-bitnet.md) | BitNet b1.58 — ternary I2_S, dedicated kernels |
 | [Pipelined Inference](docs/pipelined-inference.md) | Run models bigger than your GPU — per-layer weight streaming from shard files |
 | [Tested Models](docs/tested-models.md) | Verified models, performance benchmarks, supported quantization formats |
