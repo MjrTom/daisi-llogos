@@ -39,6 +39,21 @@ public sealed class CpuBackend : IComputeBackend
             var bRaw = ((CpuTensor)b).RawData;
             Cpu.MatMul.MultiplyQ8_0(o, aSpan, bRaw, M, K, N);
         }
+        else if (b.Type == GgmlType.Q4_0)
+        {
+            var bRaw = ((CpuTensor)b).RawData;
+            Cpu.MatMul.MultiplyQ4_0(o, aSpan, bRaw, M, K, N);
+        }
+        else if (b.Type == GgmlType.BF16)
+        {
+            var bRaw = ((CpuTensor)b).RawData;
+            Cpu.MatMul.MultiplyBF16(o, aSpan, bRaw, M, K, N);
+        }
+        else if (b.Type == GgmlType.Q4_K)
+        {
+            var bRaw = ((CpuTensor)b).RawData;
+            Cpu.MatMul.MultiplyQ4_K(o, aSpan, bRaw, M, K, N);
+        }
         else if (b.Type == GgmlType.TQ1_0)
         {
             var bRaw = ((CpuTensor)b).RawData;
@@ -71,6 +86,37 @@ public sealed class CpuBackend : IComputeBackend
             // Works for any type that CpuTensor.DequantizeTo supports (Q4_K, Q5_K, Q6_K, etc.)
             GenericDequantMatMul(o, aSpan, (CpuTensor)b, M, K, N);
         }
+    }
+
+    /// <inheritdoc />
+    public object? RepackWeightForBatchedMatMul(ITensor weight)
+    {
+        // Q4_0 → Q4_0x4. Only supported if N is divisible by 4 and K by 32.
+        if (weight.Type != GgmlType.Q4_0) return null;
+        int K = (int)weight.Dimensions[0];
+        int N = (int)weight.Dimensions[1];
+        if ((N & 3) != 0 || (K & 31) != 0) return null;
+
+        int blocksPerRow = K / 32;
+        int repackedBytes = (N / 4) * blocksPerRow * Cpu.MatMul.Q4_0x4TypeSize;
+        var dst = new byte[repackedBytes];
+        var src = ((CpuTensor)weight).RawData;
+        Cpu.MatMul.RepackQ4_0ToQ4_0x4(src, dst, N, blocksPerRow);
+        return dst;
+    }
+
+    /// <inheritdoc />
+    public void MatMulRepacked(ITensor output, ITensor a, object repackedWeight, ITensor originalWeight, int M, int K, int N)
+    {
+        if (repackedWeight is byte[] repacked && originalWeight.Type == GgmlType.Q4_0)
+        {
+            var o = ((CpuTensor)output).AsFloatSpan();
+            var aSpan = ((CpuTensor)a).AsFloatSpan();
+            Cpu.MatMul.MultiplyQ4_0x4(o, aSpan, repacked, M, K, N);
+            return;
+        }
+        // Fall back to standard matmul
+        MatMul(output, a, originalWeight, M, K, N);
     }
 
     private static unsafe void GenericDequantMatMul(Span<float> output, ReadOnlySpan<float> a, CpuTensor b, int M, int K, int N)
@@ -195,6 +241,68 @@ public sealed class CpuBackend : IComputeBackend
         var kSpan = ((CpuTensor)k).AsFloatSpan();
         int effectiveRopeDim = ropeDim > 0 ? ropeDim : headDim;
         Cpu.Rope.Apply(qSpan, kSpan, headDim, effectiveRopeDim, positionOffset, ropeTheta);
+    }
+
+    /// <inheritdoc />
+    public void RoPEWithFreqFactors(ITensor q, ITensor k, int headDim, int ropeDim,
+        int positionOffset, float ropeTheta, ITensor? freqFactors)
+    {
+        if (freqFactors == null)
+        {
+            RoPE(q, k, headDim, ropeDim, positionOffset, ropeTheta);
+            return;
+        }
+
+        var qSpan = ((CpuTensor)q).AsFloatSpan();
+        var kSpan = ((CpuTensor)k).AsFloatSpan();
+        int effectiveRopeDim = ropeDim > 0 ? ropeDim : headDim;
+        var factors = ResolveFreqFactors(freqFactors, effectiveRopeDim);
+        Cpu.Rope.ApplyWithFreqFactors(qSpan, kSpan, headDim, effectiveRopeDim, positionOffset, ropeTheta, factors);
+    }
+
+    /// <inheritdoc />
+    public void RoPENeox(ITensor q, ITensor k, int headDim, int ropeDim, int positionOffset, float ropeTheta)
+    {
+        var qSpan = ((CpuTensor)q).AsFloatSpan();
+        var kSpan = ((CpuTensor)k).AsFloatSpan();
+        int effectiveRopeDim = ropeDim > 0 ? ropeDim : headDim;
+        Cpu.Rope.ApplyNeox(qSpan, kSpan, headDim, effectiveRopeDim, positionOffset, ropeTheta);
+    }
+
+    /// <inheritdoc />
+    public void RoPENeoxWithFreqFactors(ITensor q, ITensor k, int headDim, int ropeDim,
+        int positionOffset, float ropeTheta, ITensor? freqFactors)
+    {
+        if (freqFactors == null)
+        {
+            RoPENeox(q, k, headDim, ropeDim, positionOffset, ropeTheta);
+            return;
+        }
+        var qSpan = ((CpuTensor)q).AsFloatSpan();
+        var kSpan = ((CpuTensor)k).AsFloatSpan();
+        int effectiveRopeDim = ropeDim > 0 ? ropeDim : headDim;
+        var factors = ResolveFreqFactors(freqFactors, effectiveRopeDim);
+        Cpu.Rope.ApplyNeoxWithFreqFactors(qSpan, kSpan, headDim, effectiveRopeDim, positionOffset, ropeTheta, factors);
+    }
+
+    private static float[] ResolveFreqFactors(ITensor freqFactors, int effectiveRopeDim)
+    {
+        int halfDim = effectiveRopeDim / 2;
+        var factors = new float[halfDim];
+        if (freqFactors.Type == GgmlType.F32 && freqFactors.ElementCount >= halfDim)
+        {
+            var src = ((CpuTensor)freqFactors).AsFloatSpan();
+            src.Slice(0, halfDim).CopyTo(factors);
+        }
+        else
+        {
+            var tmp = new float[freqFactors.ElementCount];
+            freqFactors.DequantizeTo(tmp);
+            int n = Math.Min(halfDim, tmp.Length);
+            for (int i = 0; i < n; i++) factors[i] = tmp[i];
+            for (int i = n; i < halfDim; i++) factors[i] = 1.0f;
+        }
+        return factors;
     }
 
     /// <inheritdoc />
@@ -624,6 +732,12 @@ public sealed class CpuBackend : IComputeBackend
         var srcData = ((CpuTensor)src).RawData;
         var dstData = ((CpuTensor)dst).RawDataMut;
         srcData.Slice(0, (int)byteCount).CopyTo(dstData.Slice(0, (int)byteCount));
+    }
+
+    /// <inheritdoc />
+    public void CopyTensorRegion(ITensor dst, ITensor src, int srcOffset, int count)
+    {
+        src.AsFloatSpan().Slice(srcOffset, count).CopyTo(dst.AsFloatSpan().Slice(0, count));
     }
 
     /// <inheritdoc />

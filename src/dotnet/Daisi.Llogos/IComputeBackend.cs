@@ -35,6 +35,25 @@ public interface IComputeBackend : IDisposable
     void MatMul(ITensor output, ITensor a, ITensor b, int M, int K, int N);
 
     /// <summary>
+    /// Repack a weight tensor into a backend-specific layout optimised for
+    /// batched (M&gt;1) matmul. Returns an opaque object (or null if the backend
+    /// has no such optimisation). The caller passes the returned handle back to
+    /// <see cref="MatMulRepacked"/>. Lifetime of the repacked data is owned by
+    /// the caller; the backend must not reference the original tensor afterwards.
+    /// </summary>
+    object? RepackWeightForBatchedMatMul(ITensor weight) => null;
+
+    /// <summary>
+    /// Batched matmul using a previously-repacked weight handle. Default
+    /// implementation falls back to <see cref="MatMul"/> if the backend does
+    /// not implement the fast path.
+    /// </summary>
+    void MatMulRepacked(ITensor output, ITensor a, object repackedWeight, ITensor originalWeight, int M, int K, int N)
+    {
+        MatMul(output, a, originalWeight, M, K, N);
+    }
+
+    /// <summary>
     /// RMS normalization: output[i] = (input[i] / rms) * weight[i]
     /// where rms = sqrt(mean(input²) + eps).
     /// All tensors are 1D with the same element count.
@@ -444,5 +463,144 @@ public interface IComputeBackend : IDisposable
     {
         ElementAdd(hidden, a, b);
         RmsNorm(output, hidden, weight, eps);
+    }
+
+    // ── Gemma 4 operations ──────────────────────────────────────────────────
+
+    /// <summary>
+    /// GeLU activation using the tanh approximation (matches PyTorch's
+    /// `gelu_pytorch_tanh` and ggml's `ggml_gelu`):
+    ///   gelu(x) = 0.5 * x * (1 + tanh(sqrt(2/π) * (x + 0.044715 * x³)))
+    /// </summary>
+    void GeluTanh(ITensor output, ITensor input)
+    {
+        var o = output.AsFloatSpan();
+        var i = input.AsFloatSpan();
+        const float c = 0.7978845608028654f; // sqrt(2/π)
+        for (int k = 0; k < i.Length; k++)
+        {
+            float x = i[k];
+            float inner = c * (x + 0.044715f * x * x * x);
+            o[k] = 0.5f * x * (1.0f + MathF.Tanh(inner));
+        }
+    }
+
+    /// <summary>
+    /// In-place GeLU (tanh approximation).
+    /// </summary>
+    void GeluTanhInPlace(ITensor data) => GeluTanh(data, data);
+
+    /// <summary>
+    /// Fused parallel GeGLU: output[i] = GeluTanh(gate[i]) * up[i].
+    /// Equivalent to <see cref="SwiGLU"/> but with GeLU instead of SiLU.
+    /// </summary>
+    void GeGLU(ITensor output, ITensor gate, ITensor up)
+    {
+        GeluTanh(gate, gate);
+        ElementMul(output, gate, up);
+    }
+
+    /// <summary>
+    /// RMS normalization with NO learned weight: output[i] = input[i] / rms(input).
+    /// Used by Gemma 4 to normalize the V projection at runtime.
+    /// </summary>
+    void RmsNormUnit(ITensor output, ITensor input, float eps)
+    {
+        var o = output.AsFloatSpan();
+        var i = input.AsFloatSpan();
+        double sumSq = 0;
+        for (int k = 0; k < i.Length; k++) sumSq += (double)i[k] * i[k];
+        float invRms = (float)(1.0 / Math.Sqrt(sumSq / i.Length + eps));
+        for (int k = 0; k < i.Length; k++) o[k] = i[k] * invRms;
+    }
+
+    /// <summary>
+    /// Per-head RMS normalization with NO learned weight, in-place.
+    /// Each contiguous head_dim slice is independently normalized: data[h*hd + i] /= rms(head_h).
+    /// Used for Gemma 4's V projection which has shape [head_dim, n_kv_heads] reshaped from [n_kv_heads × head_dim].
+    /// </summary>
+    void PerHeadRmsNormUnit(ITensor data, int numHeads, int headDim, float eps)
+    {
+        var span = data.AsFloatSpan();
+        for (int h = 0; h < numHeads; h++)
+        {
+            int off = h * headDim;
+            double sumSq = 0;
+            for (int i = 0; i < headDim; i++) sumSq += (double)span[off + i] * span[off + i];
+            float invRms = (float)(1.0 / Math.Sqrt(sumSq / headDim + eps));
+            for (int i = 0; i < headDim; i++) span[off + i] *= invRms;
+        }
+    }
+
+    /// <summary>
+    /// Apply tanh-based logit softcap in-place: data[i] = cap * tanh(data[i] / cap).
+    /// Used by Gemma 2/3/4 final logits.
+    /// </summary>
+    void LogitSoftcap(ITensor data, float cap)
+    {
+        var span = data.AsFloatSpan();
+        float invCap = 1.0f / cap;
+        for (int i = 0; i < span.Length; i++)
+            span[i] = cap * MathF.Tanh(span[i] * invCap);
+    }
+
+    /// <summary>
+    /// Multiply every element by a scalar in-place. Used to scale token embeddings
+    /// by sqrt(hidden_dim) (Gemma) and to apply per-layer output scales.
+    /// </summary>
+    void ScaleInPlace(ITensor data, float scale)
+    {
+        var span = data.AsFloatSpan();
+        for (int i = 0; i < span.Length; i++) span[i] *= scale;
+    }
+
+    /// <summary>
+    /// RoPE with explicit per-pair frequency multipliers. Used by Gemma 4 full-attention
+    /// layers for proportional/precomputed RoPE.
+    /// freqFactors is a [headDim/2] (or [ropeDim/2]) F32 tensor of multipliers applied
+    /// to each rotation pair's angle. Pass null to use plain theta-derived frequencies.
+    /// </summary>
+    void RoPEWithFreqFactors(ITensor q, ITensor k, int headDim, int ropeDim,
+        int positionOffset, float ropeTheta, ITensor? freqFactors)
+    {
+        // Default: ignore freqFactors and call regular RoPE.
+        // CPU backend overrides this to honor the freq table.
+        if (freqFactors == null)
+        {
+            RoPE(q, k, headDim, ropeDim, positionOffset, ropeTheta);
+            return;
+        }
+        throw new NotSupportedException(
+            $"{Name} backend does not implement RoPEWithFreqFactors. " +
+            "Required for Gemma 4 full-attention layers.");
+    }
+
+    /// <summary>
+    /// NEOX-style RoPE: pairs are (head[i], head[i+ropeDim/2]) instead of the
+    /// "interleaved" (head[2i], head[2i+1]) used by the regular <see cref="RoPE"/>.
+    /// Required for Gemma 4 (LLAMA_ROPE_TYPE_NEOX) and any other arch where the
+    /// converter does NOT pre-permute Q/K weights into interleaved layout.
+    /// </summary>
+    void RoPENeox(ITensor q, ITensor k, int headDim, int ropeDim, int positionOffset, float ropeTheta)
+    {
+        throw new NotSupportedException(
+            $"{Name} backend does not implement RoPENeox. Required for Gemma 4 sliding-window layers.");
+    }
+
+    /// <summary>
+    /// NEOX-style RoPE with explicit per-pair frequency multipliers (proportional RoPE).
+    /// Required for Gemma 4 full-attention layers.
+    /// </summary>
+    void RoPENeoxWithFreqFactors(ITensor q, ITensor k, int headDim, int ropeDim,
+        int positionOffset, float ropeTheta, ITensor? freqFactors)
+    {
+        if (freqFactors == null)
+        {
+            RoPENeox(q, k, headDim, ropeDim, positionOffset, ropeTheta);
+            return;
+        }
+        throw new NotSupportedException(
+            $"{Name} backend does not implement RoPENeoxWithFreqFactors. " +
+            "Required for Gemma 4 full-attention layers.");
     }
 }

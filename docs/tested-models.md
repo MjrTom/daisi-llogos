@@ -18,6 +18,7 @@ These models produce correct, coherent output on all available backends.
 | [Bonsai-8B](https://huggingface.co/prism-ml/Bonsai-8B-gguf) | qwen3 (1-bit) | 8B | Q1_0_g128 | CPU, CUDA | [Q1_0_g128](https://huggingface.co/prism-ml/Bonsai-8B-gguf/resolve/main/Bonsai-8B.gguf) (1.1 GB) |
 | [Qwen2.5-0.5B](https://huggingface.co/Qwen/Qwen2.5-0.5B-GGUF) | qwen2 | 0.5B | Q8_0 | CPU, CUDA | [Q8_0](https://huggingface.co/Qwen/Qwen2.5-0.5B-Instruct-GGUF) (0.5 GB) |
 | [Llama 3.2-1B](https://huggingface.co/bartowski/Llama-3.2-1B-Instruct-GGUF) | llama | 1B | Q8_0 | CPU, CUDA | [Q8_0](https://huggingface.co/bartowski/Llama-3.2-1B-Instruct-GGUF) (1.3 GB) |
+| [Gemma 4 E4B-it](https://huggingface.co/unsloth/gemma-3n-E4B-it-GGUF) | gemma4 | 4B | Q4_0, Q8_0 | CPU, CUDA | [Q4_0](https://huggingface.co/unsloth/gemma-3n-E4B-it-GGUF/resolve/main/gemma-3n-E4B-it-Q4_0.gguf) (2.1 GB), [Q8_0](https://huggingface.co/unsloth/gemma-3n-E4B-it-GGUF/resolve/main/gemma-3n-E4B-it-Q8_0.gguf) (4.5 GB) |
 
 ## Performance (NVIDIA RTX 5080)
 
@@ -37,6 +38,7 @@ Measured with `--bench`, 128 decode tokens, FP16 KV cache. llama.cpp b8461 compa
 | Qwen3-8B Q4_K_M | 124 | 138 | 90% |
 | Qwen3.5-9B Q8_0 | **88** | 84 | **105%** |
 | Qwen3.5-9B Q4_0 | 101 | 123 | 82% |
+| Gemma 4 E4B-it Q4_0 | 75 | — | — |
 
 ### Llogos vs llama.cpp — Vulkan
 
@@ -62,6 +64,7 @@ Measured with `--bench`, 128 decode tokens, FP16 KV cache. llama.cpp b8461 compa
 | Qwen3-8B Q4_K_M | 124 | 54 | — |
 | Qwen3.5-9B Q8_0 | 88 | 53 | — |
 | Qwen3.5-9B Q4_0 | 101 | 45 | — |
+| Gemma 4 E4B-it Q4_0 | 75 | — | 13 |
 
 ### CUDA Optimizations Applied
 
